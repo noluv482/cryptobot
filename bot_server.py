@@ -704,14 +704,15 @@ def trading_loop(trader, engine):
             now = datetime.now().strftime("%H:%M:%S")
             print(f"[{now}] {name} ${price:.4f} EMA:{ema:.2f} RSI:{rsi} → {sig}")
 
-            if sig != last_sig and sig in ("BUY","SELL"):
+            if sig in ("BUY","SELL"):
                 stop   = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
                 target = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
-                emoji  = "🟢" if sig=="BUY" else "🔴"
-                tg(f"{emoji} *{sig} Signal — {name}*\n"
-                   f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
-                   f"EMA: `{ema:.2f}` | RSI: `{rsi}`")
                 trader.on_signal(sig, price, stop, target, name)
+                if sig != last_sig:
+                    emoji = "🟢" if sig=="BUY" else "🔴"
+                    tg(f"{emoji} *{sig} Signal — {name}*\n"
+                       f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
+                       f"EMA: `{ema:.2f}` | RSI: `{rsi}`")
 
             last_sig = sig
 
