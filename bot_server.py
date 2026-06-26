@@ -590,22 +590,50 @@ def _nasdaq_loop():
         time.sleep(900)
 
 # ── Auto coin switcher ────────────────────────────────────────────────────────
+_hold_since = {}  # pair -> timestamp when HOLD started
+
 def _switcher_loop():
     global _current_coin
     time.sleep(20)
     while True:
         try:
             scores = rank_coins()
-            if scores and scores[0]["pair"] != _current_coin["pair"]:
-                best = scores[0]
-                _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==best["pair"]), _current_coin)
-                tg(f"🔀 *Switched to {best['name']}*\n"
-                   f"Score: `{best['score']}` | RSI: `{best['rsi']}` | News: `{best['news']}`\n"
-                   f"_{best['reason']}_")
-                print(f"[Switch] → {best['name']}")
+            if not scores:
+                time.sleep(600)
+                continue
+
+            pair = _current_coin["pair"]
+            # track how long current coin has been HOLDing
+            try:
+                closes, highs, lows = get_klines(pair)
+                price = get_price(pair)
+                engine_tmp = SignalEngine()
+                sig, _, _, _ = engine_tmp.evaluate(closes, highs, lows, price, _current_coin["alert_buffer"])
+                if sig == "HOLD":
+                    if pair not in _hold_since:
+                        _hold_since[pair] = time.time()
+                else:
+                    _hold_since.pop(pair, None)
+            except Exception:
+                sig = "HOLD"
+
+            hold_mins = (time.time() - _hold_since.get(pair, time.time())) / 60
+            force_switch = hold_mins >= 20  # switch if HOLD for 20+ minutes
+
+            best = scores[0]
+            if force_switch or best["pair"] != pair:
+                new_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == best["pair"]), _current_coin)
+                if new_coin["pair"] != pair:
+                    _current_coin = new_coin
+                    _hold_since.pop(pair, None)
+                    reason = f"HOLD for {hold_mins:.0f} min" if force_switch else "better score"
+                    tg(f"🔀 *Switched to {best['name']}* ({reason})\n"
+                       f"Score: `{best['score']}` | RSI: `{best['rsi']}` | News: `{best['news']}`\n"
+                       f"_{best['reason']}_")
+                    print(f"[Switch] → {best['name']} ({reason})")
         except Exception as e:
             print(f"[Switcher] {e}")
-        time.sleep(1800)
+        time.sleep(600)  # check every 10 min instead of 30
 
 # ── Telegram buttons ──────────────────────────────────────────────────────────
 def send_menu(trader=None):
