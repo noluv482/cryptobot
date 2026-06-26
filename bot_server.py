@@ -13,8 +13,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TG_TOKEN   = "8382017140:AAH-Zs0dBTAk47vwnvnKOuXlo6ee8693wfs"
-TG_CHAT_ID = "6689707091"
+TG_TOKEN   = os.environ["TG_TOKEN"]
+TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 BASE_URL   = "https://api.kraken.com/0/public"
 
@@ -34,7 +34,7 @@ MAX_TRADE_GAIN = 0.08   # close when up 8%
 MAX_TRADE_LOSS = 0.04   # close when down 4%
 MAX_TRADE_MINS = 60     # force close after 60 min
 
-SAVE_FILE = "paper_state.json"
+SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 
 SCAN_UNIVERSE = [
     {"name": "SOL/USD",   "pair": "SOLUSD",   "alert_buffer": 0.10},
@@ -123,6 +123,7 @@ _paused         = False
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
 _seen_headlines = set()
+_state_lock     = threading.Lock()   # guards _paused and _current_coin
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 def tg(msg):
@@ -151,9 +152,11 @@ def tg_answer(cb_id, text=""):
 # ── Data ──────────────────────────────────────────────────────────────────────
 def get_klines(pair):
     r = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair, "interval": INTERVAL}, timeout=10)
-    result = r.json()
-    rkey = list(result["result"].keys())[0]
-    data = result["result"][rkey][-CANDLE_LIMIT:]
+    payload = r.json()
+    if payload.get("error"):
+        raise ValueError(f"Kraken OHLC error: {payload['error']}")
+    rkey = list(payload["result"].keys())[0]
+    data = payload["result"][rkey][-CANDLE_LIMIT:]
     closes  = [float(c[4]) for c in data]
     highs   = [float(c[2]) for c in data]
     lows    = [float(c[3]) for c in data]
@@ -161,8 +164,11 @@ def get_klines(pair):
 
 def get_price(pair):
     r = requests.get(f"{BASE_URL}/Ticker", params={"pair": pair}, timeout=10)
-    key = list(r.json()["result"].keys())[0]
-    return float(r.json()["result"][key]["c"][0])
+    payload = r.json()
+    if payload.get("error"):
+        raise ValueError(f"Kraken Ticker error: {payload['error']}")
+    key = list(payload["result"].keys())[0]
+    return float(payload["result"][key]["c"][0])
 
 def calc_ema(closes):
     k   = 2.0 / (EMA_PERIOD + 1)
@@ -182,6 +188,7 @@ def calc_rsi(closes):
         d  = closes[i] - closes[i-1]
         ag = (ag*(RSI_PERIOD-1) + max(d,0))  / RSI_PERIOD
         al = (al*(RSI_PERIOD-1) + max(-d,0)) / RSI_PERIOD
+    if al == 0 and ag == 0: return 50.0
     return round(100 - 100/(1 + ag/al), 1) if al > 0 else 100.0
 
 # ── Rank coins ────────────────────────────────────────────────────────────────
@@ -282,8 +289,9 @@ class PaperTrader:
         return round(move * p["margin"] * LEVERAGE, 4)
 
     def on_signal(self, sig, price, stop, target, name):
-        global _paused
-        if _paused or self.balance < PAPER_FLOOR: return
+        with _state_lock:
+            paused = _paused
+        if paused or self.balance < PAPER_FLOOR: return
         if self.balance >= PAPER_TARGET: return
 
         if self.position:
@@ -380,10 +388,15 @@ class PaperTrader:
         self.current_rank  = RANKS[0]["name"]
         self.session_start = PAPER_START
         self._save()
+        send_menu(self)
 
 # ── Signal engine ─────────────────────────────────────────────────────────────
 class SignalEngine:
     def __init__(self):
+        self.above_ticks = 0
+        self.below_ticks = 0
+
+    def reset(self):
         self.above_ticks = 0
         self.below_ticks = 0
 
@@ -447,7 +460,7 @@ def _news_loop():
             for url in NEWS_FEEDS:
                 try:
                     r    = requests.get(url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
-                    root = ET.fromstring(r.content)
+                    root = ET.fromstring(r.content[:512_000])
                     for item in root.findall(".//item")[:10]:
                         title = item.findtext("title","").strip()
                         if not title: continue
@@ -491,15 +504,19 @@ def _nasdaq_loop():
         time.sleep(900)
 
 # ── Auto coin switcher ────────────────────────────────────────────────────────
-def _switcher_loop():
+def _switcher_loop(trader):
     global _current_coin
     time.sleep(20)
     while True:
         try:
             scores = rank_coins()
+            with _state_lock:
+                if trader.position:
+                    scores = []  # don't switch while in a trade
             if scores and scores[0]["pair"] != _current_coin["pair"]:
                 best = scores[0]
-                _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==best["pair"]), _current_coin)
+                with _state_lock:
+                    _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==best["pair"]), _current_coin)
                 tg(f"🔀 *Switched to {best['name']}*\n"
                    f"Score: `{best['score']}` | RSI: `{best['rsi']}` | News: `{best['news']}`\n"
                    f"_{best['reason']}_")
@@ -510,7 +527,9 @@ def _switcher_loop():
 
 # ── Telegram buttons ──────────────────────────────────────────────────────────
 def send_menu(trader=None):
-    status = "🟢 LIVE" if not _paused else "⏸ PAUSED"
+    with _state_lock:
+        paused = _paused
+    status = "🟢 LIVE" if not paused else "⏸ PAUSED"
     bal    = f"${trader.balance:,.2f}" if trader else "—"
     coin   = _current_coin["name"]
     nasdaq = market_mood["nasdaq"]
@@ -527,8 +546,8 @@ def send_menu(trader=None):
          {"text": "📰 News Feed",        "callback_data": "news"}],
         [{"text": "🔄 Switch Coin",      "callback_data": "switch_menu"},
          {"text": "🏆 Rank Ladder",      "callback_data": "ranks"}],
-        [{"text": "⏸ Pause" if not _paused else "▶ Resume",
-          "callback_data": "pause" if not _paused else "resume"}],
+        [{"text": "⏸ Pause" if not paused else "▶ Resume",
+          "callback_data": "pause" if not paused else "resume"}],
     ])
 
 def _handle_callback(query, trader, engine):
@@ -620,7 +639,8 @@ def _handle_callback(query, trader, engine):
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "pause":
-        _paused = True
+        with _state_lock:
+            _paused = True
         tg_buttons(
             "⏸ *Trading PAUSED*\nThe bot will not open new trades.",
             [[{"text": "▶ Resume Trading", "callback_data": "resume"},
@@ -628,7 +648,8 @@ def _handle_callback(query, trader, engine):
         )
 
     elif data == "resume":
-        _paused = False
+        with _state_lock:
+            _paused = False
         tg_buttons(
             "▶ *Trading RESUMED*\nThe bot is back to scanning for signals.",
             [[{"text": "⏸ Pause Trading", "callback_data": "pause"},
@@ -648,12 +669,19 @@ def _handle_callback(query, trader, engine):
         pair = data[3:]
         coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
         if coin:
-            _current_coin = coin
-            engine.__init__()
-            tg_buttons(
-                f"🔄 *Switched to {coin['name']}*\nBot will now trade this pair.",
-                [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
-            )
+            if trader.position:
+                tg_buttons(
+                    "⚠️ *Cannot switch — position is open.*\nClose the current trade first.",
+                    [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+                )
+            else:
+                with _state_lock:
+                    _current_coin = coin
+                engine.reset()
+                tg_buttons(
+                    f"🔄 *Switched to {coin['name']}*\nBot will now trade this pair.",
+                    [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+                )
 
     elif data == "news":
         active = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] != "NEUTRAL"]
@@ -680,8 +708,13 @@ def _poll_loop(trader, engine):
             for u in r.json().get("result",[]):
                 _last_update_id = u["update_id"]
                 if "callback_query" in u:
-                    _handle_callback(u["callback_query"], trader, engine)
+                    cb = u["callback_query"]
+                    if str(cb.get("from", {}).get("id", "")) != TG_CHAT_ID:
+                        continue
+                    _handle_callback(cb, trader, engine)
                 elif "message" in u:
+                    if str(u["message"].get("chat", {}).get("id", "")) != TG_CHAT_ID:
+                        continue
                     txt = u["message"].get("text","").strip().lower()
                     if txt in ("/start","/menu","menu"):
                         send_menu(trader)
@@ -731,7 +764,7 @@ def main():
     # Start background threads
     threading.Thread(target=_news_loop,                         daemon=True).start()
     threading.Thread(target=_nasdaq_loop,                       daemon=True).start()
-    threading.Thread(target=_switcher_loop,                     daemon=True).start()
+    threading.Thread(target=_switcher_loop, args=(trader,),     daemon=True).start()
     threading.Thread(target=_poll_loop, args=(trader, engine),  daemon=True).start()
 
     print("[Bot] All systems online.")
