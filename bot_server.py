@@ -26,13 +26,13 @@ REFRESH_SEC   = 30
 CONFIRM_TICKS = 2
 
 PAPER_START    = 100.0
-PAPER_TARGET    = 10000.0
-PAPER_FLOOR     = 50.0
-LEVERAGE        = 3
-RISK_PER_TRADE  = 0.10
-MAX_TRADE_GAIN  = 0.08   # close trade when up 8% — prevents snowball wins
-MAX_TRADE_LOSS  = 0.04   # close trade when down 4% — tighter stop
-MAX_TRADE_MINS  = 60     # force close after 60 minutes no matter what
+PAPER_TARGET   = 50000.0
+PAPER_FLOOR    = 50.0
+LEVERAGE       = 3
+RISK_PER_TRADE = 0.10
+MAX_TRADE_GAIN = 0.08   # close when up 8%
+MAX_TRADE_LOSS = 0.04   # close when down 4%
+MAX_TRADE_MINS = 60     # force close after 60 min
 
 SAVE_FILE = "paper_state.json"
 
@@ -63,13 +63,17 @@ SCAN_UNIVERSE = [
 ]
 
 RANKS = [
-    {"name": "Rookie",  "min": 0,     "emoji": "🟤", "unlock": "You're just getting started. Every trade is a lesson."},
-    {"name": "Trader",  "min": 250,   "emoji": "⚪", "unlock": "You proved you can grow. Now stay consistent."},
-    {"name": "Pro",     "min": 500,   "emoji": "🟡", "unlock": "You're not lucky — you're skilled. Keep pushing."},
-    {"name": "Expert",  "min": 1000,  "emoji": "🟠", "unlock": "Most bots never get here. You're in rare territory."},
-    {"name": "Elite",   "min": 2500,  "emoji": "🔵", "unlock": "You're in the top 1%. The goal is almost in sight."},
-    {"name": "Legend",  "min": 5000,  "emoji": "🔴", "unlock": "This is it. $10,000 or bust. No turning back."},
-    {"name": "GOAT",    "min": 10000, "emoji": "👑", "unlock": "You turned $100 into $10,000. Legend."},
+    {"name": "Rookie",    "min": 0,     "emoji": "🟤", "unlock": "You're just getting started. Every trade is a lesson."},
+    {"name": "Trader",    "min": 250,   "emoji": "⚪", "unlock": "You proved you can grow. Now stay consistent."},
+    {"name": "Pro",       "min": 500,   "emoji": "🟡", "unlock": "You're not lucky — you're skilled. Keep pushing."},
+    {"name": "Expert",    "min": 1000,  "emoji": "🟠", "unlock": "Most bots never get here. You're in rare territory."},
+    {"name": "Elite",     "min": 2500,  "emoji": "🔵", "unlock": "You're in the top 1%. Keep that momentum going."},
+    {"name": "Legend",    "min": 5000,  "emoji": "🔴", "unlock": "Half way to $10k. You're built different."},
+    {"name": "GOAT",      "min": 10000, "emoji": "👑", "unlock": "Hit $10,000. Most never get here. Keep stacking."},
+    {"name": "Diamond",   "min": 15000, "emoji": "💎", "unlock": "$15k. You're not stopping, are you."},
+    {"name": "Immortal",  "min": 25000, "emoji": "⚡", "unlock": "$25,000. A quarter of the way to greatness."},
+    {"name": "Mythic",    "min": 35000, "emoji": "🌙", "unlock": "$35k and rising. The goal is in reach."},
+    {"name": "OVERLORD",  "min": 50000, "emoji": "🏆", "unlock": "You turned $100 into $50,000. OVERLORD status."},
 ]
 
 NEWS_FEEDS = [
@@ -285,12 +289,10 @@ class PaperTrader:
         if self.position:
             p    = self.position
             side = p["side"]
-            upnl = self.unrealized_pnl(price)
             move = (price - p["entry"]) / p["entry"]
             if side == "SHORT": move = -move
             mins_open = (time.time() - p.get("opened_at", time.time())) / 60
 
-            # Cap gains and losses
             if move >= MAX_TRADE_GAIN:
                 self._close(price, name, "profit cap")
             elif move <= -MAX_TRADE_LOSS:
@@ -351,8 +353,8 @@ class PaperTrader:
         if self.balance < PAPER_FLOOR:
             self._eliminate()
         if self.balance >= PAPER_TARGET:
-            tg(f"👑 *GOAL REACHED — ${PAPER_TARGET:,.0f}!*\nStarted `${PAPER_START:.0f}` → `${self.balance:.2f}`\n"
-               f"Trades: `{len(self.trades)}` | Win rate: `{self.win_rate:.0f}%`\n🎉 Mission complete.")
+            tg(f"🏆 *GOAL REACHED — ${PAPER_TARGET:,.0f}!*\nStarted `${PAPER_START:.0f}` → `${self.balance:.2f}`\n"
+               f"Trades: `{len(self.trades)}` | Win rate: `{self.win_rate:.0f}%`\n🎉 OVERLORD. Mission complete.")
 
     def _eliminate(self):
         losses   = [t for t in self.trades if t["pnl"] < 0]
@@ -507,88 +509,164 @@ def _switcher_loop():
         time.sleep(1800)
 
 # ── Telegram buttons ──────────────────────────────────────────────────────────
-def send_menu():
-    tg_buttons(
-        "🤖 *CryptoBot Control Panel*",
-        [[{"text":"📊 Rankings","callback_data":"rankings"},
-          {"text":"💰 Balance","callback_data":"balance"}],
-         [{"text":"⏸ Pause","callback_data":"pause"},
-          {"text":"▶ Resume","callback_data":"resume"}],
-         [{"text":"🔄 Switch Coin","callback_data":"switch_menu"}],
-         [{"text":"📰 News","callback_data":"news"}]]
+def send_menu(trader=None):
+    status = "🟢 LIVE" if not _paused else "⏸ PAUSED"
+    bal    = f"${trader.balance:,.2f}" if trader else "—"
+    coin   = _current_coin["name"]
+    nasdaq = market_mood["nasdaq"]
+    nasdaq_icon = "🟢" if nasdaq == "BULLISH" else "🔴" if nasdaq == "BEARISH" else "⚫"
+    header = (
+        f"🤖 *CryptoBot* | {status}\n"
+        f"💵 Balance: `{bal}` | 🎯 Goal: `${PAPER_TARGET:,.0f}`\n"
+        f"📈 Trading: *{coin}* | {nasdaq_icon} NASDAQ: `{nasdaq}`"
     )
+    tg_buttons(header, [
+        [{"text": "💰 Balance & Stats",  "callback_data": "balance"},
+         {"text": "📊 Rankings",         "callback_data": "rankings"}],
+        [{"text": "📜 Trade History",    "callback_data": "history"},
+         {"text": "📰 News Feed",        "callback_data": "news"}],
+        [{"text": "🔄 Switch Coin",      "callback_data": "switch_menu"},
+         {"text": "🏆 Rank Ladder",      "callback_data": "ranks"}],
+        [{"text": "⏸ Pause" if not _paused else "▶ Resume",
+          "callback_data": "pause" if not _paused else "resume"}],
+    ])
 
 def _handle_callback(query, trader, engine):
     global _paused, _current_coin
     tg_answer(query["id"])
-    data = query.get("data","")
+    data = query.get("data", "")
 
     if data == "menu":
-        send_menu()
-
-    elif data == "rankings":
-        scores = rank_coins()[:5]
-        medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
-        lines  = ["*📊 Best Coins Right Now*","─────────────────────"]
-        for i,s in enumerate(scores):
-            lines.append(f"{medals[i]} *{s['name']}* — Score:`{s['score']}` RSI:`{s['rsi']}` {s['news']}\n_{s['reason']}_")
-        tg_buttons("\n".join(lines),[[{"text":"🔙 Back","callback_data":"menu"}]])
+        send_menu(trader)
 
     elif data == "balance":
         rank     = get_rank(trader.balance)
         next_rnk = get_next_rank(trader.balance)
-        progress = max(0,(trader.balance-PAPER_START)/(PAPER_TARGET-PAPER_START)*100)
-        pos_line = "No open position"
+        progress = min(100, max(0, (trader.balance - PAPER_START) / (PAPER_TARGET - PAPER_START) * 100))
+        bar_filled = int(progress / 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        losses = len(trader.trades) - trader.wins
+
+        pos_line = "None"
+        unreal   = ""
         if trader.position:
-            pos_line = f"{trader.position['side']} @ `${trader.position['entry']:.4f}`"
+            p = trader.position
+            try:
+                live = get_price(_current_coin["pair"])
+                upnl = trader.unrealized_pnl(live)
+                upnl_str = f"({'+'if upnl>=0 else ''}{upnl:.2f}$)"
+            except Exception:
+                upnl_str = ""
+            pos_line = f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} @ `${p['entry']:.4f}` {upnl_str}"
+
         tg_buttons(
-            f"{rank['emoji']} *{rank['name']}* | Balance: `${trader.balance:.2f}`\n"
-            f"Goal: `${PAPER_TARGET:,.0f}` | Progress: `{progress:.1f}%`\n"
-            f"Win rate: `{trader.win_rate:.0f}%` ({trader.wins}/{len(trader.trades)} trades)\n"
-            f"Next rank: {next_rnk['name']} @ `${next_rnk['min']:,.0f}`\n"
-            f"Position: {pos_line}\nCoin: *{_current_coin['name']}*",
-            [[{"text":"🔙 Back","callback_data":"menu"}]]
+            f"{rank['emoji']} *{rank['name']}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 Balance:  `${trader.balance:,.2f}`\n"
+            f"📈 Peak:     `${trader.peak:,.2f}`\n"
+            f"🎯 Goal:     `${PAPER_TARGET:,.0f}`\n"
+            f"⬜ Progress: `[{bar}] {progress:.1f}%`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Wins:     `{trader.wins}`  ❌ Losses: `{losses}`\n"
+            f"🎯 Win Rate: `{trader.win_rate:.0f}%`  📊 Trades: `{len(trader.trades)}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📂 Position: {pos_line}\n"
+            f"🪙 Coin:     *{_current_coin['name']}*\n"
+            f"⬆️ Next Rank: {next_rnk['emoji']} {next_rnk['name']} @ `${next_rnk['min']:,.0f}`",
+            [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
         )
+
+    elif data == "rankings":
+        scores = rank_coins()[:5]
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        lines  = ["*📊 Top 5 Coins Right Now*", "━━━━━━━━━━━━━━━━━━━━"]
+        for i, s in enumerate(scores):
+            news_icon = "🟢" if s["news"] == "BULLISH" else "🔴" if s["news"] == "BEARISH" else "⚫"
+            lines.append(
+                f"{medals[i]} *{s['name']}*\n"
+                f"   Score: `{s['score']}` | RSI: `{s['rsi']}` | Vol: `{s['volatility']}%` {news_icon}\n"
+                f"   _{s['reason']}_"
+            )
+        tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data == "history":
+        if not trader.trades:
+            tg_buttons("📜 *No trades yet.*", [[{"text": "🔙 Back", "callback_data": "menu"}]])
+            return
+        recent = trader.trades[-8:]
+        lines  = [f"📜 *Last {len(recent)} Trades*", "━━━━━━━━━━━━━━━━━━━━"]
+        for t in reversed(recent):
+            icon  = "✅" if t["pnl"] >= 0 else "❌"
+            side  = "🟢 L" if t["side"] == "LONG" else "🔴 S"
+            lines.append(
+                f"{icon} {side} `${t['entry']:.3f}` → `${t['exit']:.3f}`  "
+                f"`{'+'if t['pnl']>=0 else ''}{t['pnl']:.2f}$`"
+            )
+        total_pnl = trader.total_pnl
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"Total PnL: `{'+'if total_pnl>=0 else ''}{total_pnl:.2f}$`")
+        tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data == "ranks":
+        current = get_rank(trader.balance)
+        lines   = ["*🏆 Rank Ladder*", "━━━━━━━━━━━━━━━━━━━━"]
+        for r in RANKS:
+            if r["name"] == current["name"]:
+                lines.append(f"▶ {r['emoji']} *{r['name']}* ← YOU  `${r['min']:,.0f}`")
+            elif trader.balance >= r["min"]:
+                lines.append(f"  {r['emoji']} ~~{r['name']}~~  `${r['min']:,.0f}` ✓")
+            else:
+                lines.append(f"  {r['emoji']} {r['name']}  `${r['min']:,.0f}`")
+        tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "pause":
         _paused = True
-        tg_buttons("⏸ *Trading PAUSED*",
-                   [[{"text":"▶ Resume","callback_data":"resume"},
-                     {"text":"🔙 Back","callback_data":"menu"}]])
+        tg_buttons(
+            "⏸ *Trading PAUSED*\nThe bot will not open new trades.",
+            [[{"text": "▶ Resume Trading", "callback_data": "resume"},
+              {"text": "🔙 Back",           "callback_data": "menu"}]]
+        )
 
     elif data == "resume":
         _paused = False
-        tg_buttons("▶ *Trading RESUMED*",
-                   [[{"text":"⏸ Pause","callback_data":"pause"},
-                     {"text":"🔙 Back","callback_data":"menu"}]])
+        tg_buttons(
+            "▶ *Trading RESUMED*\nThe bot is back to scanning for signals.",
+            [[{"text": "⏸ Pause Trading", "callback_data": "pause"},
+              {"text": "🔙 Back",          "callback_data": "menu"}]]
+        )
 
     elif data == "switch_menu":
         scores = rank_coins()[:10]
         rows   = []
-        for i in range(0,len(scores),2):
-            row = [{"text":s["name"],"callback_data":f"sw_{s['pair']}"} for s in scores[i:i+2]]
+        for i in range(0, len(scores), 2):
+            row = [{"text": f"{s['name']} ({s['score']})", "callback_data": f"sw_{s['pair']}"} for s in scores[i:i+2]]
             rows.append(row)
-        rows.append([{"text":"🔙 Back","callback_data":"menu"}])
-        tg_buttons("🔄 *Top coins right now — pick one:*", rows)
+        rows.append([{"text": "🔙 Back to Menu", "callback_data": "menu"}])
+        tg_buttons("🔄 *Pick a coin — sorted by score:*", rows)
 
     elif data.startswith("sw_"):
         pair = data[3:]
-        coin = next((c for c in SCAN_UNIVERSE if c["pair"]==pair), None)
+        coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
         if coin:
             _current_coin = coin
             engine.__init__()
-            tg_buttons(f"🔄 *Switched to {coin['name']}*",
-                       [[{"text":"🔙 Back","callback_data":"menu"}]])
+            tg_buttons(
+                f"🔄 *Switched to {coin['name']}*\nBot will now trade this pair.",
+                [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+            )
 
     elif data == "news":
-        lines = ["*📰 News Sentiment*","─────────────────────"]
-        for pair, info in news_sentiment.items():
-            name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"]==pair), pair)
-            s    = info["sentiment"]
-            icon = "🟢" if s=="BULLISH" else "🔴" if s=="BEARISH" else "⚪"
+        active = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] != "NEUTRAL"]
+        neutral = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] == "NEUTRAL"]
+        lines = ["*📰 News Sentiment*", "━━━━━━━━━━━━━━━━━━━━"]
+        for pair, info in active:
+            name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+            icon = "🟢" if info["sentiment"] == "BULLISH" else "🔴"
             hl   = f"\n   _{info['headline']}_" if info["headline"] else ""
-            lines.append(f"{icon} *{name}*: `{s}`{hl}")
-        tg_buttons("\n".join(lines),[[{"text":"🔙 Back","callback_data":"menu"}]])
+            lines.append(f"{icon} *{name}*: `{info['sentiment']}`{hl}")
+        if neutral:
+            lines.append(f"⚫ {len(neutral)} coins neutral")
+        tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
 def _poll_loop(trader, engine):
     global _last_update_id
@@ -606,7 +684,7 @@ def _poll_loop(trader, engine):
                 elif "message" in u:
                     txt = u["message"].get("text","").strip().lower()
                     if txt in ("/start","/menu","menu"):
-                        send_menu()
+                        send_menu(trader)
         except Exception as e:
             print(f"[Poll] {e}")
         time.sleep(1)
@@ -673,7 +751,7 @@ def main():
     next_rnk = get_next_rank(trader.balance)
     progress = max(0,(trader.balance-PAPER_START)/(PAPER_TARGET-PAPER_START)*100)
 
-    send_menu()
+    send_menu(trader)
     tg(f"{rank['emoji']} *CryptoBot Online*\n"
        f"─────────────────────\n"
        f"Rank: *{rank['name']}* | Balance: `${trader.balance:.2f}`\n"
