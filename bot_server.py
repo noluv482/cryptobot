@@ -126,13 +126,18 @@ class Database:
             print("[DB] No DATABASE_URL — learning disabled, running on JSON only")
             return
         try:
-            import psycopg2
-            self.conn = psycopg2.connect(url)
+            try:
+                import psycopg2
+            except ImportError:
+                print("[DB] psycopg2 not installed — learning disabled")
+                return
+            self.conn = psycopg2.connect(url, connect_timeout=5)
             self.conn.autocommit = True
             self._init_schema()
             print("[DB] Connected — learning enabled")
         except Exception as e:
             print(f"[DB] Connect error: {e}")
+            self.conn = None
 
     def _init_schema(self):
         with self.conn.cursor() as cur:
