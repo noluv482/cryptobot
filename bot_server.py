@@ -26,10 +26,13 @@ REFRESH_SEC   = 30
 CONFIRM_TICKS = 2
 
 PAPER_START    = 100.0
-PAPER_TARGET   = 10000.0
-PAPER_FLOOR    = 50.0
-LEVERAGE       = 3
-RISK_PER_TRADE = 0.10
+PAPER_TARGET    = 10000.0
+PAPER_FLOOR     = 50.0
+LEVERAGE        = 3
+RISK_PER_TRADE  = 0.10
+MAX_TRADE_GAIN  = 0.08   # close trade when up 8% — prevents snowball wins
+MAX_TRADE_LOSS  = 0.04   # close trade when down 4% — tighter stop
+MAX_TRADE_MINS  = 60     # force close after 60 minutes no matter what
 
 SAVE_FILE = "paper_state.json"
 
@@ -282,14 +285,22 @@ class PaperTrader:
         if self.position:
             p    = self.position
             side = p["side"]
-            if side == "LONG"  and price >= p.get("target", float("inf")):
+            upnl = self.unrealized_pnl(price)
+            move = (price - p["entry"]) / p["entry"]
+            if side == "SHORT": move = -move
+            mins_open = (time.time() - p.get("opened_at", time.time())) / 60
+
+            # Cap gains and losses
+            if move >= MAX_TRADE_GAIN:
+                self._close(price, name, "profit cap")
+            elif move <= -MAX_TRADE_LOSS:
+                self._close(price, name, "stop loss")
+            elif mins_open >= MAX_TRADE_MINS:
+                self._close(price, name, "time limit")
+            elif side == "LONG"  and price >= p.get("target", float("inf")):
                 self._close(price, name, "take profit")
             elif side == "SHORT" and price <= p.get("target", 0):
                 self._close(price, name, "take profit")
-            elif side == "LONG"  and price <= stop:
-                self._close(price, name, "stop loss")
-            elif side == "SHORT" and price >= stop:
-                self._close(price, name, "stop loss")
             elif (side == "LONG" and sig == "SELL") or (side == "SHORT" and sig == "BUY"):
                 self._close(price, name, "signal flip")
 
@@ -303,7 +314,8 @@ class PaperTrader:
         margin    = round(self.balance * RISK_PER_TRADE, 4)
         contracts = round((margin * LEVERAGE) / price, 6)
         self.position = {"side": side, "entry": price,
-                         "contracts": contracts, "margin": margin, "target": target}
+                         "contracts": contracts, "margin": margin,
+                         "target": target, "opened_at": time.time()}
         self._save()
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${price:.4f}`\n"
