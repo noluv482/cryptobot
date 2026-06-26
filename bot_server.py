@@ -29,7 +29,8 @@ PAPER_START    = 100.0
 PAPER_TARGET   = 50000.0
 PAPER_FLOOR    = 50.0
 LEVERAGE       = 3
-RISK_PER_TRADE = 0.10
+RISK_MIN       = 0.05   # 5%  margin at low confidence
+RISK_MAX       = 0.20   # 20% margin at high confidence
 MAX_TRADE_GAIN = 0.08   # close when up 8%
 MAX_TRADE_LOSS = 0.04   # close when down 4%
 MAX_TRADE_MINS = 60     # force close after 60 min
@@ -288,7 +289,7 @@ class PaperTrader:
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * LEVERAGE, 4)
 
-    def on_signal(self, sig, price, stop, target, name):
+    def on_signal(self, sig, price, stop, target, name, confidence):
         with _state_lock:
             paused = _paused
         if paused or self.balance < PAPER_FLOOR: return
@@ -316,19 +317,23 @@ class PaperTrader:
 
         if not self.position:
             if sig == "BUY":
-                self._open("LONG",  price, name, target)
+                self._open("LONG",  price, name, target, confidence)
             elif sig == "SELL":
-                self._open("SHORT", price, name, target)
+                self._open("SHORT", price, name, target, confidence)
 
-    def _open(self, side, price, name, target):
-        margin    = round(self.balance * RISK_PER_TRADE, 4)
+    def _open(self, side, price, name, target, confidence):
+        risk      = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+        margin    = round(self.balance * risk, 4)
         contracts = round((margin * LEVERAGE) / price, 6)
+        conf_pct  = int(confidence * 100)
         self.position = {"side": side, "entry": price,
                          "contracts": contracts, "margin": margin,
-                         "target": target, "opened_at": time.time()}
+                         "target": target, "opened_at": time.time(),
+                         "confidence": confidence}
         self._save()
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${price:.4f}`\n"
+           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance\n"
            f"Margin: `${margin:.2f}` | {LEVERAGE}x leverage\n"
            f"Balance: `${self.balance:.2f}`")
 
@@ -440,16 +445,38 @@ class SignalEngine:
                     "stop":  nearest_r if nearest_r else price*1.015}
 
         # news gate
-        news = news_sentiment.get(_current_coin["pair"], {})
+        news    = news_sentiment.get(_current_coin["pair"], {})
         n_score = news.get("score", 0)
+        n_sent  = news.get("sentiment", "NEUTRAL")
         if n_score >= 3:
-            if sig == "BUY"  and news.get("sentiment") == "BEARISH": sig = "HOLD"
-            if sig == "SELL" and news.get("sentiment") == "BULLISH": sig = "HOLD"
+            if sig == "BUY"  and n_sent == "BEARISH": sig = "HOLD"
+            if sig == "SELL" and n_sent == "BULLISH": sig = "HOLD"
 
         # NASDAQ gate
-        if market_mood["nasdaq"] == "BEARISH" and sig == "BUY": sig = "HOLD"
+        nasdaq_mood = market_mood["nasdaq"]
+        if nasdaq_mood == "BEARISH" and sig == "BUY": sig = "HOLD"
 
-        return sig, plan, ema, rsi
+        # ── Confidence score (0.0 → 1.0) ─────────────────────────────────────
+        # Scored across 4 equal pillars, each worth 1 point
+        ticks = self.above_ticks if sig == "BUY" else self.below_ticks
+        pts   = 0.0
+        # 1. RSI zone
+        if 40 <= rsi <= 60:   pts += 1.0
+        elif 30 < rsi < 70:   pts += 0.5
+        # 2. News alignment
+        if   (sig == "BUY"  and n_sent == "BULLISH") or \
+             (sig == "SELL" and n_sent == "BEARISH"):  pts += 1.0
+        elif n_sent == "NEUTRAL":                       pts += 0.5
+        # 3. NASDAQ alignment
+        if   (sig == "BUY"  and nasdaq_mood == "BULLISH") or \
+             (sig == "SELL" and nasdaq_mood == "BEARISH"): pts += 1.0
+        elif nasdaq_mood == "NEUTRAL":                     pts += 0.5
+        # 4. Tick strength (1 point at 5+ consecutive ticks)
+        pts += min(ticks / 5.0, 1.0)
+
+        confidence = round(pts / 4.0, 2) if sig in ("BUY", "SELL") else 0.0
+
+        return sig, plan, ema, rsi, confidence
 
 # ── News scanner ──────────────────────────────────────────────────────────────
 def _news_loop():
@@ -576,7 +603,8 @@ def _handle_callback(query, trader, engine):
                 upnl_str = f"({'+'if upnl>=0 else ''}{upnl:.2f}$)"
             except Exception:
                 upnl_str = ""
-            pos_line = f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} @ `${p['entry']:.4f}` {upnl_str}"
+            conf_str = f" | {int(p.get('confidence',0)*100)}% conf" if p.get('confidence') else ""
+            pos_line = f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} @ `${p['entry']:.4f}` {upnl_str}{conf_str}"
 
         tg_buttons(
             f"{rank['emoji']} *{rank['name']}*\n"
@@ -732,19 +760,20 @@ def trading_loop(trader, engine):
             buf    = _current_coin["alert_buffer"]
             closes, highs, lows = get_klines(pair)
             price  = get_price(pair)
-            sig, plan, ema, rsi = engine.evaluate(closes, highs, lows, price, buf)
+            sig, plan, ema, rsi, confidence = engine.evaluate(closes, highs, lows, price, buf)
 
             now = datetime.now().strftime("%H:%M:%S")
-            print(f"[{now}] {name} ${price:.4f} EMA:{ema:.2f} RSI:{rsi} → {sig}")
+            print(f"[{now}] {name} ${price:.4f} EMA:{ema:.2f} RSI:{rsi} → {sig} conf:{confidence:.0%}")
 
             if sig != last_sig and sig in ("BUY","SELL"):
                 stop   = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
                 target = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
                 emoji  = "🟢" if sig=="BUY" else "🔴"
+                risk   = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
                 tg(f"{emoji} *{sig} Signal — {name}*\n"
                    f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
-                   f"EMA: `{ema:.2f}` | RSI: `{rsi}`")
-                trader.on_signal(sig, price, stop, target, name)
+                   f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Confidence: `{int(confidence*100)}%` → Size: `{risk*100:.1f}%`")
+                trader.on_signal(sig, price, stop, target, name, confidence)
 
             last_sig = sig
 
