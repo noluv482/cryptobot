@@ -11,6 +11,49 @@ import os
 import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
+try:
+    import psycopg2
+    import psycopg2.extras
+    _PG_URL = os.environ.get("DATABASE_URL")
+    _db_available = bool(_PG_URL)
+except ImportError:
+    _db_available = False
+
+def _db_conn():
+    return psycopg2.connect(_PG_URL, sslmode="require")
+
+def _db_init():
+    if not _db_available: return
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS state (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS trades (
+                        id SERIAL PRIMARY KEY,
+                        ts TIMESTAMP DEFAULT NOW(),
+                        coin TEXT,
+                        side TEXT,
+                        entry REAL,
+                        exit_price REAL,
+                        pnl REAL,
+                        reason TEXT,
+                        balance_after REAL
+                    );
+                    CREATE TABLE IF NOT EXISTS lessons (
+                        id SERIAL PRIMARY KEY,
+                        ts TIMESTAMP DEFAULT NOW(),
+                        lesson TEXT,
+                        win_rate REAL,
+                        total_trades INT
+                    );
+                """)
+        print("[DB] PostgreSQL connected and tables ready")
+    except Exception as e:
+        print(f"[DB] Init error: {e}")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TG_TOKEN   = "8382017140:AAH-Zs0dBTAk47vwnvnKOuXlo6ee8693wfs"
@@ -240,6 +283,23 @@ class PaperTrader:
         self._load()
 
     def _load(self):
+        if _db_available:
+            try:
+                with _db_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT key, value FROM state WHERE key IN ('balance','peak','position','current_rank','trades')")
+                        rows = {r[0]: r[1] for r in cur.fetchall()}
+                if rows:
+                    self.balance      = float(rows.get("balance", PAPER_START))
+                    self.peak         = float(rows.get("peak", self.balance))
+                    self.position     = json.loads(rows["position"]) if rows.get("position") and rows["position"] != "null" else None
+                    self.current_rank = rows.get("current_rank", RANKS[0]["name"])
+                    self.trades       = json.loads(rows.get("trades", "[]"))
+                    print(f"[DB] Loaded — Balance: ${self.balance:.2f} | Trades: {len(self.trades)}")
+                    return
+            except Exception as e:
+                print(f"[DB] Load error: {e}")
+        # fallback to file
         if os.path.exists(SAVE_FILE):
             try:
                 with open(SAVE_FILE) as f:
@@ -249,11 +309,27 @@ class PaperTrader:
                 self.trades       = d.get("trades", [])
                 self.position     = d.get("position", None)
                 self.current_rank = d.get("current_rank", RANKS[0]["name"])
-                print(f"[Paper] Loaded — Balance: ${self.balance:.2f}")
+                print(f"[Paper] Loaded from file — Balance: ${self.balance:.2f}")
             except Exception as e:
                 print(f"[Paper] Load error: {e}")
 
     def _save(self):
+        if _db_available:
+            try:
+                with _db_conn() as conn:
+                    with conn.cursor() as cur:
+                        for key, val in [
+                            ("balance",      str(self.balance)),
+                            ("peak",         str(self.peak)),
+                            ("position",     json.dumps(self.position)),
+                            ("current_rank", self.current_rank),
+                            ("trades",       json.dumps(self.trades[-200:])),
+                        ]:
+                            cur.execute("INSERT INTO state(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (key, val))
+                return
+            except Exception as e:
+                print(f"[DB] Save error: {e}")
+        # fallback to file
         try:
             with open(SAVE_FILE, "w") as f:
                 json.dump({"balance": self.balance, "peak": self.peak,
@@ -261,6 +337,26 @@ class PaperTrader:
                            "current_rank": self.current_rank}, f, indent=2)
         except Exception as e:
             print(f"[Paper] Save error: {e}")
+
+    def _save_trade_db(self, coin, side, entry, exit_price, pnl, reason):
+        if not _db_available: return
+        try:
+            with _db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO trades(coin,side,entry,exit_price,pnl,reason,balance_after) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                                (coin, side, entry, exit_price, pnl, reason, self.balance))
+        except Exception as e:
+            print(f"[DB] Trade save error: {e}")
+
+    def _save_lesson_db(self, lesson, win_rate, total_trades):
+        if not _db_available: return
+        try:
+            with _db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO lessons(lesson,win_rate,total_trades) VALUES(%s,%s,%s)",
+                                (lesson, win_rate, total_trades))
+        except Exception as e:
+            print(f"[DB] Lesson save error: {e}")
 
     @property
     def wins(self):
@@ -329,9 +425,10 @@ class PaperTrader:
         pnl          = self.unrealized_pnl(price)
         self.balance = round(self.balance + pnl, 4)
         self.peak    = max(self.peak, self.balance)
-        self.trades.append({"side": self.position["side"],
-                            "entry": self.position["entry"],
-                            "exit": price, "pnl": pnl})
+        trade = {"side": self.position["side"], "entry": self.position["entry"],
+                 "exit": price, "pnl": pnl}
+        self.trades.append(trade)
+        self._save_trade_db(name, trade["side"], trade["entry"], price, pnl, reason)
         emoji = "✅" if pnl >= 0 else "❌"
         tg(f"{emoji} *Trade CLOSED — {name}*\n"
            f"Reason: `{reason}`\n"
@@ -370,6 +467,8 @@ class PaperTrader:
         if self.win_rate < 40 and len(self.trades) >= 5:
             lessons.append(f"Win rate only {self.win_rate:.0f}%")
         lesson_txt = "\n".join(f"• {l}" for l in lessons) if lessons else "• Not enough data"
+        for l in lessons:
+            self._save_lesson_db(l, self.win_rate, len(self.trades))
         tg(f"💀 *BOT ELIMINATED — Restarting*\n"
            f"Balance: `${self.balance:.2f}` | Trades: `{len(self.trades)}`\n"
            f"📚 *Lessons:*\n{lesson_txt}\n🔄 Restarting at `${PAPER_START:.0f}`...")
@@ -725,6 +824,7 @@ def main():
     print("=" * 40)
     print("  CRYPTOBOT SERVER STARTING")
     print("=" * 40)
+    _db_init()
 
     trader = PaperTrader()
     engine = SignalEngine()
