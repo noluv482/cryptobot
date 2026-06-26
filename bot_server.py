@@ -117,6 +117,121 @@ BEARISH_WORDS = ["crash","drop","dump","ban","hack","exploit","lawsuit","sec",
                  "bearish","fear","panic","liquidation","outflow","falls",
                  "plunges","tumbles","decline","warning","investigation"]
 
+# ── Database ──────────────────────────────────────────────────────────────────
+class Database:
+    def __init__(self):
+        self.conn = None
+        url = os.environ.get("DATABASE_URL")
+        if not url:
+            print("[DB] No DATABASE_URL — learning disabled, running on JSON only")
+            return
+        try:
+            import psycopg2
+            self.conn = psycopg2.connect(url)
+            self.conn.autocommit = True
+            self._init_schema()
+            print("[DB] Connected — learning enabled")
+        except Exception as e:
+            print(f"[DB] Connect error: {e}")
+
+    def _init_schema(self):
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id          SERIAL PRIMARY KEY,
+                    ts          FLOAT,
+                    coin        TEXT,
+                    pair        TEXT,
+                    side        TEXT,
+                    entry       FLOAT,
+                    exit_price  FLOAT,
+                    pnl         FLOAT,
+                    held_mins   FLOAT,
+                    reason      TEXT,
+                    confidence  FLOAT,
+                    nasdaq_mood TEXT,
+                    news_sent   TEXT,
+                    balance_after FLOAT
+                )
+            """)
+
+    def save_trade(self, t):
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO trades
+                      (ts, coin, pair, side, entry, exit_price, pnl, held_mins,
+                       reason, confidence, nasdaq_mood, news_sent, balance_after)
+                    VALUES
+                      (%(ts)s,%(coin)s,%(pair)s,%(side)s,%(entry)s,%(exit_price)s,
+                       %(pnl)s,%(held_mins)s,%(reason)s,%(confidence)s,
+                       %(nasdaq_mood)s,%(news_sent)s,%(balance_after)s)
+                """, t)
+        except Exception as e:
+            print(f"[DB] Save error: {e}")
+
+    def coin_win_rates(self, min_trades=3):
+        """Per-pair win rate for coins with enough history."""
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT pair,
+                           COUNT(*) AS n,
+                           ROUND(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::numeric
+                                 / COUNT(*) * 100, 1) AS wr
+                    FROM trades
+                    GROUP BY pair
+                    HAVING COUNT(*) >= %s
+                """, (min_trades,))
+                return {row[0]: {"n": row[1], "wr": float(row[2])} for row in cur.fetchall()}
+        except Exception as e:
+            print(f"[DB] coin_win_rates error: {e}")
+            return {}
+
+    def confidence_calibration(self):
+        """Win rates split by confidence tier."""
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT CASE WHEN confidence >= 0.6 THEN 'high' ELSE 'low' END AS tier,
+                           COUNT(*) AS n,
+                           ROUND(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::numeric
+                                 / COUNT(*) * 100, 1) AS wr
+                    FROM trades
+                    GROUP BY tier
+                """)
+                return {row[0]: {"n": row[1], "wr": float(row[2])} for row in cur.fetchall()}
+        except Exception as e:
+            print(f"[DB] confidence_calibration error: {e}")
+            return {}
+
+    def best_exit_reason(self):
+        """Which exit reason has the best avg PnL."""
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT reason,
+                           COUNT(*) AS n,
+                           ROUND(AVG(pnl)::numeric, 3) AS avg_pnl
+                    FROM trades
+                    GROUP BY reason
+                    ORDER BY avg_pnl DESC
+                """)
+                return [(row[0], row[1], float(row[2])) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"[DB] best_exit_reason error: {e}")
+            return []
+
+    @property
+    def connected(self):
+        return self.conn is not None
+
+db = Database()
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 news_sentiment  = {p: {"sentiment": "NEUTRAL", "headline": "", "score": 0} for p in COIN_KEYWORDS}
 market_mood     = {"nasdaq": "NEUTRAL", "change_pct": 0.0}
@@ -194,7 +309,8 @@ def calc_rsi(closes):
 
 # ── Rank coins ────────────────────────────────────────────────────────────────
 def rank_coins():
-    scores = []
+    scores    = []
+    db_rates  = db.coin_win_rates()   # {} if DB not connected
     for coin in SCAN_UNIVERSE:
         pair = coin["pair"]
         try:
@@ -211,11 +327,24 @@ def rank_coins():
             news = news_sentiment.get(pair, {})
             if news.get("sentiment") == "BULLISH": score += 15
             if news.get("sentiment") == "BEARISH": score -= 15
+
+            # ── Adaptive learning boost ───────────────────────────────────
+            learned = ""
+            if pair in db_rates:
+                wr = db_rates[pair]["wr"]
+                n  = db_rates[pair]["n"]
+                if   wr >= 65: score += 20; learned = f"Learned {wr:.0f}%WR✅"
+                elif wr >= 55: score += 10; learned = f"Learned {wr:.0f}%WR"
+                elif wr <= 35: score -= 20; learned = f"Learned {wr:.0f}%WR❌"
+                elif wr <= 45: score -= 10; learned = f"Learned {wr:.0f}%WR"
+
             reason = []
             if volatility > 2:  reason.append(f"Volatility {volatility:.1f}%")
             if above_ema:       reason.append("Above EMA")
             if 40 <= rsi <= 60: reason.append(f"RSI {rsi} ideal")
             if news.get("sentiment") == "BULLISH": reason.append("Bullish news")
+            if learned:         reason.append(learned)
+
             scores.append({"name": coin["name"], "pair": pair,
                            "score": round(score,1), "rsi": rsi,
                            "volatility": round(volatility,2),
@@ -316,6 +445,24 @@ def analyse_intelligence(trades):
     lines.append("*Exit reasons:*")
     for r, n in sorted(reasons.items(), key=lambda x: -x[1]):
         lines.append(f"  `{r}`: {n}x")
+
+    # DB stats (lifetime, survives redeploys)
+    if db.connected:
+        db_rates = db.coin_win_rates()
+        exit_stats = db.best_exit_reason()
+        cal = db.confidence_calibration()
+        lifetime_total = sum(v["n"] for v in db_rates.values())
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"*📦 Lifetime DB:* `{lifetime_total}` trades stored")
+        if cal:
+            for tier, d in cal.items():
+                lines.append(f"  {tier.capitalize()} conf: `{d['wr']:.0f}%` WR ({d['n']} trades)")
+        if exit_stats:
+            best_exit = exit_stats[0]
+            lines.append(f"  Best exit: `{best_exit[0]}` avg `{best_exit[2]:+.2f}$`")
+    else:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("⚫ _Add PostgreSQL on Railway to enable lifetime learning_")
 
     return "\n".join(lines)
 
@@ -437,15 +584,31 @@ class PaperTrader:
         self.balance = round(self.balance + pnl, 4)
         self.peak    = max(self.peak, self.balance)
         held_mins    = round((time.time() - self.position.get("opened_at", time.time())) / 60, 1)
-        self.trades.append({"side":       self.position["side"],
-                            "entry":      self.position["entry"],
-                            "exit":       price,
-                            "pnl":        pnl,
-                            "coin":       self.position.get("name", name),
-                            "confidence": self.position.get("confidence", 0.0),
-                            "held_mins":  held_mins,
-                            "reason":     reason,
-                            "ts":         time.time()})
+        trade_rec = {"side":       self.position["side"],
+                     "entry":      self.position["entry"],
+                     "exit":       price,
+                     "pnl":        pnl,
+                     "coin":       self.position.get("name", name),
+                     "confidence": self.position.get("confidence", 0.0),
+                     "held_mins":  held_mins,
+                     "reason":     reason,
+                     "ts":         time.time()}
+        self.trades.append(trade_rec)
+        db.save_trade({
+            "ts":           trade_rec["ts"],
+            "coin":         trade_rec["coin"],
+            "pair":         self.position.get("pair", ""),
+            "side":         trade_rec["side"],
+            "entry":        trade_rec["entry"],
+            "exit_price":   price,
+            "pnl":          pnl,
+            "held_mins":    held_mins,
+            "reason":       reason,
+            "confidence":   trade_rec["confidence"],
+            "nasdaq_mood":  market_mood["nasdaq"],
+            "news_sent":    news_sentiment.get(self.position.get("pair",""), {}).get("sentiment","NEUTRAL"),
+            "balance_after": self.balance,
+        })
         emoji = "✅" if pnl >= 0 else "❌"
         tg(f"{emoji} *Trade CLOSED — {name}*\n"
            f"Reason: `{reason}`\n"
