@@ -226,6 +226,99 @@ def rank_coins():
             pass
     return sorted(scores, key=lambda x: x["score"], reverse=True)
 
+def analyse_intelligence(trades):
+    if not trades:
+        return "📊 No trades yet — intelligence report available after first trade."
+
+    wins   = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    total  = len(trades)
+
+    # High vs low confidence split (threshold 60%)
+    hi = [t for t in trades if t.get("confidence", 0) >= 0.60]
+    lo = [t for t in trades if t.get("confidence", 0) <  0.60]
+    hi_wr = (sum(1 for t in hi if t["pnl"] > 0) / len(hi) * 100) if hi else 0
+    lo_wr = (sum(1 for t in lo if t["pnl"] > 0) / len(lo) * 100) if lo else 0
+
+    # Profit factor
+    gross_win  = sum(t["pnl"] for t in wins)  or 0
+    gross_loss = abs(sum(t["pnl"] for t in losses)) or 1
+    pf = round(gross_win / gross_loss, 2)
+
+    # Best coin by win rate (min 2 trades)
+    coins = {}
+    for t in trades:
+        c = t.get("coin", "?")
+        coins.setdefault(c, {"w": 0, "n": 0})
+        coins[c]["n"] += 1
+        if t["pnl"] > 0: coins[c]["w"] += 1
+    best_coin = max(
+        ((c, d) for c, d in coins.items() if d["n"] >= 2),
+        key=lambda x: x[1]["w"] / x[1]["n"],
+        default=(None, None)
+    )
+
+    # Current streak
+    streak, streak_type = 0, ""
+    for t in reversed(trades):
+        kind = "W" if t["pnl"] > 0 else "L"
+        if streak == 0:
+            streak_type = kind
+        if kind == streak_type:
+            streak += 1
+        else:
+            break
+
+    # Avg hold time
+    held = [t.get("held_mins", 0) for t in trades]
+    avg_hold = round(sum(held) / len(held), 1) if held else 0
+
+    # Best / worst trade
+    best  = max(trades, key=lambda t: t["pnl"])
+    worst = min(trades, key=lambda t: t["pnl"])
+
+    conf_arrow = "🟢" if hi_wr > lo_wr else "🔴" if hi_wr < lo_wr else "⚫"
+
+    lines = [
+        "*🧠 Intelligence Report*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Trades: `{total}` | Win Rate: `{len(wins)/total*100:.0f}%`",
+        f"💰 Profit Factor: `{pf}x` ({'good' if pf >= 1.5 else 'needs work'})",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"*Confidence accuracy* {conf_arrow}",
+        f"  High (≥60%): `{len(hi)}` trades → `{hi_wr:.0f}%` win rate",
+        f"  Low  (<60%): `{len(lo)}` trades → `{lo_wr:.0f}%` win rate",
+    ]
+    if hi_wr > lo_wr + 5:
+        lines.append("  ✅ Confidence scoring is working")
+    elif lo_wr > hi_wr + 5:
+        lines.append("  ⚠️ Low-confidence trades outperforming — needs tuning")
+    else:
+        lines.append("  📌 Not enough data to judge yet")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🔥 Current streak: `{streak} {'win' if streak_type=='W' else 'loss'}{'s' if streak>1 else ''}`",
+        f"⏱ Avg hold time: `{avg_hold} min`",
+        f"🏅 Best trade:  `+{best['pnl']:.2f}$` ({best.get('coin','?')})",
+        f"💀 Worst trade: `{worst['pnl']:.2f}$` ({worst.get('coin','?')})",
+    ]
+    if best_coin[0]:
+        wr_pct = best_coin[1]['w'] / best_coin[1]['n'] * 100
+        lines.append(f"🪙 Best coin: *{best_coin[0]}* `{wr_pct:.0f}%` WR ({best_coin[1]['n']} trades)")
+
+    # Exit reason breakdown
+    reasons = {}
+    for t in trades:
+        r = t.get("reason", "?")
+        reasons[r] = reasons.get(r, 0) + 1
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("*Exit reasons:*")
+    for r, n in sorted(reasons.items(), key=lambda x: -x[1]):
+        lines.append(f"  `{r}`: {n}x")
+
+    return "\n".join(lines)
+
 def get_rank(balance):
     for r in reversed(RANKS):
         if balance >= r["min"]: return r
@@ -343,9 +436,16 @@ class PaperTrader:
         pnl          = self.unrealized_pnl(price)
         self.balance = round(self.balance + pnl, 4)
         self.peak    = max(self.peak, self.balance)
-        self.trades.append({"side": self.position["side"],
-                            "entry": self.position["entry"],
-                            "exit": price, "pnl": pnl})
+        held_mins    = round((time.time() - self.position.get("opened_at", time.time())) / 60, 1)
+        self.trades.append({"side":       self.position["side"],
+                            "entry":      self.position["entry"],
+                            "exit":       price,
+                            "pnl":        pnl,
+                            "coin":       self.position.get("name", name),
+                            "confidence": self.position.get("confidence", 0.0),
+                            "held_mins":  held_mins,
+                            "reason":     reason,
+                            "ts":         time.time()})
         emoji = "✅" if pnl >= 0 else "❌"
         tg(f"{emoji} *Trade CLOSED — {name}*\n"
            f"Reason: `{reason}`\n"
@@ -576,6 +676,7 @@ def send_menu(trader=None):
          {"text": "📰 News Feed",        "callback_data": "news"}],
         [{"text": "🔄 Switch Coin",      "callback_data": "switch_menu"},
          {"text": "🏆 Rank Ladder",      "callback_data": "ranks"}],
+        [{"text": "🧠 Intelligence",     "callback_data": "intelligence"}],
         [{"text": "⏸ Pause" if not paused else "▶ Resume",
           "callback_data": "pause" if not paused else "resume"}],
     ])
@@ -713,6 +814,10 @@ def _handle_callback(query, trader, engine):
                     f"🔄 *Switched to {coin['name']}*\nBot will now trade this pair.",
                     [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
                 )
+
+    elif data == "intelligence":
+        report = analyse_intelligence(trader.trades)
+        tg_buttons(report, [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "news":
         active = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] != "NEUTRAL"]
