@@ -627,7 +627,8 @@ def send_menu(trader=None):
         [{"text": "🔄 Switch Coin",      "callback_data": "switch_menu"},
          {"text": "🏆 Rank Ladder",      "callback_data": "ranks"}],
         [{"text": "⏸ Pause" if not _paused else "▶ Resume",
-          "callback_data": "pause" if not _paused else "resume"}],
+          "callback_data": "pause" if not _paused else "resume"},
+         {"text": "❌ Close Trade", "callback_data": "close_trade"}],
     ])
 
 def _handle_callback(query, trader, engine):
@@ -717,6 +718,23 @@ def _handle_callback(query, trader, engine):
             else:
                 lines.append(f"  {r['emoji']} {r['name']}  `${r['min']:,.0f}`")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data == "close_trade":
+        if trader.position:
+            try:
+                price = get_price(_current_coin["pair"])
+                trader._close(price, _current_coin["name"], "manual close")
+                tg_buttons(
+                    f"❌ *Trade Closed Manually*\nBalance: `${trader.balance:,.2f}`",
+                    [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+                )
+            except Exception as e:
+                tg(f"Error closing trade: {e}")
+        else:
+            tg_buttons(
+                "No open trade to close.",
+                [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+            )
 
     elif data == "pause":
         _paused = True
