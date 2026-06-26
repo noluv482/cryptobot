@@ -317,11 +317,11 @@ class PaperTrader:
 
         if not self.position:
             if sig == "BUY":
-                self._open("LONG",  price, name, target, confidence)
+                self._open("LONG",  price, name, target, confidence, _current_coin["pair"])
             elif sig == "SELL":
-                self._open("SHORT", price, name, target, confidence)
+                self._open("SHORT", price, name, target, confidence, _current_coin["pair"])
 
-    def _open(self, side, price, name, target, confidence):
+    def _open(self, side, price, name, target, confidence, pair):
         risk      = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
         margin    = round(self.balance * risk, 4)
         contracts = round((margin * LEVERAGE) / price, 6)
@@ -329,7 +329,8 @@ class PaperTrader:
         self.position = {"side": side, "entry": price,
                          "contracts": contracts, "margin": margin,
                          "target": target, "opened_at": time.time(),
-                         "confidence": confidence}
+                         "confidence": confidence,
+                         "pair": pair, "name": name}
         self._save()
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${price:.4f}`\n"
@@ -537,17 +538,19 @@ def _switcher_loop(trader):
     while True:
         try:
             scores = rank_coins()
+            switched_to = None
             with _state_lock:
-                if trader.position:
-                    scores = []  # don't switch while in a trade
-            if scores and scores[0]["pair"] != _current_coin["pair"]:
-                best = scores[0]
-                with _state_lock:
-                    _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==best["pair"]), _current_coin)
-                tg(f"🔀 *Switched to {best['name']}*\n"
-                   f"Score: `{best['score']}` | RSI: `{best['rsi']}` | News: `{best['news']}`\n"
-                   f"_{best['reason']}_")
-                print(f"[Switch] → {best['name']}")
+                # Atomic guard + write — no gap between the position check and the coin update
+                if not trader.position and scores and scores[0]["pair"] != _current_coin["pair"]:
+                    new_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == scores[0]["pair"]), None)
+                    if new_coin:
+                        _current_coin = new_coin
+                        switched_to   = scores[0]
+            if switched_to:
+                tg(f"🔀 *Switched to {switched_to['name']}*\n"
+                   f"Score: `{switched_to['score']}` | RSI: `{switched_to['rsi']}` | News: `{switched_to['news']}`\n"
+                   f"_{switched_to['reason']}_")
+                print(f"[Switch] → {switched_to['name']}")
         except Exception as e:
             print(f"[Switcher] {e}")
         time.sleep(1800)
@@ -755,9 +758,24 @@ def trading_loop(trader, engine):
     last_sig = None
     while True:
         try:
-            pair   = _current_coin["pair"]
-            name   = _current_coin["name"]
-            buf    = _current_coin["alert_buffer"]
+            with _state_lock:
+                coin = _current_coin
+
+            # If a position is open, always manage it using the coin it was opened on.
+            # This prevents the price-mismatch glitch when the coin switcher fires mid-trade.
+            if trader.position and trader.position.get("pair") != coin["pair"]:
+                pos_pair = trader.position["pair"]
+                pos_name = trader.position.get("name", pos_pair)
+                pos_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pos_pair), None)
+                if pos_coin:
+                    pos_price = get_price(pos_pair)
+                    trader.on_signal("HOLD", pos_price, 0, 0, pos_name, 0.0)
+                time.sleep(REFRESH_SEC)
+                continue
+
+            pair = coin["pair"]
+            name = coin["name"]
+            buf  = coin["alert_buffer"]
             closes, highs, lows = get_klines(pair)
             price  = get_price(pair)
             sig, plan, ema, rsi, confidence = engine.evaluate(closes, highs, lows, price, buf)
