@@ -620,17 +620,21 @@ def _switcher_loop():
             hold_mins = (time.time() - _hold_since.get(pair, time.time())) / 60
             force_switch = hold_mins >= 20  # switch if HOLD for 20+ minutes
 
-            best = scores[0]
-            if force_switch or best["pair"] != pair:
+            # If stuck on HOLD, pick best coin that isn't the current one
+            if force_switch:
+                best = next((s for s in scores if s["pair"] != pair), scores[0])
+            else:
+                best = scores[0]
+
+            if best["pair"] != pair:
                 new_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == best["pair"]), _current_coin)
-                if new_coin["pair"] != pair:
-                    _current_coin = new_coin
-                    _hold_since.pop(pair, None)
-                    reason = f"HOLD for {hold_mins:.0f} min" if force_switch else "better score"
-                    tg(f"🔀 *Switched to {best['name']}* ({reason})\n"
-                       f"Score: `{best['score']}` | RSI: `{best['rsi']}` | News: `{best['news']}`\n"
-                       f"_{best['reason']}_")
-                    print(f"[Switch] → {best['name']} ({reason})")
+                _current_coin = new_coin
+                _hold_since.pop(pair, None)
+                reason = f"HOLD {hold_mins:.0f}min — forced switch" if force_switch else "better score"
+                tg(f"🔀 *Switched to {best['name']}* ({reason})\n"
+                   f"Score: `{best['score']}` | RSI: `{best['rsi']}` | News: `{best['news']}`\n"
+                   f"_{best['reason']}_")
+                print(f"[Switch] → {best['name']} ({reason})")
         except Exception as e:
             print(f"[Switcher] {e}")
         time.sleep(600)  # check every 10 min instead of 30
