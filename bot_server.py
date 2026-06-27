@@ -836,7 +836,9 @@ def _poll_loop(trader, engine):
 
 # ── Main trading loop ─────────────────────────────────────────────────────────
 def trading_loop(trader, engine):
-    last_sig = None
+    last_sig       = None
+    last_update_tg = 0
+
     while True:
         try:
             pair   = _current_coin["pair"]
@@ -860,6 +862,22 @@ def trading_loop(trader, engine):
                        f"EMA: `{ema:.2f}` | RSI: `{rsi}`")
 
             last_sig = sig
+
+            # Send status update every 30 minutes
+            if time.time() - last_update_tg >= 1800:
+                rank   = get_rank(trader.balance)
+                upnl   = trader.unrealized_pnl(price)
+                pos    = trader.position
+                if pos:
+                    pos_txt = f"{'🟢 LONG' if pos['side']=='LONG' else '🔴 SHORT'} @ `${pos['entry']:.4f}` | uPnL: `{'+'if upnl>=0 else ''}{upnl:.2f}$`"
+                else:
+                    pos_txt = "None"
+                tg(f"📊 *30-Min Update*\n"
+                   f"{rank['emoji']} `${trader.balance:,.2f}` | Coin: *{name}*\n"
+                   f"Price: `${price:.4f}` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Signal: `{sig}`\n"
+                   f"Position: {pos_txt}\n"
+                   f"Trades: `{len(trader.trades)}` | Win Rate: `{trader.win_rate:.0f}%`")
+                last_update_tg = time.time()
 
         except Exception as e:
             print(f"[Trade] {e}")
