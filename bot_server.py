@@ -68,14 +68,18 @@ INTERVAL      = 5
 REFRESH_SEC   = 30
 CONFIRM_TICKS = 1
 
-PAPER_START    = 100.0
-PAPER_TARGET   = 50000.0
-PAPER_FLOOR    = 50.0
-LEVERAGE       = 3
-RISK_PER_TRADE = 0.10
-MAX_TRADE_GAIN = 0.06   # close when up 6%
-MAX_TRADE_LOSS = 0.03   # close when down 3%
-MAX_TRADE_MINS = 30     # force close after 30 min
+PAPER_START      = 100.0
+PAPER_TARGET     = 50000.0
+PAPER_FLOOR      = 50.0
+LEVERAGE         = 3
+RISK_PER_TRADE   = 0.05   # 5% per trade (was 10%) — safer for real money
+MAX_TRADE_GAIN   = 0.06
+MAX_TRADE_LOSS   = 0.03
+MAX_TRADE_MINS   = 30
+KRAKEN_FEE       = 0.0026  # 0.26% per side — matches real Kraken fees
+SLIPPAGE         = 0.001   # 0.1% slippage on entry/exit — realistic fills
+MAX_TRADES_DAY   = 10      # stop trading after 10 trades in one day
+DAILY_LOSS_LIMIT = 0.10    # stop trading if down 10% in one day
 
 SAVE_FILE = "paper_state.json"
 
@@ -278,6 +282,10 @@ class PaperTrader:
         self.position      = None
         self.trades        = []
         self.peak          = PAPER_START
+        self.day_start_bal = PAPER_START
+        self.day_trades    = 0
+        self.day_date      = datetime.now().strftime("%Y-%m-%d")
+        self.coin_stats    = {}  # pair -> {wins, losses}
         self.current_rank  = RANKS[0]["name"]
         self.session_start = PAPER_START
         self._load()
@@ -377,10 +385,24 @@ class PaperTrader:
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * LEVERAGE, 4)
 
+    def _reset_day_if_needed(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self.day_date:
+            self.day_date      = today
+            self.day_start_bal = self.balance
+            self.day_trades    = 0
+
     def on_signal(self, sig, price, stop, target, name):
         global _paused
         if _paused or self.balance < PAPER_FLOOR: return
         if self.balance >= PAPER_TARGET: return
+        self._reset_day_if_needed()
+        # Daily limits
+        if self.day_trades >= MAX_TRADES_DAY:
+            return
+        daily_loss = (self.balance - self.day_start_bal) / self.day_start_bal
+        if daily_loss <= -DAILY_LOSS_LIMIT:
+            return
 
         if self.position:
             p    = self.position
@@ -409,31 +431,49 @@ class PaperTrader:
                 self._open("SHORT", price, name, target)
 
     def _open(self, side, price, name, target):
+        # Apply slippage — entry is slightly worse than market price
+        fill = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
         margin    = round(self.balance * RISK_PER_TRADE, 4)
-        contracts = round((margin * LEVERAGE) / price, 6)
-        self.position = {"side": side, "entry": price,
+        contracts = round((margin * LEVERAGE) / fill, 6)
+        # Deduct entry fee immediately
+        fee = round(margin * KRAKEN_FEE, 4)
+        self.balance = round(self.balance - fee, 4)
+        self.day_trades += 1
+        self.position = {"side": side, "entry": fill, "coin": name,
                          "contracts": contracts, "margin": margin,
-                         "target": target, "opened_at": time.time()}
+                         "target": target, "opened_at": time.time(), "fee": fee}
         self._save()
         tg(f"📂 *Trade OPENED — {name}*\n"
-           f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${price:.4f}`\n"
-           f"Margin: `${margin:.2f}` | {LEVERAGE}x leverage\n"
-           f"Balance: `${self.balance:.2f}`")
+           f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}`\n"
+           f"Margin: `${margin:.2f}` | {LEVERAGE}x | Fee: `${fee:.3f}`\n"
+           f"Balance: `${self.balance:.2f}` | Day trades: `{self.day_trades}/{MAX_TRADES_DAY}`")
 
     def _close(self, price, name, reason):
         if not self.position: return
-        pnl          = self.unrealized_pnl(price)
+        # Apply slippage on exit too
+        side = self.position["side"]
+        fill = price * (1 - SLIPPAGE) if side == "LONG" else price * (1 + SLIPPAGE)
+        pnl  = self.unrealized_pnl(fill)
+        # Deduct exit fee
+        fee  = round(self.position["margin"] * KRAKEN_FEE, 4)
+        pnl  = round(pnl - fee, 4)
         self.balance = round(self.balance + pnl, 4)
         self.peak    = max(self.peak, self.balance)
-        trade = {"side": self.position["side"], "entry": self.position["entry"],
-                 "exit": price, "pnl": pnl}
+        coin = self.position.get("coin", name)
+        # Track per-coin stats
+        cs = self.coin_stats.setdefault(coin, {"wins": 0, "losses": 0})
+        if pnl >= 0: cs["wins"] += 1
+        else:        cs["losses"] += 1
+        trade = {"side": side, "entry": self.position["entry"],
+                 "exit": fill, "pnl": pnl, "coin": coin}
         self.trades.append(trade)
-        self._save_trade_db(name, trade["side"], trade["entry"], price, pnl, reason)
+        self._save_trade_db(coin, side, self.position["entry"], fill, pnl, reason)
         emoji = "✅" if pnl >= 0 else "❌"
+        daily_pnl = self.balance - self.day_start_bal
         tg(f"{emoji} *Trade CLOSED — {name}*\n"
-           f"Reason: `{reason}`\n"
-           f"PnL: `{'+'if pnl>=0 else ''}{pnl:.2f}$`\n"
-           f"Balance: `${self.balance:.2f}` | Win rate: `{self.win_rate:.0f}%`")
+           f"Reason: `{reason}` | Fee: `${fee:.3f}`\n"
+           f"PnL: `{'+'if pnl>=0 else ''}{pnl:.2f}$` | Balance: `${self.balance:.2f}`\n"
+           f"Win rate: `{self.win_rate:.0f}%` | Day P&L: `{'+'if daily_pnl>=0 else ''}{daily_pnl:.2f}$`")
 
         # rank-up check
         new_rank = get_rank(self.balance)
@@ -701,10 +741,12 @@ def _handle_callback(query, trader, engine):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ Wins:     `{trader.wins}`  ❌ Losses: `{losses}`\n"
             f"🎯 Win Rate: `{trader.win_rate:.0f}%`  📊 Trades: `{len(trader.trades)}`\n"
+            f"📅 Today:   `{trader.day_trades}/{MAX_TRADES_DAY}` trades | P&L: `{'+'if (trader.balance-trader.day_start_bal)>=0 else ''}{trader.balance-trader.day_start_bal:.2f}$`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📂 Position: {pos_line}\n"
             f"🪙 Coin:     *{_current_coin['name']}*\n"
-            f"⬆️ Next Rank: {next_rnk['emoji']} {next_rnk['name']} @ `${next_rnk['min']:,.0f}`",
+            f"⬆️ Next Rank: {next_rnk['emoji']} {next_rnk['name']} @ `${next_rnk['min']:,.0f}`\n"
+            + ("🏆 Best coin: " + max(trader.coin_stats, key=lambda c: trader.coin_stats[c]['wins']/(trader.coin_stats[c]['wins']+trader.coin_stats[c]['losses'])) if trader.coin_stats else ""),
             [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
         )
 
