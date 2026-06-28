@@ -583,7 +583,7 @@ def _nasdaq_loop():
             if len(hist) >= 2:
                 chg = ((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2]) * 100
                 market_mood["change_pct"] = round(chg, 2)
-                market_mood["nasdaq"] = "BULLISH" if chg > 1 else "BEARISH" if chg < -1 else "NEUTRAL"
+                market_mood["nasdaq"] = "BULLISH" if chg > 1 else "BEARISH" if chg < -2 else "NEUTRAL"
                 print(f"[NASDAQ] QQQ {chg:+.2f}% → {market_mood['nasdaq']}")
         except Exception as e:
             print(f"[NASDAQ] {e}")
