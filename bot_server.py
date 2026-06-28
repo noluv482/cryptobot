@@ -167,6 +167,7 @@ BEARISH_WORDS = ["crash","drop","dump","ban","hack","exploit","lawsuit","sec",
 news_sentiment  = {p: {"sentiment": "NEUTRAL", "headline": "", "score": 0} for p in COIN_KEYWORDS}
 market_mood     = {"nasdaq": "NEUTRAL", "change_pct": 0.0}
 _paused         = False
+_daily_limits   = False  # off by default — turn on when ready for real money
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
 _seen_headlines = set()
@@ -397,12 +398,13 @@ class PaperTrader:
         if _paused or self.balance < PAPER_FLOOR: return
         if self.balance >= PAPER_TARGET: return
         self._reset_day_if_needed()
-        # Daily limits
-        if self.day_trades >= MAX_TRADES_DAY:
-            return
-        daily_loss = (self.balance - self.day_start_bal) / self.day_start_bal
-        if daily_loss <= -DAILY_LOSS_LIMIT:
-            return
+        # Daily limits (only when enabled)
+        if _daily_limits:
+            if self.day_trades >= MAX_TRADES_DAY:
+                return
+            daily_loss = (self.balance - self.day_start_bal) / self.day_start_bal
+            if daily_loss <= -DAILY_LOSS_LIMIT:
+                return
 
         if self.position:
             p    = self.position
@@ -701,10 +703,12 @@ def send_menu(trader=None):
         [{"text": "⏸ Pause" if not _paused else "▶ Resume",
           "callback_data": "pause" if not _paused else "resume"},
          {"text": "❌ Close Trade", "callback_data": "close_trade"}],
+        [{"text": "🔒 Daily Limits: ON" if _daily_limits else "🔓 Daily Limits: OFF",
+          "callback_data": "toggle_limits"}],
     ])
 
 def _handle_callback(query, trader, engine):
-    global _paused, _current_coin
+    global _paused, _current_coin, _daily_limits
     tg_answer(query["id"])
     data = query.get("data", "")
 
@@ -792,6 +796,14 @@ def _handle_callback(query, trader, engine):
             else:
                 lines.append(f"  {r['emoji']} {r['name']}  `${r['min']:,.0f}`")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data == "toggle_limits":
+        _daily_limits = not _daily_limits
+        status = "ON — bot stops after 10 trades or -10% day" if _daily_limits else "OFF — bot trades unlimited (paper mode)"
+        tg_buttons(
+            f"{'🔒' if _daily_limits else '🔓'} *Daily Limits {('ON' if _daily_limits else 'OFF')}*\n_{status}_",
+            [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+        )
 
     elif data == "close_trade":
         if trader.position:
