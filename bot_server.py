@@ -73,9 +73,9 @@ PAPER_TARGET   = 50000.0
 PAPER_FLOOR    = 50.0
 LEVERAGE       = 3
 RISK_PER_TRADE = 0.10
-MAX_TRADE_GAIN = 0.08   # close when up 8%
-MAX_TRADE_LOSS = 0.04   # close when down 4%
-MAX_TRADE_MINS = 60     # force close after 60 min
+MAX_TRADE_GAIN = 0.06   # close when up 6%
+MAX_TRADE_LOSS = 0.03   # close when down 3%
+MAX_TRADE_MINS = 30     # force close after 30 min
 
 SAVE_FILE = "paper_state.json"
 
@@ -855,11 +855,13 @@ def trading_loop(trader, engine):
             now = datetime.now().strftime("%H:%M:%S")
             print(f"[{now}] {name} ${price:.4f} EMA:{ema:.2f} RSI:{rsi} → {sig}")
 
+            had_position = bool(trader.position)
             if sig in ("BUY","SELL"):
                 stop   = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
                 target = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
                 trader.on_signal(sig, price, stop, target, name)
-                if sig != last_sig:
+                # alert on signal change OR when we just re-entered after a close
+                if sig != last_sig or (not had_position and trader.position):
                     emoji = "🟢" if sig=="BUY" else "🔴"
                     tg(f"{emoji} *{sig} Signal — {name}*\n"
                        f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
