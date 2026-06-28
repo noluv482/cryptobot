@@ -703,7 +703,7 @@ def send_menu(trader=None):
         [{"text": "⏸ Pause" if not _paused else "▶ Resume",
           "callback_data": "pause" if not _paused else "resume"},
          {"text": "❌ Close Trade", "callback_data": "close_trade"}],
-        [{"text": "🔒 Daily Limits: ON" if _daily_limits else "🔓 Daily Limits: OFF",
+        [{"text": "🔒 Limits: ON  (real money)" if _daily_limits else "🔓 Limits: OFF (paper mode)",
           "callback_data": "toggle_limits"}],
     ])
 
