@@ -168,7 +168,11 @@ news_sentiment  = {p: {"sentiment": "NEUTRAL", "headline": "", "score": 0} for p
 market_mood     = {"nasdaq": "NEUTRAL", "change_pct": 0.0}
 _paused         = False
 _daily_limits   = False  # off by default — turn on when ready for real money
-_current_coin   = SCAN_UNIVERSE[0]
+_current_coin   = SCAN_UNIVERSE[0]   # kept for menu display / manual switch
+_active_coins   = SCAN_UNIVERSE[:3]  # top 3 coins trading simultaneously
+_coin_engines   = {}                 # pair -> SignalEngine
+_coin_last_sig  = {}                 # pair -> last signal
+MAX_POSITIONS   = 3                  # max open trades at once
 _last_update_id = 0
 _seen_headlines = set()
 
@@ -280,13 +284,14 @@ def get_next_rank(balance):
 class PaperTrader:
     def __init__(self):
         self.balance       = PAPER_START
-        self.position      = None
+        self.position      = None        # kept for legacy/single-coin compat
+        self.positions     = {}          # pair -> position dict (multi-coin)
         self.trades        = []
         self.peak          = PAPER_START
         self.day_start_bal = PAPER_START
         self.day_trades    = 0
         self.day_date      = datetime.now().strftime("%Y-%m-%d")
-        self.coin_stats    = {}  # pair -> {wins, losses}
+        self.coin_stats    = {}
         self.current_rank  = RANKS[0]["name"]
         self.session_start = PAPER_START
         self._load()
@@ -379,12 +384,22 @@ class PaperTrader:
     def total_pnl(self):
         return round(sum(t["pnl"] for t in self.trades), 2)
 
-    def unrealized_pnl(self, price):
-        if not self.position: return 0.0
-        p    = self.position
+    def unrealized_pnl(self, price, pair=None):
+        if pair:
+            p = self.positions.get(pair)
+        else:
+            p = self.position
+        if not p: return 0.0
         move = (price - p["entry"]) / p["entry"]
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * LEVERAGE, 4)
+
+    def total_unrealized_pnl(self, prices):
+        total = 0.0
+        for pair, pos in self.positions.items():
+            price = prices.get(pair, pos["entry"])
+            total += self.unrealized_pnl(price, pair)
+        return round(total, 4)
 
     def _reset_day_if_needed(self):
         today = datetime.now().strftime("%Y-%m-%d")
@@ -393,91 +408,84 @@ class PaperTrader:
             self.day_start_bal = self.balance
             self.day_trades    = 0
 
-    def on_signal(self, sig, price, stop, target, name):
+    def on_signal(self, sig, price, stop, target, name, pair):
         global _paused
         if _paused or self.balance < PAPER_FLOOR: return
         if self.balance >= PAPER_TARGET: return
         self._reset_day_if_needed()
-        # Daily limits (only when enabled)
         if _daily_limits:
-            if self.day_trades >= MAX_TRADES_DAY:
-                return
-            daily_loss = (self.balance - self.day_start_bal) / self.day_start_bal
-            if daily_loss <= -DAILY_LOSS_LIMIT:
-                return
+            if self.day_trades >= MAX_TRADES_DAY: return
+            if (self.balance - self.day_start_bal) / self.day_start_bal <= -DAILY_LOSS_LIMIT: return
 
-        if self.position:
-            p    = self.position
-            side = p["side"]
-            move = (price - p["entry"]) / p["entry"]
+        pos = self.positions.get(pair)
+        if pos:
+            side = pos["side"]
+            move = (price - pos["entry"]) / pos["entry"]
             if side == "SHORT": move = -move
-            mins_open = (time.time() - p.get("opened_at", time.time())) / 60
-
+            mins_open = (time.time() - pos.get("opened_at", time.time())) / 60
             if move >= MAX_TRADE_GAIN:
-                self._close(price, name, "profit cap")
+                self._close(price, name, pair, "profit cap")
             elif move <= -MAX_TRADE_LOSS:
-                self._close(price, name, "stop loss")
+                self._close(price, name, pair, "stop loss")
             elif mins_open >= MAX_TRADE_MINS:
-                self._close(price, name, "time limit")
-            elif side == "LONG"  and price >= p.get("target", float("inf")):
-                self._close(price, name, "take profit")
-            elif side == "SHORT" and price <= p.get("target", 0):
-                self._close(price, name, "take profit")
+                self._close(price, name, pair, "time limit")
+            elif side == "LONG"  and price >= pos.get("target", float("inf")):
+                self._close(price, name, pair, "take profit")
+            elif side == "SHORT" and price <= pos.get("target", 0):
+                self._close(price, name, pair, "take profit")
             elif (side == "LONG" and sig == "SELL") or (side == "SHORT" and sig == "BUY"):
-                self._close(price, name, "signal flip")
+                self._close(price, name, pair, "signal flip")
 
-        if not self.position:
+        if pair not in self.positions and len(self.positions) < MAX_POSITIONS:
             if sig == "BUY":
-                self._open("LONG",  price, name, target)
+                self._open("LONG",  price, name, pair, target)
             elif sig == "SELL":
-                self._open("SHORT", price, name, target)
+                self._open("SHORT", price, name, pair, target)
 
-    def _open(self, side, price, name, target):
-        # Apply slippage — entry is slightly worse than market price
-        fill = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
-        margin    = round(self.balance * RISK_PER_TRADE, 4)
+    def _open(self, side, price, name, pair, target):
+        fill   = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
+        margin = round(self.balance * RISK_PER_TRADE, 4)
         contracts = round((margin * LEVERAGE) / fill, 6)
-        # Deduct entry fee immediately
-        fee = round(margin * KRAKEN_FEE, 4)
+        fee    = round(margin * KRAKEN_FEE, 4)
         self.balance = round(self.balance - fee, 4)
         self.day_trades += 1
-        self.position = {"side": side, "entry": fill, "coin": name,
-                         "contracts": contracts, "margin": margin,
-                         "target": target, "opened_at": time.time(), "fee": fee}
+        pos = {"side": side, "entry": fill, "coin": name, "pair": pair,
+               "contracts": contracts, "margin": margin,
+               "target": target, "opened_at": time.time(), "fee": fee}
+        self.positions[pair] = pos
+        self.position = pos  # keep legacy ref
         self._save()
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}`\n"
            f"Margin: `${margin:.2f}` | {LEVERAGE}x | Fee: `${fee:.3f}`\n"
-           f"Balance: `${self.balance:.2f}` | Day trades: `{self.day_trades}/{MAX_TRADES_DAY}`")
+           f"Open positions: `{len(self.positions)}/{MAX_POSITIONS}` | Balance: `${self.balance:.2f}`")
 
-    def _close(self, price, name, reason):
-        if not self.position: return
-        # Apply slippage on exit too
-        side = self.position["side"]
+    def _close(self, price, name, pair, reason):
+        pos = self.positions.get(pair)
+        if not pos: return
+        side = pos["side"]
         fill = price * (1 - SLIPPAGE) if side == "LONG" else price * (1 + SLIPPAGE)
-        pnl  = self.unrealized_pnl(fill)
-        # Deduct exit fee
-        fee  = round(self.position["margin"] * KRAKEN_FEE, 4)
+        move = (fill - pos["entry"]) / pos["entry"]
+        if side == "SHORT": move = -move
+        pnl  = round(move * pos["margin"] * LEVERAGE, 4)
+        fee  = round(pos["margin"] * KRAKEN_FEE, 4)
         pnl  = round(pnl - fee, 4)
         self.balance = round(self.balance + pnl, 4)
         self.peak    = max(self.peak, self.balance)
-        coin = self.position.get("coin", name)
-        # Track per-coin stats
-        cs = self.coin_stats.setdefault(coin, {"wins": 0, "losses": 0})
+        cs = self.coin_stats.setdefault(name, {"wins": 0, "losses": 0})
         if pnl >= 0: cs["wins"] += 1
         else:        cs["losses"] += 1
-        trade = {"side": side, "entry": self.position["entry"],
-                 "exit": fill, "pnl": pnl, "coin": coin}
+        trade = {"side": side, "entry": pos["entry"], "exit": fill, "pnl": pnl, "coin": name}
         self.trades.append(trade)
-        self._save_trade_db(coin, side, self.position["entry"], fill, pnl, reason)
+        self._save_trade_db(name, side, pos["entry"], fill, pnl, reason)
+        del self.positions[pair]
+        self.position = next(iter(self.positions.values()), None)
         emoji = "✅" if pnl >= 0 else "❌"
         daily_pnl = self.balance - self.day_start_bal
         tg(f"{emoji} *Trade CLOSED — {name}*\n"
            f"Reason: `{reason}` | Fee: `${fee:.3f}`\n"
            f"PnL: `{'+'if pnl>=0 else ''}{pnl:.2f}$` | Balance: `${self.balance:.2f}`\n"
-           f"Win rate: `{self.win_rate:.0f}%` | Day P&L: `{'+'if daily_pnl>=0 else ''}{daily_pnl:.2f}$`")
-
-        # rank-up check
+           f"Open: `{len(self.positions)}/{MAX_POSITIONS}` | Win rate: `{self.win_rate:.0f}%`")
         new_rank = get_rank(self.balance)
         if new_rank["name"] != self.current_rank:
             old = next((r for r in RANKS if r["name"] == self.current_rank), RANKS[0])
@@ -485,8 +493,6 @@ class PaperTrader:
             tg(f"⬆️ *RANK UP!*\n{old['emoji']} {old['name']} → {new_rank['emoji']} *{new_rank['name']}*\n"
                f"_{new_rank['unlock']}_\nNext: {nxt['emoji']} {nxt['name']} @ `${nxt['min']:,.0f}`")
             self.current_rank = new_rank["name"]
-
-        self.position = None
         self._save()
 
         if self.balance < PAPER_FLOOR:
@@ -635,7 +641,7 @@ def _nasdaq_loop():
 _hold_since = {}  # pair -> timestamp when HOLD started
 
 def _switcher_loop():
-    global _current_coin
+    global _current_coin, _active_coins, _coin_engines
     time.sleep(20)
     while True:
         try:
@@ -643,40 +649,28 @@ def _switcher_loop():
             if not scores:
                 time.sleep(600)
                 continue
-
-            pair = _current_coin["pair"]
-            # track how long current coin has been HOLDing
-            try:
-                closes, highs, lows = get_klines(pair)
-                price = get_price(pair)
-                engine_tmp = SignalEngine()
-                sig, _, _, _ = engine_tmp.evaluate(closes, highs, lows, price, _current_coin["alert_buffer"])
-                if sig == "HOLD":
-                    if pair not in _hold_since:
-                        _hold_since[pair] = time.time()
-                else:
-                    _hold_since.pop(pair, None)
-            except Exception:
-                sig = "HOLD"
-
-            hold_mins = (time.time() - _hold_since.get(pair, time.time())) / 60
-            force_switch = hold_mins >= 20  # switch if HOLD for 20+ minutes
-
-            # If stuck on HOLD, pick best coin that isn't the current one
-            if force_switch:
-                best = next((s for s in scores if s["pair"] != pair), scores[0])
-            else:
-                best = scores[0]
-
-            if best["pair"] != pair:
-                new_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == best["pair"]), _current_coin)
-                _current_coin = new_coin
-                _hold_since.pop(pair, None)
-                reason = f"HOLD {hold_mins:.0f}min — forced switch" if force_switch else "better score"
-                tg(f"🔀 *Switched to {best['name']}* ({reason})\n"
-                   f"Score: `{best['score']}` | RSI: `{best['rsi']}` | News: `{best['news']}`\n"
-                   f"_{best['reason']}_")
-                print(f"[Switch] → {best['name']} ({reason})")
+            # Pick top MAX_POSITIONS coins as active
+            top = scores[:MAX_POSITIONS]
+            new_active = []
+            for s in top:
+                coin = next((c for c in SCAN_UNIVERSE if c["pair"] == s["pair"]), None)
+                if coin:
+                    new_active.append(coin)
+            if new_active:
+                old_pairs = {c["pair"] for c in _active_coins}
+                new_pairs = {c["pair"] for c in new_active}
+                added   = new_pairs - old_pairs
+                removed = old_pairs - new_pairs
+                _active_coins = new_active
+                _current_coin = new_active[0]
+                # clean up engines for removed coins
+                for p in removed:
+                    _coin_engines.pop(p, None)
+                    _hold_since.pop(p, None)
+                if added:
+                    names = ", ".join(c["name"] for c in new_active)
+                    tg(f"🔀 *Active coins updated*\nNow trading: *{names}*")
+                    print(f"[Switch] Active: {names}")
         except Exception as e:
             print(f"[Switcher] {e}")
         time.sleep(600)  # check every 10 min instead of 30
@@ -806,19 +800,22 @@ def _handle_callback(query, trader, engine):
         )
 
     elif data == "close_trade":
-        if trader.position:
-            try:
-                price = get_price(_current_coin["pair"])
-                trader._close(price, _current_coin["name"], "manual close")
-                tg_buttons(
-                    f"❌ *Trade Closed Manually*\nBalance: `${trader.balance:,.2f}`",
-                    [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
-                )
-            except Exception as e:
-                tg(f"Error closing trade: {e}")
+        if trader.positions:
+            closed = []
+            for pair, pos in list(trader.positions.items()):
+                try:
+                    price = get_price(pair)
+                    trader._close(price, pos["coin"], pair, "manual close")
+                    closed.append(pos["coin"])
+                except Exception as e:
+                    print(f"[Close] {e}")
+            tg_buttons(
+                f"❌ *Closed {len(closed)} trade(s)*: {', '.join(closed)}\nBalance: `${trader.balance:,.2f}`",
+                [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+            )
         else:
             tg_buttons(
-                "No open trade to close.",
+                "No open trades to close.",
                 [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
             )
 
@@ -893,49 +890,50 @@ def _poll_loop(trader, engine):
         time.sleep(1)
 
 # ── Main trading loop ─────────────────────────────────────────────────────────
-def trading_loop(trader, engine):
-    last_sig       = None
+def trading_loop(trader, engine=None):
     last_update_tg = 0
-
     while True:
         try:
-            pair   = _current_coin["pair"]
-            name   = _current_coin["name"]
-            buf    = _current_coin["alert_buffer"]
-            closes, highs, lows = get_klines(pair)
-            price  = get_price(pair)
-            sig, plan, ema, rsi = engine.evaluate(closes, highs, lows, price, buf)
-
             now = datetime.now().strftime("%H:%M:%S")
-            print(f"[{now}] {name} ${price:.4f} EMA:{ema:.2f} RSI:{rsi} → {sig}")
+            prices = {}
+            for coin in list(_active_coins):
+                pair = coin["pair"]
+                name = coin["name"]
+                buf  = coin["alert_buffer"]
+                try:
+                    closes, highs, lows = get_klines(pair)
+                    price = get_price(pair)
+                    prices[pair] = price
+                    if pair not in _coin_engines:
+                        _coin_engines[pair] = SignalEngine()
+                    eng = _coin_engines[pair]
+                    sig, plan, ema, rsi = eng.evaluate(closes, highs, lows, price, buf)
+                    print(f"[{now}] {name} ${price:.4f} EMA:{ema:.2f} RSI:{rsi} → {sig}")
+                    had_pos = pair in trader.positions
+                    if sig in ("BUY","SELL"):
+                        stop   = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
+                        target = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
+                        trader.on_signal(sig, price, stop, target, name, pair)
+                        last = _coin_last_sig.get(pair)
+                        if sig != last or (not had_pos and pair in trader.positions):
+                            emoji = "🟢" if sig=="BUY" else "🔴"
+                            tg(f"{emoji} *{sig} — {name}*\n"
+                               f"Enter: `${plan['enter']:.4f}` | EMA: `{ema:.2f}` | RSI: `{rsi}`")
+                    _coin_last_sig[pair] = sig
+                except Exception as e:
+                    print(f"[{name}] {e}")
 
-            had_position = bool(trader.position)
-            if sig in ("BUY","SELL"):
-                stop   = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
-                target = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
-                trader.on_signal(sig, price, stop, target, name)
-                # alert on signal change OR when we just re-entered after a close
-                if sig != last_sig or (not had_position and trader.position):
-                    emoji = "🟢" if sig=="BUY" else "🔴"
-                    tg(f"{emoji} *{sig} Signal — {name}*\n"
-                       f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
-                       f"EMA: `{ema:.2f}` | RSI: `{rsi}`")
-
-            last_sig = sig
-
-            # Send status update every 30 minutes
+            # 30-min update
             if time.time() - last_update_tg >= 1800:
-                rank   = get_rank(trader.balance)
-                upnl   = trader.unrealized_pnl(price)
-                pos    = trader.position
-                if pos:
-                    pos_txt = f"{'🟢 LONG' if pos['side']=='LONG' else '🔴 SHORT'} @ `${pos['entry']:.4f}` | uPnL: `{'+'if upnl>=0 else ''}{upnl:.2f}$`"
-                else:
-                    pos_txt = "None"
+                rank = get_rank(trader.balance)
+                upnl = trader.total_unrealized_pnl(prices)
+                pos_lines = "\n".join(
+                    f"  {'🟢' if p['side']=='LONG' else '🔴'} {p['coin']} @ `${p['entry']:.4f}`"
+                    for p in trader.positions.values()
+                ) or "  None"
                 tg(f"📊 *30-Min Update*\n"
-                   f"{rank['emoji']} `${trader.balance:,.2f}` | Coin: *{name}*\n"
-                   f"Price: `${price:.4f}` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Signal: `{sig}`\n"
-                   f"Position: {pos_txt}\n"
+                   f"{rank['emoji']} Balance: `${trader.balance:,.2f}` | uPnL: `{'+'if upnl>=0 else ''}{upnl:.2f}$`\n"
+                   f"Open positions ({len(trader.positions)}/{MAX_POSITIONS}):\n{pos_lines}\n"
                    f"Trades: `{len(trader.trades)}` | Win Rate: `{trader.win_rate:.0f}%`")
                 last_update_tg = time.time()
 
