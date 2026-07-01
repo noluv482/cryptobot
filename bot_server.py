@@ -1017,6 +1017,7 @@ def _handle_callback(query, trader, engine):
 
 def _poll_loop(trader, engine):
     global _last_update_id
+    print("[Poll] Starting poll loop")
     while True:
         try:
             r = requests.get(
@@ -1024,21 +1025,33 @@ def _poll_loop(trader, engine):
                 params={"offset":_last_update_id+1,"timeout":10,
                         "allowed_updates":["callback_query","message"]},
                 timeout=15)
-            for u in r.json().get("result",[]):
+            if not r.ok:
+                print(f"[Poll] getUpdates error {r.status_code}: {r.text[:200]}")
+                time.sleep(5)
+                continue
+            updates = r.json().get("result", [])
+            if updates:
+                print(f"[Poll] {len(updates)} update(s)")
+            for u in updates:
                 _last_update_id = u["update_id"]
                 if "callback_query" in u:
                     cb = u["callback_query"]
-                    if str(cb.get("from", {}).get("id", "")) != TG_CHAT_ID:
+                    sender = str(cb.get("from", {}).get("id", ""))
+                    print(f"[Poll] callback from {sender}, data={cb.get('data')}")
+                    if sender != TG_CHAT_ID:
                         continue
                     _handle_callback(cb, trader, engine)
                 elif "message" in u:
-                    if str(u["message"].get("chat", {}).get("id", "")) != TG_CHAT_ID:
+                    chat_id = str(u["message"].get("chat", {}).get("id", ""))
+                    txt = u["message"].get("text", "").strip()
+                    print(f"[Poll] msg from {chat_id}: {txt!r}")
+                    if chat_id != TG_CHAT_ID:
                         continue
-                    txt = u["message"].get("text","").strip().lower()
-                    if txt in ("/start","/menu","menu"):
+                    if txt.lower() in ("/start", "/menu", "menu"):
+                        print("[Poll] sending menu")
                         send_menu(trader)
         except Exception as e:
-            print(f"[Poll] {e}")
+            print(f"[Poll] error: {e}")
         time.sleep(1)
 
 # ── Main trading loop ─────────────────────────────────────────────────────────
@@ -1094,6 +1107,14 @@ def main():
     print("  CRYPTOBOT SERVER STARTING")
     print("=" * 40)
     print(f"[Boot] TG_CHAT_ID={TG_CHAT_ID!r}")
+
+    # Remove any webhook so long-polling (getUpdates) works
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/deleteWebhook",
+                          json={"drop_pending_updates": False}, timeout=10)
+        print(f"[Boot] deleteWebhook: {r.json()}")
+    except Exception as e:
+        print(f"[Boot] deleteWebhook error: {e}")
 
     # Plain-text ping — proves connectivity before any markdown
     ok = tg(f"CryptoBot booting... (chat_id={TG_CHAT_ID})", plain=True)
