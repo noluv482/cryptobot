@@ -10,7 +10,7 @@ import time
 import os
 import json
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TG_TOKEN   = os.environ["TG_TOKEN"]
@@ -32,7 +32,7 @@ LEVERAGE       = 3
 RISK_MIN       = 0.05   # 5%  margin at low confidence
 RISK_MAX       = 0.20   # 20% margin at high confidence
 MAX_TRADE_GAIN = 0.08   # close when up 8%
-MAX_TRADE_LOSS = 0.04   # close when down 4%
+TRAIL_PCT      = 0.03   # trailing stop: 3% below/above the peak
 MAX_TRADE_MINS = 60     # force close after 60 min
 
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
@@ -286,13 +286,15 @@ def tg_answer(cb_id, text=""):
         pass
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-def get_klines(pair):
-    r = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair, "interval": INTERVAL}, timeout=10)
+def get_klines(pair, interval=None, limit=None):
+    iv = interval or INTERVAL
+    lm = limit or CANDLE_LIMIT
+    r = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair, "interval": iv}, timeout=10)
     payload = r.json()
     if payload.get("error"):
         raise ValueError(f"Kraken OHLC error: {payload['error']}")
     rkey = list(payload["result"].keys())[0]
-    data = payload["result"][rkey][-CANDLE_LIMIT:]
+    data = payload["result"][rkey][-lm:]
     closes  = [float(c[4]) for c in data]
     highs   = [float(c[2]) for c in data]
     lows    = [float(c[3]) for c in data]
@@ -562,10 +564,24 @@ class PaperTrader:
             if side == "SHORT": move = -move
             mins_open = (time.time() - p.get("opened_at", time.time())) / 60
 
+            # Update trailing stop
+            if side == "LONG":
+                if price > p.get("trail_peak", p["entry"]):
+                    p["trail_peak"] = price
+                    p["trail_stop"] = round(price * (1 - TRAIL_PCT), 6)
+            else:
+                if price < p.get("trail_peak", p["entry"]):
+                    p["trail_peak"] = price
+                    p["trail_stop"] = round(price * (1 + TRAIL_PCT), 6)
+
+            trail_stop = p.get("trail_stop", 0)
+            hit_trail  = (side == "LONG"  and price <= trail_stop) or \
+                         (side == "SHORT" and price >= trail_stop)
+
             if move >= MAX_TRADE_GAIN:
                 self._close(price, name, "profit cap")
-            elif move <= -MAX_TRADE_LOSS:
-                self._close(price, name, "stop loss")
+            elif hit_trail:
+                self._close(price, name, "trailing stop")
             elif mins_open >= MAX_TRADE_MINS:
                 self._close(price, name, "time limit")
             elif side == "LONG"  and price >= p.get("target", float("inf")):
@@ -582,21 +598,22 @@ class PaperTrader:
                 self._open("SHORT", price, name, target, confidence, _current_coin["pair"])
 
     def _open(self, side, price, name, target, confidence, pair):
-        risk      = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
-        margin    = round(self.balance * risk, 4)
-        contracts = round((margin * LEVERAGE) / price, 6)
-        conf_pct  = int(confidence * 100)
+        risk       = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+        margin     = round(self.balance * risk, 4)
+        contracts  = round((margin * LEVERAGE) / price, 6)
+        conf_pct   = int(confidence * 100)
+        trail_stop = round(price * (1 - TRAIL_PCT) if side == "LONG" else price * (1 + TRAIL_PCT), 6)
         self.position = {"side": side, "entry": price,
                          "contracts": contracts, "margin": margin,
                          "target": target, "opened_at": time.time(),
-                         "confidence": confidence,
-                         "pair": pair, "name": name}
+                         "confidence": confidence, "pair": pair, "name": name,
+                         "trail_stop": trail_stop, "trail_peak": price}
         self._save()
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${price:.4f}`\n"
            f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance\n"
            f"Margin: `${margin:.2f}` | {LEVERAGE}x leverage\n"
-           f"Balance: `${self.balance:.2f}`")
+           f"Trail stop: `${trail_stop:.4f}` | Balance: `${self.balance:.2f}`")
 
     def _close(self, price, name, reason):
         if not self.position: return
@@ -1015,6 +1032,58 @@ def _handle_callback(query, trader, engine):
             lines.append(f"⚫ {len(neutral)} coins neutral")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
+def _daily_summary_loop(trader):
+    while True:
+        now      = datetime.now()
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        time.sleep((midnight - now).total_seconds())
+        try:
+            cutoff = time.time() - 86400
+            trades_today = [t for t in trader.trades if t.get("ts", 0) >= cutoff]
+            rank = get_rank(trader.balance)
+            if not trades_today:
+                tg(f"📅 *Daily Summary*\nNo trades in the last 24 h.\n"
+                   f"Balance: `${trader.balance:.2f}` | Trading: *{_current_coin['name']}*")
+                continue
+            wins      = [t for t in trades_today if t["pnl"] > 0]
+            losses    = [t for t in trades_today if t["pnl"] <= 0]
+            total_pnl = sum(t["pnl"] for t in trades_today)
+            best      = max(trades_today, key=lambda t: t["pnl"])
+            worst     = min(trades_today, key=lambda t: t["pnl"])
+            wr        = len(wins) / len(trades_today) * 100
+            tg(f"📅 *Daily Summary*\n"
+               f"━━━━━━━━━━━━━━━━━━━━\n"
+               f"Trades: `{len(trades_today)}` | W: `{len(wins)}` L: `{len(losses)}`\n"
+               f"Win Rate: `{wr:.0f}%` | PnL: `{'+'if total_pnl>=0 else ''}{total_pnl:.2f}$`\n"
+               f"━━━━━━━━━━━━━━━━━━━━\n"
+               f"Best:  `+{best['pnl']:.2f}$` ({best.get('coin','?')})\n"
+               f"Worst: `{worst['pnl']:.2f}$` ({worst.get('coin','?')})\n"
+               f"━━━━━━━━━━━━━━━━━━━━\n"
+               f"Balance: `${trader.balance:.2f}` | {rank['emoji']} {rank['name']}\n"
+               f"Trading: *{_current_coin['name']}*")
+        except Exception as e:
+            print(f"[DailySummary] {e}")
+
+def _pnl_update_loop(trader):
+    while True:
+        time.sleep(600)  # every 10 minutes
+        if not trader.position:
+            continue
+        try:
+            p     = trader.position
+            price = get_price(p["pair"])
+            upnl  = trader.unrealized_pnl(price)
+            mins  = round((time.time() - p.get("opened_at", time.time())) / 60, 1)
+            pct   = upnl / p["margin"] * 100 if p.get("margin") else 0
+            trail = p.get("trail_stop", 0)
+            emoji = "📈" if upnl >= 0 else "📉"
+            tg(f"{emoji} *Live Update — {p['name']}*\n"
+               f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} entry `${p['entry']:.4f}` → now `${price:.4f}`\n"
+               f"P&L: `{'+'if upnl>=0 else ''}{upnl:.2f}$` (`{pct:+.1f}%`)\n"
+               f"Trail stop: `${trail:.4f}` | Open: `{mins:.0f} min`")
+        except Exception as e:
+            print(f"[PnL] {e}")
+
 def _poll_loop(trader, engine):
     global _last_update_id
     print("[Poll] Starting poll loop")
@@ -1085,6 +1154,19 @@ def trading_loop(trader, engine):
             price  = get_price(pair)
             sig, plan, ema, rsi, confidence = engine.evaluate(closes, highs, lows, price, buf)
 
+            # 1-hour trend confirmation — only trade with the higher timeframe
+            if sig in ("BUY", "SELL"):
+                try:
+                    closes_1h, _, _ = get_klines(pair, interval=60, limit=24)
+                    ema_1h   = calc_ema(closes_1h)
+                    trend_1h = "UP" if closes_1h[-1] > ema_1h else "DOWN"
+                    if sig == "BUY"  and trend_1h != "UP":
+                        sig = "HOLD"
+                    if sig == "SELL" and trend_1h != "DOWN":
+                        sig = "HOLD"
+                except Exception:
+                    pass  # if 1h data unavailable, proceed without filter
+
             now = datetime.now().strftime("%H:%M:%S")
             print(f"[{now}] {name} ${price:.4f} EMA:{ema:.2f} RSI:{rsi} → {sig} conf:{confidence:.0%}")
 
@@ -1128,10 +1210,12 @@ def main():
     engine = SignalEngine()
 
     # Start background threads
-    threading.Thread(target=_news_loop,                         daemon=True).start()
-    threading.Thread(target=_nasdaq_loop,                       daemon=True).start()
-    threading.Thread(target=_switcher_loop, args=(trader,),     daemon=True).start()
-    threading.Thread(target=_poll_loop, args=(trader, engine),  daemon=True).start()
+    threading.Thread(target=_news_loop,                            daemon=True).start()
+    threading.Thread(target=_nasdaq_loop,                          daemon=True).start()
+    threading.Thread(target=_switcher_loop,    args=(trader,),     daemon=True).start()
+    threading.Thread(target=_poll_loop,        args=(trader, engine), daemon=True).start()
+    threading.Thread(target=_daily_summary_loop, args=(trader,),   daemon=True).start()
+    threading.Thread(target=_pnl_update_loop,  args=(trader,),     daemon=True).start()
 
     print("[Bot] All systems online.")
 
