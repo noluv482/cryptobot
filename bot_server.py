@@ -247,23 +247,34 @@ _seen_headlines = set()
 _state_lock     = threading.Lock()   # guards _paused and _current_coin
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
-def tg(msg):
+def tg(msg, plain=False):
     try:
-        r = requests.post(TG_URL, data={"chat_id": TG_CHAT_ID, "text": msg,
-                                        "parse_mode": "Markdown"}, timeout=8)
+        payload = {"chat_id": TG_CHAT_ID, "text": msg}
+        if not plain:
+            payload["parse_mode"] = "Markdown"
+        r = requests.post(TG_URL, json=payload, timeout=10)
         if not r.ok:
-            print(f"[TG] Error {r.status_code}: {r.text[:200]}")
+            print(f"[TG] Error {r.status_code}: {r.text[:300]}")
+        return r.ok
     except Exception as e:
         print(f"[TG] Send error: {e}")
+        return False
 
 def tg_buttons(msg, buttons):
     try:
         r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                           json={"chat_id": TG_CHAT_ID, "text": msg,
                                 "parse_mode": "Markdown",
-                                "reply_markup": {"inline_keyboard": buttons}}, timeout=8)
+                                "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
         if not r.ok:
-            print(f"[TG] Buttons error {r.status_code}: {r.text[:200]}")
+            print(f"[TG] Buttons error {r.status_code}: {r.text[:300]}")
+            # Retry without Markdown if formatting was the problem
+            if r.status_code == 400:
+                r2 = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                                   json={"chat_id": TG_CHAT_ID, "text": msg,
+                                         "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
+                if not r2.ok:
+                    print(f"[TG] Buttons retry error {r2.status_code}: {r2.text[:300]}")
     except Exception as e:
         print(f"[TG] Buttons send error: {e}")
 
@@ -1081,6 +1092,11 @@ def main():
     print("=" * 40)
     print("  CRYPTOBOT SERVER STARTING")
     print("=" * 40)
+    print(f"[Boot] TG_CHAT_ID={TG_CHAT_ID!r}")
+
+    # Plain-text ping — proves connectivity before any markdown
+    ok = tg(f"CryptoBot booting... (chat_id={TG_CHAT_ID})", plain=True)
+    print(f"[Boot] Ping sent: {ok}")
 
     trader = PaperTrader()
     engine = SignalEngine()
