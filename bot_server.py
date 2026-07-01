@@ -1036,16 +1036,20 @@ def _poll_loop(trader, engine):
                 _last_update_id = u["update_id"]
                 if "callback_query" in u:
                     cb = u["callback_query"]
-                    sender = str(cb.get("from", {}).get("id", ""))
-                    print(f"[Poll] callback from {sender}, data={cb.get('data')}")
-                    if sender != TG_CHAT_ID:
+                    user_id  = str(cb.get("from", {}).get("id", ""))
+                    chat_id  = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                    print(f"[Poll] callback user={user_id} chat={chat_id} data={cb.get('data')}")
+                    # Accept if either the user ID or the chat ID matches TG_CHAT_ID
+                    if user_id != TG_CHAT_ID and chat_id != TG_CHAT_ID:
                         continue
                     _handle_callback(cb, trader, engine)
                 elif "message" in u:
                     chat_id = str(u["message"].get("chat", {}).get("id", ""))
+                    user_id = str(u["message"].get("from", {}).get("id", ""))
                     txt = u["message"].get("text", "").strip()
-                    print(f"[Poll] msg from {chat_id}: {txt!r}")
-                    if chat_id != TG_CHAT_ID:
+                    print(f"[Poll] msg chat={chat_id} user={user_id}: {txt!r}")
+                    # Accept if either the user ID or the chat ID matches TG_CHAT_ID
+                    if chat_id != TG_CHAT_ID and user_id != TG_CHAT_ID:
                         continue
                     if txt.lower() in ("/start", "/menu", "menu"):
                         print("[Poll] sending menu")
