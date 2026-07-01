@@ -1089,6 +1089,7 @@ def trading_loop(trader, engine):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
+    global _current_coin
     print("=" * 40)
     print("  CRYPTOBOT SERVER STARTING")
     print("=" * 40)
@@ -1130,7 +1131,6 @@ def main():
         print("[Bot] Scanning for best coin...")
         scores = rank_coins()
         if scores:
-            global _current_coin
             _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==scores[0]["pair"]), SCAN_UNIVERSE[0])
             print(f"[Bot] Best coin: {_current_coin['name']}")
     except Exception as e:
