@@ -249,19 +249,23 @@ _state_lock     = threading.Lock()   # guards _paused and _current_coin
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 def tg(msg):
     try:
-        requests.post(TG_URL, data={"chat_id": TG_CHAT_ID, "text": msg,
-                                    "parse_mode": "Markdown"}, timeout=5)
-    except Exception:
-        pass
+        r = requests.post(TG_URL, data={"chat_id": TG_CHAT_ID, "text": msg,
+                                        "parse_mode": "Markdown"}, timeout=8)
+        if not r.ok:
+            print(f"[TG] Error {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[TG] Send error: {e}")
 
 def tg_buttons(msg, buttons):
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT_ID, "text": msg,
-                            "parse_mode": "Markdown",
-                            "reply_markup": {"inline_keyboard": buttons}}, timeout=5)
-    except Exception:
-        pass
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT_ID, "text": msg,
+                                "parse_mode": "Markdown",
+                                "reply_markup": {"inline_keyboard": buttons}}, timeout=8)
+        if not r.ok:
+            print(f"[TG] Buttons error {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[TG] Buttons send error: {e}")
 
 def tg_answer(cb_id, text=""):
     try:
@@ -1089,21 +1093,11 @@ def main():
 
     print("[Bot] All systems online.")
 
-    # Find best coin on startup
-    try:
-        print("[Bot] Scanning for best coin...")
-        scores = rank_coins()
-        if scores:
-            global _current_coin
-            _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==scores[0]["pair"]), SCAN_UNIVERSE[0])
-            print(f"[Bot] Best coin: {_current_coin['name']}")
-    except Exception as e:
-        print(f"[Bot] Scan error: {e}")
-
+    # Send menu immediately so Telegram responds without waiting for the coin scan
     rank     = get_rank(trader.balance)
     next_rnk = get_next_rank(trader.balance)
     progress = max(0,(trader.balance-PAPER_START)/(PAPER_TARGET-PAPER_START)*100)
-
+    print(f"[Bot] Sending startup menu to chat_id={TG_CHAT_ID}...")
     send_menu(trader)
     tg(f"{rank['emoji']} *CryptoBot Online*\n"
        f"─────────────────────\n"
@@ -1113,6 +1107,18 @@ def main():
        f"Next rank: {next_rnk['name']} @ `${next_rnk['min']:,.0f}`\n"
        f"─────────────────────\n"
        f"_{rank['unlock']}_")
+    print("[Bot] Startup messages sent.")
+
+    # Find best coin on startup (runs after menu is already shown)
+    try:
+        print("[Bot] Scanning for best coin...")
+        scores = rank_coins()
+        if scores:
+            global _current_coin
+            _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==scores[0]["pair"]), SCAN_UNIVERSE[0])
+            print(f"[Bot] Best coin: {_current_coin['name']}")
+    except Exception as e:
+        print(f"[Bot] Scan error: {e}")
 
     # Main trading loop (runs forever)
     trading_loop(trader, engine)
