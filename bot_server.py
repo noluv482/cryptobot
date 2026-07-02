@@ -28,7 +28,8 @@ CONFIRM_TICKS = 2
 PAPER_START    = 100.0
 PAPER_TARGET   = 50000.0
 PAPER_FLOOR    = 50.0
-LEVERAGE       = 3
+LEVERAGE_MIN   = 2      # 2x at low confidence
+LEVERAGE_MAX   = 5      # 5x at high confidence
 RISK_MIN       = 0.05   # 5%  margin at low confidence
 RISK_MAX       = 0.20   # 20% margin at high confidence
 MAX_TRADE_GAIN = 0.08   # close when up 8%
@@ -549,7 +550,7 @@ class PaperTrader:
         p    = self.position
         move = (price - p["entry"]) / p["entry"]
         if p["side"] == "SHORT": move = -move
-        return round(move * p["margin"] * LEVERAGE, 4)
+        return round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN), 4)
 
     def on_signal(self, sig, price, stop, target, name, confidence):
         with _state_lock:
@@ -599,20 +600,22 @@ class PaperTrader:
 
     def _open(self, side, price, name, target, confidence, pair):
         risk       = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+        leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
         margin     = round(self.balance * risk, 4)
-        contracts  = round((margin * LEVERAGE) / price, 6)
+        contracts  = round((margin * leverage) / price, 6)
         conf_pct   = int(confidence * 100)
         trail_stop = round(price * (1 - TRAIL_PCT) if side == "LONG" else price * (1 + TRAIL_PCT), 6)
         self.position = {"side": side, "entry": price,
                          "contracts": contracts, "margin": margin,
                          "target": target, "opened_at": time.time(),
-                         "confidence": confidence, "pair": pair, "name": name,
+                         "confidence": confidence, "leverage": leverage,
+                         "pair": pair, "name": name,
                          "trail_stop": trail_stop, "trail_peak": price}
         self._save()
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${price:.4f}`\n"
            f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance\n"
-           f"Margin: `${margin:.2f}` | {LEVERAGE}x leverage\n"
+           f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
            f"Trail stop: `${trail_stop:.4f}` | Balance: `${self.balance:.2f}`")
 
     def _close(self, price, name, reason):
@@ -907,7 +910,7 @@ def _handle_callback(query, trader, engine):
                 upnl_str = f"({'+'if upnl>=0 else ''}{upnl:.2f}$)"
             except Exception:
                 upnl_str = ""
-            conf_str = f" | {int(p.get('confidence',0)*100)}% conf" if p.get('confidence') else ""
+            conf_str = f" | {int(p.get('confidence',0)*100)}% conf {p.get('leverage', LEVERAGE_MIN)}x" if p.get('confidence') else ""
             pos_line = f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} @ `${p['entry']:.4f}` {upnl_str}{conf_str}"
 
         tg_buttons(
@@ -1173,11 +1176,13 @@ def trading_loop(trader, engine):
             if sig != last_sig and sig in ("BUY","SELL"):
                 stop   = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
                 target = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
-                emoji  = "🟢" if sig=="BUY" else "🔴"
-                risk   = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+                emoji    = "🟢" if sig=="BUY" else "🔴"
+                risk     = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+                leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
                 tg(f"{emoji} *{sig} Signal — {name}*\n"
                    f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
-                   f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Confidence: `{int(confidence*100)}%` → Size: `{risk*100:.1f}%`")
+                   f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(confidence*100)}%`\n"
+                   f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
                 trader.on_signal(sig, price, stop, target, name, confidence)
 
             last_sig = sig
