@@ -905,7 +905,7 @@ def _handle_callback(query, trader, engine):
         if trader.position:
             p = trader.position
             try:
-                live = get_price(_current_coin["pair"])
+                live = get_price(p["pair"])  # use position's own pair, not current coin
                 upnl = trader.unrealized_pnl(live)
                 upnl_str = f"({'+'if upnl>=0 else ''}{upnl:.2f}$)"
             except Exception:
@@ -968,9 +968,9 @@ def _handle_callback(query, trader, engine):
             if r["name"] == current["name"]:
                 lines.append(f"▶ {r['emoji']} *{r['name']}* ← YOU  `${r['min']:,.0f}`")
             elif trader.balance >= r["min"]:
-                lines.append(f"  {r['emoji']} ~~{r['name']}~~  `${r['min']:,.0f}` ✓")
+                lines.append(f"  ✅ {r['emoji']} {r['name']}  `${r['min']:,.0f}`")
             else:
-                lines.append(f"  {r['emoji']} {r['name']}  `${r['min']:,.0f}`")
+                lines.append(f"  ⬜ {r['emoji']} {r['name']}  `${r['min']:,.0f}`")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "pause":
