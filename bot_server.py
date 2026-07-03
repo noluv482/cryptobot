@@ -294,7 +294,7 @@ def get_klines(pair, interval=None, limit=None):
     payload = r.json()
     if payload.get("error"):
         raise ValueError(f"Kraken OHLC error: {payload['error']}")
-    rkey = list(payload["result"].keys())[0]
+    rkey = next(k for k in payload["result"] if k != "last")
     data = payload["result"][rkey][-lm:]
     closes  = [float(c[4]) for c in data]
     highs   = [float(c[2]) for c in data]
@@ -310,6 +310,8 @@ def get_price(pair):
     return float(payload["result"][key]["c"][0])
 
 def calc_ema(closes):
+    if len(closes) < EMA_PERIOD:
+        raise ValueError(f"calc_ema needs {EMA_PERIOD} candles, got {len(closes)}")
     k   = 2.0 / (EMA_PERIOD + 1)
     ema = sum(closes[:EMA_PERIOD]) / EMA_PERIOD
     for p in closes[EMA_PERIOD:]:
@@ -317,6 +319,8 @@ def calc_ema(closes):
     return ema
 
 def calc_rsi(closes):
+    if len(closes) < RSI_PERIOD + 1:
+        raise ValueError(f"calc_rsi needs {RSI_PERIOD+1} candles, got {len(closes)}")
     gains, losses = [], []
     for i in range(1, RSI_PERIOD + 1):
         d = closes[i] - closes[i-1]
@@ -552,12 +556,13 @@ class PaperTrader:
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN), 4)
 
-    def on_signal(self, sig, price, stop, target, name, confidence):
+    def on_signal(self, sig, price, stop, target, name, confidence, pair=None):
         with _state_lock:
             paused = _paused
         if paused or self.balance < PAPER_FLOOR: return
         if self.balance >= PAPER_TARGET: return
 
+        closed_this_tick = False
         if self.position:
             p    = self.position
             side = p["side"]
@@ -575,28 +580,32 @@ class PaperTrader:
                     p["trail_peak"] = price
                     p["trail_stop"] = round(price * (1 + TRAIL_PCT), 6)
 
-            trail_stop = p.get("trail_stop", 0)
-            hit_trail  = (side == "LONG"  and price <= trail_stop) or \
-                         (side == "SHORT" and price >= trail_stop)
+            if side == "LONG":
+                trail_stop = p.get("trail_stop", 0)
+                hit_trail  = price <= trail_stop
+            else:
+                trail_stop = p.get("trail_stop", float("inf"))
+                hit_trail  = price >= trail_stop
 
             if move >= MAX_TRADE_GAIN:
-                self._close(price, name, "profit cap")
+                self._close(price, name, "profit cap");   closed_this_tick = True
             elif hit_trail:
-                self._close(price, name, "trailing stop")
+                self._close(price, name, "trailing stop"); closed_this_tick = True
             elif mins_open >= MAX_TRADE_MINS:
-                self._close(price, name, "time limit")
+                self._close(price, name, "time limit");   closed_this_tick = True
             elif side == "LONG"  and price >= p.get("target", float("inf")):
-                self._close(price, name, "take profit")
+                self._close(price, name, "take profit");  closed_this_tick = True
             elif side == "SHORT" and price <= p.get("target", 0):
-                self._close(price, name, "take profit")
+                self._close(price, name, "take profit");  closed_this_tick = True
             elif (side == "LONG" and sig == "SELL") or (side == "SHORT" and sig == "BUY"):
-                self._close(price, name, "signal flip")
+                self._close(price, name, "signal flip");  closed_this_tick = True
 
-        if not self.position:
+        if not self.position and not closed_this_tick:
+            open_pair = pair or _current_coin["pair"]
             if sig == "BUY":
-                self._open("LONG",  price, name, target, confidence, _current_coin["pair"])
+                self._open("LONG",  price, name, target, confidence, open_pair)
             elif sig == "SELL":
-                self._open("SHORT", price, name, target, confidence, _current_coin["pair"])
+                self._open("SHORT", price, name, target, confidence, open_pair)
 
     def _open(self, side, price, name, target, confidence, pair):
         risk       = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
@@ -835,7 +844,7 @@ def _nasdaq_loop():
         time.sleep(900)
 
 # ── Auto coin switcher ────────────────────────────────────────────────────────
-def _switcher_loop(trader):
+def _switcher_loop(trader, engine):
     global _current_coin
     time.sleep(20)
     while True:
@@ -850,6 +859,7 @@ def _switcher_loop(trader):
                         _current_coin = new_coin
                         switched_to   = scores[0]
             if switched_to:
+                engine.reset()  # clear stale tick counts so new coin starts fresh
                 tg(f"🔀 *Switched to {switched_to['name']}*\n"
                    f"Score: `{switched_to['score']}` | RSI: `{switched_to['rsi']}` | News: `{switched_to['news']}`\n"
                    f"_{switched_to['reason']}_")
@@ -901,9 +911,8 @@ def _handle_callback(query, trader, engine):
         losses = len(trader.trades) - trader.wins
 
         pos_line = "None"
-        unreal   = ""
-        if trader.position:
-            p = trader.position
+        p = trader.position  # snapshot — trading_loop may close it concurrently
+        if p:
             try:
                 live = get_price(p["pair"])  # use position's own pair, not current coin
                 upnl = trader.unrealized_pnl(live)
@@ -1070,10 +1079,10 @@ def _daily_summary_loop(trader):
 def _pnl_update_loop(trader):
     while True:
         time.sleep(600)  # every 10 minutes
-        if not trader.position:
+        p = trader.position  # snapshot once — avoids TOCTOU if trading_loop closes concurrently
+        if not p:
             continue
         try:
-            p     = trader.position
             price = get_price(p["pair"])
             upnl  = trader.unrealized_pnl(price)
             mins  = round((time.time() - p.get("opened_at", time.time())) / 60, 1)
@@ -1183,7 +1192,7 @@ def trading_loop(trader, engine):
                    f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
                    f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(confidence*100)}%`\n"
                    f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
-                trader.on_signal(sig, price, stop, target, name, confidence)
+                trader.on_signal(sig, price, stop, target, name, confidence, pair)
 
             last_sig = sig
 
@@ -1217,7 +1226,7 @@ def main():
     # Start background threads
     threading.Thread(target=_news_loop,                            daemon=True).start()
     threading.Thread(target=_nasdaq_loop,                          daemon=True).start()
-    threading.Thread(target=_switcher_loop,    args=(trader,),     daemon=True).start()
+    threading.Thread(target=_switcher_loop,    args=(trader, engine), daemon=True).start()
     threading.Thread(target=_poll_loop,        args=(trader, engine), daemon=True).start()
     threading.Thread(target=_daily_summary_loop, args=(trader,),   daemon=True).start()
     threading.Thread(target=_pnl_update_loop,  args=(trader,),     daemon=True).start()
