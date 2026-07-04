@@ -38,8 +38,10 @@ TRAIL_PCT        = 0.03  # fallback trailing stop (used when ATR unavailable)
 ATR_PERIOD       = 14    # candles for ATR calculation
 ATR_MULTIPLIER   = 1.5   # trail distance = 1.5 × ATR
 MAX_TRADE_MINS   = 60    # force close after 60 min
-ACTIVE_HOURS_UTC = (7, 21)   # only trade 07:00–21:00 UTC; skip low-liquidity overnight
+ACTIVE_HOURS_UTC  = (7, 21)  # only trade 07:00–21:00 UTC; skip low-liquidity overnight
 FUNDING_THRESHOLD = 0.0005   # 0.05% per 8h → overcrowded side, block new entries
+MAX_POSITIONS     = 3        # max simultaneous open positions
+MAX_TOTAL_RISK    = 0.40     # total margin across all positions ≤ 40% of balance
 
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 
@@ -624,12 +626,22 @@ def get_next_rank(balance):
 class PaperTrader:
     def __init__(self):
         self.balance       = PAPER_START
-        self.position      = None
+        self.positions     = {}   # pair → position dict (multi-coin)
         self.trades        = []
         self.peak          = PAPER_START
         self.current_rank  = RANKS[0]["name"]
         self.session_start = PAPER_START
         self._load()
+
+    @property
+    def position(self):
+        """First open position — backward compat for 'if trader.position' checks."""
+        return next(iter(self.positions.values()), None)
+
+    def can_open_new(self):
+        if len(self.positions) >= MAX_POSITIONS: return False
+        used = sum(p["margin"] for p in self.positions.values())
+        return (used / max(self.balance, 0.01)) < MAX_TOTAL_RISK
 
     def _load(self):
         if os.path.exists(SAVE_FILE):
@@ -639,9 +651,18 @@ class PaperTrader:
                 self.balance      = d.get("balance", PAPER_START)
                 self.peak         = d.get("peak", self.balance)
                 self.trades       = d.get("trades", [])
-                self.position     = d.get("position", None)
                 self.current_rank = d.get("current_rank", RANKS[0]["name"])
-                print(f"[Paper] Loaded — Balance: ${self.balance:.2f}")
+                # Backward compat: old saves used "position" (single dict)
+                pos_data = d.get("positions")
+                if pos_data is None:
+                    old = d.get("position")
+                    if old and isinstance(old, dict) and "side" in old:
+                        self.positions = {old.get("pair", "XBTUSD"): old}
+                    else:
+                        self.positions = {}
+                else:
+                    self.positions = pos_data
+                print(f"[Paper] Loaded — Balance: ${self.balance:.2f}, Positions: {len(self.positions)}")
             except Exception as e:
                 print(f"[Paper] Load error: {e}")
 
@@ -649,7 +670,7 @@ class PaperTrader:
         try:
             with open(SAVE_FILE, "w") as f:
                 json.dump({"balance": self.balance, "peak": self.peak,
-                           "trades": self.trades, "position": self.position,
+                           "trades": self.trades, "positions": self.positions,
                            "current_rank": self.current_rank}, f, indent=2)
         except Exception as e:
             print(f"[Paper] Save error: {e}")
@@ -669,9 +690,9 @@ class PaperTrader:
         if losses >= 3: return 0.50
         return 1.0
 
-    def _partial_close(self, price, name):
+    def _partial_close(self, price, name, pair):
         """Close 50% of position at current price and let the rest ride."""
-        p = self.position
+        p = self.positions.get(pair)
         if not p or p.get("partial_taken"): return
         move = (price - p["entry"]) / p["entry"]
         if p["side"] == "SHORT": move = -move
@@ -698,22 +719,22 @@ class PaperTrader:
     def total_pnl(self):
         return round(sum(t["pnl"] for t in self.trades), 2)
 
-    def unrealized_pnl(self, price):
-        if not self.position: return 0.0
-        p    = self.position
+    def unrealized_pnl(self, price, pair=None):
+        p = self.positions.get(pair) if pair else self.position
+        if not p: return 0.0
         move = (price - p["entry"]) / p["entry"]
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN), 4)
 
-    def on_signal(self, sig, price, stop, target, name, confidence, pair=None, atr=None):
+    def on_signal(self, sig, price, stop, target, name, confidence, pair, atr=None):
         with _state_lock:
             paused = _paused
         if paused or self.balance < PAPER_FLOOR: return
         if self.balance >= PAPER_TARGET: return
 
         closed_this_tick = False
-        if self.position:
-            p    = self.position
+        p = self.positions.get(pair)
+        if p:
             side = p["side"]
             move = (price - p["entry"]) / p["entry"]
             if side == "SHORT": move = -move
@@ -721,7 +742,7 @@ class PaperTrader:
 
             # Partial take-profit: book 50% at PARTIAL_TAKE_PCT, let rest ride
             if not p.get("partial_taken") and move >= PARTIAL_TAKE_PCT:
-                self._partial_close(price, name)
+                self._partial_close(price, name, pair)
 
             # Update trailing stop using stored ATR distance (or fixed % fallback)
             atr_dist = p.get("atr_dist", price * TRAIL_PCT)
@@ -742,24 +763,23 @@ class PaperTrader:
                 hit_trail  = price >= trail_stop
 
             if move >= MAX_TRADE_GAIN:
-                self._close(price, name, "profit cap");   closed_this_tick = True
+                self._close(price, name, "profit cap",   pair); closed_this_tick = True
             elif hit_trail:
-                self._close(price, name, "trailing stop"); closed_this_tick = True
+                self._close(price, name, "trailing stop", pair); closed_this_tick = True
             elif mins_open >= MAX_TRADE_MINS:
-                self._close(price, name, "time limit");   closed_this_tick = True
+                self._close(price, name, "time limit",   pair); closed_this_tick = True
             elif side == "LONG"  and price >= p.get("target", float("inf")):
-                self._close(price, name, "take profit");  closed_this_tick = True
+                self._close(price, name, "take profit",  pair); closed_this_tick = True
             elif side == "SHORT" and price <= p.get("target", 0):
-                self._close(price, name, "take profit");  closed_this_tick = True
+                self._close(price, name, "take profit",  pair); closed_this_tick = True
             elif (side == "LONG" and sig == "SELL") or (side == "SHORT" and sig == "BUY"):
-                self._close(price, name, "signal flip");  closed_this_tick = True
+                self._close(price, name, "signal flip",  pair); closed_this_tick = True
 
-        if not self.position and not closed_this_tick:
-            open_pair = pair or _current_coin["pair"]
-            if sig == "BUY":
-                self._open("LONG",  price, name, target, confidence, open_pair, atr)
-            elif sig == "SELL":
-                self._open("SHORT", price, name, target, confidence, open_pair, atr)
+        if pair not in self.positions and not closed_this_tick:
+            if sig == "BUY"  and self.can_open_new():
+                self._open("LONG",  price, name, target, confidence, pair, atr)
+            elif sig == "SELL" and self.can_open_new():
+                self._open("SHORT", price, name, target, confidence, pair, atr)
 
     def _open(self, side, price, name, target, confidence, pair, atr=None):
         risk       = (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence) * self._risk_multiplier()
@@ -772,13 +792,13 @@ class PaperTrader:
         else:
             atr_dist   = round(price * TRAIL_PCT, 8)
         trail_stop = round(price - atr_dist if side == "LONG" else price + atr_dist, 6)
-        self.position = {"side": side, "entry": price,
-                         "contracts": contracts, "margin": margin,
-                         "target": target, "opened_at": time.time(),
-                         "confidence": confidence, "leverage": leverage,
-                         "pair": pair, "name": name,
-                         "trail_stop": trail_stop, "trail_peak": price,
-                         "atr_dist": atr_dist}
+        self.positions[pair] = {"side": side, "entry": price,
+                                "contracts": contracts, "margin": margin,
+                                "target": target, "opened_at": time.time(),
+                                "confidence": confidence, "leverage": leverage,
+                                "pair": pair, "name": name,
+                                "trail_stop": trail_stop, "trail_peak": price,
+                                "atr_dist": atr_dist}
         self._save()
         mul = self._risk_multiplier()
         dd_note = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
@@ -789,35 +809,27 @@ class PaperTrader:
            f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
            f"Trail stop: `${trail_stop:.4f}` ({stop_label}) | Balance: `${self.balance:.2f}`")
 
-    def _close(self, price, name, reason):
-        if not self.position: return
-        pnl          = self.unrealized_pnl(price)
+    def _close(self, price, name, reason, pair):
+        p = self.positions.get(pair)
+        if not p: return
+        move = (price - p["entry"]) / p["entry"]
+        if p["side"] == "SHORT": move = -move
+        pnl          = round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN), 4)
         self.balance = round(self.balance + pnl, 4)
         self.peak    = max(self.peak, self.balance)
-        held_mins    = round((time.time() - self.position.get("opened_at", time.time())) / 60, 1)
-        trade_rec = {"side":       self.position["side"],
-                     "entry":      self.position["entry"],
-                     "exit":       price,
-                     "pnl":        pnl,
-                     "coin":       self.position.get("name", name),
-                     "confidence": self.position.get("confidence", 0.0),
-                     "held_mins":  held_mins,
-                     "reason":     reason,
-                     "ts":         time.time()}
+        held_mins    = round((time.time() - p.get("opened_at", time.time())) / 60, 1)
+        trade_rec = {"side": p["side"], "entry": p["entry"], "exit": price,
+                     "pnl": pnl, "coin": p.get("name", name),
+                     "confidence": p.get("confidence", 0.0),
+                     "held_mins": held_mins, "reason": reason, "ts": time.time()}
         self.trades.append(trade_rec)
         db.save_trade({
-            "ts":           trade_rec["ts"],
-            "coin":         trade_rec["coin"],
-            "pair":         self.position.get("pair", ""),
-            "side":         trade_rec["side"],
-            "entry":        trade_rec["entry"],
-            "exit_price":   price,
-            "pnl":          pnl,
-            "held_mins":    held_mins,
-            "reason":       reason,
-            "confidence":   trade_rec["confidence"],
-            "nasdaq_mood":  market_mood["nasdaq"],
-            "news_sent":    news_sentiment.get(self.position.get("pair",""), {}).get("sentiment","NEUTRAL"),
+            "ts": trade_rec["ts"], "coin": trade_rec["coin"], "pair": pair,
+            "side": trade_rec["side"], "entry": trade_rec["entry"],
+            "exit_price": price, "pnl": pnl, "held_mins": held_mins,
+            "reason": reason, "confidence": trade_rec["confidence"],
+            "nasdaq_mood": market_mood["nasdaq"],
+            "news_sent": news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"),
             "balance_after": self.balance,
         })
         emoji = "✅" if pnl >= 0 else "❌"
@@ -826,7 +838,6 @@ class PaperTrader:
            f"PnL: `{'+'if pnl>=0 else ''}{pnl:.2f}$`\n"
            f"Balance: `${self.balance:.2f}` | Win rate: `{self.win_rate:.0f}%`")
 
-        # rank-up check
         new_rank = get_rank(self.balance)
         if new_rank["name"] != self.current_rank:
             old = next((r for r in RANKS if r["name"] == self.current_rank), RANKS[0])
@@ -835,7 +846,7 @@ class PaperTrader:
                f"_{new_rank['unlock']}_\nNext: {nxt['emoji']} {nxt['name']} @ `${nxt['min']:,.0f}`")
             self.current_rank = new_rank["name"]
 
-        self.position = None
+        del self.positions[pair]
         self._save()
 
         if self.balance < PAPER_FLOOR:
@@ -862,7 +873,7 @@ class PaperTrader:
            f"Balance: `${self.balance:.2f}` | Trades: `{len(self.trades)}`\n"
            f"📚 *Lessons:*\n{lesson_txt}\n🔄 Restarting at `${PAPER_START:.0f}`...")
         self.balance       = PAPER_START
-        self.position      = None
+        self.positions     = {}
         self.trades        = []
         self.peak          = PAPER_START
         self.current_rank  = RANKS[0]["name"]
@@ -880,7 +891,7 @@ class SignalEngine:
         self.above_ticks = 0
         self.below_ticks = 0
 
-    def evaluate(self, closes, highs, lows, volumes, price, alert_buffer):
+    def evaluate(self, closes, highs, lows, volumes, price, alert_buffer, pair=None):
         ema = calc_ema(closes)
         rsi = calc_rsi(closes)
 
@@ -933,7 +944,8 @@ class SignalEngine:
                     "stop":  nearest_r if nearest_r else price*1.015}
 
         # news gate + news-triggered entry
-        news    = news_sentiment.get(_current_coin["pair"], {})
+        current_pair = pair or _current_coin["pair"]
+        news    = news_sentiment.get(current_pair, {})
         n_score = news.get("score", 0)
         n_sent  = news.get("sentiment", "NEUTRAL")
 
@@ -970,11 +982,11 @@ class SignalEngine:
 
         # Bitcoin dominance gate — rising BTC dominance means capital rotating into BTC,
         # altcoins bleed; block new altcoin longs until dominance stabilises
-        if btc_dominance["rising"] and sig == "BUY" and _current_coin["pair"] != "XBTUSD":
+        if btc_dominance["rising"] and sig == "BUY" and current_pair != "XBTUSD":
             sig = "HOLD"
 
         # Funding rate gate — extreme funding = overcrowded side, flush risk
-        fr = funding_rates.get(_current_coin["pair"], 0.0)
+        fr = funding_rates.get(current_pair, 0.0)
         if fr >  FUNDING_THRESHOLD and sig == "BUY":  sig = "HOLD"
         if fr < -FUNDING_THRESHOLD and sig == "SELL": sig = "HOLD"
 
@@ -1188,27 +1200,21 @@ def _funding_loop():
         print(f"[Funding] Updated {updated}/{len(KRAKEN_TO_BINANCE)} pairs")
         time.sleep(3600)  # funding resets every 8h; refresh hourly is sufficient
 
-# ── Auto coin switcher ────────────────────────────────────────────────────────
-def _switcher_loop(trader, engine):
+# ── Top-coin display updater ─────────────────────────────────────────────────
+def _switcher_loop(trader):
     global _current_coin
     time.sleep(20)
     while True:
         try:
             scores = rank_coins()
-            switched_to = None
-            with _state_lock:
-                # Atomic guard + write — no gap between the position check and the coin update
-                if not trader.position and scores and scores[0]["pair"] != _current_coin["pair"]:
-                    new_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == scores[0]["pair"]), None)
-                    if new_coin:
-                        _current_coin = new_coin
-                        switched_to   = scores[0]
-            if switched_to:
-                engine.reset()  # clear stale tick counts so new coin starts fresh
-                tg(f"🔀 *Switched to {switched_to['name']}*\n"
-                   f"Score: `{switched_to['score']}` | RSI: `{switched_to['rsi']}` | News: `{switched_to['news']}`\n"
-                   f"_{switched_to['reason']}_")
-                print(f"[Switch] → {switched_to['name']}")
+            if scores:
+                top_pair = scores[0]["pair"]
+                with _state_lock:
+                    if top_pair != _current_coin["pair"]:
+                        new_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == top_pair), None)
+                        if new_coin:
+                            _current_coin = new_coin
+                            print(f"[Switcher] Top coin: {new_coin['name']}")
         except Exception as e:
             print(f"[Switcher] {e}")
         time.sleep(1800)
@@ -1224,10 +1230,12 @@ def send_menu(trader=None):
     nasdaq_icon = "🟢" if nasdaq == "BULLISH" else "🔴" if nasdaq == "BEARISH" else "⚫"
     fg_val  = fear_greed["value"]
     fg_icon = "😱" if fg_val < 25 else "😨" if fg_val < 45 else "😐" if fg_val < 55 else "😄" if fg_val < 75 else "🤑"
+    n_pos  = len(trader.positions) if trader else 0
+    pos_str = f" | 📂 `{n_pos}/{MAX_POSITIONS}` open" if n_pos else ""
     header = (
         f"🤖 *CryptoBot* | {status}\n"
         f"💵 Balance: `{bal}` | 🎯 Goal: `${PAPER_TARGET:,.0f}`\n"
-        f"📈 Trading: *{coin}* | {nasdaq_icon} NASDAQ: `{nasdaq}`\n"
+        f"📈 Top: *{coin}*{pos_str} | {nasdaq_icon} NASDAQ: `{nasdaq}`\n"
         f"{fg_icon} Fear & Greed: `{fg_val}` — _{fear_greed['label']}_"
     )
     rows = [
@@ -1241,22 +1249,23 @@ def send_menu(trader=None):
         [{"text": "⏸ Pause" if not paused else "▶ Resume",
           "callback_data": "pause" if not paused else "resume"}],
     ]
-    if trader and trader.position:
-        rows.insert(-1, [{"text": "🚨 Close Position Now", "callback_data": "force_close"}])
+    if trader and trader.positions:
+        n = len(trader.positions)
+        rows.insert(-1, [{"text": f"🚨 Close {n} Position{'s' if n > 1 else ''}", "callback_data": "force_close"}])
     tg_buttons(header, rows)
 
-def _handle_callback(query, trader, engine):
+def _handle_callback(query, trader):
     global _paused, _current_coin
     tg_answer(query["id"])
     data = query.get("data", "")
     try:
-        _dispatch_callback(data, query, trader, engine)
+        _dispatch_callback(data, query, trader)
     except Exception as e:
         print(f"[Callback] {data!r} error: {e}")
         tg_buttons(f"⚠️ *Error:* `{e}`",
                    [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
-def _dispatch_callback(data, query, trader, engine):
+def _dispatch_callback(data, query, trader):
     global _paused, _current_coin
 
     if data == "menu":
@@ -1270,22 +1279,32 @@ def _dispatch_callback(data, query, trader, engine):
         bar = "█" * bar_filled + "░" * (10 - bar_filled)
         losses = len(trader.trades) - trader.wins
 
-        pos_line = "None"
-        p = trader.position  # snapshot — trading_loop may close it concurrently
-        if p:
+        # Build positions section with live PnL per position
+        pos_snap   = dict(trader.positions)
+        pos_lines  = []
+        close_btns = []
+        for pr, p in pos_snap.items():
             try:
-                live = get_price(p["pair"])  # use position's own pair, not current coin
-                upnl = trader.unrealized_pnl(live)
-                upnl_str = f"({'+'if upnl>=0 else ''}{upnl:.2f}$)"
+                live = get_price(pr)
+                upnl = trader.unrealized_pnl(live, pr)
+                upnl_str = f" `({'+'if upnl>=0 else ''}{upnl:.2f}$)`"
             except Exception:
                 upnl_str = ""
-            conf_str = f" | {int(p.get('confidence',0)*100)}% conf {p.get('leverage', LEVERAGE_MIN)}x" if p.get('confidence') else ""
-            pos_line = f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} @ `${p['entry']:.4f}` {upnl_str}{conf_str}"
+            side_icon = "🟢 L" if p["side"] == "LONG" else "🔴 S"
+            conf_str  = f" {int(p.get('confidence',0)*100)}% {p.get('leverage',LEVERAGE_MIN)}x"
+            pos_lines.append(f"  {side_icon} *{p['name']}* @ `${p['entry']:.4f}`{upnl_str}{conf_str}")
+            close_btns.append({"text": f"🚨 Close {p['name']}", "callback_data": f"close_{pr}"})
+        pos_text = "\n".join(pos_lines) if pos_lines else "  None"
 
         fg_val  = fear_greed["value"]
         fg_icon = "😱" if fg_val < 25 else "😨" if fg_val < 45 else "😐" if fg_val < 55 else "😄" if fg_val < 75 else "🤑"
         cons_loss = trader.consecutive_losses
         dd_line = f"⚠️ Streak: `{cons_loss} losses` → size at `{int(trader._risk_multiplier()*100)}%`" if cons_loss >= 3 else f"✅ Streak: `{cons_loss} losses` (full size)"
+
+        buttons = []
+        for i in range(0, len(close_btns), 2):
+            buttons.append(close_btns[i:i+2])
+        buttons.append([{"text": "🔙 Back to Menu", "callback_data": "menu"}])
         tg_buttons(
             f"{rank['emoji']} *{rank['name']}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1298,11 +1317,10 @@ def _dispatch_callback(data, query, trader, engine):
             f"🎯 Win Rate: `{trader.win_rate:.0f}%`  📊 Trades: `{len(trader.trades)}`\n"
             f"{dd_line}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📂 Position: {pos_line}\n"
-            f"🪙 Coin:     *{_current_coin['name']}*\n"
+            f"📂 Positions ({len(pos_snap)}/{MAX_POSITIONS}):\n{pos_text}\n"
             f"{fg_icon} Fear & Greed: `{fg_val}` — _{fear_greed['label']}_\n"
             f"⬆️ Next Rank: {next_rnk['emoji']} {next_rnk['name']} @ `${next_rnk['min']:,.0f}`",
-            [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+            buttons
         )
 
     elif data == "rankings":
@@ -1380,34 +1398,43 @@ def _dispatch_callback(data, query, trader, engine):
         coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
         if not coin:
             tg_buttons("⚠️ *Unknown coin.*", [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
-        elif trader.position:
-            tg_buttons(
-                "⚠️ *Cannot switch — position is open.*\nClose the current trade first.",
-                [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
-            )
         else:
             with _state_lock:
                 _current_coin = coin
-            engine.reset()
             tg_buttons(
-                f"🔄 *Switched to {coin['name']}*\nBot will now trade this pair.",
+                f"🔄 *Displaying {coin['name']}*\nBot scans all top coins automatically.",
                 [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
             )
 
     elif data == "force_close":
-        p = trader.position
-        if not p:
-            tg_buttons("ℹ️ *No open position.*",
+        pos_snap = dict(trader.positions)
+        if not pos_snap:
+            tg_buttons("ℹ️ *No open positions.*",
                        [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
         else:
-            try:
-                price = get_price(p["pair"])
-                trader._close(price, p["name"], "manual close")
-                tg_buttons(f"🚨 *Position closed manually.*\n{p['name']} @ `${price:.4f}`",
-                           [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
-            except Exception as e:
-                tg_buttons(f"⚠️ *Close failed:* {e}",
-                           [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+            closed, failed = [], []
+            for pr, p in pos_snap.items():
+                try:
+                    price = get_price(pr)
+                    trader._close(price, p["name"], "manual close", pr)
+                    closed.append(p["name"])
+                except Exception as e:
+                    failed.append(f"{p['name']}: {e}")
+            summary = f"🚨 *Closed {len(closed)} position{'s' if len(closed)!=1 else ''}:* {', '.join(closed)}"
+            if failed: summary += f"\n⚠️ Failed: {', '.join(failed)}"
+            tg_buttons(summary, [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data.startswith("close_"):
+        pr = data[6:]
+        p  = trader.positions.get(pr)
+        if not p:
+            tg_buttons("ℹ️ *Position already closed.*",
+                       [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+        else:
+            price = get_price(pr)
+            trader._close(price, p["name"], "manual close", pr)
+            tg_buttons(f"🚨 *Closed {p['name']}* @ `${price:.4f}`",
+                       [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "intelligence":
         try:
@@ -1467,24 +1494,22 @@ def _daily_summary_loop(trader):
 def _pnl_update_loop(trader):
     while True:
         time.sleep(600)  # every 10 minutes
-        p = trader.position  # snapshot once — avoids TOCTOU if trading_loop closes concurrently
-        if not p:
-            continue
-        try:
-            price = get_price(p["pair"])
-            upnl  = trader.unrealized_pnl(price)
-            mins  = round((time.time() - p.get("opened_at", time.time())) / 60, 1)
-            pct   = upnl / p["margin"] * 100 if p.get("margin") else 0
-            trail = p.get("trail_stop", 0)
-            emoji = "📈" if upnl >= 0 else "📉"
-            tg(f"{emoji} *Live Update — {p['name']}*\n"
-               f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} entry `${p['entry']:.4f}` → now `${price:.4f}`\n"
-               f"P&L: `{'+'if upnl>=0 else ''}{upnl:.2f}$` (`{pct:+.1f}%`)\n"
-               f"Trail stop: `${trail:.4f}` | Open: `{mins:.0f} min`")
-        except Exception as e:
-            print(f"[PnL] {e}")
+        for pr, p in list(trader.positions.items()):
+            try:
+                price = get_price(pr)
+                upnl  = trader.unrealized_pnl(price, pr)
+                mins  = round((time.time() - p.get("opened_at", time.time())) / 60, 1)
+                pct   = upnl / p["margin"] * 100 if p.get("margin") else 0
+                trail = p.get("trail_stop", 0)
+                emoji = "📈" if upnl >= 0 else "📉"
+                tg(f"{emoji} *Live Update — {p['name']}*\n"
+                   f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} entry `${p['entry']:.4f}` → now `${price:.4f}`\n"
+                   f"P&L: `{'+'if upnl>=0 else ''}{upnl:.2f}$` (`{pct:+.1f}%`)\n"
+                   f"Trail stop: `${trail:.4f}` | Open: `{mins:.0f} min`")
+            except Exception as e:
+                print(f"[PnL] {pr}: {e}")
 
-def _poll_loop(trader, engine):
+def _poll_loop(trader):
     global _last_update_id
     print("[Poll] Starting poll loop")
     while True:
@@ -1511,7 +1536,7 @@ def _poll_loop(trader, engine):
                     # Accept if either the user ID or the chat ID matches TG_CHAT_ID
                     if user_id != TG_CHAT_ID and chat_id != TG_CHAT_ID:
                         continue
-                    _handle_callback(cb, trader, engine)
+                    _handle_callback(cb, trader)
                 elif "message" in u:
                     chat_id = str(u["message"].get("chat", {}).get("id", ""))
                     user_id = str(u["message"].get("from", {}).get("id", ""))
@@ -1528,69 +1553,85 @@ def _poll_loop(trader, engine):
         time.sleep(1)
 
 # ── Main trading loop ─────────────────────────────────────────────────────────
-def trading_loop(trader, engine):
-    last_sig = None
+def trading_loop(trader):
+    engine_map   = {}   # pair → SignalEngine
+    last_sigs    = {}   # pair → last signal string
+    ranked_list  = []   # cached top coins from rank_coins()
+    ranked_ts    = 0    # timestamp of last rankings refresh
+
     while True:
         try:
-            with _state_lock:
-                coin = _current_coin
+            now_ts = time.time()
 
-            # If a position is open, always manage it using the coin it was opened on.
-            # This prevents the price-mismatch glitch when the coin switcher fires mid-trade.
-            if trader.position and trader.position.get("pair") != coin["pair"]:
-                pos_pair = trader.position["pair"]
-                pos_name = trader.position.get("name", pos_pair)
-                pos_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pos_pair), None)
-                if pos_coin:
-                    pos_price = get_price(pos_pair)
-                    trader.on_signal("HOLD", pos_price, 0, 0, pos_name, 0.0)
-                time.sleep(REFRESH_SEC)
-                continue
-
-            pair = coin["pair"]
-            name = coin["name"]
-            buf  = coin["alert_buffer"]
-            closes, highs, lows, volumes = get_klines(pair)
-            price  = get_price(pair)
-            sig, plan, ema, rsi, confidence = engine.evaluate(closes, highs, lows, volumes, price, buf)
-
-            try:
-                atr = calc_atr(highs, lows, closes)
-            except Exception:
-                atr = None
-
-            # 1-hour trend confirmation — only trade with the higher timeframe
-            if sig in ("BUY", "SELL"):
+            # Refresh coin rankings every 5 minutes
+            if now_ts - ranked_ts > 300:
                 try:
-                    closes_1h, _, _, _ = get_klines(pair, interval=60, limit=24)
-                    ema_1h   = calc_ema(closes_1h)
-                    trend_1h = "UP" if closes_1h[-1] > ema_1h else "DOWN"
-                    if sig == "BUY"  and trend_1h != "UP":
-                        sig = "HOLD"
-                    if sig == "SELL" and trend_1h != "DOWN":
-                        sig = "HOLD"
-                except Exception:
-                    pass  # if 1h data unavailable, proceed without filter
+                    ranked_list = rank_coins()
+                    ranked_ts   = now_ts
+                except Exception as e:
+                    print(f"[Trade] rank_coins: {e}")
 
-            now = datetime.now().strftime("%H:%M:%S")
-            print(f"[{now}] {name} ${price:.4f} EMA:{ema:.2f} RSI:{rsi} → {sig} conf:{confidence:.0%}")
+            # ── Manage every open position every tick ──────────────────────
+            for pair in list(trader.positions.keys()):
+                p = trader.positions.get(pair)
+                if not p: continue
+                try:
+                    closes, highs, lows, volumes = get_klines(pair)
+                    price = get_price(pair)
+                    try: atr = calc_atr(highs, lows, closes)
+                    except Exception: atr = None
+                    trader.on_signal("HOLD", price, 0, 0, p["name"], 0.0, pair, atr=atr)
+                except Exception as e:
+                    print(f"[Trade] manage {pair}: {e}")
 
-            if sig != last_sig and sig in ("BUY","SELL"):
-                stop   = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
-                target = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
-                emoji    = "🟢" if sig=="BUY" else "🔴"
-                risk     = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
-                leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
-                tg(f"{emoji} *{sig} Signal — {name}*\n"
-                   f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
-                   f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(confidence*100)}%`\n"
-                   f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
-                trader.on_signal(sig, price, stop, target, name, confidence, pair, atr=atr)
-            elif trader.position:
-                # Always manage open position every tick (trail stop, partial take, time limit)
-                trader.on_signal("HOLD", price, 0, 0, name, 0.0, pair, atr=atr)
+            # ── Scan top-ranked coins for new entry signals ────────────────
+            for coin_score in ranked_list[:8]:
+                pair = coin_score["pair"]
+                if pair in trader.positions: continue   # already in this coin
+                if not trader.can_open_new(): break     # position slots full
 
-            last_sig = sig
+                coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
+                if not coin: continue
+                try:
+                    closes, highs, lows, volumes = get_klines(pair)
+                    price = get_price(pair)
+                    if pair not in engine_map:
+                        engine_map[pair] = SignalEngine()
+                    eng = engine_map[pair]
+                    sig, plan, ema, rsi, conf = eng.evaluate(
+                        closes, highs, lows, volumes, price, coin["alert_buffer"], pair=pair)
+                    try: atr = calc_atr(highs, lows, closes)
+                    except Exception: atr = None
+
+                    # 1-hour trend confirmation
+                    if sig in ("BUY", "SELL"):
+                        try:
+                            closes_1h, _, _, _ = get_klines(pair, interval=60, limit=24)
+                            ema_1h   = calc_ema(closes_1h)
+                            trend_1h = "UP" if closes_1h[-1] > ema_1h else "DOWN"
+                            if sig == "BUY"  and trend_1h != "UP":   sig = "HOLD"
+                            if sig == "SELL" and trend_1h != "DOWN": sig = "HOLD"
+                        except Exception: pass
+
+                    now_str = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{now_str}] {coin['name']} ${price:.4f} RSI:{rsi} → {sig} conf:{conf:.0%}")
+
+                    last_sig = last_sigs.get(pair)
+                    if sig != last_sig and sig in ("BUY", "SELL"):
+                        stop     = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
+                        target   = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
+                        risk     = RISK_MIN + (RISK_MAX - RISK_MIN) * conf
+                        leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * conf)
+                        emoji    = "🟢" if sig == "BUY" else "🔴"
+                        tg(f"{emoji} *{sig} Signal — {coin['name']}*\n"
+                           f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
+                           f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
+                           f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
+                        trader.on_signal(sig, price, stop, target, coin["name"], conf, pair, atr=atr)
+
+                    last_sigs[pair] = sig
+                except Exception as e:
+                    print(f"[Trade] scan {pair}: {e}")
 
         except Exception as e:
             print(f"[Trade] {e}")
@@ -1617,19 +1658,18 @@ def main():
     print(f"[Boot] Ping sent: {ok}")
 
     trader = PaperTrader()
-    engine = SignalEngine()
 
     # Start background threads
-    threading.Thread(target=_news_loop,                            daemon=True).start()
-    threading.Thread(target=_nasdaq_loop,                          daemon=True).start()
-    threading.Thread(target=_fear_greed_loop,                      daemon=True).start()
-    threading.Thread(target=_btc_dominance_loop,                   daemon=True).start()
-    threading.Thread(target=_funding_loop,                         daemon=True).start()
-    threading.Thread(target=_trending_loop,                        daemon=True).start()
-    threading.Thread(target=_switcher_loop,    args=(trader, engine), daemon=True).start()
-    threading.Thread(target=_poll_loop,        args=(trader, engine), daemon=True).start()
-    threading.Thread(target=_daily_summary_loop, args=(trader,),   daemon=True).start()
-    threading.Thread(target=_pnl_update_loop,  args=(trader,),     daemon=True).start()
+    threading.Thread(target=_news_loop,                             daemon=True).start()
+    threading.Thread(target=_nasdaq_loop,                           daemon=True).start()
+    threading.Thread(target=_fear_greed_loop,                       daemon=True).start()
+    threading.Thread(target=_btc_dominance_loop,                    daemon=True).start()
+    threading.Thread(target=_funding_loop,                          daemon=True).start()
+    threading.Thread(target=_trending_loop,                         daemon=True).start()
+    threading.Thread(target=_switcher_loop,    args=(trader,),      daemon=True).start()
+    threading.Thread(target=_poll_loop,        args=(trader,),      daemon=True).start()
+    threading.Thread(target=_daily_summary_loop, args=(trader,),    daemon=True).start()
+    threading.Thread(target=_pnl_update_loop,  args=(trader,),      daemon=True).start()
 
     print("[Bot] All systems online.")
 
@@ -1660,7 +1700,7 @@ def main():
         print(f"[Bot] Scan error: {e}")
 
     # Main trading loop (runs forever)
-    trading_loop(trader, engine)
+    trading_loop(trader)
 
 if __name__ == "__main__":
     main()
