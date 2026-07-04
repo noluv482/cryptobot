@@ -38,6 +38,8 @@ TRAIL_PCT        = 0.03  # fallback trailing stop (used when ATR unavailable)
 ATR_PERIOD       = 14    # candles for ATR calculation
 ATR_MULTIPLIER   = 1.5   # trail distance = 1.5 × ATR
 MAX_TRADE_MINS   = 60    # force close after 60 min
+ACTIVE_HOURS_UTC = (7, 21)   # only trade 07:00–21:00 UTC; skip low-liquidity overnight
+FUNDING_THRESHOLD = 0.0005   # 0.05% per 8h → overcrowded side, block new entries
 
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 
@@ -148,6 +150,19 @@ COIN_KEYWORDS = {
     "SHIBUSD": ["shiba","shib","$shib"],
     "WIFUSD":  ["dogwifhat","wif","$wif"],
     "FLOKIUSD":["floki","$floki"],
+}
+
+# Kraken pair → Binance USDT perpetual symbol (for funding rate fetches)
+KRAKEN_TO_BINANCE = {
+    "SOLUSD":   "SOLUSDT",  "XBTUSD":   "BTCUSDT",  "ETHUSD":  "ETHUSDT",
+    "XRPUSD":   "XRPUSDT",  "XDGUSD":   "DOGEUSDT", "ADAUSD":  "ADAUSDT",
+    "AVAXUSD":  "AVAXUSDT", "LINKUSD":  "LINKUSDT", "DOTUSD":  "DOTUSDT",
+    "LTCUSD":   "LTCUSDT",  "ATOMUSD":  "ATOMUSDT", "UNIUSD":  "UNIUSDT",
+    "AAVEUSD":  "AAVEUSDT", "INJUSD":   "INJUSDT",  "SUIUSD":  "SUIUSDT",
+    "APTUSD":   "APTUSDT",  "ARBUSD":   "ARBUSDT",  "NEARUSD": "NEARUSDT",
+    "ALGOUSD":  "ALGOUSDT", "FILUSD":   "FILUSDT",  "BCHUSD":  "BCHUSDT",
+    "PEPEUSD":  "PEPEUSDT", "BONKUSD":  "BONKUSDT", "SHIBUSD": "SHIBUSDT",
+    "WIFUSD":   "WIFUSDT",  "FLOKIUSD": "FLOKIUSDT",
 }
 
 BULLISH_WORDS = ["surge","rally","pump","moon","breakout","all-time high","ath",
@@ -282,6 +297,7 @@ news_sentiment  = {p: {"sentiment": "NEUTRAL", "headline": "", "score": 0} for p
 market_mood     = {"nasdaq": "NEUTRAL", "change_pct": 0.0}
 fear_greed      = {"value": 50, "label": "Neutral"}
 btc_dominance   = {"pct": 50.0, "prev_pct": 50.0, "rising": False}
+funding_rates   = {}   # pair → last funding rate float (from Binance futures)
 trending_boost  = {}   # pair → bonus score from social/trending sources
 _paused         = False
 _current_coin   = SCAN_UNIVERSE[0]
@@ -408,6 +424,27 @@ def calc_atr(highs, lows, closes, period=ATR_PERIOD):
                    abs(lows[i]  - closes[i-1]))
                for i in range(1, len(closes))]
     return sum(tr_vals[-period:]) / period
+
+def _in_active_hours():
+    """Return True during the 07:00–21:00 UTC trading window."""
+    return ACTIVE_HOURS_UTC[0] <= datetime.utcnow().hour < ACTIVE_HOURS_UTC[1]
+
+def detect_divergence(closes, rsi_now, lookback=15):
+    """
+    Compare price direction vs RSI direction over the last `lookback` candles.
+    Returns 'BEARISH_DIV' (price up, RSI down) or 'BULLISH_DIV' (price down, RSI up).
+    """
+    if len(closes) < lookback + RSI_PERIOD + 1:
+        return None
+    try:
+        rsi_then     = calc_rsi(closes[-(lookback + RSI_PERIOD + 1):-lookback])
+        price_change = (closes[-1] - closes[-lookback]) / closes[-lookback]
+        rsi_change   = rsi_now - rsi_then
+        if price_change >  0.01 and rsi_change < -5: return "BEARISH_DIV"
+        if price_change < -0.01 and rsi_change >  5: return "BULLISH_DIV"
+    except Exception:
+        pass
+    return None
 
 # ── Rank coins ────────────────────────────────────────────────────────────────
 def rank_coins():
@@ -936,6 +973,20 @@ class SignalEngine:
         if btc_dominance["rising"] and sig == "BUY" and _current_coin["pair"] != "XBTUSD":
             sig = "HOLD"
 
+        # Funding rate gate — extreme funding = overcrowded side, flush risk
+        fr = funding_rates.get(_current_coin["pair"], 0.0)
+        if fr >  FUNDING_THRESHOLD and sig == "BUY":  sig = "HOLD"
+        if fr < -FUNDING_THRESHOLD and sig == "SELL": sig = "HOLD"
+
+        # RSI divergence gate — price and RSI disagreeing = unreliable signal
+        divergence = detect_divergence(closes, rsi)
+        if divergence == "BEARISH_DIV" and sig == "BUY":  sig = "HOLD"
+        if divergence == "BULLISH_DIV" and sig == "SELL": sig = "HOLD"
+
+        # Time-of-day filter — avoid low-liquidity overnight hours
+        if not _in_active_hours() and sig in ("BUY", "SELL"):
+            sig = "HOLD"
+
         # ── Confidence score (0.0 → 1.0) ─────────────────────────────────────
         # Scored across 6 pillars, each worth 1 point → normalised to 0–1
         ticks = self.above_ticks if sig == "BUY" else self.below_ticks
@@ -1116,6 +1167,27 @@ def _btc_dominance_loop():
             print(f"[BTC Dom] {e}")
         time.sleep(3600)  # hourly
 
+# ── Binance funding rate monitor ─────────────────────────────────────────────
+def _funding_loop():
+    while True:
+        updated = 0
+        for pair, symbol in KRAKEN_TO_BINANCE.items():
+            try:
+                r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
+                                 params={"symbol": symbol}, timeout=5)
+                if r.ok:
+                    fr = float(r.json()["lastFundingRate"])
+                    funding_rates[pair] = fr
+                    updated += 1
+                    if abs(fr) >= FUNDING_THRESHOLD:
+                        name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+                        side = "LONG" if fr > 0 else "SHORT"
+                        print(f"[Funding] {name} {fr:.4%} — extreme, {side}s blocked")
+            except Exception:
+                pass
+        print(f"[Funding] Updated {updated}/{len(KRAKEN_TO_BINANCE)} pairs")
+        time.sleep(3600)  # funding resets every 8h; refresh hourly is sufficient
+
 # ── Auto coin switcher ────────────────────────────────────────────────────────
 def _switcher_loop(trader, engine):
     global _current_coin
@@ -1158,7 +1230,7 @@ def send_menu(trader=None):
         f"📈 Trading: *{coin}* | {nasdaq_icon} NASDAQ: `{nasdaq}`\n"
         f"{fg_icon} Fear & Greed: `{fg_val}` — _{fear_greed['label']}_"
     )
-    tg_buttons(header, [
+    rows = [
         [{"text": "💰 Balance & Stats",  "callback_data": "balance"},
          {"text": "📊 Rankings",         "callback_data": "rankings"}],
         [{"text": "📜 Trade History",    "callback_data": "history"},
@@ -1168,7 +1240,10 @@ def send_menu(trader=None):
         [{"text": "🧠 Intelligence",     "callback_data": "intelligence"}],
         [{"text": "⏸ Pause" if not paused else "▶ Resume",
           "callback_data": "pause" if not paused else "resume"}],
-    ])
+    ]
+    if trader and trader.position:
+        rows.insert(-1, [{"text": "🚨 Close Position Now", "callback_data": "force_close"}])
+    tg_buttons(header, rows)
 
 def _handle_callback(query, trader, engine):
     global _paused, _current_coin
@@ -1309,6 +1384,21 @@ def _handle_callback(query, trader, engine):
                 f"🔄 *Switched to {coin['name']}*\nBot will now trade this pair.",
                 [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
             )
+
+    elif data == "force_close":
+        p = trader.position
+        if not p:
+            tg_buttons("ℹ️ *No open position.*",
+                       [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+        else:
+            try:
+                price = get_price(p["pair"])
+                trader._close(price, p["name"], "manual close")
+                tg_buttons(f"🚨 *Position closed manually.*\n{p['name']} @ `${price:.4f}`",
+                           [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+            except Exception as e:
+                tg_buttons(f"⚠️ *Close failed:* {e}",
+                           [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "intelligence":
         report = analyse_intelligence(trader.trades)
@@ -1519,6 +1609,7 @@ def main():
     threading.Thread(target=_nasdaq_loop,                          daemon=True).start()
     threading.Thread(target=_fear_greed_loop,                      daemon=True).start()
     threading.Thread(target=_btc_dominance_loop,                   daemon=True).start()
+    threading.Thread(target=_funding_loop,                         daemon=True).start()
     threading.Thread(target=_trending_loop,                        daemon=True).start()
     threading.Thread(target=_switcher_loop,    args=(trader, engine), daemon=True).start()
     threading.Thread(target=_poll_loop,        args=(trader, engine), daemon=True).start()
