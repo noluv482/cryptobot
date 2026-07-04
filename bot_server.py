@@ -757,13 +757,28 @@ class SignalEngine:
                     "exit":  nearest_s if nearest_s else price*0.985,
                     "stop":  nearest_r if nearest_r else price*1.015}
 
-        # news gate
+        # news gate + news-triggered entry
         news    = news_sentiment.get(_current_coin["pair"], {})
         n_score = news.get("score", 0)
         n_sent  = news.get("sentiment", "NEUTRAL")
-        if n_score >= 3:
+
+        # Block trades that go strongly against news
+        if n_score >= 2:
             if sig == "BUY"  and n_sent == "BEARISH": sig = "HOLD"
             if sig == "SELL" and n_sent == "BULLISH": sig = "HOLD"
+
+        # News-triggered entry: strong news + EMA alignment → trade even without confirm ticks
+        if sig == "HOLD" and n_score >= 3:
+            if n_sent == "BULLISH" and above_ema and rsi < 65:
+                sig  = "BUY"
+                plan = {"enter": price,
+                        "exit":  nearest_r if nearest_r else price * 1.015,
+                        "stop":  nearest_s if nearest_s else price * 0.985}
+            elif n_sent == "BEARISH" and not above_ema and rsi > 35:
+                sig  = "SELL"
+                plan = {"enter": price,
+                        "exit":  nearest_s if nearest_s else price * 0.985,
+                        "stop":  nearest_r if nearest_r else price * 1.015}
 
         # NASDAQ gate
         nasdaq_mood = market_mood["nasdaq"]
@@ -776,7 +791,7 @@ class SignalEngine:
         # 1. RSI zone
         if 40 <= rsi <= 60:   pts += 1.0
         elif 30 < rsi < 70:   pts += 0.5
-        # 2. News alignment
+        # 2. News alignment (full point for news-triggered trades since news IS the signal)
         if   (sig == "BUY"  and n_sent == "BULLISH") or \
              (sig == "SELL" and n_sent == "BEARISH"):  pts += 1.0
         elif n_sent == "NEUTRAL":                       pts += 0.5
@@ -784,8 +799,11 @@ class SignalEngine:
         if   (sig == "BUY"  and nasdaq_mood == "BULLISH") or \
              (sig == "SELL" and nasdaq_mood == "BEARISH"): pts += 1.0
         elif nasdaq_mood == "NEUTRAL":                     pts += 0.5
-        # 4. Tick strength (1 point at 5+ consecutive ticks)
-        pts += min(ticks / 5.0, 1.0)
+        # 4. Tick strength — news-triggered entries use score as proxy (capped at 1.0)
+        if ticks > 0:
+            pts += min(ticks / 5.0, 1.0)
+        elif sig in ("BUY", "SELL") and n_score >= 3:
+            pts += min(n_score / 5.0, 1.0)  # use news score when ticks are 0
 
         confidence = round(pts / 4.0, 2) if sig in ("BUY", "SELL") else 0.0
 
