@@ -32,9 +32,12 @@ LEVERAGE_MIN   = 2      # 2x at low confidence
 LEVERAGE_MAX   = 5      # 5x at high confidence
 RISK_MIN       = 0.05   # 5%  margin at low confidence
 RISK_MAX       = 0.20   # 20% margin at high confidence
-MAX_TRADE_GAIN = 0.08   # close when up 8%
-TRAIL_PCT      = 0.03   # trailing stop: 3% below/above the peak
-MAX_TRADE_MINS = 60     # force close after 60 min
+MAX_TRADE_GAIN   = 0.08  # full-close when remaining half is up 8%
+PARTIAL_TAKE_PCT = 0.05  # take 50% profit at 5% move
+TRAIL_PCT        = 0.03  # fallback trailing stop (used when ATR unavailable)
+ATR_PERIOD       = 14    # candles for ATR calculation
+ATR_MULTIPLIER   = 1.5   # trail distance = 1.5 × ATR
+MAX_TRADE_MINS   = 60    # force close after 60 min
 
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 
@@ -278,6 +281,7 @@ db = Database()
 news_sentiment  = {p: {"sentiment": "NEUTRAL", "headline": "", "score": 0} for p in COIN_KEYWORDS}
 market_mood     = {"nasdaq": "NEUTRAL", "change_pct": 0.0}
 fear_greed      = {"value": 50, "label": "Neutral"}
+btc_dominance   = {"pct": 50.0, "prev_pct": 50.0, "rising": False}
 trending_boost  = {}   # pair → bonus score from social/trending sources
 _paused         = False
 _current_coin   = SCAN_UNIVERSE[0]
@@ -394,6 +398,16 @@ def calc_macd(closes):
         sig = v * k9 + sig * (1 - k9)
     macd = macd_vals[-1]
     return macd, sig, macd - sig  # (macd_line, signal_line, histogram)
+
+def calc_atr(highs, lows, closes, period=ATR_PERIOD):
+    """Average True Range — measures typical candle-to-candle volatility."""
+    if len(closes) < period + 1:
+        raise ValueError(f"calc_atr needs {period+1} candles, got {len(closes)}")
+    tr_vals = [max(highs[i] - lows[i],
+                   abs(highs[i] - closes[i-1]),
+                   abs(lows[i]  - closes[i-1]))
+               for i in range(1, len(closes))]
+    return sum(tr_vals[-period:]) / period
 
 # ── Rank coins ────────────────────────────────────────────────────────────────
 def rank_coins():
@@ -618,6 +632,23 @@ class PaperTrader:
         if losses >= 3: return 0.50
         return 1.0
 
+    def _partial_close(self, price, name):
+        """Close 50% of position at current price and let the rest ride."""
+        p = self.position
+        if not p or p.get("partial_taken"): return
+        move = (price - p["entry"]) / p["entry"]
+        if p["side"] == "SHORT": move = -move
+        pnl = round(move * (p["margin"] / 2) * p.get("leverage", LEVERAGE_MIN), 4)
+        self.balance = round(self.balance + pnl, 4)
+        p["contracts"]     = round(p["contracts"] / 2, 6)
+        p["margin"]        = round(p["margin"] / 2, 4)
+        p["partial_taken"] = True
+        self.peak = max(self.peak, self.balance)
+        self._save()
+        tg(f"🎯 *Partial Take-Profit — {name}*\n"
+           f"Closed 50% @ `${price:.4f}` | PnL: `+{pnl:.2f}$`\n"
+           f"Remaining half still running | Balance: `${self.balance:.2f}`")
+
     @property
     def wins(self):
         return sum(1 for t in self.trades if t["pnl"] > 0)
@@ -637,7 +668,7 @@ class PaperTrader:
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN), 4)
 
-    def on_signal(self, sig, price, stop, target, name, confidence, pair=None):
+    def on_signal(self, sig, price, stop, target, name, confidence, pair=None, atr=None):
         with _state_lock:
             paused = _paused
         if paused or self.balance < PAPER_FLOOR: return
@@ -651,15 +682,20 @@ class PaperTrader:
             if side == "SHORT": move = -move
             mins_open = (time.time() - p.get("opened_at", time.time())) / 60
 
-            # Update trailing stop
+            # Partial take-profit: book 50% at PARTIAL_TAKE_PCT, let rest ride
+            if not p.get("partial_taken") and move >= PARTIAL_TAKE_PCT:
+                self._partial_close(price, name)
+
+            # Update trailing stop using stored ATR distance (or fixed % fallback)
+            atr_dist = p.get("atr_dist", price * TRAIL_PCT)
             if side == "LONG":
                 if price > p.get("trail_peak", p["entry"]):
                     p["trail_peak"] = price
-                    p["trail_stop"] = round(price * (1 - TRAIL_PCT), 6)
+                    p["trail_stop"] = round(price - atr_dist, 6)
             else:
                 if price < p.get("trail_peak", p["entry"]):
                     p["trail_peak"] = price
-                    p["trail_stop"] = round(price * (1 + TRAIL_PCT), 6)
+                    p["trail_stop"] = round(price + atr_dist, 6)
 
             if side == "LONG":
                 trail_stop = p.get("trail_stop", 0)
@@ -684,31 +720,37 @@ class PaperTrader:
         if not self.position and not closed_this_tick:
             open_pair = pair or _current_coin["pair"]
             if sig == "BUY":
-                self._open("LONG",  price, name, target, confidence, open_pair)
+                self._open("LONG",  price, name, target, confidence, open_pair, atr)
             elif sig == "SELL":
-                self._open("SHORT", price, name, target, confidence, open_pair)
+                self._open("SHORT", price, name, target, confidence, open_pair, atr)
 
-    def _open(self, side, price, name, target, confidence, pair):
+    def _open(self, side, price, name, target, confidence, pair, atr=None):
         risk       = (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence) * self._risk_multiplier()
         leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
         margin     = round(self.balance * risk, 4)
         contracts  = round((margin * leverage) / price, 6)
         conf_pct   = int(confidence * 100)
-        trail_stop = round(price * (1 - TRAIL_PCT) if side == "LONG" else price * (1 + TRAIL_PCT), 6)
+        if atr is not None:
+            atr_dist   = round(atr * ATR_MULTIPLIER, 8)
+        else:
+            atr_dist   = round(price * TRAIL_PCT, 8)
+        trail_stop = round(price - atr_dist if side == "LONG" else price + atr_dist, 6)
         self.position = {"side": side, "entry": price,
                          "contracts": contracts, "margin": margin,
                          "target": target, "opened_at": time.time(),
                          "confidence": confidence, "leverage": leverage,
                          "pair": pair, "name": name,
-                         "trail_stop": trail_stop, "trail_peak": price}
+                         "trail_stop": trail_stop, "trail_peak": price,
+                         "atr_dist": atr_dist}
         self._save()
         mul = self._risk_multiplier()
         dd_note = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
+        stop_label = "ATR" if atr is not None else "fixed"
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${price:.4f}`\n"
            f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}\n"
            f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
-           f"Trail stop: `${trail_stop:.4f}` | Balance: `${self.balance:.2f}`")
+           f"Trail stop: `${trail_stop:.4f}` ({stop_label}) | Balance: `${self.balance:.2f}`")
 
     def _close(self, price, name, reason):
         if not self.position: return
@@ -889,6 +931,11 @@ class SignalEngine:
         if fg_val > 80 and sig == "BUY":  sig = "HOLD"  # extreme greed = dangerous to buy
         if fg_val < 20 and sig == "SELL": sig = "HOLD"  # extreme fear = bounce likely, skip shorts
 
+        # Bitcoin dominance gate — rising BTC dominance means capital rotating into BTC,
+        # altcoins bleed; block new altcoin longs until dominance stabilises
+        if btc_dominance["rising"] and sig == "BUY" and _current_coin["pair"] != "XBTUSD":
+            sig = "HOLD"
+
         # ── Confidence score (0.0 → 1.0) ─────────────────────────────────────
         # Scored across 6 pillars, each worth 1 point → normalised to 0–1
         ticks = self.above_ticks if sig == "BUY" else self.below_ticks
@@ -1046,6 +1093,28 @@ def _fear_greed_loop():
         except Exception as e:
             print(f"[F&G] {e}")
         time.sleep(3600)  # refresh hourly
+
+# ── Bitcoin dominance monitor ────────────────────────────────────────────────
+def _btc_dominance_loop():
+    while True:
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/global",
+                             timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if r.ok:
+                pct  = r.json()["data"]["market_cap_percentage"].get("btc", 50.0)
+                prev = btc_dominance["pct"]
+                # Only flag as "rising" when dominance climbs meaningfully (>0.3pp)
+                rising = pct > prev + 0.3
+                btc_dominance["prev_pct"] = prev
+                btc_dominance["pct"]      = round(pct, 1)
+                btc_dominance["rising"]   = rising
+                print(f"[BTC Dom] {pct:.1f}% ({'↑ rising — altcoin longs blocked' if rising else 'stable/falling'})")
+                if rising:
+                    tg(f"⚠️ *BTC Dominance Rising — {pct:.1f}%*\n"
+                       f"Capital rotating into BTC — altcoin longs blocked until it stabilises")
+        except Exception as e:
+            print(f"[BTC Dom] {e}")
+        time.sleep(3600)  # hourly
 
 # ── Auto coin switcher ────────────────────────────────────────────────────────
 def _switcher_loop(trader, engine):
@@ -1380,6 +1449,11 @@ def trading_loop(trader, engine):
             price  = get_price(pair)
             sig, plan, ema, rsi, confidence = engine.evaluate(closes, highs, lows, volumes, price, buf)
 
+            try:
+                atr = calc_atr(highs, lows, closes)
+            except Exception:
+                atr = None
+
             # 1-hour trend confirmation — only trade with the higher timeframe
             if sig in ("BUY", "SELL"):
                 try:
@@ -1406,7 +1480,10 @@ def trading_loop(trader, engine):
                    f"Enter: `${plan['enter']:.4f}`\nExit: `${target:.4f}`\nStop: `${stop:.4f}`\n"
                    f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(confidence*100)}%`\n"
                    f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
-                trader.on_signal(sig, price, stop, target, name, confidence, pair)
+                trader.on_signal(sig, price, stop, target, name, confidence, pair, atr=atr)
+            elif trader.position:
+                # Always manage open position every tick (trail stop, partial take, time limit)
+                trader.on_signal("HOLD", price, 0, 0, name, 0.0, pair, atr=atr)
 
             last_sig = sig
 
@@ -1441,6 +1518,7 @@ def main():
     threading.Thread(target=_news_loop,                            daemon=True).start()
     threading.Thread(target=_nasdaq_loop,                          daemon=True).start()
     threading.Thread(target=_fear_greed_loop,                      daemon=True).start()
+    threading.Thread(target=_btc_dominance_loop,                   daemon=True).start()
     threading.Thread(target=_trending_loop,                        daemon=True).start()
     threading.Thread(target=_switcher_loop,    args=(trader, engine), daemon=True).start()
     threading.Thread(target=_poll_loop,        args=(trader, engine), daemon=True).start()
