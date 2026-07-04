@@ -1012,20 +1012,21 @@ def _handle_callback(query, trader, engine):
     elif data.startswith("sw_"):
         pair = data[3:]
         coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
-        if coin:
-            if trader.position:
-                tg_buttons(
-                    "⚠️ *Cannot switch — position is open.*\nClose the current trade first.",
-                    [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
-                )
-            else:
-                with _state_lock:
-                    _current_coin = coin
-                engine.reset()
-                tg_buttons(
-                    f"🔄 *Switched to {coin['name']}*\nBot will now trade this pair.",
-                    [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
-                )
+        if not coin:
+            tg_buttons("⚠️ *Unknown coin.*", [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+        elif trader.position:
+            tg_buttons(
+                "⚠️ *Cannot switch — position is open.*\nClose the current trade first.",
+                [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+            )
+        else:
+            with _state_lock:
+                _current_coin = coin
+            engine.reset()
+            tg_buttons(
+                f"🔄 *Switched to {coin['name']}*\nBot will now trade this pair.",
+                [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+            )
 
     elif data == "intelligence":
         report = analyse_intelligence(trader.trades)
