@@ -62,7 +62,40 @@ SCAN_UNIVERSE = [
     {"name": "BCH/USD",   "pair": "BCHUSD",   "alert_buffer": 1.0},
     {"name": "PEPE/USD",  "pair": "PEPEUSD",  "alert_buffer": 0.0000001},
     {"name": "BONK/USD",  "pair": "BONKUSD",  "alert_buffer": 0.0000001},
+    {"name": "SHIB/USD",  "pair": "SHIBUSD",  "alert_buffer": 0.0000001},
+    {"name": "WIF/USD",   "pair": "WIFUSD",   "alert_buffer": 0.01},
+    {"name": "FLOKI/USD", "pair": "FLOKIUSD", "alert_buffer": 0.000001},
 ]
+
+# CoinGecko coin ID → Kraken pair (used by the trending scanner)
+COINGECKO_TO_KRAKEN = {
+    "shiba-inu":    "SHIBUSD",
+    "dogwifcoin":   "WIFUSD",
+    "floki":        "FLOKIUSD",
+    "pepe":         "PEPEUSD",
+    "bonk":         "BONKUSD",
+    "dogecoin":     "XDGUSD",
+    "solana":       "SOLUSD",
+    "bitcoin":      "XBTUSD",
+    "ethereum":     "ETHUSD",
+    "ripple":       "XRPUSD",
+    "cardano":      "ADAUSD",
+    "avalanche-2":  "AVAXUSD",
+    "chainlink":    "LINKUSD",
+    "polkadot":     "DOTUSD",
+    "litecoin":     "LTCUSD",
+    "cosmos":       "ATOMUSD",
+    "uniswap":      "UNIUSD",
+    "aave":         "AAVEUSD",
+    "injective-protocol": "INJUSD",
+    "sui":          "SUIUSD",
+    "aptos":        "APTUSD",
+    "arbitrum":     "ARBUSD",
+    "near":         "NEARUSD",
+    "algorand":     "ALGOUSD",
+    "filecoin":     "FILUSD",
+    "bitcoin-cash": "BCHUSD",
+}
 
 RANKS = [
     {"name": "Rookie",    "min": 0,     "emoji": "🟤", "unlock": "You're just getting started. Every trade is a lesson."},
@@ -109,6 +142,9 @@ COIN_KEYWORDS = {
     "BCHUSD":  ["bitcoin cash","bch","$bch"],
     "PEPEUSD": ["pepe","$pepe"],
     "BONKUSD": ["bonk","$bonk"],
+    "SHIBUSD": ["shiba","shib","$shib"],
+    "WIFUSD":  ["dogwifhat","wif","$wif"],
+    "FLOKIUSD":["floki","$floki"],
 }
 
 BULLISH_WORDS = ["surge","rally","pump","moon","breakout","all-time high","ath",
@@ -242,6 +278,7 @@ db = Database()
 news_sentiment  = {p: {"sentiment": "NEUTRAL", "headline": "", "score": 0} for p in COIN_KEYWORDS}
 market_mood     = {"nasdaq": "NEUTRAL", "change_pct": 0.0}
 fear_greed      = {"value": 50, "label": "Neutral"}
+trending_boost  = {}   # pair → bonus score from social/trending sources
 _paused         = False
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
@@ -389,12 +426,17 @@ def rank_coins():
                 elif wr <= 35: score -= 20; learned = f"Learned {wr:.0f}%WR❌"
                 elif wr <= 45: score -= 10; learned = f"Learned {wr:.0f}%WR"
 
+            # ── Social / trending boost ───────────────────────────────────
+            tb = trending_boost.get(pair, 0)
+            if tb > 0: score += tb
+
             reason = []
             if volatility > 2:  reason.append(f"Volatility {volatility:.1f}%")
             if above_ema:       reason.append("Above EMA")
             if 40 <= rsi <= 60: reason.append(f"RSI {rsi} ideal")
             if news.get("sentiment") == "BULLISH": reason.append("Bullish news")
             if learned:         reason.append(learned)
+            if tb > 0:          reason.append(f"🔥 Trending +{tb}")
 
             scores.append({"name": coin["name"], "pair": pair,
                            "score": round(score,1), "rsi": rsi,
@@ -929,6 +971,64 @@ def _nasdaq_loop():
             print(f"[NASDAQ] {e}")
         time.sleep(900)
 
+# ── Social / trending scanner ─────────────────────────────────────────────────
+REDDIT_SUBS = [
+    "https://www.reddit.com/r/CryptoCurrency/hot.json?limit=25",
+    "https://www.reddit.com/r/memecoins/hot.json?limit=25",
+    "https://www.reddit.com/r/dogecoin/hot.json?limit=15",
+    "https://www.reddit.com/r/SHIBArmy/hot.json?limit=15",
+]
+
+def _trending_loop():
+    global trending_boost
+    known_trending = set()
+    while True:
+        new_boost = {}
+        # ── CoinGecko trending (top 7 globally) ──────────────────────────
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/search/trending",
+                             timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if r.ok:
+                for item in r.json().get("coins", []):
+                    cg_id = item["item"]["id"]
+                    pair  = COINGECKO_TO_KRAKEN.get(cg_id)
+                    if pair and pair in {c["pair"] for c in SCAN_UNIVERSE}:
+                        new_boost[pair] = new_boost.get(pair, 0) + 25
+                        if pair not in known_trending:
+                            known_trending.add(pair)
+                            name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"]==pair), pair)
+                            tg(f"🔥 *Trending on CoinGecko — {name}*\n"
+                               f"Top 7 globally — score boosted for next scan")
+        except Exception as e:
+            print(f"[Trending] CoinGecko error: {e}")
+        # ── Reddit hot posts ──────────────────────────────────────────────
+        for sub_url in REDDIT_SUBS:
+            try:
+                r = requests.get(sub_url, timeout=10,
+                                 headers={"User-Agent": "CryptoBot/1.0"})
+                if not r.ok: continue
+                posts = r.json()["data"]["children"]
+                for post in posts:
+                    title = post["data"]["title"].lower()
+                    for coin in SCAN_UNIVERSE:
+                        kws = COIN_KEYWORDS.get(coin["pair"], [])
+                        if any(kw in title for kw in kws):
+                            new_boost[coin["pair"]] = new_boost.get(coin["pair"], 0) + 8
+            except Exception as e:
+                print(f"[Trending] Reddit error: {e}")
+        # Alert on new entries from Reddit too
+        for pair, pts in new_boost.items():
+            if pts >= 16 and pair not in known_trending:
+                known_trending.add(pair)
+                name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"]==pair), pair)
+                tg(f"📢 *Viral on Reddit — {name}*\n"
+                   f"Multiple posts detected — added to scan priority")
+        # Reset known_trending each cycle so coins can re-alert if they stop/restart trending
+        known_trending = set(new_boost.keys())
+        trending_boost = new_boost
+        print(f"[Trending] Updated: {[(k,v) for k,v in new_boost.items() if v>0]}")
+        time.sleep(1800)  # refresh every 30 min
+
 # ── Fear & Greed Index ────────────────────────────────────────────────────────
 def _fear_greed_loop():
     while True:
@@ -1341,6 +1441,7 @@ def main():
     threading.Thread(target=_news_loop,                            daemon=True).start()
     threading.Thread(target=_nasdaq_loop,                          daemon=True).start()
     threading.Thread(target=_fear_greed_loop,                      daemon=True).start()
+    threading.Thread(target=_trending_loop,                        daemon=True).start()
     threading.Thread(target=_switcher_loop,    args=(trader, engine), daemon=True).start()
     threading.Thread(target=_poll_loop,        args=(trader, engine), daemon=True).start()
     threading.Thread(target=_daily_summary_loop, args=(trader,),   daemon=True).start()
