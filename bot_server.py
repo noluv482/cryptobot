@@ -241,6 +241,7 @@ db = Database()
 # ── Shared state ──────────────────────────────────────────────────────────────
 news_sentiment  = {p: {"sentiment": "NEUTRAL", "headline": "", "score": 0} for p in COIN_KEYWORDS}
 market_mood     = {"nasdaq": "NEUTRAL", "change_pct": 0.0}
+fear_greed      = {"value": 50, "label": "Neutral"}
 _paused         = False
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
@@ -299,7 +300,8 @@ def get_klines(pair, interval=None, limit=None):
     closes  = [float(c[4]) for c in data]
     highs   = [float(c[2]) for c in data]
     lows    = [float(c[3]) for c in data]
-    return closes, highs, lows
+    volumes = [float(c[6]) for c in data]
+    return closes, highs, lows, volumes
 
 def get_price(pair):
     r = requests.get(f"{BASE_URL}/Ticker", params={"pair": pair}, timeout=10)
@@ -334,6 +336,28 @@ def calc_rsi(closes):
     if al == 0 and ag == 0: return 50.0
     return round(100 - 100/(1 + ag/al), 1) if al > 0 else 100.0
 
+def calc_macd(closes):
+    """Returns (macd, signal, histogram). Needs 35+ candles."""
+    def _ema_series(vals, period):
+        k = 2.0 / (period + 1)
+        e = sum(vals[:period]) / period
+        out = [e]
+        for v in vals[period:]:
+            e = v * k + e * (1 - k)
+            out.append(e)
+        return out
+    if len(closes) < 35:
+        raise ValueError(f"calc_macd needs 35 candles, got {len(closes)}")
+    fast = _ema_series(closes, 12)   # starts at candle 11
+    slow = _ema_series(closes, 26)   # starts at candle 25
+    macd_vals = [f - s for f, s in zip(fast[14:], slow)]  # aligned
+    k9 = 2.0 / (9 + 1)
+    sig = sum(macd_vals[:9]) / 9
+    for v in macd_vals[9:]:
+        sig = v * k9 + sig * (1 - k9)
+    macd = macd_vals[-1]
+    return macd, sig, macd - sig  # (macd_line, signal_line, histogram)
+
 # ── Rank coins ────────────────────────────────────────────────────────────────
 def rank_coins():
     scores    = []
@@ -341,7 +365,7 @@ def rank_coins():
     for coin in SCAN_UNIVERSE:
         pair = coin["pair"]
         try:
-            closes, highs, lows = get_klines(pair)
+            closes, highs, lows, _ = get_klines(pair)
             volatility = (max(highs) - min(lows)) / closes[-1] * 100
             ema        = calc_ema(closes)
             rsi        = calc_rsi(closes)
@@ -538,6 +562,21 @@ class PaperTrader:
             print(f"[Paper] Save error: {e}")
 
     @property
+    def consecutive_losses(self):
+        count = 0
+        for t in reversed(self.trades):
+            if t["pnl"] < 0: count += 1
+            else: break
+        return count
+
+    def _risk_multiplier(self):
+        """Shrink position size after losing streaks to survive choppy markets."""
+        losses = self.consecutive_losses
+        if losses >= 5: return 0.25
+        if losses >= 3: return 0.50
+        return 1.0
+
+    @property
     def wins(self):
         return sum(1 for t in self.trades if t["pnl"] > 0)
 
@@ -608,7 +647,7 @@ class PaperTrader:
                 self._open("SHORT", price, name, target, confidence, open_pair)
 
     def _open(self, side, price, name, target, confidence, pair):
-        risk       = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+        risk       = (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence) * self._risk_multiplier()
         leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
         margin     = round(self.balance * risk, 4)
         contracts  = round((margin * leverage) / price, 6)
@@ -621,9 +660,11 @@ class PaperTrader:
                          "pair": pair, "name": name,
                          "trail_stop": trail_stop, "trail_peak": price}
         self._save()
+        mul = self._risk_multiplier()
+        dd_note = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${price:.4f}`\n"
-           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance\n"
+           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}\n"
            f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
            f"Trail stop: `${trail_stop:.4f}` | Balance: `${self.balance:.2f}`")
 
@@ -718,9 +759,22 @@ class SignalEngine:
         self.above_ticks = 0
         self.below_ticks = 0
 
-    def evaluate(self, closes, highs, lows, price, alert_buffer):
+    def evaluate(self, closes, highs, lows, volumes, price, alert_buffer):
         ema = calc_ema(closes)
         rsi = calc_rsi(closes)
+
+        # MACD momentum
+        try:
+            macd, macd_sig, macd_hist = calc_macd(closes)
+            macd_bull = macd_hist > 0   # histogram above zero = bullish momentum
+            macd_bear = macd_hist < 0
+        except Exception:
+            macd_bull = macd_bear = False
+            macd_hist = 0.0
+
+        # Volume confirmation — is this candle backed by above-average volume?
+        avg_vol = sum(volumes) / len(volumes) if volumes else 1
+        high_volume = volumes[-1] > avg_vol * 1.2 if avg_vol > 0 else False
         price_range = max(highs) - min(lows) or 1
         tolerance   = price_range * 0.005
         levels = []
@@ -767,14 +821,18 @@ class SignalEngine:
             if sig == "BUY"  and n_sent == "BEARISH": sig = "HOLD"
             if sig == "SELL" and n_sent == "BULLISH": sig = "HOLD"
 
+        # MACD gate — block signals that fight the momentum
+        if sig == "BUY"  and macd_bear and macd_hist < -0.005 * price / 1000: sig = "HOLD"
+        if sig == "SELL" and macd_bull and macd_hist >  0.005 * price / 1000: sig = "HOLD"
+
         # News-triggered entry: strong news + EMA alignment → trade even without confirm ticks
         if sig == "HOLD" and n_score >= 3:
-            if n_sent == "BULLISH" and above_ema and rsi < 65:
+            if n_sent == "BULLISH" and above_ema and rsi < 65 and not macd_bear:
                 sig  = "BUY"
                 plan = {"enter": price,
                         "exit":  nearest_r if nearest_r else price * 1.015,
                         "stop":  nearest_s if nearest_s else price * 0.985}
-            elif n_sent == "BEARISH" and not above_ema and rsi > 35:
+            elif n_sent == "BEARISH" and not above_ema and rsi > 35 and not macd_bull:
                 sig  = "SELL"
                 plan = {"enter": price,
                         "exit":  nearest_s if nearest_s else price * 0.985,
@@ -784,14 +842,19 @@ class SignalEngine:
         nasdaq_mood = market_mood["nasdaq"]
         if nasdaq_mood == "BEARISH" and sig == "BUY": sig = "HOLD"
 
+        # Fear & Greed gate
+        fg_val = fear_greed["value"]
+        if fg_val > 80 and sig == "BUY":  sig = "HOLD"  # extreme greed = dangerous to buy
+        if fg_val < 20 and sig == "SELL": sig = "HOLD"  # extreme fear = bounce likely, skip shorts
+
         # ── Confidence score (0.0 → 1.0) ─────────────────────────────────────
-        # Scored across 4 equal pillars, each worth 1 point
+        # Scored across 6 pillars, each worth 1 point → normalised to 0–1
         ticks = self.above_ticks if sig == "BUY" else self.below_ticks
         pts   = 0.0
         # 1. RSI zone
         if 40 <= rsi <= 60:   pts += 1.0
         elif 30 < rsi < 70:   pts += 0.5
-        # 2. News alignment (full point for news-triggered trades since news IS the signal)
+        # 2. News alignment
         if   (sig == "BUY"  and n_sent == "BULLISH") or \
              (sig == "SELL" and n_sent == "BEARISH"):  pts += 1.0
         elif n_sent == "NEUTRAL":                       pts += 0.5
@@ -799,13 +862,18 @@ class SignalEngine:
         if   (sig == "BUY"  and nasdaq_mood == "BULLISH") or \
              (sig == "SELL" and nasdaq_mood == "BEARISH"): pts += 1.0
         elif nasdaq_mood == "NEUTRAL":                     pts += 0.5
-        # 4. Tick strength — news-triggered entries use score as proxy (capped at 1.0)
+        # 4. Tick strength (or news score as proxy for news-triggered entries)
         if ticks > 0:
             pts += min(ticks / 5.0, 1.0)
         elif sig in ("BUY", "SELL") and n_score >= 3:
-            pts += min(n_score / 5.0, 1.0)  # use news score when ticks are 0
+            pts += min(n_score / 5.0, 1.0)
+        # 5. MACD momentum alignment
+        if (sig == "BUY" and macd_bull) or (sig == "SELL" and macd_bear): pts += 1.0
+        # 6. Volume — high-volume moves are more reliable
+        if high_volume: pts += 1.0
+        else:           pts += 0.5
 
-        confidence = round(pts / 4.0, 2) if sig in ("BUY", "SELL") else 0.0
+        confidence = round(pts / 6.0, 2) if sig in ("BUY", "SELL") else 0.0
 
         return sig, plan, ema, rsi, confidence
 
@@ -861,6 +929,24 @@ def _nasdaq_loop():
             print(f"[NASDAQ] {e}")
         time.sleep(900)
 
+# ── Fear & Greed Index ────────────────────────────────────────────────────────
+def _fear_greed_loop():
+    while True:
+        try:
+            r = requests.get("https://api.alternative.me/fng/", timeout=10)
+            data = r.json()["data"][0]
+            fear_greed["value"] = int(data["value"])
+            fear_greed["label"] = data["value_classification"]
+            val = fear_greed["value"]
+            emoji = "😱" if val < 25 else "😨" if val < 45 else "😐" if val < 55 else "😄" if val < 75 else "🤑"
+            print(f"[F&G] {val} — {fear_greed['label']}")
+            if val <= 20 or val >= 80:
+                tg(f"{emoji} *Fear & Greed: {val} — {fear_greed['label']}*\n"
+                   f"{'Extreme fear — market may be oversold' if val <= 20 else 'Extreme greed — new longs are blocked'}")
+        except Exception as e:
+            print(f"[F&G] {e}")
+        time.sleep(3600)  # refresh hourly
+
 # ── Auto coin switcher ────────────────────────────────────────────────────────
 def _switcher_loop(trader, engine):
     global _current_coin
@@ -895,10 +981,13 @@ def send_menu(trader=None):
     coin   = _current_coin["name"]
     nasdaq = market_mood["nasdaq"]
     nasdaq_icon = "🟢" if nasdaq == "BULLISH" else "🔴" if nasdaq == "BEARISH" else "⚫"
+    fg_val  = fear_greed["value"]
+    fg_icon = "😱" if fg_val < 25 else "😨" if fg_val < 45 else "😐" if fg_val < 55 else "😄" if fg_val < 75 else "🤑"
     header = (
         f"🤖 *CryptoBot* | {status}\n"
         f"💵 Balance: `{bal}` | 🎯 Goal: `${PAPER_TARGET:,.0f}`\n"
-        f"📈 Trading: *{coin}* | {nasdaq_icon} NASDAQ: `{nasdaq}`"
+        f"📈 Trading: *{coin}* | {nasdaq_icon} NASDAQ: `{nasdaq}`\n"
+        f"{fg_icon} Fear & Greed: `{fg_val}` — _{fear_greed['label']}_"
     )
     tg_buttons(header, [
         [{"text": "💰 Balance & Stats",  "callback_data": "balance"},
@@ -940,6 +1029,10 @@ def _handle_callback(query, trader, engine):
             conf_str = f" | {int(p.get('confidence',0)*100)}% conf {p.get('leverage', LEVERAGE_MIN)}x" if p.get('confidence') else ""
             pos_line = f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} @ `${p['entry']:.4f}` {upnl_str}{conf_str}"
 
+        fg_val  = fear_greed["value"]
+        fg_icon = "😱" if fg_val < 25 else "😨" if fg_val < 45 else "😐" if fg_val < 55 else "😄" if fg_val < 75 else "🤑"
+        cons_loss = trader.consecutive_losses
+        dd_line = f"⚠️ Streak: `{cons_loss} losses` → size at `{int(trader._risk_multiplier()*100)}%`" if cons_loss >= 3 else f"✅ Streak: `{cons_loss} losses` (full size)"
         tg_buttons(
             f"{rank['emoji']} *{rank['name']}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -950,9 +1043,11 @@ def _handle_callback(query, trader, engine):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ Wins:     `{trader.wins}`  ❌ Losses: `{losses}`\n"
             f"🎯 Win Rate: `{trader.win_rate:.0f}%`  📊 Trades: `{len(trader.trades)}`\n"
+            f"{dd_line}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📂 Position: {pos_line}\n"
             f"🪙 Coin:     *{_current_coin['name']}*\n"
+            f"{fg_icon} Fear & Greed: `{fg_val}` — _{fear_greed['label']}_\n"
             f"⬆️ Next Rank: {next_rnk['emoji']} {next_rnk['name']} @ `${next_rnk['min']:,.0f}`",
             [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
         )
@@ -1181,14 +1276,14 @@ def trading_loop(trader, engine):
             pair = coin["pair"]
             name = coin["name"]
             buf  = coin["alert_buffer"]
-            closes, highs, lows = get_klines(pair)
+            closes, highs, lows, volumes = get_klines(pair)
             price  = get_price(pair)
-            sig, plan, ema, rsi, confidence = engine.evaluate(closes, highs, lows, price, buf)
+            sig, plan, ema, rsi, confidence = engine.evaluate(closes, highs, lows, volumes, price, buf)
 
             # 1-hour trend confirmation — only trade with the higher timeframe
             if sig in ("BUY", "SELL"):
                 try:
-                    closes_1h, _, _ = get_klines(pair, interval=60, limit=24)
+                    closes_1h, _, _, _ = get_klines(pair, interval=60, limit=24)
                     ema_1h   = calc_ema(closes_1h)
                     trend_1h = "UP" if closes_1h[-1] > ema_1h else "DOWN"
                     if sig == "BUY"  and trend_1h != "UP":
@@ -1245,6 +1340,7 @@ def main():
     # Start background threads
     threading.Thread(target=_news_loop,                            daemon=True).start()
     threading.Thread(target=_nasdaq_loop,                          daemon=True).start()
+    threading.Thread(target=_fear_greed_loop,                      daemon=True).start()
     threading.Thread(target=_switcher_loop,    args=(trader, engine), daemon=True).start()
     threading.Thread(target=_poll_loop,        args=(trader, engine), daemon=True).start()
     threading.Thread(target=_daily_summary_loop, args=(trader,),   daemon=True).start()
