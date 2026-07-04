@@ -1249,6 +1249,15 @@ def _handle_callback(query, trader, engine):
     global _paused, _current_coin
     tg_answer(query["id"])
     data = query.get("data", "")
+    try:
+        _dispatch_callback(data, query, trader, engine)
+    except Exception as e:
+        print(f"[Callback] {data!r} error: {e}")
+        tg_buttons(f"⚠️ *Error:* `{e}`",
+                   [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+def _dispatch_callback(data, query, trader, engine):
+    global _paused, _current_coin
 
     if data == "menu":
         send_menu(trader)
@@ -1401,7 +1410,13 @@ def _handle_callback(query, trader, engine):
                            [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "intelligence":
-        report = analyse_intelligence(trader.trades)
+        try:
+            report = analyse_intelligence(trader.trades)
+            # Telegram hard limit is 4096 chars; trim with a note if needed
+            if len(report) > 3800:
+                report = report[:3800].rsplit("\n", 1)[0] + "\n_...truncated_"
+        except Exception as e:
+            report = f"⚠️ Intelligence error: {e}"
         tg_buttons(report, [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "news":
