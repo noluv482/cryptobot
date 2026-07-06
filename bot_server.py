@@ -9,8 +9,67 @@ import threading
 import time
 import os
 import json
+import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+
+# ── Terminal colours ──────────────────────────────────────────────────────────
+_USE_COLOUR = sys.stdout.isatty() or os.environ.get("FORCE_COLOR", "0") == "1"
+
+class _C:  # ANSI codes
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    # foreground
+    RED    = "\033[91m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE   = "\033[94m"
+    MAGENTA= "\033[95m"
+    CYAN   = "\033[96m"
+    WHITE  = "\033[97m"
+    GREY   = "\033[90m"
+
+def _c(code, text):
+    return f"{code}{text}{_C.RESET}" if _USE_COLOUR else text
+
+# Tag colours per module
+_TAG_COLOUR = {
+    "BOOT":    _C.CYAN  + _C.BOLD,
+    "BOT":     _C.CYAN  + _C.BOLD,
+    "TRADE":   _C.MAGENTA,
+    "SIGNAL":  _C.MAGENTA + _C.BOLD,
+    "OPEN":    _C.GREEN + _C.BOLD,
+    "CLOSE":   _C.YELLOW + _C.BOLD,
+    "PnL":     _C.YELLOW,
+    "NEWS":    _C.BLUE,
+    "NASDAQ":  _C.BLUE,
+    "F&G":     _C.BLUE,
+    "BTC DOM": _C.BLUE,
+    "FUNDING": _C.BLUE,
+    "TRENDING":_C.BLUE,
+    "SWITCH":  _C.CYAN,
+    "POLL":    _C.GREY,
+    "DB":      _C.GREY,
+    "TG":      _C.GREY,
+    "PAPER":   _C.GREY,
+    "CALLBACK":_C.GREY,
+    "ERROR":   _C.RED + _C.BOLD,
+    "WARN":    _C.YELLOW,
+}
+
+def log(tag: str, msg: str, level: str = "INFO"):
+    ts   = datetime.now().strftime("%H:%M:%S")
+    tcol = _TAG_COLOUR.get(tag, _C.WHITE)
+    if level == "ERR":
+        lvl_str = _c(_C.RED + _C.BOLD, "ERR")
+    elif level == "WARN":
+        lvl_str = _c(_C.YELLOW, "WRN")
+    else:
+        lvl_str = _c(_C.GREY, "INF")
+    tag_str = _c(tcol, f"{tag:<8}")
+    ts_str  = _c(_C.GREY, ts)
+    print(f"{ts_str}  {lvl_str}  {tag_str}  {msg}", flush=True)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TG_TOKEN   = os.environ["TG_TOKEN"]
@@ -184,20 +243,20 @@ class Database:
         self.conn = None
         url = os.environ.get("DATABASE_URL")
         if not url:
-            print("[DB] No DATABASE_URL — learning disabled, running on JSON only")
+            log("DB", "No DATABASE_URL — learning disabled, running on JSON only", "WARN")
             return
         try:
             try:
                 import psycopg2
             except ImportError:
-                print("[DB] psycopg2 not installed — learning disabled")
+                log("DB", "psycopg2 not installed — learning disabled", "WARN")
                 return
             self.conn = psycopg2.connect(url, connect_timeout=5)
             self.conn.autocommit = True
             self._init_schema()
-            print("[DB] Connected — learning enabled")
+            log("DB", "Connected — learning enabled")
         except Exception as e:
-            print(f"[DB] Connect error: {e}")
+            log("DB", f"Connect error: {e}", "ERR")
             self.conn = None
 
     def _init_schema(self):
@@ -235,7 +294,7 @@ class Database:
                        %(nasdaq_mood)s,%(news_sent)s,%(balance_after)s)
                 """, t)
         except Exception as e:
-            print(f"[DB] Save error: {e}")
+            log("DB", f"Save error: {e}", "ERR")
 
     def coin_win_rates(self, min_trades=3):
         """Per-pair win rate for coins with enough history."""
@@ -253,7 +312,7 @@ class Database:
                 """, (min_trades,))
                 return {row[0]: {"n": row[1], "wr": float(row[2])} for row in cur.fetchall()}
         except Exception as e:
-            print(f"[DB] coin_win_rates error: {e}")
+            log("DB", f"coin_win_rates error: {e}", "ERR")
             return {}
 
     def confidence_calibration(self):
@@ -271,7 +330,7 @@ class Database:
                 """)
                 return {row[0]: {"n": row[1], "wr": float(row[2])} for row in cur.fetchall()}
         except Exception as e:
-            print(f"[DB] confidence_calibration error: {e}")
+            log("DB", f"confidence_calibration error: {e}", "ERR")
             return {}
 
     def best_exit_reason(self):
@@ -289,7 +348,7 @@ class Database:
                 """)
                 return [(row[0], row[1], float(row[2])) for row in cur.fetchall()]
         except Exception as e:
-            print(f"[DB] best_exit_reason error: {e}")
+            log("DB", f"best_exit_reason error: {e}", "ERR")
             return []
 
     @property
@@ -320,10 +379,10 @@ def tg(msg, plain=False):
             payload["parse_mode"] = "Markdown"
         r = requests.post(TG_URL, json=payload, timeout=10)
         if not r.ok:
-            print(f"[TG] Error {r.status_code}: {r.text[:300]}")
+            log("TG", f"Error {r.status_code}: {r.text[:200]}", "ERR")
         return r.ok
     except Exception as e:
-        print(f"[TG] Send error: {e}")
+        log("TG", f"Send error: {e}", "ERR")
         return False
 
 def tg_buttons(msg, buttons):
@@ -333,16 +392,15 @@ def tg_buttons(msg, buttons):
                                 "parse_mode": "Markdown",
                                 "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
         if not r.ok:
-            print(f"[TG] Buttons error {r.status_code}: {r.text[:300]}")
-            # Retry without Markdown if formatting was the problem
+            log("TG", f"Buttons error {r.status_code}: {r.text[:200]}", "ERR")
             if r.status_code == 400:
                 r2 = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                                    json={"chat_id": TG_CHAT_ID, "text": msg,
                                          "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
                 if not r2.ok:
-                    print(f"[TG] Buttons retry error {r2.status_code}: {r2.text[:300]}")
+                    log("TG", f"Buttons retry error {r2.status_code}: {r2.text[:200]}", "ERR")
     except Exception as e:
-        print(f"[TG] Buttons send error: {e}")
+        log("TG", f"Buttons send error: {e}", "ERR")
 
 def tg_answer(cb_id, text=""):
     try:
@@ -671,9 +729,9 @@ class PaperTrader:
                         self.positions = {}
                 else:
                     self.positions = pos_data
-                print(f"[Paper] Loaded — Balance: ${self.balance:.2f}, Positions: {len(self.positions)}")
+                log("PAPER", f"Loaded  balance=${self.balance:.2f}  positions={len(self.positions)}")
             except Exception as e:
-                print(f"[Paper] Load error: {e}")
+                log("PAPER", f"Load error: {e}", "ERR")
 
     def _save(self):
         try:
@@ -682,7 +740,7 @@ class PaperTrader:
                            "trades": self.trades, "positions": self.positions,
                            "current_rank": self.current_rank}, f, indent=2)
         except Exception as e:
-            print(f"[Paper] Save error: {e}")
+            log("PAPER", f"Save error: {e}", "ERR")
 
     @property
     def consecutive_losses(self):
@@ -1092,7 +1150,7 @@ def _news_loop():
             for pair in COIN_KEYWORDS:
                 news_sentiment[pair] = new_scores[pair]
         except Exception as e:
-            print(f"[News] {e}")
+            log("NEWS", str(e), "ERR")
         time.sleep(120)
 
 # ── NASDAQ monitor ────────────────────────────────────────────────────────────
@@ -1105,9 +1163,10 @@ def _nasdaq_loop():
                 chg = ((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2]) * 100
                 market_mood["change_pct"] = round(chg, 2)
                 market_mood["nasdaq"] = "BULLISH" if chg > 1 else "BEARISH" if chg < -2 else "NEUTRAL"
-                print(f"[NASDAQ] QQQ {chg:+.2f}% → {market_mood['nasdaq']}")
+                mood_col = _C.GREEN if market_mood["nasdaq"]=="BULLISH" else _C.RED if market_mood["nasdaq"]=="BEARISH" else _C.GREY
+                log("NASDAQ", f"QQQ {chg:+.2f}%  →  {_c(mood_col + _C.BOLD, market_mood['nasdaq'])}")
         except Exception as e:
-            print(f"[NASDAQ] {e}")
+            log("NASDAQ", str(e), "ERR")
         time.sleep(900)
 
 # ── Social / trending scanner ─────────────────────────────────────────────────
@@ -1139,7 +1198,7 @@ def _trending_loop():
                             tg(f"🔥 *Trending on CoinGecko — {name}*\n"
                                f"Top 7 globally — score boosted for next scan")
         except Exception as e:
-            print(f"[Trending] CoinGecko error: {e}")
+            log("TRENDING", f"CoinGecko error: {e}", "ERR")
         # ── Reddit hot posts ──────────────────────────────────────────────
         for sub_url in REDDIT_SUBS:
             try:
@@ -1154,7 +1213,7 @@ def _trending_loop():
                         if any(kw in title for kw in kws):
                             new_boost[coin["pair"]] = new_boost.get(coin["pair"], 0) + 8
             except Exception as e:
-                print(f"[Trending] Reddit error: {e}")
+                log("TRENDING", f"Reddit error: {e}", "ERR")
         # Alert on new entries from Reddit too
         for pair, pts in new_boost.items():
             if pts >= 16 and pair not in known_trending:
@@ -1165,7 +1224,8 @@ def _trending_loop():
         # Reset known_trending each cycle so coins can re-alert if they stop/restart trending
         known_trending = set(new_boost.keys())
         trending_boost = new_boost
-        print(f"[Trending] Updated: {[(k,v) for k,v in new_boost.items() if v>0]}")
+        hits = [(k, v) for k, v in new_boost.items() if v > 0]
+        log("TRENDING", f"Updated  {len(hits)} boosted coins: {hits if hits else 'none'}")
         time.sleep(1800)  # refresh every 30 min
 
 # ── Fear & Greed Index ────────────────────────────────────────────────────────
@@ -1178,12 +1238,13 @@ def _fear_greed_loop():
             fear_greed["label"] = data["value_classification"]
             val = fear_greed["value"]
             emoji = "😱" if val < 25 else "😨" if val < 45 else "😐" if val < 55 else "😄" if val < 75 else "🤑"
-            print(f"[F&G] {val} — {fear_greed['label']}")
+            fg_col = _C.RED if val < 25 else _C.YELLOW if val < 45 else _C.GREY if val < 55 else _C.GREEN if val < 75 else _C.MAGENTA
+            log("F&G", f"{_c(fg_col + _C.BOLD, str(val))} — {fear_greed['label']}")
             if val <= 20 or val >= 80:
                 tg(f"{emoji} *Fear & Greed: {val} — {fear_greed['label']}*\n"
                    f"{'Extreme fear — market may be oversold' if val <= 20 else 'Extreme greed — new longs are blocked'}")
         except Exception as e:
-            print(f"[F&G] {e}")
+            log("F&G", str(e), "ERR")
         time.sleep(3600)  # refresh hourly
 
 # ── Bitcoin dominance monitor ────────────────────────────────────────────────
@@ -1200,12 +1261,13 @@ def _btc_dominance_loop():
                 btc_dominance["prev_pct"] = prev
                 btc_dominance["pct"]      = round(pct, 1)
                 btc_dominance["rising"]   = rising
-                print(f"[BTC Dom] {pct:.1f}% ({'↑ rising — altcoin longs blocked' if rising else 'stable/falling'})")
+                dom_note = _c(_C.YELLOW + _C.BOLD, "↑ rising — altcoin longs blocked") if rising else _c(_C.GREY, "stable/falling")
+                log("BTC DOM", f"{pct:.1f}%  {dom_note}")
                 if rising:
                     tg(f"⚠️ *BTC Dominance Rising — {pct:.1f}%*\n"
                        f"Capital rotating into BTC — altcoin longs blocked until it stabilises")
         except Exception as e:
-            print(f"[BTC Dom] {e}")
+            log("BTC DOM", str(e), "ERR")
         time.sleep(3600)  # hourly
 
 # ── Binance funding rate monitor ─────────────────────────────────────────────
@@ -1223,10 +1285,10 @@ def _funding_loop():
                     if abs(fr) >= FUNDING_THRESHOLD:
                         name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
                         side = "LONG" if fr > 0 else "SHORT"
-                        print(f"[Funding] {name} {fr:.4%} — extreme, {side}s blocked")
+                        log("FUNDING", f"{name}  {fr:.4%}  {_c(_C.YELLOW, f'extreme -> {side}s blocked')}")
             except Exception:
                 pass
-        print(f"[Funding] Updated {updated}/{len(KRAKEN_TO_BINANCE)} pairs")
+        log("FUNDING", f"Updated {updated}/{len(KRAKEN_TO_BINANCE)} pairs")
         time.sleep(3600)  # funding resets every 8h; refresh hourly is sufficient
 
 # ── Top-coin display updater ─────────────────────────────────────────────────
@@ -1243,9 +1305,9 @@ def _switcher_loop(trader):
                         new_coin = next((c for c in SCAN_UNIVERSE if c["pair"] == top_pair), None)
                         if new_coin:
                             _current_coin = new_coin
-                            print(f"[Switcher] Top coin: {new_coin['name']}")
+                            log("SWITCH", f"Top coin → {_c(_C.CYAN + _C.BOLD, new_coin['name'])}")
         except Exception as e:
-            print(f"[Switcher] {e}")
+            log("SWITCH", str(e), "ERR")
         time.sleep(1800)
 
 # ── Telegram buttons ──────────────────────────────────────────────────────────
@@ -1292,7 +1354,7 @@ def _handle_callback(query, trader):
     try:
         _dispatch_callback(data, query, trader)
     except Exception as e:
-        print(f"[Callback] {data!r} error: {e}")
+        log("CALLBACK", f"{data!r} error: {e}", "ERR")
         tg_buttons(f"⚠️ *Error:* `{e}`",
                    [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
@@ -1529,7 +1591,7 @@ def _daily_summary_loop(trader):
                f"Balance: `${trader.balance:.2f}` | {rank['emoji']} {rank['name']}\n"
                f"Trading: *{_current_coin['name']}*")
         except Exception as e:
-            print(f"[DailySummary] {e}")
+            log("BOT", f"DailySummary error: {e}", "ERR")
 
 def _pnl_update_loop(trader):
     while True:
@@ -1547,11 +1609,11 @@ def _pnl_update_loop(trader):
                    f"P&L: `{'+'if upnl>=0 else ''}{upnl:.2f}$` (`{pct:+.1f}%`)\n"
                    f"Trail stop: `${trail:.4f}` | Open: `{mins:.0f} min`")
             except Exception as e:
-                print(f"[PnL] {pr}: {e}")
+                log("PnL", f"{pr}: {e}", "ERR")
 
 def _poll_loop(trader):
     global _last_update_id
-    print("[Poll] Starting poll loop")
+    log("POLL", "Starting Telegram poll loop")
     while True:
         try:
             r = requests.get(
@@ -1560,36 +1622,32 @@ def _poll_loop(trader):
                         "allowed_updates":["callback_query","message"]},
                 timeout=15)
             if not r.ok:
-                print(f"[Poll] getUpdates error {r.status_code}: {r.text[:200]}")
+                log("POLL", f"getUpdates error {r.status_code}: {r.text[:200]}", "ERR")
                 time.sleep(5)
                 continue
             updates = r.json().get("result", [])
-            if updates:
-                print(f"[Poll] {len(updates)} update(s)")
             for u in updates:
                 _last_update_id = u["update_id"]
                 if "callback_query" in u:
                     cb = u["callback_query"]
                     user_id  = str(cb.get("from", {}).get("id", ""))
                     chat_id  = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-                    print(f"[Poll] callback user={user_id} chat={chat_id} data={cb.get('data')}")
-                    # Accept if either the user ID or the chat ID matches TG_CHAT_ID
                     if user_id != TG_CHAT_ID and chat_id != TG_CHAT_ID:
                         continue
+                    btn = cb.get("data", "?")
+                    log("POLL", f"Button → {_c(_C.CYAN, btn)}")
                     _handle_callback(cb, trader)
                 elif "message" in u:
                     chat_id = str(u["message"].get("chat", {}).get("id", ""))
                     user_id = str(u["message"].get("from", {}).get("id", ""))
                     txt = u["message"].get("text", "").strip()
-                    print(f"[Poll] msg chat={chat_id} user={user_id}: {txt!r}")
-                    # Accept if either the user ID or the chat ID matches TG_CHAT_ID
                     if chat_id != TG_CHAT_ID and user_id != TG_CHAT_ID:
                         continue
                     if txt.lower() in ("/start", "/menu", "menu"):
-                        print("[Poll] sending menu")
+                        log("POLL", "Sending menu")
                         send_menu(trader)
         except Exception as e:
-            print(f"[Poll] error: {e}")
+            log("POLL", str(e), "ERR")
         time.sleep(1)
 
 # ── Main trading loop ─────────────────────────────────────────────────────────
@@ -1609,7 +1667,7 @@ def trading_loop(trader):
                     ranked_list = rank_coins()
                     ranked_ts   = now_ts
                 except Exception as e:
-                    print(f"[Trade] rank_coins: {e}")
+                    log("TRADE", f"rank_coins: {e}", "ERR")
 
             # ── Manage every open position every tick ──────────────────────
             for pair in list(trader.positions.keys()):
@@ -1622,7 +1680,7 @@ def trading_loop(trader):
                     except Exception: atr = None
                     trader.on_signal("HOLD", price, 0, 0, p["name"], 0.0, pair, atr=atr)
                 except Exception as e:
-                    print(f"[Trade] manage {pair}: {e}")
+                    log("TRADE", f"manage {pair}: {e}", "ERR")
 
             # ── Scan top-ranked coins for new entry signals ────────────────
             for coin_score in ranked_list[:8]:
@@ -1653,8 +1711,17 @@ def trading_loop(trader):
                             if sig == "SELL" and trend_1h != "DOWN": sig = "HOLD"
                         except Exception: pass
 
-                    now_str = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{now_str}] {coin['name']} ${price:.4f} RSI:{rsi} → {sig} conf:{conf:.0%}")
+                    sig_col  = _C.GREEN + _C.BOLD if sig == "BUY" else _C.RED + _C.BOLD if sig == "SELL" else _C.GREY
+                    conf_col = _C.GREEN if conf >= 0.6 else _C.YELLOW if conf >= 0.4 else _C.RED
+                    cname    = coin["name"]
+                    sig_str  = _c(sig_col, f"{sig:<4}")
+                    conf_str = _c(conf_col, f"{conf:.0%}")
+                    log("TRADE", (f"{_c(_C.WHITE + _C.BOLD, cname):<12}"
+                                  f"  ${price:<10.4f}"
+                                  f"  RSI {rsi:<5}"
+                                  f"  EMA {ema:<10.2f}"
+                                  f"  {sig_str}"
+                                  f"  conf {conf_str}"))
 
                     last_sig = last_sigs.get(pair)
                     if sig != last_sig and sig in ("BUY", "SELL"):
@@ -1662,6 +1729,11 @@ def trading_loop(trader):
                         target   = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
                         risk     = RISK_MIN + (RISK_MAX - RISK_MIN) * conf
                         leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * conf)
+                        arrow    = "↑" if sig == "BUY" else "↓"
+                        conf_pct = f"{int(conf*100)}%"
+                        log("SIGNAL", (f"{_c(sig_col, f'{arrow} {sig} {cname}')}  "
+                                       f"${price:.4f}  target ${target:.4f}  stop ${stop:.4f}  "
+                                       f"conf {_c(conf_col, conf_pct)}  {leverage}x"))
                         emoji    = "🟢" if sig == "BUY" else "🔴"
                         tg(f"{emoji} *{sig} Signal — {coin['name']}*\n"
                            f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
@@ -1671,53 +1743,71 @@ def trading_loop(trader):
 
                     last_sigs[pair] = sig
                 except Exception as e:
-                    print(f"[Trade] scan {pair}: {e}")
+                    log("TRADE", f"scan {pair}: {e}", "ERR")
 
         except Exception as e:
-            print(f"[Trade] {e}")
+            log("TRADE", str(e), "ERR")
         time.sleep(REFRESH_SEC)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     global _current_coin
-    print("=" * 40)
-    print("  CRYPTOBOT SERVER STARTING")
-    print("=" * 40)
-    print(f"[Boot] TG_CHAT_ID={TG_CHAT_ID!r}")
+
+    # ── Startup banner ────────────────────────────────────────────────────────
+    W = 52
+    border = _c(_C.CYAN, "─" * W)
+    def _banner(line, col=_C.WHITE + _C.BOLD):
+        pad = (W - len(line)) // 2
+        print(_c(_C.CYAN, "│") + " " * pad + _c(col, line) + " " * (W - pad - len(line)) + _c(_C.CYAN, "│"))
+    print(_c(_C.CYAN, "┌" + "─" * W + "┐"))
+    _banner("")
+    _banner("  C R Y P T O B O T  ", _C.CYAN + _C.BOLD)
+    _banner("paper trading  ·  multi-coin  ·  26 pairs", _C.GREY)
+    _banner("")
+    print(_c(_C.CYAN, "└" + "─" * W + "┘"))
+    print()
+
+    log("BOOT", f"Chat ID: {_c(_C.CYAN, TG_CHAT_ID)}")
 
     # Remove any webhook so long-polling (getUpdates) works
     try:
         r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/deleteWebhook",
                           json={"drop_pending_updates": False}, timeout=10)
-        print(f"[Boot] deleteWebhook: {r.json()}")
+        log("BOOT", f"deleteWebhook: {r.json().get('description', 'ok')}")
     except Exception as e:
-        print(f"[Boot] deleteWebhook error: {e}")
+        log("BOOT", f"deleteWebhook error: {e}", "ERR")
 
     # Plain-text ping — proves connectivity before any markdown
     ok = tg(f"CryptoBot booting... (chat_id={TG_CHAT_ID})", plain=True)
-    print(f"[Boot] Ping sent: {ok}")
+    log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
 
     trader = PaperTrader()
 
     # Start background threads
-    threading.Thread(target=_news_loop,                             daemon=True).start()
-    threading.Thread(target=_nasdaq_loop,                           daemon=True).start()
-    threading.Thread(target=_fear_greed_loop,                       daemon=True).start()
-    threading.Thread(target=_btc_dominance_loop,                    daemon=True).start()
-    threading.Thread(target=_funding_loop,                          daemon=True).start()
-    threading.Thread(target=_trending_loop,                         daemon=True).start()
-    threading.Thread(target=_switcher_loop,    args=(trader,),      daemon=True).start()
-    threading.Thread(target=_poll_loop,        args=(trader,),      daemon=True).start()
-    threading.Thread(target=_daily_summary_loop, args=(trader,),    daemon=True).start()
-    threading.Thread(target=_pnl_update_loop,  args=(trader,),      daemon=True).start()
+    threads = [
+        ("News scanner",      _news_loop,          ()),
+        ("NASDAQ monitor",    _nasdaq_loop,         ()),
+        ("Fear & Greed",      _fear_greed_loop,     ()),
+        ("BTC Dominance",     _btc_dominance_loop,  ()),
+        ("Funding rates",     _funding_loop,        ()),
+        ("Trending scanner",  _trending_loop,       ()),
+        ("Coin switcher",     _switcher_loop,       (trader,)),
+        ("Telegram poll",     _poll_loop,           (trader,)),
+        ("Daily summary",     _daily_summary_loop,  (trader,)),
+        ("PnL updater",       _pnl_update_loop,     (trader,)),
+    ]
+    for name, fn, args in threads:
+        threading.Thread(target=fn, args=args, daemon=True).start()
+        log("BOOT", f"Started  {_c(_C.GREY, name)}")
 
-    print("[Bot] All systems online.")
+    log("BOT", _c(_C.GREEN + _C.BOLD, "All systems online"))
 
     # Send menu immediately so Telegram responds without waiting for the coin scan
     rank     = get_rank(trader.balance)
     next_rnk = get_next_rank(trader.balance)
     progress = max(0,(trader.balance-PAPER_START)/(PAPER_TARGET-PAPER_START)*100)
-    print(f"[Bot] Sending startup menu to chat_id={TG_CHAT_ID}...")
+    log("BOT", f"Balance: {_c(_C.GREEN + _C.BOLD, f'${trader.balance:.2f}')}  "
+               f"rank: {rank['name']}  progress: {progress:.1f}%")
     send_menu(trader)
     tg(f"{rank['emoji']} *CryptoBot Online*\n"
        f"─────────────────────\n"
@@ -1727,17 +1817,16 @@ def main():
        f"Next rank: {next_rnk['name']} @ `${next_rnk['min']:,.0f}`\n"
        f"─────────────────────\n"
        f"_{rank['unlock']}_")
-    print("[Bot] Startup messages sent.")
 
     # Find best coin on startup (runs after menu is already shown)
     try:
-        print("[Bot] Scanning for best coin...")
+        log("BOT", "Scanning for best coin...")
         scores = rank_coins()
         if scores:
             _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==scores[0]["pair"]), SCAN_UNIVERSE[0])
-            print(f"[Bot] Best coin: {_current_coin['name']}")
+            log("BOT", f"Best coin: {_c(_C.CYAN + _C.BOLD, _current_coin['name'])}")
     except Exception as e:
-        print(f"[Bot] Scan error: {e}")
+        log("BOT", f"Scan error: {e}", "ERR")
 
     # Main trading loop (runs forever)
     trading_loop(trader)
