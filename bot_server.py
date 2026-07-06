@@ -10,6 +10,7 @@ import time
 import os
 import json
 import sys
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
@@ -70,6 +71,148 @@ def log(tag: str, msg: str, level: str = "INFO"):
     tag_str = _c(tcol, f"{tag:<8}")
     ts_str  = _c(_C.GREY, ts)
     print(f"{ts_str}  {lvl_str}  {tag_str}  {msg}", flush=True)
+
+# ── ANSI-aware display helpers ────────────────────────────────────────────────
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+
+def _vlen(s: str) -> int:
+    return len(_ANSI_RE.sub('', s))
+
+def _vpad(s: str, w: int) -> str:
+    return s + " " * max(0, w - _vlen(s))
+
+
+def _print_rank_table(scores):
+    """Formatted top-coin ranking table — printed on each rankings refresh."""
+    top = scores[:8]
+    if not top:
+        return
+    W = 63  # inner width; visual content = W-2 (1-space margin each side)
+
+    def brow(text=""):
+        return _c(_C.CYAN, "│") + " " + _vpad(text, W - 2) + " " + _c(_C.CYAN, "│")
+
+    ts  = datetime.now().strftime("%H:%M:%S")
+    hdr = (_c(_C.CYAN + _C.BOLD, "◈  MARKET SCAN") +
+           "  " + _c(_C.GREY, ts + "  ·  " + str(len(top)) + " coins"))
+
+    print(_c(_C.CYAN, "┌" + "─" * W + "┐"))
+    print(brow(hdr))
+    print(_c(_C.CYAN, "├" + "─" * W + "┤"))
+
+    col_hdr = ("  " +
+               _vpad(_c(_C.GREY, "COIN"),  10) + "  " +
+               _vpad(_c(_C.GREY, "RSI"),    5) + "  " +
+               _vpad(_c(_C.GREY, "SCORE"),  6) + "  " +
+               _vpad(_c(_C.GREY, "NEWS"),   8) + "  " +
+               _c(_C.GREY, "REASON"))
+    print(brow(col_hdr))
+    print(_c(_C.CYAN, "├" + "─" * W + "┤"))
+
+    for i, s in enumerate(top):
+        marker   = _c(_C.CYAN + _C.BOLD, "►") if i == 0 else " "
+        name_col = (_C.WHITE + _C.BOLD) if i == 0 else _C.WHITE
+        name_str = _c(name_col, s["name"][:10])
+
+        rsi = s.get("rsi", 0)
+        rsi_col = (_C.RED    if rsi > 70 else
+                   _C.YELLOW if rsi > 60 else
+                   _C.GREEN  if rsi < 40 else _C.WHITE)
+        rsi_str = _c(rsi_col, str(rsi))
+
+        sc = round(s.get("score", 0))
+        sc_col = (_C.GREEN + _C.BOLD if sc >= 80 else
+                  _C.GREEN           if sc >= 60 else
+                  _C.YELLOW          if sc >= 40 else _C.RED)
+        score_str = _c(sc_col, str(sc))
+
+        news = s.get("news", "NEUTRAL")
+        news_col = (_C.GREEN if news == "BULLISH" else
+                    _C.RED   if news == "BEARISH" else _C.GREY)
+        news_str = _c(news_col, news[:7])
+
+        reason = s.get("reason", "")[:22]
+
+        row_text = (marker + " " +
+                    _vpad(name_str,  10) + "  " +
+                    _vpad(rsi_str,    5) + "  " +
+                    _vpad(score_str,  6) + "  " +
+                    _vpad(news_str,   8) + "  " +
+                    _c(_C.GREY, reason))
+        print(brow(row_text))
+
+    print(_c(_C.CYAN, "└" + "─" * W + "┘"))
+    print()
+
+
+def _print_trade_box(action, name, side, price, **kw):
+    """Print a colored trade notification box to terminal."""
+    W        = 52
+    is_open  = action == "OPEN"
+    is_long  = side == "LONG"
+    side_col = _C.GREEN if is_long else _C.RED
+    pnl      = kw.get("pnl", 0)
+    if is_open:
+        box_col = _C.GREEN + _C.BOLD
+    elif pnl >= 0:
+        box_col = _C.GREEN + _C.BOLD
+    else:
+        box_col = _C.RED + _C.BOLD
+    arrow   = "▲" if is_open else "▼"
+    act_lbl = "TRADE OPENED" if is_open else "TRADE CLOSED"
+
+    def brow(text=""):
+        return _c(box_col, "║") + " " + _vpad(text, W - 2) + " " + _c(box_col, "║")
+
+    title = (_c(box_col, arrow + "  " + act_lbl + "  —  ") +
+             _c(_C.WHITE + _C.BOLD, name))
+    print(_c(box_col, "╔" + "═" * W + "╗"))
+    print(brow(title))
+    print(_c(box_col, "╠" + "═" * W + "╣"))
+
+    if is_open:
+        stop      = kw.get("stop", 0)
+        target    = kw.get("target", 0)
+        conf      = kw.get("confidence", 0)
+        lev       = kw.get("leverage", 2)
+        margin    = kw.get("margin", 0)
+        fee       = kw.get("fee", 0)
+        bal       = kw.get("balance", 0)
+        stop_type = kw.get("stop_type", "ATR")
+        conf_col  = (_C.GREEN if conf >= 0.6 else
+                     _C.YELLOW if conf >= 0.4 else _C.RED)
+        conf_pct  = str(int(conf * 100)) + "%"
+        lev_str   = str(lev) + "x"
+        print(brow(_c(side_col + _C.BOLD, side) +
+                   _c(_C.GREY, "  @  ") + _c(_C.WHITE, f"${price:.4f}")))
+        print(brow(_c(_C.GREY, "Stop    ") + _c(_C.RED, f"${stop:.4f}") +
+                   _c(_C.GREY, "  ·  Target  ") + _c(_C.GREEN, f"${target:.4f}") +
+                   _c(_C.GREY, "  [" + stop_type + "]")))
+        print(brow(_c(_C.GREY, "Conf    ") + _c(conf_col, conf_pct) +
+                   _c(_C.GREY, "  ·  Leverage  ") + _c(_C.WHITE + _C.BOLD, lev_str)))
+        print(brow(_c(_C.GREY, "Margin  ") + _c(_C.WHITE, f"${margin:.2f}") +
+                   _c(_C.GREY, "  ·  Fee  ") + _c(_C.GREY, f"${fee:.3f}")))
+        print(brow(_c(_C.GREY, "Balance  ") + _c(_C.WHITE + _C.BOLD, f"${bal:.2f}")))
+    else:
+        reason  = kw.get("reason", "")
+        held    = kw.get("held_mins", 0)
+        bal     = kw.get("balance", 0)
+        wr      = kw.get("win_rate", 0.0)
+        pnl_col = (_C.GREEN + _C.BOLD if pnl >= 0 else _C.RED + _C.BOLD)
+        pnl_sgn = "+" if pnl >= 0 else ""
+        icon    = "✓" if pnl >= 0 else "✗"
+        pnl_str = pnl_sgn + f"{pnl:.2f}$"
+        print(brow(_c(side_col + _C.BOLD, side) +
+                   _c(_C.GREY, "  @  ") + _c(_C.WHITE, f"${price:.4f}") +
+                   _c(_C.GREY, "  (" + reason + ")")))
+        print(brow(_c(_C.GREY, "PnL     ") + _c(pnl_col, icon + "  " + pnl_str)))
+        print(brow(_c(_C.GREY, "Held    ") + _c(_C.WHITE, str(round(held)) + " min") +
+                   _c(_C.GREY, "  ·  Win rate  ") + _c(_C.WHITE, f"{wr:.0f}%")))
+        print(brow(_c(_C.GREY, "Balance  ") + _c(_C.WHITE + _C.BOLD, f"${bal:.2f}")))
+
+    print(_c(box_col, "╚" + "═" * W + "╝"))
+    print()
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TG_TOKEN   = os.environ["TG_TOKEN"]
@@ -890,6 +1033,12 @@ class PaperTrader:
            f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}\n"
            f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
            f"Trail stop: `${trail_stop:.4f}` ({stop_label}) | Balance: `${self.balance:.2f}`")
+        _print_trade_box("OPEN", name, side, fill,
+                         stop=trail_stop, target=target,
+                         confidence=confidence, leverage=leverage,
+                         margin=margin, fee=fee,
+                         balance=self.balance,
+                         stop_type=stop_label)
 
     def _close(self, price, name, reason, pair):
         p = self.positions.get(pair)
@@ -924,6 +1073,11 @@ class PaperTrader:
            f"Reason: `{reason}` | Fee: `${fee:.3f}`\n"
            f"PnL: `{'+'if pnl>=0 else ''}{pnl:.2f}$`\n"
            f"Balance: `${self.balance:.2f}` | Win rate: `{self.win_rate:.0f}%`")
+        _print_trade_box("CLOSE", name, p["side"], fill,
+                         pnl=pnl, reason=reason,
+                         held_mins=held_mins,
+                         balance=self.balance,
+                         win_rate=self.win_rate)
 
         new_rank = get_rank(self.balance)
         if new_rank["name"] != self.current_rank:
@@ -1666,6 +1820,7 @@ def trading_loop(trader):
                 try:
                     ranked_list = rank_coins()
                     ranked_ts   = now_ts
+                    _print_rank_table(ranked_list)
                 except Exception as e:
                     log("TRADE", f"rank_coins: {e}", "ERR")
 
@@ -1754,17 +1909,21 @@ def main():
     global _current_coin
 
     # ── Startup banner ────────────────────────────────────────────────────────
-    W = 52
-    border = _c(_C.CYAN, "─" * W)
-    def _banner(line, col=_C.WHITE + _C.BOLD):
-        pad = (W - len(line)) // 2
-        print(_c(_C.CYAN, "│") + " " * pad + _c(col, line) + " " * (W - pad - len(line)) + _c(_C.CYAN, "│"))
-    print(_c(_C.CYAN, "┌" + "─" * W + "┐"))
-    _banner("")
-    _banner("  C R Y P T O B O T  ", _C.CYAN + _C.BOLD)
-    _banner("paper trading  ·  multi-coin  ·  26 pairs", _C.GREY)
-    _banner("")
-    print(_c(_C.CYAN, "└" + "─" * W + "┘"))
+    BW = 56
+    def _bcenter(text, col=_C.WHITE):
+        pad_l = (BW - len(text)) // 2
+        pad_r  = BW - len(text) - pad_l
+        print(_c(_C.CYAN, "║") + " " * pad_l + _c(col, text) + " " * pad_r + _c(_C.CYAN, "║"))
+    print(_c(_C.CYAN, "╔" + "═" * BW + "╗"))
+    _bcenter("")
+    _bcenter("◈  C R Y P T O B O T  ◈", _C.CYAN + _C.BOLD)
+    _bcenter("─" * 30, _C.GREY)
+    _bcenter("paper trading  ·  multi-coin  ·  26 pairs", _C.GREY)
+    _bcenter("ATR trailing stops  ·  6-pillar confidence", _C.GREY)
+    _bcenter("")
+    print(_c(_C.CYAN, "╠" + "═" * BW + "╣"))
+    _bcenter(datetime.now().strftime("Started  %Y-%m-%d  %H:%M  UTC"), _C.GREY)
+    print(_c(_C.CYAN, "╚" + "═" * BW + "╝"))
     print()
 
     log("BOOT", f"Chat ID: {_c(_C.CYAN, TG_CHAT_ID)}")
@@ -1825,6 +1984,7 @@ def main():
         if scores:
             _current_coin = next((c for c in SCAN_UNIVERSE if c["pair"]==scores[0]["pair"]), SCAN_UNIVERSE[0])
             log("BOT", f"Best coin: {_c(_C.CYAN + _C.BOLD, _current_coin['name'])}")
+            _print_rank_table(scores)
     except Exception as e:
         log("BOT", f"Scan error: {e}", "ERR")
 
