@@ -215,8 +215,8 @@ def _print_trade_box(action, name, side, price, **kw):
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TG_TOKEN   = os.environ["TG_TOKEN"]
-TG_CHAT_ID = os.environ["TG_CHAT_ID"]
+TG_TOKEN   = os.environ.get("TG_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 BASE_URL   = "https://api.kraken.com/0/public"
 
@@ -422,6 +422,13 @@ class Database:
                     balance_after FLOAT
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    id         INT PRIMARY KEY DEFAULT 1,
+                    data       JSONB,
+                    updated_at FLOAT
+                )
+            """)
 
     def save_trade(self, t):
         if not self.conn: return
@@ -494,6 +501,33 @@ class Database:
             log("DB", f"best_exit_reason error: {e}", "ERR")
             return []
 
+    def save_state(self, state: dict):
+        if not self.conn: return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO bot_state (id, data, updated_at)
+                    VALUES (1, %s, %s)
+                    ON CONFLICT (id) DO UPDATE
+                      SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at
+                """, (json.dumps(state), time.time()))
+            return True
+        except Exception as e:
+            log("DB", f"save_state error: {e}", "ERR")
+            return False
+
+    def load_state(self):
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT data FROM bot_state WHERE id = 1")
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        except Exception as e:
+            log("DB", f"load_state error: {e}", "ERR")
+        return None
+
     @property
     def connected(self):
         return self.conn is not None
@@ -516,6 +550,8 @@ _state_lock     = threading.Lock()   # guards _paused and _current_coin
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 def tg(msg, plain=False):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return False
     try:
         payload = {"chat_id": TG_CHAT_ID, "text": msg}
         if not plain:
@@ -529,6 +565,8 @@ def tg(msg, plain=False):
         return False
 
 def tg_buttons(msg, buttons):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
     try:
         r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                           json={"chat_id": TG_CHAT_ID, "text": msg,
@@ -830,7 +868,8 @@ def get_next_rank(balance):
 
 # ── Paper trader ──────────────────────────────────────────────────────────────
 class PaperTrader:
-    def __init__(self):
+    def __init__(self, no_persist=False):
+        self._no_persist   = no_persist
         self.balance       = PAPER_START
         self.positions     = {}   # pair → position dict (multi-coin)
         self.trades        = []
@@ -841,6 +880,8 @@ class PaperTrader:
         self.day_date      = datetime.utcnow().strftime("%Y-%m-%d")
         self.current_rank  = RANKS[0]["name"]
         self.session_start = PAPER_START
+        self._calib        = {}
+        self._calib_ts     = 0.0
         self._load()
 
     @property
@@ -853,37 +894,90 @@ class PaperTrader:
         used = sum(p["margin"] for p in self.positions.values())
         return (used / max(self.balance, 0.01)) < MAX_TOTAL_RISK
 
+    def _apply_state(self, d):
+        self.balance      = d.get("balance", PAPER_START)
+        self.peak         = d.get("peak", self.balance)
+        self.trades       = d.get("trades", [])
+        self.current_rank = d.get("current_rank", RANKS[0]["name"])
+        pos_data = d.get("positions")
+        if pos_data is None:
+            old = d.get("position")
+            if old and isinstance(old, dict) and "side" in old:
+                self.positions = {old.get("pair", "XBTUSD"): old}
+            else:
+                self.positions = {}
+        else:
+            self.positions = pos_data
+
     def _load(self):
+        if self._no_persist:
+            return
+        if db.connected:
+            state = db.load_state()
+            if state:
+                try:
+                    self._apply_state(state)
+                    log("PAPER", f"Loaded from DB  balance=${self.balance:.2f}  "
+                                 f"positions={len(self.positions)}  trades={len(self.trades)}")
+                    self._save_file()
+                    return
+                except Exception as e:
+                    log("PAPER", f"DB load error: {e}", "ERR")
         if os.path.exists(SAVE_FILE):
             try:
                 with open(SAVE_FILE) as f:
                     d = json.load(f)
-                self.balance      = d.get("balance", PAPER_START)
-                self.peak         = d.get("peak", self.balance)
-                self.trades       = d.get("trades", [])
-                self.current_rank = d.get("current_rank", RANKS[0]["name"])
-                # Backward compat: old saves used "position" (single dict)
-                pos_data = d.get("positions")
-                if pos_data is None:
-                    old = d.get("position")
-                    if old and isinstance(old, dict) and "side" in old:
-                        self.positions = {old.get("pair", "XBTUSD"): old}
-                    else:
-                        self.positions = {}
-                else:
-                    self.positions = pos_data
-                log("PAPER", f"Loaded  balance=${self.balance:.2f}  positions={len(self.positions)}")
+                self._apply_state(d)
+                log("PAPER", f"Loaded from file  balance=${self.balance:.2f}  "
+                             f"positions={len(self.positions)}")
+                if db.connected:
+                    self._save_db()
+                    log("PAPER", "Migrated file state → Postgres")
             except Exception as e:
                 log("PAPER", f"Load error: {e}", "ERR")
 
-    def _save(self):
+    def _state_dict(self):
+        return {"balance": self.balance, "peak": self.peak,
+                "trades": self.trades[-1000:], "positions": self.positions,
+                "current_rank": self.current_rank}
+
+    def _save_file(self):
         try:
             with open(SAVE_FILE, "w") as f:
-                json.dump({"balance": self.balance, "peak": self.peak,
-                           "trades": self.trades, "positions": self.positions,
-                           "current_rank": self.current_rank}, f, indent=2)
+                json.dump(self._state_dict(), f, indent=2)
         except Exception as e:
-            log("PAPER", f"Save error: {e}", "ERR")
+            log("PAPER", f"File save error: {e}", "ERR")
+
+    def _save_db(self):
+        if db.connected:
+            db.save_state(self._state_dict())
+
+    def _save(self):
+        if self._no_persist:
+            return
+        self._save_db()
+        self._save_file()
+
+    def _calibration_multiplier(self, confidence):
+        if self._no_persist or not db.connected:
+            return 1.0
+        now = time.time()
+        if now - self._calib_ts > 300:
+            try:
+                self._calib = db.confidence_calibration()
+            except Exception as e:
+                log("PAPER", f"calibration fetch error: {e}", "ERR")
+            self._calib_ts = now
+        tier  = "high" if confidence >= 0.6 else "low"
+        stats = self._calib.get(tier)
+        if not stats or stats.get("n", 0) < 15:
+            return 1.0
+        wr = stats.get("wr", 50.0)
+        if wr >= 55: return 1.0
+        if wr >= 50: return 0.85
+        if wr >= 45: return 0.65
+        if wr >= 40: return 0.50
+        return 0.35
 
     @property
     def consecutive_losses(self):
@@ -1003,7 +1097,9 @@ class PaperTrader:
                 self._open("SHORT", price, name, target, confidence, pair, atr)
 
     def _open(self, side, price, name, target, confidence, pair, atr=None):
-        risk       = (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence) * self._risk_multiplier()
+        risk       = ((RISK_MIN + (RISK_MAX - RISK_MIN) * confidence)
+                      * self._risk_multiplier()
+                      * self._calibration_multiplier(confidence))
         leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
         fill       = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
         margin     = round(self.balance * risk, 4)
