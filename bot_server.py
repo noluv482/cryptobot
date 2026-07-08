@@ -1886,7 +1886,11 @@ def _poll_loop(trader):
                         continue
                     btn = cb.get("data", "?")
                     log("POLL", f"Button → {_c(_C.CYAN, btn)}")
-                    _handle_callback(cb, trader)
+                    # Dispatch in a thread so the poll loop stays free to ack
+                    # the next update — some callbacks (rankings, balance) make
+                    # Kraken HTTP calls that can block for several seconds.
+                    threading.Thread(target=_handle_callback,
+                                     args=(cb, trader), daemon=True).start()
                 elif "message" in u:
                     chat_id = str(u["message"].get("chat", {}).get("id", ""))
                     user_id = str(u["message"].get("from", {}).get("id", ""))
