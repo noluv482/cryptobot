@@ -1984,7 +1984,12 @@ def _dispatch_callback(data, query, trader):
             tg_buttons("ℹ️ *Position already closed.*",
                        [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
         else:
-            price = get_price(pr)
+            try:
+                price = get_price(pr)
+            except Exception as e:
+                tg_buttons(f"⚠️ *Could not fetch price for {p['name']}*\n`{e}`\nTry again.",
+                           [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+                return
             trader._close(price, p["name"], "manual close", pr)
             tg_buttons(f"🚨 *Closed {p['name']}* @ `${price:.4f}`",
                        [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
