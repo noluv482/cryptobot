@@ -969,6 +969,8 @@ class PaperTrader:
         # Per-pair exit-quality cache
         self._exit_cache   = {}   # pair → dict
         self._exit_ts      = {}   # pair → float
+        # Per-pair re-entry cooldown after a loss
+        self._cooldown     = {}   # pair → timestamp when cooldown expires
         self._load()
 
     @property
@@ -1266,13 +1268,15 @@ class PaperTrader:
                 self._close(price, name, "signal flip",  pair); closed_this_tick = True
 
         if pair not in self.positions and not closed_this_tick:
+            if time.time() < self._cooldown.get(pair, 0):
+                return
             min_conf = self._min_conf_threshold(pair)
             if sig == "BUY"  and self.can_open_new() and confidence >= min_conf:
-                self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey)
+                self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop)
             elif sig == "SELL" and self.can_open_new() and confidence >= min_conf:
-                self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey)
+                self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop)
 
-    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey=""):
+    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None):
         risk       = min(
                         (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence)
                         * self._risk_multiplier()
@@ -1288,9 +1292,24 @@ class PaperTrader:
         self.day_trades += 1
         conf_pct   = int(confidence * 100)
         if atr is not None:
-            atr_dist   = round(atr * self._atr_mult(pair), 8)
+            atr_dist = round(atr * self._atr_mult(pair), 8)
         else:
-            atr_dist   = round(fill * TRAIL_PCT, 8)
+            atr_dist = round(fill * TRAIL_PCT, 8)
+        # Better stop placement: use nearest support/resistance when tighter than ATR
+        stop_label = "ATR"
+        if stop is not None and stop > 0:
+            if side == "LONG":
+                struct_dist = fill - stop
+                if 0 < struct_dist < atr_dist * 1.5:
+                    atr_dist   = round(struct_dist, 8)
+                    stop_label = "structure"
+            else:
+                struct_dist = stop - fill
+                if 0 < struct_dist < atr_dist * 1.5:
+                    atr_dist   = round(struct_dist, 8)
+                    stop_label = "structure"
+        if atr is None:
+            stop_label = "fixed"
         trail_stop = round(fill - atr_dist if side == "LONG" else fill + atr_dist, 6)
         effective_target = float("inf") if (side == "LONG"  and self._trail_only(pair)) else \
                            0.0          if (side == "SHORT" and self._trail_only(pair)) else target
@@ -1300,11 +1319,12 @@ class PaperTrader:
                                 "confidence": confidence, "leverage": leverage,
                                 "pair": pair, "name": name,
                                 "trail_stop": trail_stop, "trail_peak": fill,
-                                "atr_dist": atr_dist, "fkey": fkey}
+                                "atr_dist": atr_dist, "fkey": fkey,
+                                "entry_nasdaq": market_mood["nasdaq"],
+                                "entry_news": news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL")}
         self._save()
         mul = self._risk_multiplier()
         dd_note = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
-        stop_label = "ATR" if atr is not None else "fixed"
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
            f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}\n"
@@ -1331,26 +1351,43 @@ class PaperTrader:
         cs = self.coin_stats.setdefault(name, {"wins": 0, "losses": 0})
         if pnl >= 0: cs["wins"] += 1
         else:        cs["losses"] += 1
+        fkey       = p.get("fkey", "")
+        entry_nasdaq = p.get("entry_nasdaq", market_mood["nasdaq"])
+        entry_news   = p.get("entry_news",   news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"))
         trade_rec = {"side": p["side"], "entry": p["entry"], "exit": fill,
                      "pnl": pnl, "coin": p.get("name", name),
                      "confidence": p.get("confidence", 0.0),
                      "held_mins": held_mins, "reason": reason, "ts": time.time()}
-        db.log_feature(p.get("fkey", ""), pair, pnl > 0)
+        db.log_feature(fkey, pair, pnl > 0)
         self.trades.append(trade_rec)
         db.save_trade({
             "ts": trade_rec["ts"], "coin": trade_rec["coin"], "pair": pair,
             "side": trade_rec["side"], "entry": trade_rec["entry"],
             "exit_price": fill, "pnl": pnl, "held_mins": held_mins,
             "reason": reason, "confidence": trade_rec["confidence"],
-            "nasdaq_mood": market_mood["nasdaq"],
-            "news_sent": news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"),
+            "nasdaq_mood": entry_nasdaq,
+            "news_sent": entry_news,
             "balance_after": self.balance,
         })
+        # Cooldown: block re-entry on this pair after a loss
+        if pnl < 0:
+            cooldown = 1800 if reason in ("trailing stop", "signal flip") else 900
+            self._cooldown[pair] = time.time() + cooldown
+            log("PAPER", f"{name} cooldown {cooldown//60}m after {reason} loss")
         emoji = "✅" if pnl >= 0 else "❌"
+        # Trade journal — rich close message
+        nasdaq_icon = "📈" if entry_nasdaq == "BULLISH" else "📉" if entry_nasdaq == "BEARISH" else "➖"
+        news_icon   = "🟢" if entry_news  == "BULLISH" else "🔴" if entry_news  == "BEARISH" else "⚫"
+        move_pct    = round((fill - p["entry"]) / p["entry"] * 100 * (1 if p["side"]=="LONG" else -1), 2)
+        fkey_note   = f"\n📊 Signal: `{fkey}`" if fkey else ""
         tg(f"{emoji} *Trade CLOSED — {name}*\n"
-           f"Reason: `{reason}` | Fee: `${fee:.3f}`\n"
-           f"PnL: `{'+'if pnl>=0 else ''}{pnl:.2f}$`\n"
-           f"Balance: `${self.balance:.2f}` | Win rate: `{self.win_rate:.0f}%`")
+           f"{'🟢 L' if p['side']=='LONG' else '🔴 S'} "
+           f"`${p['entry']:.4f}` → `${fill:.4f}` ({move_pct:+.2f}%)\n"
+           f"Reason: `{reason}` | Held: `{held_mins:.0f} min`\n"
+           f"Conf: `{int(p.get('confidence',0)*100)}%` | Fee: `${fee:.3f}`\n"
+           f"PnL: `{'+'if pnl>=0 else ''}{pnl:.2f}$` | Balance: `${self.balance:.2f}`\n"
+           f"Win rate: `{self.win_rate:.0f}%`{fkey_note}\n"
+           f"{nasdaq_icon} NASDAQ: `{entry_nasdaq}` {news_icon} News: `{entry_news}`")
         _print_trade_box("CLOSE", name, p["side"], fill,
                          pnl=pnl, reason=reason,
                          held_mins=held_mins,
@@ -1609,16 +1646,28 @@ def _nasdaq_loop():
     while True:
         try:
             import yfinance as yf
-            hist = yf.Ticker("QQQ").history(period="2d", interval="1d")
+            # Use intraday 5-min bars for same-session change vs today's open
+            hist = yf.Ticker("QQQ").history(period="1d", interval="5m")
             if len(hist) >= 2:
-                chg = ((hist["Close"].iloc[-1] - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2]) * 100
+                open_price  = float(hist["Open"].iloc[0])
+                last_price  = float(hist["Close"].iloc[-1])
+                chg = (last_price - open_price) / open_price * 100
                 market_mood["change_pct"] = round(chg, 2)
-                market_mood["nasdaq"] = "BULLISH" if chg > 1 else "BEARISH" if chg < -2 else "NEUTRAL"
+                market_mood["nasdaq"] = "BULLISH" if chg > 0.5 else "BEARISH" if chg < -1.0 else "NEUTRAL"
                 mood_col = _C.GREEN if market_mood["nasdaq"]=="BULLISH" else _C.RED if market_mood["nasdaq"]=="BEARISH" else _C.GREY
-                log("NASDAQ", f"QQQ {chg:+.2f}%  →  {_c(mood_col + _C.BOLD, market_mood['nasdaq'])}")
+                log("NASDAQ", f"QQQ intraday {chg:+.2f}%  →  {_c(mood_col + _C.BOLD, market_mood['nasdaq'])}")
+            else:
+                # Market closed / pre-market: fall back to prior-day comparison
+                hist2 = yf.Ticker("QQQ").history(period="2d", interval="1d")
+                if len(hist2) >= 2:
+                    chg = ((hist2["Close"].iloc[-1] - hist2["Close"].iloc[-2]) / hist2["Close"].iloc[-2]) * 100
+                    market_mood["change_pct"] = round(chg, 2)
+                    market_mood["nasdaq"] = "BULLISH" if chg > 1 else "BEARISH" if chg < -2 else "NEUTRAL"
+                    mood_col = _C.GREEN if market_mood["nasdaq"]=="BULLISH" else _C.RED if market_mood["nasdaq"]=="BEARISH" else _C.GREY
+                    log("NASDAQ", f"QQQ prior-day {chg:+.2f}%  →  {_c(mood_col + _C.BOLD, market_mood['nasdaq'])}")
         except Exception as e:
             log("NASDAQ", str(e), "ERR")
-        time.sleep(900)
+        time.sleep(300)
 
 # ── Social / trending scanner ─────────────────────────────────────────────────
 REDDIT_SUBS = [
