@@ -624,23 +624,33 @@ def tg_buttons(msg, buttons):
                           json={"chat_id": TG_CHAT_ID, "text": msg,
                                 "parse_mode": "Markdown",
                                 "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
-        if not r.ok:
-            log("TG", f"Buttons error {r.status_code}: {r.text[:200]}", "ERR")
-            if r.status_code == 400:
-                r2 = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                                   json={"chat_id": TG_CHAT_ID, "text": msg,
-                                         "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
-                if not r2.ok:
-                    log("TG", f"Buttons retry error {r2.status_code}: {r2.text[:200]}", "ERR")
+        if r.ok:
+            return
+        log("TG", f"Buttons error {r.status_code}: {r.text[:200]}", "ERR")
+        # Retry 1: drop Markdown (special chars in dynamic text can trigger 400)
+        r2 = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                           json={"chat_id": TG_CHAT_ID, "text": msg,
+                                 "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
+        if r2.ok:
+            return
+        log("TG", f"Buttons retry error {r2.status_code}: {r2.text[:200]}", "ERR")
+        # Retry 2: strip to plain short message so the user gets SOMETHING
+        short = msg[:300].split("\n")[0]
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT_ID, "text": f"[Response] {short}",
+                            "reply_markup": {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "menu"}]]}},
+                      timeout=10)
     except Exception as e:
         log("TG", f"Buttons send error: {e}", "ERR")
 
 def tg_answer(cb_id, text=""):
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery",
-                      json={"callback_query_id": cb_id, "text": text}, timeout=5)
-    except Exception:
-        pass
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/answerCallbackQuery",
+                          json={"callback_query_id": cb_id, "text": text}, timeout=5)
+        if not r.ok:
+            log("TG", f"answerCallbackQuery {r.status_code}: {r.text[:100]}", "WARN")
+    except Exception as e:
+        log("TG", f"answerCallbackQuery error: {e}", "WARN")
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 def get_klines(pair, interval=None, limit=None):
@@ -2138,6 +2148,7 @@ def _poll_loop(trader):
                     user_id  = str(cb.get("from", {}).get("id", ""))
                     chat_id  = str(cb.get("message", {}).get("chat", {}).get("id", ""))
                     if user_id != TG_CHAT_ID and chat_id != TG_CHAT_ID:
+                        log("POLL", f"Ignored callback from user={user_id} chat={chat_id} (expected {TG_CHAT_ID})", "WARN")
                         continue
                     btn = cb.get("data", "?")
                     log("POLL", f"Button → {_c(_C.CYAN, btn)}")
