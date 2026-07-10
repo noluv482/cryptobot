@@ -215,8 +215,8 @@ def _print_trade_box(action, name, side, price, **kw):
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TG_TOKEN   = os.environ["TG_TOKEN"]
-TG_CHAT_ID = os.environ["TG_CHAT_ID"]
+TG_TOKEN   = os.environ.get("TG_TOKEN", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 BASE_URL   = "https://api.kraken.com/0/public"
 
@@ -422,6 +422,23 @@ class Database:
                     balance_after FLOAT
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    id         INT PRIMARY KEY DEFAULT 1,
+                    data       JSONB,
+                    updated_at FLOAT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS feature_outcomes (
+                    id   SERIAL PRIMARY KEY,
+                    fkey TEXT,
+                    pair TEXT,
+                    won  BOOLEAN,
+                    ts   FLOAT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS fi_fkey ON feature_outcomes(fkey)")
 
     def save_trade(self, t):
         if not self.conn: return
@@ -494,6 +511,75 @@ class Database:
             log("DB", f"best_exit_reason error: {e}", "ERR")
             return []
 
+    def log_feature(self, fkey, pair, won):
+        if not self.conn or not fkey: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO feature_outcomes (fkey,pair,won,ts) VALUES (%s,%s,%s,%s)",
+                    (fkey, pair, won, time.time()))
+        except Exception as e:
+            log("DB", f"log_feature error: {e}", "ERR")
+
+    def feature_win_rates(self):
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT fkey, COUNT(*) AS n,
+                           SUM(CASE WHEN won THEN 1 ELSE 0 END)::float/COUNT(*)*100 AS wr
+                    FROM feature_outcomes
+                    GROUP BY fkey HAVING COUNT(*) >= 5
+                """)
+                return {r[0]: {"n": r[1], "wr": float(r[2])} for r in cur.fetchall()}
+        except Exception as e:
+            log("DB", f"feature_win_rates error: {e}", "ERR")
+            return {}
+
+    def exit_pattern(self, pair):
+        """Per-exit-reason stats for a pair (n, avg_pnl, early-stop count)."""
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT reason, COUNT(*) AS n, AVG(pnl) AS avg_pnl,
+                           SUM(CASE WHEN held_mins < 5 THEN 1 ELSE 0 END) AS early
+                    FROM trades WHERE pair=%s
+                    GROUP BY reason
+                """, (pair,))
+                return {r[0]: {"n": r[1], "avg_pnl": float(r[2]), "early": r[3]}
+                        for r in cur.fetchall()}
+        except Exception as e:
+            log("DB", f"exit_pattern error: {e}", "ERR")
+            return {}
+
+    def save_state(self, state: dict):
+        if not self.conn: return False
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO bot_state (id, data, updated_at)
+                    VALUES (1, %s, %s)
+                    ON CONFLICT (id) DO UPDATE
+                      SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at
+                """, (json.dumps(state), time.time()))
+            return True
+        except Exception as e:
+            log("DB", f"save_state error: {e}", "ERR")
+            return False
+
+    def load_state(self):
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT data FROM bot_state WHERE id = 1")
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        except Exception as e:
+            log("DB", f"load_state error: {e}", "ERR")
+        return None
+
     @property
     def connected(self):
         return self.conn is not None
@@ -516,6 +602,8 @@ _state_lock     = threading.Lock()   # guards _paused and _current_coin
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 def tg(msg, plain=False):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return False
     try:
         payload = {"chat_id": TG_CHAT_ID, "text": msg}
         if not plain:
@@ -529,6 +617,8 @@ def tg(msg, plain=False):
         return False
 
 def tg_buttons(msg, buttons):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
     try:
         r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                           json={"chat_id": TG_CHAT_ID, "text": msg,
@@ -653,6 +743,32 @@ def detect_divergence(closes, rsi_now, lookback=15):
     except Exception:
         pass
     return None
+
+def detect_regime(closes, highs, lows, lookback=20):
+    """Classify recent market as TRENDING / CHOPPY / NEUTRAL.
+    TRENDING: strong EMA slope + directional bias.
+    CHOPPY:   price oscillates without net direction (ATR-normalised range wide, no slope)."""
+    if len(closes) < lookback + 2:
+        return "NEUTRAL"
+    try:
+        ema_now  = calc_ema(closes)
+        ema_prev = calc_ema(closes[:-lookback//2])
+        slope    = (ema_now - ema_prev) / max(ema_prev, 1e-9)
+
+        window   = closes[-lookback:]
+        net_move = abs(window[-1] - window[0]) / max(window[0], 1e-9)
+        atr_vals  = [highs[i] - lows[i] for i in range(len(highs) - lookback, len(highs))]
+        avg_atr   = sum(atr_vals) / len(atr_vals) if atr_vals else 0
+        atr_ratio = avg_atr / max(closes[-1], 1e-9)
+
+        if abs(slope) > 0.005 and net_move > atr_ratio * 1.5:
+            return "TRENDING"
+        if net_move < atr_ratio * 0.5:
+            return "CHOPPY"
+    except Exception:
+        pass
+    return "NEUTRAL"
+
 
 # ── Rank coins ────────────────────────────────────────────────────────────────
 def rank_coins():
@@ -830,7 +946,8 @@ def get_next_rank(balance):
 
 # ── Paper trader ──────────────────────────────────────────────────────────────
 class PaperTrader:
-    def __init__(self):
+    def __init__(self, no_persist=False):
+        self._no_persist   = no_persist
         self.balance       = PAPER_START
         self.positions     = {}   # pair → position dict (multi-coin)
         self.trades        = []
@@ -841,6 +958,17 @@ class PaperTrader:
         self.day_date      = datetime.utcnow().strftime("%Y-%m-%d")
         self.current_rank  = RANKS[0]["name"]
         self.session_start = PAPER_START
+        self._calib        = {}
+        self._calib_ts     = 0.0
+        # Feature fingerprint cache
+        self._feat_cache   = {}
+        self._feat_ts      = 0.0
+        # Per-pair ATR multiplier cache
+        self._atr_cache    = {}   # pair → float
+        self._atr_ts       = {}   # pair → float
+        # Per-pair exit-quality cache
+        self._exit_cache   = {}   # pair → dict
+        self._exit_ts      = {}   # pair → float
         self._load()
 
     @property
@@ -853,37 +981,90 @@ class PaperTrader:
         used = sum(p["margin"] for p in self.positions.values())
         return (used / max(self.balance, 0.01)) < MAX_TOTAL_RISK
 
+    def _apply_state(self, d):
+        self.balance      = d.get("balance", PAPER_START)
+        self.peak         = d.get("peak", self.balance)
+        self.trades       = d.get("trades", [])
+        self.current_rank = d.get("current_rank", RANKS[0]["name"])
+        pos_data = d.get("positions")
+        if pos_data is None:
+            old = d.get("position")
+            if old and isinstance(old, dict) and "side" in old:
+                self.positions = {old.get("pair", "XBTUSD"): old}
+            else:
+                self.positions = {}
+        else:
+            self.positions = pos_data
+
     def _load(self):
+        if self._no_persist:
+            return
+        if db.connected:
+            state = db.load_state()
+            if state:
+                try:
+                    self._apply_state(state)
+                    log("PAPER", f"Loaded from DB  balance=${self.balance:.2f}  "
+                                 f"positions={len(self.positions)}  trades={len(self.trades)}")
+                    self._save_file()
+                    return
+                except Exception as e:
+                    log("PAPER", f"DB load error: {e}", "ERR")
         if os.path.exists(SAVE_FILE):
             try:
                 with open(SAVE_FILE) as f:
                     d = json.load(f)
-                self.balance      = d.get("balance", PAPER_START)
-                self.peak         = d.get("peak", self.balance)
-                self.trades       = d.get("trades", [])
-                self.current_rank = d.get("current_rank", RANKS[0]["name"])
-                # Backward compat: old saves used "position" (single dict)
-                pos_data = d.get("positions")
-                if pos_data is None:
-                    old = d.get("position")
-                    if old and isinstance(old, dict) and "side" in old:
-                        self.positions = {old.get("pair", "XBTUSD"): old}
-                    else:
-                        self.positions = {}
-                else:
-                    self.positions = pos_data
-                log("PAPER", f"Loaded  balance=${self.balance:.2f}  positions={len(self.positions)}")
+                self._apply_state(d)
+                log("PAPER", f"Loaded from file  balance=${self.balance:.2f}  "
+                             f"positions={len(self.positions)}")
+                if db.connected:
+                    self._save_db()
+                    log("PAPER", "Migrated file state → Postgres")
             except Exception as e:
                 log("PAPER", f"Load error: {e}", "ERR")
 
-    def _save(self):
+    def _state_dict(self):
+        return {"balance": self.balance, "peak": self.peak,
+                "trades": self.trades[-1000:], "positions": self.positions,
+                "current_rank": self.current_rank}
+
+    def _save_file(self):
         try:
             with open(SAVE_FILE, "w") as f:
-                json.dump({"balance": self.balance, "peak": self.peak,
-                           "trades": self.trades, "positions": self.positions,
-                           "current_rank": self.current_rank}, f, indent=2)
+                json.dump(self._state_dict(), f, indent=2)
         except Exception as e:
-            log("PAPER", f"Save error: {e}", "ERR")
+            log("PAPER", f"File save error: {e}", "ERR")
+
+    def _save_db(self):
+        if db.connected:
+            db.save_state(self._state_dict())
+
+    def _save(self):
+        if self._no_persist:
+            return
+        self._save_db()
+        self._save_file()
+
+    def _calibration_multiplier(self, confidence):
+        if self._no_persist or not db.connected:
+            return 1.0
+        now = time.time()
+        if now - self._calib_ts > 300:
+            try:
+                self._calib = db.confidence_calibration()
+            except Exception as e:
+                log("PAPER", f"calibration fetch error: {e}", "ERR")
+            self._calib_ts = now
+        tier  = "high" if confidence >= 0.6 else "low"
+        stats = self._calib.get(tier)
+        if not stats or stats.get("n", 0) < 15:
+            return 1.0
+        wr = stats.get("wr", 50.0)
+        if wr >= 55: return 1.0
+        if wr >= 50: return 0.85
+        if wr >= 45: return 0.65
+        if wr >= 40: return 0.50
+        return 0.35
 
     @property
     def consecutive_losses(self):
@@ -906,6 +1087,94 @@ class PaperTrader:
         if losses >= 5: return 0.25
         if losses >= 3: return 0.50
         return 1.0
+
+    # ── Learning method 1: signal-condition fingerprint ──────────────────────
+    def _feature_multiplier(self, fkey):
+        """Scale stake up/down based on realized win rate of this signal fingerprint.
+        Needs ≥5 samples; safe to boost proven patterns up to 1.15×."""
+        if self._no_persist or not db.connected or not fkey:
+            return 1.0
+        now = time.time()
+        if now - self._feat_ts > 600:
+            try:
+                self._feat_cache = db.feature_win_rates()
+            except Exception as e:
+                log("PAPER", f"feature cache: {e}", "ERR")
+            self._feat_ts = now
+        stats = self._feat_cache.get(fkey)
+        if not stats or stats["n"] < 5:
+            return 1.0
+        wr = stats["wr"]
+        if wr >= 65: return 1.15
+        if wr >= 55: return 1.0
+        if wr >= 45: return 0.70
+        if wr >= 35: return 0.45
+        return 0.25
+
+    # ── Learning method 2: per-pair ATR multiplier self-tuning ───────────────
+    def _refresh_exit_cache(self, pair):
+        """Shared 30-min cache refresh for exit-pattern data."""
+        now = time.time()
+        if now - self._exit_ts.get(pair, 0) > 1800:
+            self._exit_ts[pair] = now
+            try:
+                self._exit_cache[pair] = db.exit_pattern(pair)
+            except Exception as e:
+                log("PAPER", f"exit cache {pair}: {e}", "ERR")
+
+    def _atr_mult(self, pair):
+        """Per-pair ATR trailing-stop multiplier. Starts at ATR_MULTIPLIER
+        and self-tunes every 30 min using the exit-reason breakdown."""
+        if self._no_persist or not db.connected:
+            return ATR_MULTIPLIER
+        self._refresh_exit_cache(pair)
+        exits = self._exit_cache.get(pair, {})
+        if not exits:
+            return self._atr_cache.get(pair, ATR_MULTIPLIER)
+        try:
+            trail = exits.get("trailing stop", {})
+            tp    = exits.get("take profit",   {})
+            if trail.get("n", 0) >= 10:
+                current = self._atr_cache.get(pair, ATR_MULTIPLIER)
+                if trail.get("avg_pnl", 0) < 0:
+                    current = min(current + 0.2, 3.0)  # widen — stops firing at loss
+                elif tp.get("n", 0) >= 10 and tp.get("avg_pnl", 0) > trail.get("avg_pnl", 0) * 1.5:
+                    current = max(current - 0.1, 0.8)  # tighten — take-profit beats trail
+                self._atr_cache[pair] = current
+        except Exception as e:
+            log("PAPER", f"_atr_mult {pair}: {e}", "ERR")
+        return self._atr_cache.get(pair, ATR_MULTIPLIER)
+
+    # ── Learning method 3: exit quality → skip fixed target when trail wins ──
+    def _trail_only(self, pair):
+        """True when trailing stop consistently earns more per trade than
+        the fixed target. Lets winning trades run further."""
+        if self._no_persist or not db.connected:
+            return False
+        self._refresh_exit_cache(pair)
+        exits = self._exit_cache.get(pair, {})
+        trail = exits.get("trailing stop", {})
+        tp    = exits.get("take profit",   {})
+        if trail.get("n", 0) >= 5 and tp.get("n", 0) >= 5:
+            return trail.get("avg_pnl", 0) > tp.get("avg_pnl", 0) * 1.2
+        return False
+
+    # ── Learning method 4: require higher confidence on bad-entry pairs ───────
+    def _min_conf_threshold(self, pair):
+        """Returns 0.60 confidence floor when early-stop rate ≥40% of total exits."""
+        if self._no_persist or not db.connected:
+            return 0.0
+        self._refresh_exit_cache(pair)
+        exits = self._exit_cache.get(pair, {})
+        total = sum(v.get("n", 0) for v in exits.values())
+        if total < 8:
+            return 0.0
+        trail = exits.get("trailing stop", {})
+        early = trail.get("early", 0)
+        if total > 0 and early / total >= 0.40:
+            log("PAPER", f"{pair} early-stop rate {early/total:.0%} → raising confidence floor")
+            return 0.60
+        return 0.0
 
     def _partial_close(self, price, name, pair):
         """Close 50% of position at current price and let the rest ride."""
@@ -943,7 +1212,7 @@ class PaperTrader:
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN), 4)
 
-    def on_signal(self, sig, price, stop, target, name, confidence, pair, atr=None):
+    def on_signal(self, sig, price, stop, target, name, confidence, pair, atr=None, fkey=""):
         with _state_lock:
             paused = _paused
         if paused or self.balance < PAPER_FLOOR: return
@@ -997,13 +1266,19 @@ class PaperTrader:
                 self._close(price, name, "signal flip",  pair); closed_this_tick = True
 
         if pair not in self.positions and not closed_this_tick:
-            if sig == "BUY"  and self.can_open_new():
-                self._open("LONG",  price, name, target, confidence, pair, atr)
-            elif sig == "SELL" and self.can_open_new():
-                self._open("SHORT", price, name, target, confidence, pair, atr)
+            min_conf = self._min_conf_threshold(pair)
+            if sig == "BUY"  and self.can_open_new() and confidence >= min_conf:
+                self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey)
+            elif sig == "SELL" and self.can_open_new() and confidence >= min_conf:
+                self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey)
 
-    def _open(self, side, price, name, target, confidence, pair, atr=None):
-        risk       = (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence) * self._risk_multiplier()
+    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey=""):
+        risk       = min(
+                        (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence)
+                        * self._risk_multiplier()
+                        * self._calibration_multiplier(confidence)
+                        * self._feature_multiplier(fkey),
+                        RISK_MAX)
         leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
         fill       = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
         margin     = round(self.balance * risk, 4)
@@ -1013,17 +1288,19 @@ class PaperTrader:
         self.day_trades += 1
         conf_pct   = int(confidence * 100)
         if atr is not None:
-            atr_dist   = round(atr * ATR_MULTIPLIER, 8)
+            atr_dist   = round(atr * self._atr_mult(pair), 8)
         else:
             atr_dist   = round(fill * TRAIL_PCT, 8)
         trail_stop = round(fill - atr_dist if side == "LONG" else fill + atr_dist, 6)
+        effective_target = float("inf") if (side == "LONG"  and self._trail_only(pair)) else \
+                           0.0          if (side == "SHORT" and self._trail_only(pair)) else target
         self.positions[pair] = {"side": side, "entry": fill,
                                 "contracts": contracts, "margin": margin,
-                                "target": target, "opened_at": time.time(),
+                                "target": effective_target, "opened_at": time.time(),
                                 "confidence": confidence, "leverage": leverage,
                                 "pair": pair, "name": name,
                                 "trail_stop": trail_stop, "trail_peak": fill,
-                                "atr_dist": atr_dist}
+                                "atr_dist": atr_dist, "fkey": fkey}
         self._save()
         mul = self._risk_multiplier()
         dd_note = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
@@ -1058,6 +1335,7 @@ class PaperTrader:
                      "pnl": pnl, "coin": p.get("name", name),
                      "confidence": p.get("confidence", 0.0),
                      "held_mins": held_mins, "reason": reason, "ts": time.time()}
+        db.log_feature(p.get("fkey", ""), pair, pnl > 0)
         self.trades.append(trade_rec)
         db.save_trade({
             "ts": trade_rec["ts"], "coin": trade_rec["coin"], "pair": pair,
@@ -1236,6 +1514,11 @@ class SignalEngine:
         if divergence == "BEARISH_DIV" and sig == "BUY":  sig = "HOLD"
         if divergence == "BULLISH_DIV" and sig == "SELL": sig = "HOLD"
 
+        # Market regime gate — suppress entries in choppy, directionless markets
+        regime = detect_regime(closes, highs, lows)
+        if regime == "CHOPPY" and sig in ("BUY", "SELL"):
+            sig = "HOLD"
+
         # Time-of-day filter — avoid low-liquidity overnight hours
         if not _in_active_hours() and sig in ("BUY", "SELL"):
             sig = "HOLD"
@@ -1267,6 +1550,20 @@ class SignalEngine:
         else:           pts += 0.5
 
         confidence = round(pts / 6.0, 2) if sig in ("BUY", "SELL") else 0.0
+
+        # Trending regime boosts confidence slightly (signal quality is higher)
+        if regime == "TRENDING" and sig in ("BUY", "SELL"):
+            confidence = min(round(confidence + 0.05, 2), 1.0)
+
+        # ── Feature fingerprint key ──────────────────────────────────────────
+        rsi_bin  = min(int(rsi / 20), 4)          # 0-4 (20-point buckets)
+        ema_side = 1 if above_ema else 0
+        macd_bit = 1 if macd_bull else 0
+        vol_bit  = 1 if high_volume else 0
+        news_bit = "B" if n_sent == "BULLISH" else "R" if n_sent == "BEARISH" else "N"
+        fkey     = f"r{rsi_bin}e{ema_side}m{macd_bit}v{vol_bit}n{news_bit}"
+        if sig in ("BUY", "SELL"):
+            plan["fkey"] = fkey
 
         return sig, plan, ema, rsi, confidence
 
@@ -1790,7 +2087,11 @@ def _poll_loop(trader):
                         continue
                     btn = cb.get("data", "?")
                     log("POLL", f"Button → {_c(_C.CYAN, btn)}")
-                    _handle_callback(cb, trader)
+                    # Dispatch in a thread so the poll loop stays free to ack
+                    # the next update — some callbacks (rankings, balance) make
+                    # Kraken HTTP calls that can block for several seconds.
+                    threading.Thread(target=_handle_callback,
+                                     args=(cb, trader), daemon=True).start()
                 elif "message" in u:
                     chat_id = str(u["message"].get("chat", {}).get("id", ""))
                     user_id = str(u["message"].get("from", {}).get("id", ""))
@@ -1882,6 +2183,7 @@ def trading_loop(trader):
                     if sig != last_sig and sig in ("BUY", "SELL"):
                         stop     = plan.get("stop",  price*0.985 if sig=="BUY" else price*1.015)
                         target   = plan.get("exit",  price*1.015 if sig=="BUY" else price*0.985)
+                        fkey     = plan.get("fkey",  "")
                         risk     = RISK_MIN + (RISK_MAX - RISK_MIN) * conf
                         leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * conf)
                         arrow    = "↑" if sig == "BUY" else "↓"
@@ -1894,7 +2196,8 @@ def trading_loop(trader):
                            f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
                            f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
-                        trader.on_signal(sig, price, stop, target, coin["name"], conf, pair, atr=atr)
+                        trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
+                                         atr=atr, fkey=fkey)
 
                     last_sigs[pair] = sig
                 except Exception as e:
