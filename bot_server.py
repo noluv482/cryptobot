@@ -215,8 +215,11 @@ def _print_trade_box(action, name, side, price, **kw):
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TG_TOKEN   = os.environ.get("TG_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+def _clean_env(val):
+    return val.strip().strip('"').strip("'").strip()
+
+TG_TOKEN   = _clean_env(os.environ.get("TG_TOKEN",   ""))
+TG_CHAT_ID = _clean_env(os.environ.get("TG_CHAT_ID", ""))
 TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 BASE_URL   = "https://api.kraken.com/0/public"
 
@@ -617,31 +620,26 @@ def tg(msg, plain=False):
         return False
 
 def tg_buttons(msg, buttons):
-    if not TG_TOKEN or not TG_CHAT_ID:
+    if not TG_TOKEN:
         return
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          json={"chat_id": TG_CHAT_ID, "text": msg,
-                                "parse_mode": "Markdown",
-                                "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
-        if r.ok:
-            return
-        log("TG", f"Buttons error {r.status_code}: {r.text[:200]}", "ERR")
-        # Retry 1: drop Markdown (special chars in dynamic text can trigger 400)
-        r2 = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                           json={"chat_id": TG_CHAT_ID, "text": msg,
-                                 "reply_markup": {"inline_keyboard": buttons}}, timeout=10)
-        if r2.ok:
-            return
-        log("TG", f"Buttons retry error {r2.status_code}: {r2.text[:200]}", "ERR")
-        # Retry 2: strip to plain short message so the user gets SOMETHING
-        short = msg[:300].split("\n")[0]
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT_ID, "text": f"[Response] {short}",
-                            "reply_markup": {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "menu"}]]}},
-                      timeout=10)
-    except Exception as e:
-        log("TG", f"Buttons send error: {e}", "ERR")
+    chat = TG_CHAT_ID or "0"
+    attempts = [
+        {"chat_id": chat, "text": msg, "parse_mode": "Markdown",
+         "reply_markup": {"inline_keyboard": buttons}},
+        {"chat_id": chat, "text": msg,
+         "reply_markup": {"inline_keyboard": buttons}},
+        {"chat_id": chat, "text": msg[:200].split("\n")[0],
+         "reply_markup": {"inline_keyboard": [[{"text": "Menu", "callback_data": "menu"}]]}},
+    ]
+    for i, payload in enumerate(attempts):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                              json=payload, timeout=10)
+            if r.ok:
+                return
+            log("TG", f"Buttons attempt {i+1} failed {r.status_code}: {r.text[:200]}", "ERR")
+        except Exception as e:
+            log("TG", f"Buttons attempt {i+1} error: {e}", "ERR")
 
 def tg_answer(cb_id, text=""):
     try:
@@ -2128,13 +2126,12 @@ def _pnl_update_loop(trader):
 
 def _poll_loop(trader):
     global _last_update_id
-    log("POLL", "Starting Telegram poll loop")
+    log("POLL", f"Starting Telegram poll loop  token_len={len(TG_TOKEN)}  chat_id={TG_CHAT_ID!r}")
     while True:
         try:
             r = requests.get(
                 f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
-                params={"offset":_last_update_id+1,"timeout":10,
-                        "allowed_updates":["callback_query","message"]},
+                params={"offset": _last_update_id + 1, "timeout": 10},
                 timeout=15)
             if not r.ok:
                 log("POLL", f"getUpdates error {r.status_code}: {r.text[:200]}", "ERR")
@@ -2145,12 +2142,14 @@ def _poll_loop(trader):
                 _last_update_id = u["update_id"]
                 if "callback_query" in u:
                     cb = u["callback_query"]
-                    user_id  = str(cb.get("from", {}).get("id", ""))
-                    chat_id  = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-                    if user_id != TG_CHAT_ID and chat_id != TG_CHAT_ID:
-                        log("POLL", f"Ignored callback from user={user_id} chat={chat_id} (expected {TG_CHAT_ID})", "WARN")
+                    user_id = str(cb.get("from", {}).get("id", ""))
+                    chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                    btn     = cb.get("data", "?")
+                    log("POLL", f"Callback: data={btn!r} user={user_id} chat={chat_id} expected={TG_CHAT_ID!r}")
+                    # Accept if no TG_CHAT_ID configured, or if user/chat matches
+                    if TG_CHAT_ID and user_id != TG_CHAT_ID and chat_id != TG_CHAT_ID:
+                        log("POLL", f"Ignored callback — ID mismatch (expected {TG_CHAT_ID!r})", "WARN")
                         continue
-                    btn = cb.get("data", "?")
                     log("POLL", f"Button → {_c(_C.CYAN, btn)}")
                     # Dispatch in a thread so the poll loop stays free to ack
                     # the next update — some callbacks (rankings, balance) make
@@ -2160,8 +2159,8 @@ def _poll_loop(trader):
                 elif "message" in u:
                     chat_id = str(u["message"].get("chat", {}).get("id", ""))
                     user_id = str(u["message"].get("from", {}).get("id", ""))
-                    txt = u["message"].get("text", "").strip()
-                    if chat_id != TG_CHAT_ID and user_id != TG_CHAT_ID:
+                    txt     = u["message"].get("text", "").strip()
+                    if TG_CHAT_ID and chat_id != TG_CHAT_ID and user_id != TG_CHAT_ID:
                         continue
                     if txt.lower() in ("/start", "/menu", "menu"):
                         log("POLL", "Sending menu")
