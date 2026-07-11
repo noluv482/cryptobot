@@ -1819,6 +1819,63 @@ def _switcher_loop(trader):
         time.sleep(1800)
 
 # ── Telegram buttons ──────────────────────────────────────────────────────────
+# Persistent reply keyboard shown after every menu call.
+# Tapping a reply-keyboard button sends a plain text message — handled by the
+# message branch of _poll_loop — so buttons work even when callback_query
+# delivery is broken.
+_REPLY_KB = {
+    "keyboard": [
+        [{"text": "💰 Balance"},  {"text": "📊 Rankings"}],
+        [{"text": "📜 History"},  {"text": "📰 News"}],
+        [{"text": "🧠 Intel"},    {"text": "🏆 Ranks"}],
+        [{"text": "🔄 Switch"},   {"text": "⏸ Pause"},  {"text": "▶ Resume"}],
+    ],
+    "resize_keyboard": True,
+}
+
+# Maps incoming text (lower-cased) to the same action strings _dispatch_callback uses.
+_TEXT_ACTION: dict = {
+    "💰 balance":  "balance",
+    "📊 rankings": "rankings",
+    "📜 history":  "history",
+    "📰 news":     "news",
+    "🧠 intel":    "intelligence",
+    "🏆 ranks":    "ranks",
+    "🔄 switch":   "switch_menu",
+    "⏸ pause":     "pause",
+    "▶ resume":    "resume",
+    # text commands
+    "/start":      "menu",
+    "/menu":       "menu",
+    "/balance":    "balance",
+    "/bal":        "balance",
+    "/rankings":   "rankings",
+    "/history":    "history",
+    "/news":       "news",
+    "/intel":      "intelligence",
+    "/pause":      "pause",
+    "/resume":     "resume",
+    "/close":      "force_close",
+    "/status":     "balance",
+}
+
+def _tg_with_kb(msg, kb):
+    """Send a message with a ReplyKeyboardMarkup."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    for parse_mode in ("Markdown", None):
+        payload = {"chat_id": TG_CHAT_ID, "text": msg, "reply_markup": kb}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                              json=payload, timeout=10)
+            if r.ok:
+                return
+            log("TG", f"tg_with_kb {r.status_code}: {r.text[:200]}", "ERR")
+        except Exception as e:
+            log("TG", f"tg_with_kb error: {e}", "ERR")
+
 def send_menu(trader=None):
     with _state_lock:
         paused = _paused
@@ -1837,34 +1894,23 @@ def send_menu(trader=None):
         f"📈 Top: *{coin}*{pos_str} | {nasdaq_icon} NASDAQ: `{nasdaq}`\n"
         f"{fg_icon} Fear & Greed: `{fg_val}` — _{fear_greed['label']}_"
     )
-    rows = [
-        [{"text": "💰 Balance & Stats",  "callback_data": "balance"},
-         {"text": "📊 Rankings",         "callback_data": "rankings"}],
-        [{"text": "📜 Trade History",    "callback_data": "history"},
-         {"text": "📰 News Feed",        "callback_data": "news"}],
-        [{"text": "🔄 Switch Coin",      "callback_data": "switch_menu"},
-         {"text": "🏆 Rank Ladder",      "callback_data": "ranks"}],
-        [{"text": "🧠 Intelligence",     "callback_data": "intelligence"}],
-        [{"text": "⏸ Pause" if not paused else "▶ Resume",
-          "callback_data": "pause" if not paused else "resume"},
-         {"text": "🔒 Limits: ON" if _daily_limits else "🔓 Limits: OFF",
-          "callback_data": "toggle_limits"}],
-    ]
+    pos_close = ""
     if trader and trader.positions:
         n = len(trader.positions)
-        rows.insert(-1, [{"text": f"🚨 Close {n} Position{'s' if n > 1 else ''}", "callback_data": "force_close"}])
-    tg_buttons(header, rows)
+        pos_close = f"\n🚨 *{n} open position{'s' if n > 1 else ''}* — tap 💰 Balance to close"
+    _tg_with_kb(header + pos_close, _REPLY_KB)
 
 def _handle_callback(query, trader):
     global _paused, _current_coin
-    tg_answer(query["id"])
+    cb_id = query.get("id")
+    if cb_id:
+        tg_answer(cb_id, "")
     data = query.get("data", "")
     try:
         _dispatch_callback(data, query, trader)
     except Exception as e:
         log("CALLBACK", f"{data!r} error: {e}", "ERR")
-        tg_buttons(f"⚠️ *Error:* `{e}`",
-                   [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+        tg(f"Error: {e}", plain=True)
 
 def _dispatch_callback(data, query, trader):
     global _paused, _current_coin, _daily_limits
@@ -2141,29 +2187,26 @@ def _poll_loop(trader):
             for u in updates:
                 _last_update_id = u["update_id"]
                 if "callback_query" in u:
-                    cb = u["callback_query"]
+                    cb      = u["callback_query"]
                     user_id = str(cb.get("from", {}).get("id", ""))
                     chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
                     btn     = cb.get("data", "?")
-                    log("POLL", f"Callback: data={btn!r} user={user_id} chat={chat_id} expected={TG_CHAT_ID!r}")
-                    # Accept if no TG_CHAT_ID configured, or if user/chat matches
-                    if TG_CHAT_ID and user_id != TG_CHAT_ID and chat_id != TG_CHAT_ID:
-                        log("POLL", f"Ignored callback — ID mismatch (expected {TG_CHAT_ID!r})", "WARN")
-                        continue
-                    log("POLL", f"Button → {_c(_C.CYAN, btn)}")
-                    # Dispatch in a thread so the poll loop stays free to ack
-                    # the next update — some callbacks (rankings, balance) make
-                    # Kraken HTTP calls that can block for several seconds.
+                    log("POLL", f"Callback: data={btn!r} user={user_id} chat={chat_id}")
+                    # No ID filter — single-user personal bot; process all callbacks.
                     threading.Thread(target=_handle_callback,
                                      args=(cb, trader), daemon=True).start()
                 elif "message" in u:
                     chat_id = str(u["message"].get("chat", {}).get("id", ""))
                     user_id = str(u["message"].get("from", {}).get("id", ""))
                     txt     = u["message"].get("text", "").strip()
-                    if TG_CHAT_ID and chat_id != TG_CHAT_ID and user_id != TG_CHAT_ID:
-                        continue
-                    if txt.lower() in ("/start", "/menu", "menu"):
-                        log("POLL", "Sending menu")
+                    # Route text/commands to the same dispatch as inline buttons.
+                    action = _TEXT_ACTION.get(txt.lower())
+                    if action:
+                        log("POLL", f"Text → {action!r} ({txt!r})")
+                        threading.Thread(target=_handle_callback,
+                                         args=({"data": action}, trader),
+                                         daemon=True).start()
+                    elif txt.lower() in ("menu", "/start", "/menu"):
                         send_menu(trader)
         except Exception as e:
             log("POLL", str(e), "ERR")
