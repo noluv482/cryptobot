@@ -251,6 +251,11 @@ ACTIVE_HOURS_UTC  = (7, 21)  # only trade 07:00–21:00 UTC; skip low-liquidity 
 FUNDING_THRESHOLD = 0.0005   # 0.05% per 8h → overcrowded side, block new entries
 MAX_POSITIONS     = 3        # max simultaneous open positions
 MAX_TOTAL_RISK    = 0.40     # total margin across all positions ≤ 40% of balance
+BREAKEVEN_PCT     = 0.012    # move stop to entry once trade is +1.2% in profit
+MAX_SESSION_DD    = 0.12     # auto-pause if balance drops 12% from session peak
+VOLUME_FILTER_MULT= 1.5      # require 1.5× average volume before entering
+EXTREME_FUNDING   = 0.001    # 0.1% / 8h = overcrowded → use as contrarian booster
+ECON_BLACKOUT_MINS= 15       # block new entries this many minutes around high-impact events
 
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 
@@ -281,6 +286,14 @@ SCAN_UNIVERSE = [
     {"name": "SHIB/USD",  "pair": "SHIBUSD",  "alert_buffer": 0.0000001},
     {"name": "WIF/USD",   "pair": "WIFUSD",   "alert_buffer": 0.01},
     {"name": "FLOKI/USD", "pair": "FLOKIUSD", "alert_buffer": 0.000001},
+]
+
+# Pairs that move together — don't hold two in the same direction simultaneously
+CORRELATED_GROUPS = [
+    frozenset({"XBTUSD", "ETHUSD"}),
+    frozenset({"PEPEUSD", "BONKUSD", "WIFUSD", "FLOKIUSD", "XDGUSD"}),
+    frozenset({"SOLUSD", "AVAXUSD", "APTUSD", "SUIUSD", "NEARUSD"}),
+    frozenset({"XRPUSD", "ADAUSD", "ALGOUSD"}),
 ]
 
 # CoinGecko coin ID → Kraken pair (used by the trending scanner)
@@ -602,6 +615,12 @@ _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
 _seen_headlines = set()
 _state_lock     = threading.Lock()   # guards _paused and _current_coin
+# Long/Short ratio from Binance Futures (liquidation pressure proxy)
+lsr_data        = {}   # pair → {"lsr": float, "bias": "LONG_HEAVY"|"SHORT_HEAVY"|"NEUTRAL"}
+# High-impact economic calendar events (Forex Factory feed)
+_econ_events    = []   # list of {"title": str, "date": str, "impact": str}
+# User-set price alerts  {pair: [{"target": float, "above": bool, "label": str}]}
+_price_alerts   = {}
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 def tg(msg, plain=False):
@@ -1255,6 +1274,18 @@ class PaperTrader:
                     p["trail_peak"] = price
                     p["trail_stop"] = round(price + atr_dist, 6)
 
+            # Breakeven stop: once up BREAKEVEN_PCT, push stop to entry so we never lose
+            if not p.get("breakeven_set") and move >= BREAKEVEN_PCT:
+                if side == "LONG":
+                    if p["trail_stop"] < p["entry"]:
+                        p["trail_stop"] = round(p["entry"], 6)
+                        tg(f"🔒 *Breakeven — {name}*\nStop moved to entry `${p['entry']:.4f}` (up {move*100:.1f}%)")
+                else:
+                    if p["trail_stop"] > p["entry"]:
+                        p["trail_stop"] = round(p["entry"], 6)
+                        tg(f"🔒 *Breakeven — {name}*\nStop moved to entry `${p['entry']:.4f}` (up {move*100:.1f}%)")
+                p["breakeven_set"] = True
+
             if side == "LONG":
                 trail_stop = p.get("trail_stop", 0)
                 hit_trail  = price <= trail_stop
@@ -1285,6 +1316,14 @@ class PaperTrader:
                 self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop)
 
     def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None):
+        # Correlation filter: don't pile into the same direction on correlated coins
+        for grp in CORRELATED_GROUPS:
+            if pair not in grp: continue
+            for ep, ep_data in self.positions.items():
+                if ep in grp and ep != pair and ep_data["side"] == side:
+                    log("PAPER", f"Blocked {name} {side} — correlated with {ep_data['name']}")
+                    return
+
         risk       = min(
                         (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence)
                         * self._risk_multiplier()
@@ -1365,7 +1404,8 @@ class PaperTrader:
         trade_rec = {"side": p["side"], "entry": p["entry"], "exit": fill,
                      "pnl": pnl, "coin": p.get("name", name),
                      "confidence": p.get("confidence", 0.0),
-                     "held_mins": held_mins, "reason": reason, "ts": time.time()}
+                     "held_mins": held_mins, "reason": reason, "ts": time.time(),
+                     "fkey": p.get("fkey", ""), "hour": datetime.utcnow().hour}
         db.log_feature(fkey, pair, pnl > 0)
         self.trades.append(trade_rec)
         db.save_trade({
@@ -1377,6 +1417,16 @@ class PaperTrader:
             "news_sent": entry_news,
             "balance_after": self.balance,
         })
+        # Max session drawdown: auto-pause if down MAX_SESSION_DD from peak
+        if self.peak > 0 and (self.peak - self.balance) / self.peak >= MAX_SESSION_DD:
+            with _state_lock:
+                global _paused
+                _paused = True
+            dd_pct = (self.peak - self.balance) / self.peak * 100
+            tg(f"⚠️ *Max drawdown hit — trading PAUSED*\n"
+               f"Balance dropped `{dd_pct:.1f}%` from peak `${self.peak:.2f}`\n"
+               f"Current: `${self.balance:.2f}` | Tap ▶ Resume to continue")
+
         # Cooldown: block re-entry on this pair after a loss
         if pnl < 0:
             cooldown = 1800 if reason in ("trailing stop", "signal flip") else 900
@@ -1468,9 +1518,9 @@ class SignalEngine:
             macd_bull = macd_bear = False
             macd_hist = 0.0
 
-        # Volume confirmation — is this candle backed by above-average volume?
+        # Volume confirmation — require 1.5× average; low-volume breakouts fail often
         avg_vol = sum(volumes) / len(volumes) if volumes else 1
-        high_volume = volumes[-1] > avg_vol * 1.2 if avg_vol > 0 else False
+        high_volume = volumes[-1] > avg_vol * VOLUME_FILTER_MULT if avg_vol > 0 else False
         price_range = max(highs) - min(lows) or 1
         tolerance   = price_range * 0.005
         levels = []
@@ -1568,6 +1618,14 @@ class SignalEngine:
         if not _in_active_hours() and sig in ("BUY", "SELL"):
             sig = "HOLD"
 
+        # Volume gate — low-volume moves fail too often to act on
+        if sig in ("BUY", "SELL") and not high_volume:
+            sig = "HOLD"
+
+        # Economic calendar blackout — skip entries around high-impact events
+        if sig in ("BUY", "SELL") and _near_econ_event():
+            sig = "HOLD"
+
         # ── Confidence score (0.0 → 1.0) ─────────────────────────────────────
         # Scored across 6 pillars, each worth 1 point → normalised to 0–1
         ticks = self.above_ticks if sig == "BUY" else self.below_ticks
@@ -1595,6 +1653,15 @@ class SignalEngine:
         else:           pts += 0.5
 
         confidence = round(pts / 6.0, 2) if sig in ("BUY", "SELL") else 0.0
+
+        # Bonus: Long/Short Ratio squeeze potential (contrarian liquidation boost)
+        lsr = lsr_data.get(current_pair, {})
+        if sig == "BUY"  and lsr.get("bias") == "SHORT_HEAVY": confidence = min(round(confidence + 0.08, 2), 1.0)
+        if sig == "SELL" and lsr.get("bias") == "LONG_HEAVY":  confidence = min(round(confidence + 0.08, 2), 1.0)
+
+        # Bonus: extreme funding rate = overcrowded side = contrarian squeeze setup
+        if fr < -EXTREME_FUNDING and sig == "BUY":  confidence = min(round(confidence + 0.06, 2), 1.0)
+        if fr >  EXTREME_FUNDING and sig == "SELL": confidence = min(round(confidence + 0.06, 2), 1.0)
 
         # Trending regime boosts confidence slightly (signal quality is higher)
         if regime == "TRENDING" and sig in ("BUY", "SELL"):
@@ -1799,6 +1866,84 @@ def _funding_loop():
         log("FUNDING", f"Updated {updated}/{len(KRAKEN_TO_BINANCE)} pairs")
         time.sleep(3600)  # funding resets every 8h; refresh hourly is sufficient
 
+# ── Long/Short Ratio monitor (liquidation pressure proxy) ────────────────────
+def _lsr_loop():
+    while True:
+        for pair, symbol in KRAKEN_TO_BINANCE.items():
+            try:
+                r = requests.get(
+                    "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+                    params={"symbol": symbol, "period": "5m", "limit": 1}, timeout=6)
+                if r.ok:
+                    data = r.json()
+                    if data:
+                        lsr = float(data[0]["longShortRatio"])
+                        bias = ("LONG_HEAVY" if lsr > 1.5
+                                else "SHORT_HEAVY" if lsr < 0.67
+                                else "NEUTRAL")
+                        lsr_data[pair] = {"lsr": round(lsr, 3), "bias": bias}
+            except Exception:
+                pass
+            time.sleep(0.3)
+        time.sleep(300)  # refresh every 5 minutes
+
+# ── Economic calendar (Forex Factory JSON feed) ───────────────────────────────
+def _econ_calendar_loop():
+    global _econ_events
+    while True:
+        try:
+            r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                             timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if r.ok:
+                events = [e for e in r.json()
+                          if e.get("impact") == "High"
+                          and e.get("country") == "USD"]
+                _econ_events = events
+                log("ECON", f"Loaded {len(events)} high-impact USD events this week")
+        except Exception as e:
+            log("ECON", str(e), "ERR")
+        time.sleep(3600)  # refresh hourly
+
+def _near_econ_event():
+    """Return True if within ECON_BLACKOUT_MINS of a high-impact USD event."""
+    from datetime import timezone as _tz
+    now = datetime.now(_tz.utc)
+    for ev in _econ_events:
+        try:
+            ev_dt = datetime.fromisoformat(ev["date"])
+            if ev_dt.tzinfo is None:
+                ev_dt = ev_dt.replace(tzinfo=_tz.utc)
+            diff = abs((ev_dt.astimezone(_tz.utc) - now).total_seconds() / 60)
+            if diff <= ECON_BLACKOUT_MINS:
+                log("ECON", f"Blackout: {ev.get('title','event')} in {diff:.0f} min")
+                return True
+        except Exception:
+            pass
+    return False
+
+# ── Price alert checker ───────────────────────────────────────────────────────
+def _alert_loop(trader):
+    while True:
+        for pair, alerts in list(_price_alerts.items()):
+            if not alerts: continue
+            try:
+                price = get_price(pair)
+            except Exception:
+                continue
+            kept = []
+            for a in alerts:
+                triggered = (price >= a["target"] if a["above"] else price <= a["target"])
+                if triggered:
+                    name  = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+                    dirn  = "above" if a["above"] else "below"
+                    label = f" — {a['label']}" if a.get("label") else ""
+                    tg(f"🔔 *Price Alert — {name}*\nNow `${price:.4f}` ({dirn} `${a['target']:.4f}`){label}",
+                       plain=True)
+                else:
+                    kept.append(a)
+            _price_alerts[pair] = kept
+        time.sleep(30)
+
 # ── Top-coin display updater ─────────────────────────────────────────────────
 def _switcher_loop(trader):
     global _current_coin
@@ -1857,7 +2002,55 @@ _TEXT_ACTION: dict = {
     "/resume":     "resume",
     "/close":      "force_close",
     "/status":     "balance",
+    "/alerts":     "alert_list",
 }
+
+def _parse_alert_command(txt):
+    """Parse /alert BTC 65000 [above|below] and register it."""
+    # Supported: /alert BTC 65000  or  /alert BTC above 65000  or  /alert BTC below 65000
+    parts = txt.strip().split()
+    # parts[0] = /alert, parts[1] = coin symbol, rest = price / direction
+    if len(parts) < 3:
+        tg("Usage: /alert BTC 65000  or  /alert BTC above 65000", plain=True)
+        return
+    sym = parts[1].upper().replace("/", "")
+    # Find matching pair
+    pair = next((c["pair"] for c in SCAN_UNIVERSE
+                 if c["name"].upper().startswith(sym) or c["pair"].startswith(sym)), None)
+    if not pair:
+        tg(f"Unknown coin: {parts[1]}", plain=True)
+        return
+    try:
+        if parts[2].lower() in ("above", "below"):
+            above  = parts[2].lower() == "above"
+            target = float(parts[3])
+        else:
+            target = float(parts[2])
+            try:
+                current = get_price(pair)
+                above = target > current
+            except Exception:
+                above = True
+    except (ValueError, IndexError):
+        tg("Usage: /alert BTC 65000  or  /alert BTC above 65000", plain=True)
+        return
+    _price_alerts.setdefault(pair, []).append({"target": target, "above": above, "label": ""})
+    name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+    dirn = "above" if above else "below"
+    tg(f"🔔 Alert set: {name} {dirn} ${target:,.4f}", plain=True)
+
+def _decode_fkey(fkey):
+    """Translate a signal fingerprint key into human-readable entry reasons."""
+    if not fkey: return ""
+    parts = []
+    if "e1" in fkey: parts.append("above EMA")
+    elif "e0" in fkey: parts.append("below EMA")
+    if "m1" in fkey: parts.append("MACD bull")
+    elif "m0" in fkey: parts.append("MACD bear")
+    if "v1" in fkey: parts.append("high vol")
+    if "nB" in fkey: parts.append("bullish news")
+    elif "nR" in fkey: parts.append("bearish news")
+    return ", ".join(parts)
 
 def _tg_with_kb(msg, kb):
     """Send a message with a ReplyKeyboardMarkup."""
@@ -1991,14 +2184,18 @@ def _dispatch_callback(data, query, trader):
         recent = trader.trades[-8:]
         lines  = [f"📜 *Last {len(recent)} Trades*", "━━━━━━━━━━━━━━━━━━━━"]
         for t in reversed(recent):
-            icon  = "✅" if t["pnl"] >= 0 else "❌"
-            side  = "🟢 L" if t["side"] == "LONG" else "🔴 S"
+            icon   = "✅" if t["pnl"] >= 0 else "❌"
+            side   = "🟢 L" if t["side"] == "LONG" else "🔴 S"
+            reason = _decode_fkey(t.get("fkey", ""))
+            reason_str = f"\n   _{reason}_" if reason else ""
             lines.append(
-                f"{icon} {side} `${t['entry']:.3f}` → `${t['exit']:.3f}`  "
-                f"`{'+'if t['pnl']>=0 else ''}{t['pnl']:.2f}$`"
+                f"{icon} {side} *{t.get('coin','?')}*  "
+                f"`{'+'if t['pnl']>=0 else ''}{t['pnl']:.2f}$`  "
+                f"_{t.get('reason','?')}_"
+                f"{reason_str}"
             )
         total_pnl = trader.total_pnl
-        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"Total PnL: `{'+'if total_pnl>=0 else ''}{total_pnl:.2f}$`")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
@@ -2100,12 +2297,59 @@ def _dispatch_callback(data, query, trader):
     elif data == "intelligence":
         try:
             report = analyse_intelligence(trader.trades)
-            # Telegram hard limit is 4096 chars; trim with a note if needed
+            # Append best-hours analysis
+            if trader.trades:
+                hour_stats: dict = {}
+                for t in trader.trades:
+                    h = t.get("hour", datetime.utcfromtimestamp(t.get("ts", 0)).hour)
+                    hs = hour_stats.setdefault(h, {"w": 0, "l": 0, "pnl": 0.0})
+                    if t["pnl"] > 0: hs["w"] += 1
+                    else:            hs["l"] += 1
+                    hs["pnl"] += t["pnl"]
+                ranked = sorted(hour_stats.items(), key=lambda x: x[1]["pnl"], reverse=True)
+                best3  = [(h, s) for h, s in ranked if s["w"] + s["l"] >= 2][:3]
+                worst3 = [(h, s) for h, s in reversed(ranked) if s["w"] + s["l"] >= 2][:3]
+                if best3 or worst3:
+                    report += "\n\n*⏰ Best Trading Hours (UTC)*\n"
+                    for h, s in best3:
+                        tot = s["w"] + s["l"] or 1
+                        report += f"  ✅ {h:02d}:00  W{s['w']}/L{s['l']}  `{s['pnl']:+.2f}$`  `{s['w']/tot*100:.0f}%`\n"
+                    if worst3:
+                        report += "*⏰ Worst Hours*\n"
+                        for h, s in worst3:
+                            tot = s["w"] + s["l"] or 1
+                            report += f"  ❌ {h:02d}:00  W{s['w']}/L{s['l']}  `{s['pnl']:+.2f}$`  `{s['w']/tot*100:.0f}%`\n"
+            # Append top LSR readings
+            hot_lsr = [(p, d) for p, d in lsr_data.items() if d["bias"] != "NEUTRAL"]
+            if hot_lsr:
+                report += "\n*📊 L/S Ratio Pressure*\n"
+                for p, d in sorted(hot_lsr, key=lambda x: abs(x[1]["lsr"] - 1), reverse=True)[:4]:
+                    name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == p), p)
+                    icon = "🐂" if d["bias"] == "SHORT_HEAVY" else "🐻"
+                    report += f"  {icon} {name}: `{d['lsr']:.2f}` ({d['bias']})\n"
             if len(report) > 3800:
                 report = report[:3800].rsplit("\n", 1)[0] + "\n_...truncated_"
         except Exception as e:
             report = f"⚠️ Intelligence error: {e}"
         tg_buttons(report, [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data.startswith("alert_"):
+        # alert_set_XBTUSD_65000_above  or  alert_del_XBTUSD
+        parts = data.split("_")
+        if parts[1] == "del" and len(parts) >= 3:
+            _price_alerts.pop(parts[2], None)
+            tg_buttons("🔕 Alert cleared.", [[{"text": "🔙 Back", "callback_data": "menu"}]])
+        elif parts[1] == "list":
+            if not any(_price_alerts.values()):
+                tg_buttons("🔕 No active alerts.", [[{"text": "🔙 Back", "callback_data": "menu"}]])
+            else:
+                lines = ["*🔔 Active Price Alerts*"]
+                for pair, alerts in _price_alerts.items():
+                    name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+                    for a in alerts:
+                        dirn = "above" if a["above"] else "below"
+                        lines.append(f"  {name} {dirn} `${a['target']:.4f}`")
+                tg_buttons("\n".join(lines), [[{"text": "🔙 Back", "callback_data": "menu"}]])
 
     elif data == "news":
         active = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] != "NEUTRAL"]
@@ -2120,6 +2364,38 @@ def _dispatch_callback(data, query, trader):
             lines.append(f"⚫ {len(neutral)} coins neutral")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
+def _weekly_summary(trader):
+    cutoff = time.time() - 7 * 86400
+    week   = [t for t in trader.trades if t.get("ts", 0) >= cutoff]
+    rank   = get_rank(trader.balance)
+    if not week:
+        tg(f"📆 *Weekly Summary*\nNo trades this week.\nBalance: `${trader.balance:.2f}`")
+        return
+    wins      = [t for t in week if t["pnl"] > 0]
+    losses    = [t for t in week if t["pnl"] <= 0]
+    total_pnl = sum(t["pnl"] for t in week)
+    best      = max(week, key=lambda t: t["pnl"])
+    worst     = min(week, key=lambda t: t["pnl"])
+    wr        = len(wins) / len(week) * 100
+    # Best coin this week
+    coin_pnl: dict = {}
+    for t in week:
+        coin_pnl[t.get("coin", "?")] = coin_pnl.get(t.get("coin", "?"), 0) + t["pnl"]
+    top_coin  = max(coin_pnl, key=lambda k: coin_pnl[k])
+    bot_coin  = min(coin_pnl, key=lambda k: coin_pnl[k])
+    tg(f"📆 *Weekly Summary*\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"Trades: `{len(week)}` | W: `{len(wins)}` L: `{len(losses)}`\n"
+       f"Win Rate: `{wr:.0f}%` | PnL: `{'+'if total_pnl>=0 else ''}{total_pnl:.2f}$`\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"Best trade:  `+{best['pnl']:.2f}$` ({best.get('coin','?')})\n"
+       f"Worst trade: `{worst['pnl']:.2f}$` ({worst.get('coin','?')})\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"Top coin: *{top_coin}* `{coin_pnl[top_coin]:+.2f}$`\n"
+       f"Worst coin: *{bot_coin}* `{coin_pnl[bot_coin]:+.2f}$`\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"Balance: `${trader.balance:.2f}` | {rank['emoji']} {rank['name']}")
+
 def _daily_summary_loop(trader):
     while True:
         now      = datetime.now()
@@ -2132,23 +2408,26 @@ def _daily_summary_loop(trader):
             if not trades_today:
                 tg(f"📅 *Daily Summary*\nNo trades in the last 24 h.\n"
                    f"Balance: `${trader.balance:.2f}` | Trading: *{_current_coin['name']}*")
-                continue
-            wins      = [t for t in trades_today if t["pnl"] > 0]
-            losses    = [t for t in trades_today if t["pnl"] <= 0]
-            total_pnl = sum(t["pnl"] for t in trades_today)
-            best      = max(trades_today, key=lambda t: t["pnl"])
-            worst     = min(trades_today, key=lambda t: t["pnl"])
-            wr        = len(wins) / len(trades_today) * 100
-            tg(f"📅 *Daily Summary*\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n"
-               f"Trades: `{len(trades_today)}` | W: `{len(wins)}` L: `{len(losses)}`\n"
-               f"Win Rate: `{wr:.0f}%` | PnL: `{'+'if total_pnl>=0 else ''}{total_pnl:.2f}$`\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n"
-               f"Best:  `+{best['pnl']:.2f}$` ({best.get('coin','?')})\n"
-               f"Worst: `{worst['pnl']:.2f}$` ({worst.get('coin','?')})\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n"
-               f"Balance: `${trader.balance:.2f}` | {rank['emoji']} {rank['name']}\n"
-               f"Trading: *{_current_coin['name']}*")
+            else:
+                wins      = [t for t in trades_today if t["pnl"] > 0]
+                losses    = [t for t in trades_today if t["pnl"] <= 0]
+                total_pnl = sum(t["pnl"] for t in trades_today)
+                best      = max(trades_today, key=lambda t: t["pnl"])
+                worst     = min(trades_today, key=lambda t: t["pnl"])
+                wr        = len(wins) / len(trades_today) * 100
+                tg(f"📅 *Daily Summary*\n"
+                   f"━━━━━━━━━━━━━━━━━━━━\n"
+                   f"Trades: `{len(trades_today)}` | W: `{len(wins)}` L: `{len(losses)}`\n"
+                   f"Win Rate: `{wr:.0f}%` | PnL: `{'+'if total_pnl>=0 else ''}{total_pnl:.2f}$`\n"
+                   f"━━━━━━━━━━━━━━━━━━━━\n"
+                   f"Best:  `+{best['pnl']:.2f}$` ({best.get('coin','?')})\n"
+                   f"Worst: `{worst['pnl']:.2f}$` ({worst.get('coin','?')})\n"
+                   f"━━━━━━━━━━━━━━━━━━━━\n"
+                   f"Balance: `${trader.balance:.2f}` | {rank['emoji']} {rank['name']}\n"
+                   f"Trading: *{_current_coin['name']}*")
+            # Weekly summary every Sunday (weekday 6)
+            if now.weekday() == 6:
+                _weekly_summary(trader)
         except Exception as e:
             log("BOT", f"DailySummary error: {e}", "ERR")
 
@@ -2206,6 +2485,8 @@ def _poll_loop(trader):
                         threading.Thread(target=_handle_callback,
                                          args=({"data": action}, trader),
                                          daemon=True).start()
+                    elif txt.lower().startswith("/alert "):
+                        _parse_alert_command(txt)
                     elif txt.lower() in ("menu", "/start", "/menu"):
                         send_menu(trader)
         except Exception as e:
@@ -2364,6 +2645,9 @@ def main():
         ("Telegram poll",     _poll_loop,           (trader,)),
         ("Daily summary",     _daily_summary_loop,  (trader,)),
         ("PnL updater",       _pnl_update_loop,     (trader,)),
+        ("LSR monitor",       _lsr_loop,            ()),
+        ("Econ calendar",     _econ_calendar_loop,  ()),
+        ("Price alerts",      _alert_loop,          (trader,)),
     ]
     for name, fn, args in threads:
         threading.Thread(target=fn, args=args, daemon=True).start()
