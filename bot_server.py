@@ -1385,6 +1385,7 @@ class PaperTrader:
                          stop_type=stop_label)
 
     def _close(self, price, name, reason, pair):
+        global _paused
         p = self.positions.get(pair)
         if not p: return
         fill = price * (1 - SLIPPAGE) if p["side"] == "LONG" else price * (1 + SLIPPAGE)
@@ -1420,7 +1421,6 @@ class PaperTrader:
         # Max session drawdown: auto-pause if down MAX_SESSION_DD from peak
         if self.peak > 0 and (self.peak - self.balance) / self.peak >= MAX_SESSION_DD:
             with _state_lock:
-                global _paused
                 _paused = True
             dd_pct = (self.peak - self.balance) / self.peak * 100
             tg(f"⚠️ *Max drawdown hit — trading PAUSED*\n"
@@ -1974,6 +1974,7 @@ _REPLY_KB = {
         [{"text": "📜 History"},  {"text": "📰 News"}],
         [{"text": "🧠 Intel"},    {"text": "🏆 Ranks"}],
         [{"text": "🔄 Switch"},   {"text": "⏸ Pause"},  {"text": "▶ Resume"}],
+        [{"text": "📋 Menu"}],
     ],
     "resize_keyboard": True,
 }
@@ -1989,6 +1990,7 @@ _TEXT_ACTION: dict = {
     "🔄 switch":   "switch_menu",
     "⏸ pause":     "pause",
     "▶ resume":    "resume",
+    "📋 menu":     "menu",
     # text commands
     "/start":      "menu",
     "/menu":       "menu",
@@ -2486,7 +2488,8 @@ def _poll_loop(trader):
                                          args=({"data": action}, trader),
                                          daemon=True).start()
                     elif txt.lower().startswith("/alert "):
-                        _parse_alert_command(txt)
+                        threading.Thread(target=_parse_alert_command,
+                                         args=(txt,), daemon=True).start()
                     elif txt.lower() in ("menu", "/start", "/menu"):
                         send_menu(trader)
         except Exception as e:
