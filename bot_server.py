@@ -669,7 +669,6 @@ _gate_counters = {
     "btc_dom": 0, "news": 0, "macd": 0, "1h_trend": 0, "pullback": 0,
 }
 _gate_counter_lock = threading.Lock()
-_gate_reset_date   = datetime.utcnow().strftime("%Y-%m-%d")
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 def tg(msg, plain=False):
@@ -1709,8 +1708,6 @@ class SignalEngine:
         # Hard-blocking CHOPPY eliminated most signals; let the bot trade but smaller
         regime   = detect_regime(closes, highs, lows)
         choppy   = (regime == "CHOPPY" and sig in ("BUY", "SELL"))
-        if choppy:
-            with _gate_counter_lock: _gate_counters["choppy"] += 1
 
         # Time-of-day filter — avoid extreme low-liquidity overnight hours
         if not _in_active_hours() and sig in ("BUY", "SELL"):
@@ -1773,7 +1770,9 @@ class SignalEngine:
         confidence = round(pts / max(max_pts, 0.1), 2) if sig in ("BUY", "SELL") else 0.0
 
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
+        # Counter here so it only fires when the signal survived all hard gates
         if choppy:
+            with _gate_counter_lock: _gate_counters["choppy"] += 1
             confidence = max(0.0, round(confidence - 0.15, 2))
 
         # Bonus: Long/Short Ratio squeeze potential (contrarian liquidation boost)
@@ -2285,7 +2284,9 @@ def _cmd_learn(trader):
             lines.append("━━━━━━━━━━━━━━━━━━━━")
             lines.append("*🔑 Signal pattern win rates (min 5 trades):*")
             best = sorted(feat.items(), key=lambda x: -x[1]["wr"])[:4]
-            worst = sorted(feat.items(), key=lambda x: x[1]["wr"])[:3]
+            best_keys = {fk for fk, _ in best}
+            worst = [x for x in sorted(feat.items(), key=lambda x: x[1]["wr"])
+                     if x[0] not in best_keys][:3]
             lines.append("_Best:_")
             for fk, s in best:
                 lines.append(f"  ✅ `{fk}` {_decode_fkey(fk)}: `{s['wr']:.0f}%`  n={s['n']}")
