@@ -259,6 +259,8 @@ MAX_POSITIONS     = 3        # max simultaneous open positions
 MAX_TOTAL_RISK    = 0.40     # total margin across all positions ≤ 40% of balance
 BREAKEVEN_PCT     = 0.012    # move stop to entry once trade is +1.2% in profit
 MIN_RR_RATIO      = 1.5      # minimum reward-to-risk ratio; skip entries below this
+DAILY_GAIN_SOFT   = 0.03     # at +3% today: halve position size to protect the day
+DAILY_GAIN_HARD   = 0.06     # at +6% today: stop new entries entirely
 MAX_SESSION_DD    = 0.12     # auto-pause if balance drops 12% from session peak
 VOLUME_FILTER_MULT= 1.5      # require 1.5× average volume before entering
 EXTREME_FUNDING   = 0.001    # 0.1% / 8h = overcrowded → use as contrarian booster
@@ -702,7 +704,7 @@ _gate_counters = {
     "choppy": 0, "volume": 0, "active_hours": 0, "econ": 0,
     "funding": 0, "divergence": 0, "nasdaq": 0, "fear_greed": 0,
     "btc_dom": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
-    "pullback": 0, "momentum": 0, "rr_ratio": 0,
+    "pullback": 0, "momentum": 0, "rr_ratio": 0, "vwap": 0, "spike": 0, "daily_gain": 0,
 }
 _gate_counter_lock = threading.Lock()
 
@@ -1273,6 +1275,23 @@ class PaperTrader:
             return 1.08
         return 1.0
 
+    def _session_multiplier(self):
+        """Size by trading session: US hours have the most volume and follow-through;
+        Asian session is choppier with more false breakouts."""
+        h = datetime.utcnow().hour
+        if 13 <= h < 20:   # US session (NY open → close)
+            return 1.10
+        if 0 <= h < 6:     # Asian session (low liquidity, choppy)
+            return 0.75
+        return 1.0          # London / EU / other
+
+    def _daily_gain_multiplier(self):
+        """Protect a good day: at DAILY_GAIN_SOFT reduce size; caller blocks at HARD."""
+        daily_pct = (self.balance - self.day_start_bal) / max(self.day_start_bal, 0.01)
+        if daily_pct >= DAILY_GAIN_SOFT:
+            return 0.50   # half size — lock in the gains
+        return 1.0
+
     def _reset_day_if_needed(self):
         today = datetime.utcnow().strftime("%Y-%m-%d")
         if today != self.day_date:
@@ -1560,6 +1579,11 @@ class PaperTrader:
                 return
             if time.time() < self._streak_cool_until:
                 return   # global pause: ≥3 consecutive losses; wait for market to settle
+            # Daily gain hard ceiling — protect the day's profits
+            _dgain = (self.balance - self.day_start_bal) / max(self.day_start_bal, 0.01)
+            if _dgain >= DAILY_GAIN_HARD:
+                with _gate_counter_lock: _gate_counters["daily_gain"] += 1
+                return
             min_conf = max(self._min_conf_threshold(pair), self._dynamic_conf_gate())
             if sig == "BUY"  and self.can_open_new() and confidence >= min_conf:
                 self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
@@ -1612,7 +1636,9 @@ class PaperTrader:
                 vol_ratio = atr / new_base
                 vol_mult  = max(0.5, min(1.0, 1.0 / max(vol_ratio, 1.0)))
 
-        streak_mult = self._win_streak_multiplier(confidence)
+        streak_mult  = self._win_streak_multiplier(confidence)
+        session_mult = self._session_multiplier()
+        gain_mult    = self._daily_gain_multiplier()
         risk       = min(
                         base_risk
                         * self._risk_multiplier()
@@ -1620,7 +1646,9 @@ class PaperTrader:
                         * self._feature_multiplier(fkey)
                         * wr_mult
                         * vol_mult
-                        * streak_mult,
+                        * streak_mult
+                        * session_mult
+                        * gain_mult,
                         RISK_MAX)
         leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
         fill       = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
@@ -1664,13 +1692,16 @@ class PaperTrader:
                                 "pillars": pillars or {}}
         self._save()
         mul = self._risk_multiplier()
-        dd_note     = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
-        vol_note    = f" 🌊 vol×`{vol_mult:.2f}`" if vol_mult < 0.95 else ""
-        kelly_note  = " 📐 Kelly" if kelly > 0 else ""
-        streak_note = f" 🔥 streak×`{streak_mult:.2f}`" if streak_mult > 1.0 else ""
+        dd_note      = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
+        vol_note     = f" 🌊 vol×`{vol_mult:.2f}`" if vol_mult < 0.95 else ""
+        kelly_note   = " 📐 Kelly" if kelly > 0 else ""
+        streak_note  = f" 🔥 streak×`{streak_mult:.2f}`" if streak_mult > 1.0 else ""
+        session_note = f" 🇺🇸 US×`{session_mult:.2f}`" if session_mult > 1.0 else \
+                       f" 🌙 Asia×`{session_mult:.2f}`" if session_mult < 1.0 else ""
+        gain_note    = f" 🔒 gain-protect×`{gain_mult:.2f}`" if gain_mult < 1.0 else ""
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
-           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}{streak_note}\n"
+           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}{streak_note}{session_note}{gain_note}\n"
            f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
            f"Trail stop: `${trail_stop:.4f}` ({stop_label}) | Balance: `${self.balance:.2f}`")
         _print_trade_box("OPEN", name, side, fill,
@@ -1967,6 +1998,26 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["volume"] += 1
             sig = "HOLD"
 
+        # VWAP gate — institutions watch this; trading against it means fighting big money
+        # Typical price = (H+L+C)/3; VWAP = cumulative(TP×Vol) / cumulative(Vol)
+        try:
+            _vols = volumes if volumes else []
+            _tvol = sum(_vols)
+            if _tvol > 0:
+                _tp = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(len(closes))]
+                vwap = sum(_tp[i] * _vols[i] for i in range(len(_tp))) / _tvol
+            else:
+                vwap = None
+        except Exception:
+            vwap = None
+        above_vwap = price > vwap if vwap else True
+        if sig == "BUY"  and vwap and not above_vwap:
+            with _gate_counter_lock: _gate_counters["vwap"] += 1
+            sig = "HOLD"
+        if sig == "SELL" and vwap and above_vwap:
+            with _gate_counter_lock: _gate_counters["vwap"] += 1
+            sig = "HOLD"
+
         # Economic calendar blackout — skip entries around high-impact events
         if sig in ("BUY", "SELL") and _near_econ_event():
             with _gate_counter_lock: _gate_counters["econ"] += 1
@@ -2007,6 +2058,11 @@ class SignalEngine:
                       else 0.0 if (sig == "BUY"  and candle_pat == "BEAR") or
                                   (sig == "SELL" and candle_pat == "BULL")
                       else 0.5)   # NONE = neutral
+        # VWAP pillar: being on the right side of VWAP boosts confidence;
+        # unknown (no volume data) scores neutral
+        vwap_pts   = (1.0 if ((sig == "BUY"  and above_vwap) or
+                              (sig == "SELL" and not above_vwap))
+                      else 0.5 if vwap is None else 0.0)
 
         pts = (rsi_pts    * pw.get("rsi_zone",       1.0) +
                news_pts   * pw.get("news_align",     1.0) +
@@ -2014,14 +2070,16 @@ class SignalEngine:
                tick_pts   * pw.get("tick_strength",  1.0) +
                macd_pts   * pw.get("macd_align",     1.0) +
                vol_pts    * pw.get("high_volume",    1.0) +
-               candle_pts * pw.get("candle_pattern", 1.0))
+               candle_pts * pw.get("candle_pattern", 1.0) +
+               vwap_pts   * pw.get("vwap_align",     1.0))
         max_pts = (1.0 * pw.get("rsi_zone",       1.0) +
                    1.0 * pw.get("news_align",     1.0) +
                    1.0 * pw.get("nasdaq_align",   1.0) +
                    1.0 * pw.get("tick_strength",  1.0) +
                    1.0 * pw.get("macd_align",     1.0) +
                    1.0 * pw.get("high_volume",    1.0) +
-                   1.0 * pw.get("candle_pattern", 1.0))
+                   1.0 * pw.get("candle_pattern", 1.0) +
+                   1.0 * pw.get("vwap_align",     1.0))
         confidence = round(pts / max(max_pts, 0.1), 2) if sig in ("BUY", "SELL") else 0.0
 
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
@@ -2095,6 +2153,7 @@ class SignalEngine:
             "macd_align":    macd_pts >= 1.0,
             "high_volume":   high_volume,
             "candle_pattern":candle_pts >= 1.0,
+            "vwap_align":    vwap_pts >= 1.0,
         }
 
         # ── Feature fingerprint key ──────────────────────────────────────────
@@ -3408,6 +3467,8 @@ def _daily_summary_loop(trader):
                     "divergence": "RSI div", "active_hours": "Off-hours",
                     "econ": "Econ event", "fear_greed": "Fear/Greed",
                     "btc_dom": "BTC dom", "news": "News", "macd": "MACD",
+                    "rr_ratio": "Bad R:R", "vwap": "VWAP side",
+                    "spike": "Candle spike", "daily_gain": "Day profit cap",
                 }
                 top_gates = sorted(gate_snap.items(), key=lambda x: -x[1])[:5]
                 gate_lines = "  ".join(f"{gate_labels.get(k, k)}: `{v}`" for k, v in top_gates if v > 0)
@@ -3510,10 +3571,57 @@ def trading_loop(trader):
                 p = trader.positions.get(pair)
                 if not p: continue
                 try:
-                    closes, highs, lows, volumes, _ = get_klines(pair)
+                    closes, highs, lows, volumes, opens_m = get_klines(pair)
                     price = get_price(pair)
                     try: atr = calc_atr(highs, lows, closes)
                     except Exception: atr = None
+
+                    # ── Parabolic move: tighten trail before the reversal ──
+                    if not p.get("parabolic_tightened"):
+                        try:
+                            _rsi_live = calc_rsi(closes)
+                            _avg_vol  = sum(volumes) / len(volumes) if volumes else 1
+                            _vol_spike = volumes[-1] > _avg_vol * 3
+                            _bull3 = all(closes[-i] > closes[-i-1] for i in range(1, 4))
+                            _bear3 = all(closes[-i] < closes[-i-1] for i in range(1, 4))
+                            _move = (price - p["entry"]) / p["entry"]
+                            if p["side"] == "SHORT": _move = -_move
+                            if _move > 0.02:  # only tighten if already in profit
+                                if ((p["side"] == "LONG"  and _rsi_live > 82 and _vol_spike and _bull3) or
+                                    (p["side"] == "SHORT" and _rsi_live < 18 and _vol_spike and _bear3)):
+                                    _tight = round(price * 0.010, 8)
+                                    if _tight < p.get("atr_dist", float("inf")):
+                                        p["atr_dist"] = _tight
+                                        p["parabolic_tightened"] = True
+                                        tg(f"🌋 *Parabolic — {p['name']}*\n"
+                                           f"RSI `{_rsi_live:.0f}` + vol spike + 3-candle run\n"
+                                           f"Trail tightened to `1%` before reversal")
+                        except Exception: pass
+
+                    # ── Divergence exit: RSI/price disagreement while in trade ──
+                    if not p.get("div_tightened"):
+                        try:
+                            _rsi_live = calc_rsi(closes)
+                            _div = detect_divergence(closes, _rsi_live)
+                            _move = (price - p["entry"]) / p["entry"]
+                            if p["side"] == "SHORT": _move = -_move
+                            if _move > 0.01:  # only tighten if in profit
+                                if _div == "BEARISH_DIV" and p["side"] == "LONG":
+                                    _tight = round(atr * 1.0, 8) if atr else round(price * 0.015, 8)
+                                    if _tight < p.get("atr_dist", float("inf")):
+                                        p["atr_dist"] = _tight
+                                        p["div_tightened"] = True
+                                        tg(f"⚠️ *Bearish Divergence — {p['name']}*\n"
+                                           f"Price making highs, RSI declining\nTrail tightened to `1×ATR`")
+                                elif _div == "BULLISH_DIV" and p["side"] == "SHORT":
+                                    _tight = round(atr * 1.0, 8) if atr else round(price * 0.015, 8)
+                                    if _tight < p.get("atr_dist", float("inf")):
+                                        p["atr_dist"] = _tight
+                                        p["div_tightened"] = True
+                                        tg(f"⚠️ *Bullish Divergence — {p['name']}*\n"
+                                           f"Price making lows, RSI rising\nTrail tightened to `1×ATR`")
+                        except Exception: pass
+
                     trader.on_signal("HOLD", price, 0, 0, p["name"], 0.0, pair, atr=atr)
                 except Exception as e:
                     log("TRADE", f"manage {pair}: {e}", "ERR")
@@ -3594,6 +3702,19 @@ def trading_loop(trader):
                             elif sig == "SELL" and mom5 >= 0 and mom15 >= 0:
                                 with _gate_counter_lock: _gate_counters["momentum"] += 1
                                 sig = "HOLD"
+                        except Exception: pass
+
+                    # Spike/chase filter: if current candle body > 2× ATR the move is
+                    # already exhausted — don't enter at the top of a spike
+                    if sig in ("BUY", "SELL") and atr and atr > 0 and opens:
+                        try:
+                            body = abs(closes[-1] - opens[-1])
+                            if body > 2 * atr:
+                                bull_spike = closes[-1] > opens[-1] and sig == "BUY"
+                                bear_spike = closes[-1] < opens[-1] and sig == "SELL"
+                                if bull_spike or bear_spike:
+                                    with _gate_counter_lock: _gate_counters["spike"] += 1
+                                    sig = "HOLD"
                         except Exception: pass
 
                     sig_col  = _C.GREEN + _C.BOLD if sig == "BUY" else _C.RED + _C.BOLD if sig == "SELL" else _C.GREY
