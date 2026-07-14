@@ -12,8 +12,13 @@ import json
 import sys
 import re
 import math
+import io
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # ── Terminal colours ──────────────────────────────────────────────────────────
 _USE_COLOUR = sys.stdout.isatty() or os.environ.get("FORCE_COLOR", "0") == "1"
@@ -712,6 +717,22 @@ def tg(msg, plain=False):
     except Exception as e:
         log("TG", f"Send error: {e}", "ERR")
         return False
+
+def tg_photo(buf, caption=""):
+    """Send a PNG image buffer to the Telegram chat."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+            data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "Markdown"},
+            files={"photo": ("chart.png", buf, "image/png")},
+            timeout=20,
+        )
+        if not r.ok:
+            log("TG", f"sendPhoto {r.status_code}: {r.text[:200]}", "ERR")
+    except Exception as e:
+        log("TG", f"sendPhoto error: {e}", "ERR")
 
 def tg_buttons(msg, buttons):
     if not TG_TOKEN:
@@ -2328,7 +2349,7 @@ _REPLY_KB = {
         [{"text": "📜 History"},  {"text": "📰 News"}],
         [{"text": "🧠 Intel"},    {"text": "🏆 Ranks"},  {"text": "🎓 Learn"}],
         [{"text": "🔄 Switch"},   {"text": "⏸ Pause"},  {"text": "▶ Resume"}],
-        [{"text": "🔍 Why"},      {"text": "📋 Menu"}],
+        [{"text": "🔍 Why"},      {"text": "📈 Chart"}, {"text": "📋 Menu"}],
     ],
     "resize_keyboard": True,
 }
@@ -2346,6 +2367,7 @@ _TEXT_ACTION: dict = {
     "⏸ pause":     "pause",
     "▶ resume":    "resume",
     "🔍 why":      "why",
+    "📈 chart":    "chart",
     "📋 menu":     "menu",
     # text commands
     "/start":      "menu",
@@ -2358,6 +2380,7 @@ _TEXT_ACTION: dict = {
     "/intel":      "intelligence",
     "/learn":      "learn",
     "/why":        "why",
+    "/chart":      "chart",
     "/pause":      "pause",
     "/resume":     "resume",
     "/close":      "force_close",
@@ -2505,6 +2528,84 @@ def _readiness_score(trader):
         f"Learning patterns: {feat_count}  ({l_pts}/10 pts — need DB + 5 patterns)",
     ]
     return score, breakdown
+
+def _cmd_chart(trader):
+    """Handler for /chart — sends an equity curve graph as a Telegram photo."""
+    trades = trader.trades
+    if not trades:
+        tg("📊 No trade history yet — make some trades first and then check back!")
+        return
+
+    # Build equity curve: balance after each closed trade
+    balances  = [PAPER_START]
+    timestamps = [trades[0]["ts"] - 60]  # synthetic start point 1 min before first trade
+    for t in trades:
+        balances.append(round(balances[-1] + t["pnl"], 2))
+        timestamps.append(t["ts"])
+    dates = [datetime.utcfromtimestamp(ts) for ts in timestamps]
+
+    wins    = sum(1 for t in trades if t["pnl"] > 0)
+    wr      = wins / len(trades) * 100
+    total_pnl = trader.balance - PAPER_START
+    pnl_sign  = "+" if total_pnl >= 0 else ""
+
+    # ── Dark-theme chart ───────────────────────────────────────────────────────
+    BG_DARK  = "#0d1117"
+    BG_PANEL = "#161b22"
+    ACCENT   = "#58a6ff"
+    GREEN    = "#3fb950"
+    RED      = "#f85149"
+    GRID     = "#21262d"
+    TEXT     = "#c9d1d9"
+    MUTED    = "#8b949e"
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.patch.set_facecolor(BG_DARK)
+    ax.set_facecolor(BG_PANEL)
+
+    # Equity line
+    ax.plot(dates, balances, color=ACCENT, linewidth=2, zorder=2)
+
+    # Shaded area: green above start, red below
+    ax.fill_between(dates, PAPER_START, balances,
+                    where=[b >= PAPER_START for b in balances],
+                    alpha=0.20, color=GREEN, interpolate=True)
+    ax.fill_between(dates, PAPER_START, balances,
+                    where=[b < PAPER_START for b in balances],
+                    alpha=0.20, color=RED, interpolate=True)
+
+    # Trade dots (skip the synthetic start point)
+    for i, t in enumerate(trades):
+        dt    = datetime.utcfromtimestamp(t["ts"])
+        bal   = balances[i + 1]
+        color = GREEN if t["pnl"] > 0 else RED
+        ax.scatter(dt, bal, color=color, s=22, zorder=3, edgecolors="none")
+
+    # Starting balance reference line
+    ax.axhline(PAPER_START, color=MUTED, linestyle="--", linewidth=0.8, alpha=0.6)
+
+    # Axis formatting
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+    fig.autofmt_xdate(rotation=30, ha="right")
+    ax.tick_params(colors=MUTED, labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(GRID)
+    ax.grid(color=GRID, linewidth=0.5, zorder=0)
+    ax.set_ylabel("Balance ($)", color=MUTED, fontsize=9)
+
+    # Title
+    title = (f"Balance: ${trader.balance:,.2f}  ({pnl_sign}{total_pnl:.2f}$)   "
+             f"WR {wr:.0f}%   {len(trades)} trades")
+    ax.set_title(title, color=TEXT, fontsize=10, pad=10)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+
+    tg_photo(buf, f"📈 *Equity Curve* — `{len(trades)}` trades | WR `{wr:.0f}%` | `{pnl_sign}{total_pnl:.2f}$`")
 
 def _cmd_learn(trader):
     """Handler for /learn — learning status + real-money readiness."""
@@ -2911,6 +3012,9 @@ def _dispatch_callback(data, query, trader):
 
     elif data == "why":
         _cmd_why()
+
+    elif data == "chart":
+        _cmd_chart(trader)
 
     elif data == "news":
         active = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] != "NEUTRAL"]
