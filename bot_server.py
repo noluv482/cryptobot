@@ -258,6 +258,7 @@ FUNDING_THRESHOLD = 0.0005   # 0.05% per 8h → overcrowded side, block new entr
 MAX_POSITIONS     = 3        # max simultaneous open positions
 MAX_TOTAL_RISK    = 0.40     # total margin across all positions ≤ 40% of balance
 BREAKEVEN_PCT     = 0.012    # move stop to entry once trade is +1.2% in profit
+MIN_RR_RATIO      = 1.5      # minimum reward-to-risk ratio; skip entries below this
 MAX_SESSION_DD    = 0.12     # auto-pause if balance drops 12% from session peak
 VOLUME_FILTER_MULT= 1.5      # require 1.5× average volume before entering
 EXTREME_FUNDING   = 0.001    # 0.1% / 8h = overcrowded → use as contrarian booster
@@ -693,12 +694,15 @@ _econ_events    = []   # list of {"title": str, "date": str, "impact": str}
 # User-set price alerts  {pair: [{"target": float, "above": bool, "label": str}]}
 _price_alerts   = {}
 
+# Market breadth: how many scanned coins are above their EMA (updated each rank cycle)
+_market_breadth = {"above": 0, "total": 0}
+
 # Gate telemetry — count how many BUY/SELL signals each gate blocked per day
 _gate_counters = {
     "choppy": 0, "volume": 0, "active_hours": 0, "econ": 0,
     "funding": 0, "divergence": 0, "nasdaq": 0, "fear_greed": 0,
     "btc_dom": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
-    "pullback": 0, "momentum": 0,
+    "pullback": 0, "momentum": 0, "rr_ratio": 0,
 }
 _gate_counter_lock = threading.Lock()
 
@@ -979,7 +983,8 @@ def rank_coins():
                            "volatility": round(volatility,2),
                            "news": news.get("sentiment","NEUTRAL"),
                            "reason": ", ".join(reason) or "No signal",
-                           "alert_buffer": coin["alert_buffer"]})
+                           "alert_buffer": coin["alert_buffer"],
+                           "above_ema": above_ema})
         except Exception:
             pass
     return sorted(scores, key=lambda x: x["score"], reverse=True)
@@ -1247,6 +1252,27 @@ class PaperTrader:
             else: break
         return count
 
+    @property
+    def consecutive_wins(self):
+        count = 0
+        for t in reversed(self.trades):
+            if t["pnl"] > 0: count += 1
+            else: break
+        return count
+
+    def _win_streak_multiplier(self, confidence):
+        """Scale up size modestly on win streaks — symmetric with loss-streak reduction.
+        Only fires when not already in a loss-streak penalty, and needs conf ≥ 0.70
+        so the bot doesn't bet big on weak high-streak signals."""
+        if self._risk_multiplier() < 1.0:
+            return 1.0   # never layer win bonus on top of loss-streak cut
+        wins = self.consecutive_wins
+        if wins >= 5 and confidence >= 0.70:
+            return 1.15
+        if wins >= 3 and confidence >= 0.70:
+            return 1.08
+        return 1.0
+
     def _reset_day_if_needed(self):
         today = datetime.utcnow().strftime("%Y-%m-%d")
         if today != self.day_date:
@@ -1494,6 +1520,21 @@ class PaperTrader:
                     p["tier2_trail_set"] = True
                     tg(f"🔐 *+7% Locked — {name}*\nUp `{move*100:.1f}%` → stop `${lock_stop:.4f}` (trail tightened to 3%)")
 
+            # Tier-3 trailing stop: at +20% lock in ≥17% profit (1.5% trail from peak)
+            if not p.get("tier3_trail_set") and move >= 0.20:
+                lock_stop = round(p["entry"] * 1.17 if side == "LONG" else p["entry"] * 0.83, 6)
+                tight_atr = round(price * 0.015, 8)  # 1.5% trail — preserve big winners
+                if side == "LONG" and lock_stop > p.get("trail_stop", 0):
+                    p["trail_stop"]      = lock_stop
+                    p["atr_dist"]        = tight_atr
+                    p["tier3_trail_set"] = True
+                    tg(f"🏆 *+17% Locked — {name}*\nUp `{move*100:.1f}%` → stop `${lock_stop:.4f}` (trail tightened to 1.5%)")
+                elif side == "SHORT" and lock_stop < p.get("trail_stop", float("inf")):
+                    p["trail_stop"]      = lock_stop
+                    p["atr_dist"]        = tight_atr
+                    p["tier3_trail_set"] = True
+                    tg(f"🏆 *+17% Locked — {name}*\nUp `{move*100:.1f}%` → stop `${lock_stop:.4f}` (trail tightened to 1.5%)")
+
             if side == "LONG":
                 trail_stop = p.get("trail_stop", 0)
                 hit_trail  = price <= trail_stop
@@ -1571,13 +1612,15 @@ class PaperTrader:
                 vol_ratio = atr / new_base
                 vol_mult  = max(0.5, min(1.0, 1.0 / max(vol_ratio, 1.0)))
 
+        streak_mult = self._win_streak_multiplier(confidence)
         risk       = min(
                         base_risk
                         * self._risk_multiplier()
                         * self._calibration_multiplier(confidence)
                         * self._feature_multiplier(fkey)
                         * wr_mult
-                        * vol_mult,
+                        * vol_mult
+                        * streak_mult,
                         RISK_MAX)
         leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
         fill       = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
@@ -1621,12 +1664,13 @@ class PaperTrader:
                                 "pillars": pillars or {}}
         self._save()
         mul = self._risk_multiplier()
-        dd_note  = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
-        vol_note = f" 🌊 vol×`{vol_mult:.2f}`" if vol_mult < 0.95 else ""
-        kelly_note = " 📐 Kelly" if kelly > 0 else ""
+        dd_note     = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
+        vol_note    = f" 🌊 vol×`{vol_mult:.2f}`" if vol_mult < 0.95 else ""
+        kelly_note  = " 📐 Kelly" if kelly > 0 else ""
+        streak_note = f" 🔥 streak×`{streak_mult:.2f}`" if streak_mult > 1.0 else ""
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
-           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}\n"
+           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}{streak_note}\n"
            f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
            f"Trail stop: `${trail_stop:.4f}` ({stop_label}) | Balance: `${self.balance:.2f}`")
         _print_trade_box("OPEN", name, side, fill,
@@ -1826,12 +1870,12 @@ class SignalEngine:
         if self.above_ticks >= CONFIRM_TICKS and rsi < 70:
             sig  = "BUY"
             plan = {"enter": price,
-                    "exit":  nearest_r if nearest_r else price*1.015,
+                    "exit":  nearest_r if nearest_r else price*1.030,
                     "stop":  nearest_s if nearest_s else price*0.985}
         elif self.below_ticks >= CONFIRM_TICKS and rsi > 30:
             sig  = "SELL"
             plan = {"enter": price,
-                    "exit":  nearest_s if nearest_s else price*0.985,
+                    "exit":  nearest_s if nearest_s else price*0.970,
                     "stop":  nearest_r if nearest_r else price*1.015}
 
         # news gate + news-triggered entry
@@ -2023,6 +2067,24 @@ class SignalEngine:
                 confidence = min(round(confidence + 0.05, 2), 1.0)
             elif hour_data["wr"] <= 35:
                 confidence = max(round(confidence - 0.10, 2), 0.0)
+
+        # Market breadth: how many scanned coins are trending in the signal direction?
+        # Strong agreement = macro move (boost); isolated signal = noise (penalty)
+        if sig in ("BUY", "SELL"):
+            _ab = _market_breadth.get("above", 0)
+            _tot = max(_market_breadth.get("total", 0), 1)
+            if _tot >= 5:
+                _bp = _ab / _tot
+                if sig == "BUY":
+                    if _bp >= 0.70:   # 7+/10 coins above EMA → broad uptrend
+                        confidence = min(round(confidence + 0.08, 2), 1.0)
+                    elif _bp <= 0.30:  # isolated bid against falling market
+                        confidence = max(round(confidence - 0.05, 2), 0.0)
+                else:  # SELL
+                    if _bp <= 0.30:   # 7+/10 coins below EMA → broad downtrend
+                        confidence = min(round(confidence + 0.08, 2), 1.0)
+                    elif _bp >= 0.70:  # isolated short into rising market
+                        confidence = max(round(confidence - 0.05, 2), 0.0)
 
         # ── Pillar states for DB adaptive weight logging ─────────────────────
         plan["pillars"] = {
@@ -3437,6 +3499,9 @@ def trading_loop(trader):
                     ranked_list = rank_coins()
                     ranked_ts   = now_ts
                     _print_rank_table(ranked_list)
+                    # Update market breadth for confidence scoring
+                    _market_breadth["above"] = sum(1 for s in ranked_list if s.get("above_ema"))
+                    _market_breadth["total"] = len(ranked_list)
                 except Exception as e:
                     log("TRADE", f"rank_coins: {e}", "ERR")
 
@@ -3546,20 +3611,30 @@ def trading_loop(trader):
                     last_sig = last_sigs.get(pair)
                     if sig != last_sig and sig in ("BUY", "SELL"):
                         stop     = plan.get("stop",    price*0.985 if sig=="BUY" else price*1.015)
-                        target   = plan.get("exit",    price*1.015 if sig=="BUY" else price*0.985)
+                        target   = plan.get("exit",    price*1.030 if sig=="BUY" else price*0.970)
                         fkey     = plan.get("fkey",    "")
                         pillars  = plan.get("pillars", {})
+
+                        # R:R gate: skip entry when reward doesn't justify the risk
+                        _rr_reward = (target - price) if sig == "BUY" else (price - target)
+                        _rr_risk   = (price - stop)   if sig == "BUY" else (stop - price)
+                        if _rr_risk > 0 and _rr_reward / _rr_risk < MIN_RR_RATIO:
+                            with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
+                            last_sigs[pair] = sig
+                            continue
+
                         risk     = RISK_MIN + (RISK_MAX - RISK_MIN) * conf
                         leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * conf)
                         arrow    = "↑" if sig == "BUY" else "↓"
                         conf_pct = f"{int(conf*100)}%"
                         log("SIGNAL", (f"{_c(sig_col, f'{arrow} {sig} {cname}')}  "
                                        f"${price:.4f}  target ${target:.4f}  stop ${stop:.4f}  "
+                                       f"R:R {_rr_reward/_rr_risk:.1f}  "
                                        f"conf {_c(conf_col, conf_pct)}  {leverage}x"))
                         emoji    = "🟢" if sig == "BUY" else "🔴"
                         tg(f"{emoji} *{sig} Signal — {coin['name']}*\n"
                            f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
-                           f"EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
+                           f"R:R: `{_rr_reward/_rr_risk:.1f}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
                         trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
                                          atr=atr, fkey=fkey, pillars=pillars)
