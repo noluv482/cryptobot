@@ -927,8 +927,9 @@ def calc_obv_trend(closes, volumes, period=10):
         n = max(period // 2, 2)
         recent_avg = sum(obv_vals[-n:])   / n
         older_avg  = sum(obv_vals[-2*n:-n]) / n
-        if recent_avg > older_avg * 1.03:  return "RISING"
-        if recent_avg < older_avg * 0.97:  return "FALLING"
+        threshold = abs(older_avg) * 0.03
+        if recent_avg > older_avg + threshold: return "RISING"
+        if recent_avg < older_avg - threshold: return "FALLING"
         return "FLAT"
     except Exception:
         return "FLAT"
@@ -1330,7 +1331,7 @@ class PaperTrader:
     def consecutive_losses(self):
         count = 0
         for t in reversed(self.trades):
-            if t["pnl"] < 0: count += 1
+            if t["pnl"] <= 0: count += 1
             else: break
         return count
 
@@ -2165,9 +2166,10 @@ class SignalEngine:
                       else 0.5)   # NONE = neutral
         # VWAP pillar: being on the right side of VWAP boosts confidence;
         # unknown (no volume data) scores neutral
-        vwap_pts   = (1.0 if ((sig == "BUY"  and above_vwap) or
+        vwap_pts   = (0.5 if vwap is None else
+                      1.0 if ((sig == "BUY"  and above_vwap) or
                               (sig == "SELL" and not above_vwap))
-                      else 0.5 if vwap is None else 0.0)
+                      else 0.0)
 
         # OBV pillar (Granville): volume must lead/confirm price direction
         obv_pts = (1.0 if (sig == "BUY"  and obv_trend == "RISING")  or
@@ -2242,8 +2244,9 @@ class SignalEngine:
         # Market breadth: how many scanned coins are trending in the signal direction?
         # Strong agreement = macro move (boost); isolated signal = noise (penalty)
         if sig in ("BUY", "SELL"):
-            _ab = _market_breadth.get("above", 0)
-            _tot = max(_market_breadth.get("total", 0), 1)
+            _mb  = _market_breadth  # single reference load; avoids torn read across two keys
+            _ab  = _mb.get("above", 0)
+            _tot = max(_mb.get("total", 0), 1)
             if _tot >= 5:
                 _bp = _ab / _tot
                 if sig == "BUY":
@@ -3053,23 +3056,25 @@ def _backtest_coin(pair, bt_limit=720, bt_interval=5):
     position = None
     win      = CANDLE_LIMIT
 
-    for i in range(win, len(closes)):
+    for i in range(win, len(closes) - 1):
         c = closes[:i][-win:]
         h = highs[:i][-win:]
         l = lows[:i][-win:]
         v = volumes[:i][-win:]
         o = opens[:i][-win:]
-        price = closes[i - 1]
+        sig_price = closes[i - 1]     # last close of the evaluation window
+        entry_price = closes[i]       # next candle's close — realistic fill
 
         if position is None:
             try:
                 sig, plan, ema, rsi, conf = engine.evaluate(
-                    c, h, l, v, price, alert_buffer=0.10, pair=pair, opens=o)
+                    c, h, l, v, sig_price, alert_buffer=0.10, pair=pair, opens=o)
             except Exception:
                 continue
             if sig in ("BUY", "SELL") and conf >= MIN_CONFIDENCE:
+                price = entry_price
                 try:    atr = calc_atr(h, l, c)
-                except: atr = None
+                except Exception: atr = None
                 stop   = plan.get("stop",   price * (0.985 if sig == "BUY" else 1.015))
                 target = plan.get("exit",   price * (1.030 if sig == "BUY" else 0.970))
                 atr_d  = (atr * ATR_MULTIPLIER) if atr else abs(price - stop)
@@ -3079,7 +3084,7 @@ def _backtest_coin(pair, bt_limit=720, bt_interval=5):
         else:
             p     = position
             side  = p["side"]
-            price = closes[i - 1]
+            price = closes[i]
             p["bars"] += 1
 
             # Trail stop ratchet
@@ -3119,6 +3124,9 @@ def _cmd_backtest(trader):
         per_coin   = {}
         errors     = []
 
+        with _gate_counter_lock:
+            _saved_gates = dict(_gate_counters)
+
         for coin in SCAN_UNIVERSE[:10]:
             try:
                 trades = _backtest_coin(coin["pair"])
@@ -3128,6 +3136,9 @@ def _cmd_backtest(trader):
             except Exception as e:
                 errors.append(coin["name"])
                 log("BT", f"{coin['name']}: {e}", "ERR")
+
+        with _gate_counter_lock:
+            _gate_counters.update(_saved_gates)
 
         if not all_trades:
             tg("⚠️ *Backtest: zero trades generated.*\n"
@@ -3850,8 +3861,10 @@ def trading_loop(trader):
                     ranked_ts   = now_ts
                     _print_rank_table(ranked_list)
                     # Update market breadth for confidence scoring
-                    _market_breadth["above"] = sum(1 for s in ranked_list if s.get("above_ema"))
-                    _market_breadth["total"] = len(ranked_list)
+                    _market_breadth = {
+                        "above": sum(1 for s in ranked_list if s.get("above_ema")),
+                        "total": len(ranked_list),
+                    }
                 except Exception as e:
                     log("TRADE", f"rank_coins: {e}", "ERR")
 
@@ -4049,7 +4062,7 @@ def trading_loop(trader):
                         # R:R gate: skip entry when reward doesn't justify the risk
                         _rr_reward = (target - price) if sig == "BUY" else (price - target)
                         _rr_risk   = (price - stop)   if sig == "BUY" else (stop - price)
-                        if _rr_risk > 0 and _rr_reward / _rr_risk < MIN_RR_RATIO:
+                        if _rr_risk <= 0 or _rr_reward / _rr_risk < MIN_RR_RATIO:
                             with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
                             last_sigs[pair] = sig
                             continue
@@ -4058,14 +4071,15 @@ def trading_loop(trader):
                         leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * conf)
                         arrow    = "↑" if sig == "BUY" else "↓"
                         conf_pct = f"{int(conf*100)}%"
+                        _rr_str  = f"{_rr_reward / _rr_risk:.1f}"
                         log("SIGNAL", (f"{_c(sig_col, f'{arrow} {sig} {cname}')}  "
                                        f"${price:.4f}  target ${target:.4f}  stop ${stop:.4f}  "
-                                       f"R:R {_rr_reward/_rr_risk:.1f}  "
+                                       f"R:R {_rr_str}  "
                                        f"conf {_c(conf_col, conf_pct)}  {leverage}x"))
                         emoji    = "🟢" if sig == "BUY" else "🔴"
                         tg(f"{emoji} *{sig} Signal — {coin['name']}*\n"
                            f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
-                           f"R:R: `{_rr_reward/_rr_risk:.1f}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
+                           f"R:R: `{_rr_str}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
                         trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
                                          atr=atr, fkey=fkey, pillars=pillars)
@@ -4330,11 +4344,12 @@ def _web_chart_png():
     trader = _web_trader_ref[0] if _web_trader_ref else None
     pair = entry = entry_side = trail_stop = None
     if trader and trader.positions:
-        pair = next(iter(trader.positions))
-        pos  = trader.positions[pair]
-        entry      = pos["entry"]
-        entry_side = pos["side"]
-        trail_stop = pos.get("trail_stop")
+        snap = dict(trader.positions)  # snapshot avoids TOCTOU race with _close()
+        if snap:
+            pair, pos  = next(iter(snap.items()))
+            entry      = pos["entry"]
+            entry_side = pos["side"]
+            trail_stop = pos.get("trail_stop")
     if not pair:
         pair = _current_coin.get("pair")
     if not pair:
