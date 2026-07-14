@@ -3818,85 +3818,236 @@ _DASHBOARD_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CryptoBot Live</title>
+<title>CryptoBot</title>
 <style>
+:root {
+  --bg:       #07101f;
+  --surface:  #0d1a2e;
+  --border:   #192d47;
+  --border2:  #223d5e;
+  --text:     #ddeeff;
+  --muted:    #4a6a8a;
+  --green:    #00d47e;
+  --red:      #ff3d57;
+  --blue:     #4d8fff;
+  --yellow:   #ffb020;
+  --fn: 'SF Mono','Fira Mono',ui-monospace,monospace;
+  --fu: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh}
-header{background:#161b22;border-bottom:1px solid #21262d;padding:14px 20px;display:flex;align-items:center;gap:12px}
-header h1{font-size:1.1rem;font-weight:600;color:#58a6ff}
-.dot{width:8px;height:8px;border-radius:50%;background:#3fb950;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px}
-.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:14px 16px}
-.card label{font-size:.72rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:4px}
-.val{font-size:1.35rem;font-weight:600}
-.green{color:#3fb950}.red{color:#f85149}.blue{color:#58a6ff}
-.section{padding:0 16px 8px;font-size:.75rem;color:#6e7681;text-transform:uppercase;letter-spacing:.06em}
-.pos-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;margin:0 16px 8px;display:flex;justify-content:space-between;align-items:center}
-.pos-card .name{font-weight:600;font-size:1rem}
-.pos-card .meta{font-size:.8rem;color:#6e7681;margin-top:2px}
-.chart-wrap{margin:0 16px 16px;background:#161b22;border:1px solid #21262d;border-radius:8px;overflow:hidden}
+body{background:var(--bg);color:var(--text);font-family:var(--fu);min-height:100vh;-webkit-font-smoothing:antialiased}
+
+/* ── Header ── */
+header{
+  padding:13px 16px 11px;
+  display:flex;align-items:center;gap:10px;
+  background:linear-gradient(180deg,#0c1e38 0%,var(--bg) 100%);
+  border-bottom:1px solid var(--border);
+}
+.logo{font-size:.78rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--blue)}
+.live-badge{
+  display:flex;align-items:center;gap:5px;
+  background:rgba(0,212,126,.09);border:1px solid rgba(0,212,126,.22);
+  border-radius:20px;padding:3px 9px;
+  font-size:.62rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--green);
+}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.8)}}
+.countdown{margin-left:auto;font-family:var(--fn);font-size:.65rem;color:var(--muted)}
+
+/* ── Stats grid ── */
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:14px 14px 0}
+
+.card{
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:13px 14px;position:relative;overflow:hidden;
+}
+.card::before{
+  content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
+  border-radius:8px 0 0 8px;background:var(--stripe,var(--border2));
+  transition:background .4s;
+}
+.card.c-blue  {--stripe:var(--blue)}
+.card.c-green {--stripe:var(--green)}
+.card.c-red   {--stripe:var(--red)}
+.card.c-muted {--stripe:var(--muted)}
+
+.card-lbl{font-size:.62rem;letter-spacing:.11em;text-transform:uppercase;color:var(--muted);margin-bottom:7px}
+.card-val{font-family:var(--fn);font-size:1.4rem;font-weight:600;line-height:1;font-variant-numeric:tabular-nums}
+.card-val.green{color:var(--green)}
+.card-val.red  {color:var(--red)}
+.card-val.blue {color:var(--blue)}
+.card-val.sm   {font-size:1.1rem}
+
+.wr-bar{margin-top:8px;height:3px;background:var(--border2);border-radius:2px;overflow:hidden}
+.wr-fill{height:100%;border-radius:2px;background:var(--blue);transition:width .7s ease,background .4s}
+
+/* ── Section divider ── */
+.sec{
+  display:flex;align-items:center;gap:9px;
+  padding:16px 14px 8px;
+}
+.sec span{font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);white-space:nowrap}
+.sec::after{content:'';flex:1;height:1px;background:var(--border)}
+
+/* ── Position cards ── */
+.pos-wrap{padding:0 14px}
+.pos-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:12px 14px;margin-bottom:8px;
+  display:flex;justify-content:space-between;align-items:center;
+}
+.pos-name{font-weight:600;font-size:.95rem}
+.pos-meta{font-size:.7rem;color:var(--muted);margin-top:3px}
+.chip{
+  display:inline-block;font-size:.58rem;font-weight:700;
+  letter-spacing:.07em;text-transform:uppercase;
+  padding:2px 7px;border-radius:4px;margin-right:7px;
+}
+.chip-long {background:rgba(0,212,126,.13);color:var(--green);border:1px solid rgba(0,212,126,.28)}
+.chip-short{background:rgba(255,61,87,.11); color:var(--red);  border:1px solid rgba(255,61,87,.24)}
+.pos-pnl{font-family:var(--fn);font-size:1.1rem;font-weight:600;font-variant-numeric:tabular-nums}
+.no-pos{padding:0 14px 6px;font-size:.78rem;color:var(--muted)}
+
+/* ── Chart ── */
+.chart-wrap{
+  margin:0 14px 16px;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden;
+}
 .chart-wrap img{width:100%;display:block}
-footer{text-align:center;padding:16px;color:#6e7681;font-size:.72rem}
-@media(max-width:600px){.grid{grid-template-columns:1fr 1fr}}
+
+/* ── Footer ── */
+footer{
+  padding:11px 16px 22px;text-align:center;
+  font-size:.65rem;color:var(--muted);border-top:1px solid var(--border);
+}
+
+/* ── Animations ── */
+.card,.pos-card{animation:up .28s ease both}
+@keyframes up{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
+
 <header>
-  <div class="dot"></div>
-  <h1>&#9679; CryptoBot Live</h1>
-  <span style="margin-left:auto;font-size:.75rem;color:#6e7681" id="ts">Loading…</span>
+  <div class="logo">CryptoBot</div>
+  <div class="live-badge"><div class="live-dot"></div>Live</div>
+  <div class="countdown" id="cd">—</div>
 </header>
 
-<div class="grid">
-  <div class="card"><label>Balance</label><div class="val blue" id="balance">—</div></div>
-  <div class="card"><label>Today P&L</label><div class="val" id="day_pnl">—</div></div>
-  <div class="card"><label>Win Rate</label><div class="val" id="wr">—</div></div>
-  <div class="card"><label>Positions</label><div class="val" id="pos_count">—</div></div>
-  <div class="card"><label>Trades</label><div class="val" id="trades">—</div></div>
-  <div class="card"><label>Watching</label><div class="val blue" id="coin">—</div></div>
+<div class="stats">
+  <div class="card c-blue">
+    <div class="card-lbl">Balance</div>
+    <div class="card-val blue" id="balance">—</div>
+  </div>
+  <div class="card" id="pnl_card">
+    <div class="card-lbl">Today P&amp;L</div>
+    <div class="card-val" id="day_pnl">—</div>
+  </div>
+  <div class="card c-muted">
+    <div class="card-lbl">Win Rate</div>
+    <div class="card-val blue" id="wr">—</div>
+    <div class="wr-bar"><div class="wr-fill" id="wr_fill" style="width:0%"></div></div>
+  </div>
+  <div class="card c-muted">
+    <div class="card-lbl">Positions</div>
+    <div class="card-val" id="pos_count">—</div>
+  </div>
+  <div class="card c-muted">
+    <div class="card-lbl">Trades</div>
+    <div class="card-val" id="trades">—</div>
+  </div>
+  <div class="card c-blue">
+    <div class="card-lbl">Watching</div>
+    <div class="card-val blue sm" id="coin">—</div>
+  </div>
 </div>
 
-<div class="section" id="pos_title"></div>
-<div id="pos_list"></div>
+<div class="sec" id="pos_sec" style="display:none"><span>Open Positions</span></div>
+<div class="pos-wrap" id="pos_list"></div>
 
-<div class="section">Live Chart</div>
-<div class="chart-wrap"><img id="chart" src="/chart.png" alt="chart"></div>
+<div class="sec"><span>Live Chart</span></div>
+<div class="chart-wrap">
+  <img id="chart" src="/chart.png" alt="Live chart" onerror="this.style.opacity='.25'">
+</div>
 
-<footer>Auto-refreshes every 30 s &nbsp;&middot;&nbsp; CryptoBot</footer>
+<footer>Refreshes every 30 s &nbsp;&middot;&nbsp; CryptoBot</footer>
+
 <script>
-async function fetchStatus(){
-  try{
-    const d=await(await fetch('/status')).json();
-    document.getElementById('balance').textContent='$'+d.balance.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
-    const el=document.getElementById('day_pnl');
-    el.textContent=(d.day_pnl>=0?'+':'')+d.day_pnl.toFixed(2)+'$';
-    el.className='val '+(d.day_pnl>=0?'green':'red');
-    document.getElementById('wr').textContent=d.win_rate.toFixed(0)+'%';
-    document.getElementById('pos_count').textContent=d.positions;
-    document.getElementById('trades').textContent=d.trades;
-    document.getElementById('coin').textContent=d.coin;
-    document.getElementById('ts').textContent='Updated '+new Date().toLocaleTimeString();
-    const title=document.getElementById('pos_title');
-    const list=document.getElementById('pos_list');
-    if(d.open_positions&&d.open_positions.length){
-      title.textContent='Open Positions';
-      list.innerHTML=d.open_positions.map(p=>{
-        const cls=p.unrealized_pnl>=0?'green':'red';
-        const icon=p.side==='LONG'?'&#x1F7E2; L':'&#x1F534; S';
-        return'<div class="pos-card"><div><div class="name">'+icon+' '+p.name+'</div>'
-          +'<div class="meta">Entry $'+p.entry.toFixed(4)+' &middot; '+p.leverage+'x</div></div>'
-          +'<div class="val '+cls+'">'+(p.unrealized_pnl>=0?'+':'')+p.unrealized_pnl.toFixed(2)+'$</div></div>';
+let secs = 30;
+
+function money(n) {
+  const s = Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  return (n < 0 ? '−$' : '$') + s;
+}
+function moneySign(n) {
+  const s = Math.abs(n).toFixed(2);
+  return (n >= 0 ? '+$' : '−$') + s;
+}
+
+async function fetchStatus() {
+  try {
+    const d = await (await fetch('/status')).json();
+
+    document.getElementById('balance').textContent = money(d.balance);
+
+    const pnl = d.day_pnl;
+    const pnlEl   = document.getElementById('day_pnl');
+    const pnlCard = document.getElementById('pnl_card');
+    pnlEl.textContent  = moneySign(pnl);
+    pnlEl.className    = 'card-val ' + (pnl >= 0 ? 'green' : 'red');
+    pnlCard.style.cssText += pnl >= 0
+      ? ';--stripe:var(--green)' : ';--stripe:var(--red)';
+
+    const wr = d.win_rate;
+    document.getElementById('wr').textContent = wr.toFixed(0) + '%';
+    const fill = document.getElementById('wr_fill');
+    fill.style.width      = wr + '%';
+    fill.style.background = wr >= 50 ? 'var(--green)' : wr >= 35 ? 'var(--yellow)' : 'var(--red)';
+
+    document.getElementById('pos_count').textContent = d.positions;
+    document.getElementById('trades').textContent     = d.trades.toLocaleString();
+    document.getElementById('coin').textContent       = d.coin;
+
+    const sec  = document.getElementById('pos_sec');
+    const list = document.getElementById('pos_list');
+    if (d.open_positions && d.open_positions.length) {
+      sec.style.display = '';
+      list.innerHTML = d.open_positions.map(p => {
+        const sign = p.unrealized_pnl >= 0;
+        const chip = p.side === 'LONG'
+          ? '<span class="chip chip-long">Long</span>'
+          : '<span class="chip chip-short">Short</span>';
+        return '<div class="pos-card">' +
+          '<div>' +
+            '<div class="pos-name">' + chip + p.name + '</div>' +
+            '<div class="pos-meta">Entry $' + p.entry.toFixed(4) + ' &middot; ' + p.leverage + 'x leverage</div>' +
+          '</div>' +
+          '<div class="pos-pnl ' + (sign ? 'green' : 'red') + '">' + moneySign(p.unrealized_pnl) + '</div>' +
+        '</div>';
       }).join('');
-    }else{title.textContent='';list.innerHTML='';}
-  }catch(e){console.warn('status error',e);}
+    } else {
+      sec.style.display = 'none';
+      list.innerHTML = '';
+    }
+
+    secs = 30;
+  } catch(e) { console.warn(e); }
 }
-function refreshChart(){
-  document.getElementById('chart').src='/chart.png?t='+Date.now();
+
+function refreshChart() {
+  document.getElementById('chart').src = '/chart.png?t=' + Date.now();
 }
+
+function tick() {
+  secs--;
+  if (secs <= 0) { fetchStatus(); refreshChart(); secs = 30; }
+  document.getElementById('cd').textContent = 'refresh in ' + secs + 's';
+}
+
 fetchStatus();
-setInterval(fetchStatus,30000);
-setInterval(refreshChart,30000);
+setInterval(tick, 1000);
 </script>
 </body>
 </html>"""
