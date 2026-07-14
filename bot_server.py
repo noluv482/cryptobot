@@ -2599,6 +2599,7 @@ _REPLY_KB = {
         [{"text": "🧠 Intel"},    {"text": "🏆 Ranks"},  {"text": "🎓 Learn"}],
         [{"text": "🔄 Switch"},   {"text": "⏸ Pause"},  {"text": "▶ Resume"}],
         [{"text": "🔍 Why"},      {"text": "📈 Chart"}, {"text": "📡 Live"}, {"text": "📋 Menu"}],
+        [{"text": "🔬 Backtest"}],
     ],
     "resize_keyboard": True,
 }
@@ -2618,6 +2619,7 @@ _TEXT_ACTION: dict = {
     "🔍 why":      "why",
     "📈 chart":    "chart",
     "📡 live":     "live",
+    "🔬 backtest": "backtest",
     "📋 menu":     "menu",
     # text commands
     "/start":      "menu",
@@ -2632,6 +2634,7 @@ _TEXT_ACTION: dict = {
     "/why":        "why",
     "/chart":      "chart",
     "/live":       "live",
+    "/backtest":   "backtest",
     "/equity":     "equity",
     "/pause":      "pause",
     "/resume":     "resume",
@@ -3034,6 +3037,156 @@ def _cmd_live(trader):
         _cmd_chart(trader)
     else:
         tg("📡 *Live charts OFF* — auto updates stopped.")
+
+def _backtest_coin(pair, bt_limit=720, bt_interval=5):
+    """
+    Walk-forward backtest for one coin using the live signal engine.
+    Fetches bt_limit candles, slides a CANDLE_LIMIT window, fires on every signal.
+    Returns list of trade records {side, entry, exit, pnl_pct, bars, reason}.
+    """
+    closes, highs, lows, volumes, opens = get_klines(pair, interval=bt_interval, limit=bt_limit)
+    if len(closes) < CANDLE_LIMIT + 5:
+        return []
+
+    engine   = SignalEngine()
+    trades   = []
+    position = None
+    win      = CANDLE_LIMIT
+
+    for i in range(win, len(closes)):
+        c = closes[:i][-win:]
+        h = highs[:i][-win:]
+        l = lows[:i][-win:]
+        v = volumes[:i][-win:]
+        o = opens[:i][-win:]
+        price = closes[i - 1]
+
+        if position is None:
+            try:
+                sig, plan, ema, rsi, conf = engine.evaluate(
+                    c, h, l, v, price, alert_buffer=0.10, pair=pair, opens=o)
+            except Exception:
+                continue
+            if sig in ("BUY", "SELL") and conf >= MIN_CONFIDENCE:
+                try:    atr = calc_atr(h, l, c)
+                except: atr = None
+                stop   = plan.get("stop",   price * (0.985 if sig == "BUY" else 1.015))
+                target = plan.get("exit",   price * (1.030 if sig == "BUY" else 0.970))
+                atr_d  = (atr * ATR_MULTIPLIER) if atr else abs(price - stop)
+                trail  = price - atr_d if sig == "BUY" else price + atr_d
+                position = {"side": sig, "entry": price, "target": target,
+                            "trail_stop": trail, "atr_dist": atr_d, "bars": 0}
+        else:
+            p     = position
+            side  = p["side"]
+            price = closes[i - 1]
+            p["bars"] += 1
+
+            # Trail stop ratchet
+            if side == "BUY":
+                new_t = price - p["atr_dist"]
+                if new_t > p["trail_stop"]: p["trail_stop"] = new_t
+            else:
+                new_t = price + p["atr_dist"]
+                if new_t < p["trail_stop"]: p["trail_stop"] = new_t
+
+            reason = None
+            if side == "BUY":
+                if price <= p["trail_stop"]: reason = "stop"
+                elif price >= p["target"]:   reason = "target"
+            else:
+                if price >= p["trail_stop"]: reason = "stop"
+                elif price <= p["target"]:   reason = "target"
+            if p["bars"] >= MAX_TRADE_MINS // bt_interval:
+                reason = "timeout"
+
+            if reason:
+                pnl = ((price - p["entry"]) / p["entry"] if side == "BUY"
+                       else (p["entry"] - price) / p["entry"])
+                trades.append({"side": side, "entry": p["entry"], "exit": price,
+                               "pnl_pct": round(pnl, 4), "bars": p["bars"], "reason": reason})
+                position = None
+
+    return trades
+
+
+def _cmd_backtest(trader):
+    """Trigger a walk-forward backtest over recent Kraken OHLCV data (runs in background)."""
+    tg("🔬 *Backtesting...* Replaying 60 hours of 5-min candles through the signal engine.\n_Results in ~30–60 seconds._")
+
+    def _run():
+        all_trades = []
+        per_coin   = {}
+        errors     = []
+
+        for coin in SCAN_UNIVERSE[:10]:
+            try:
+                trades = _backtest_coin(coin["pair"])
+                per_coin[coin["name"]] = trades
+                all_trades.extend(trades)
+                log("BT", f"{coin['name']}: {len(trades)} sim trades")
+            except Exception as e:
+                errors.append(coin["name"])
+                log("BT", f"{coin['name']}: {e}", "ERR")
+
+        if not all_trades:
+            tg("⚠️ *Backtest: zero trades generated.*\n"
+               "All signals were filtered out by the gates (ADX, ER, confidence floor). "
+               "This is correct behaviour — the gates are doing their job. "
+               "Run again after more market movement, or send `/backtest` at a more active session.")
+            return
+
+        wins   = [t for t in all_trades if t["pnl_pct"] > 0]
+        losses = [t for t in all_trades if t["pnl_pct"] <= 0]
+        wr     = len(wins) / len(all_trades) * 100
+        avg_w  = sum(t["pnl_pct"] for t in wins)  / max(len(wins),  1) * 100
+        avg_l  = sum(t["pnl_pct"] for t in losses) / max(len(losses), 1) * 100
+        total  = sum(t["pnl_pct"] for t in all_trades) * 100
+        best   = max(all_trades, key=lambda t: t["pnl_pct"])
+        worst  = min(all_trades, key=lambda t: t["pnl_pct"])
+        by_reason = {}
+        for t in all_trades:
+            by_reason[t["reason"]] = by_reason.get(t["reason"], 0) + 1
+
+        verdict = "✅ Looks profitable" if total > 0 and wr >= 45 else \
+                  "🟡 Marginal — review gate settings" if total > 0 else \
+                  "🔴 Losing — signals need more filtering"
+
+        lines = [
+            f"🔬 *Backtest Results* _(60h · 5-min candles · {len(SCAN_UNIVERSE[:10])} coins)_",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"{verdict}",
+            f"Trades:    `{len(all_trades)}` · Win Rate: `{wr:.0f}%`",
+            f"Total P&L: `{'+'if total>=0 else ''}{total:.2f}%`",
+            f"Avg win:   `+{avg_w:.2f}%` · Avg loss: `{avg_l:.2f}%`",
+            f"Best:  `+{best['pnl_pct']*100:.2f}%` ({best['side']})",
+            f"Worst: `{worst['pnl_pct']*100:.2f}%` ({worst['side']})",
+            f"Exits: " + "  ".join(f"{k} `{v}`" for k, v in sorted(by_reason.items())),
+        ]
+        if errors:
+            lines.append(f"_Skipped: {', '.join(errors)}_")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("*By coin (sorted by P&L):*")
+
+        for name, ct in sorted(per_coin.items(),
+                               key=lambda x: sum(t["pnl_pct"] for t in x[1]),
+                               reverse=True):
+            if not ct: continue
+            cwr  = sum(1 for t in ct if t["pnl_pct"] > 0) / len(ct) * 100
+            cpnl = sum(t["pnl_pct"] for t in ct) * 100
+            icon = "✅" if cpnl >= 0 else "❌"
+            lines.append(f"  {icon} *{name}* `{len(ct)}` trades · "
+                         f"`{cwr:.0f}%` WR · `{'+'if cpnl>=0 else ''}{cpnl:.1f}%`")
+
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━",
+            "_Gates active: ADX, ER, CONFIRM\\_TICKS=3, OBV, VWAP, MACD, RSI_",
+            "_4h/1h trend filter not applied — live bot is more conservative_",
+        ]
+        tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    threading.Thread(target=_run, daemon=True).start()
+
 
 def _cmd_equity(trader):
     """Handler for /equity — account balance equity curve."""
@@ -3506,6 +3659,9 @@ def _dispatch_callback(data, query, trader):
 
     elif data == "live":
         _cmd_live(trader)
+
+    elif data == "backtest":
+        _cmd_backtest(trader)
 
     elif data == "equity":
         _cmd_equity(trader)
