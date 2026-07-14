@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from flask import Flask as _Flask, Response as _Response
 
 # ── Terminal colours ──────────────────────────────────────────────────────────
 _USE_COLOUR = sys.stdout.isatty() or os.environ.get("FORCE_COLOR", "0") == "1"
@@ -3808,6 +3809,163 @@ def trading_loop(trader):
             log("TRADE", str(e), "ERR")
         time.sleep(REFRESH_SEC)
 
+# ── Web Dashboard ─────────────────────────────────────────────────────────────
+_flask_app      = _Flask("cryptobot")
+_web_trader_ref: list = []   # filled in main(); list so route closures can mutate it
+
+_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CryptoBot Live</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh}
+header{background:#161b22;border-bottom:1px solid #21262d;padding:14px 20px;display:flex;align-items:center;gap:12px}
+header h1{font-size:1.1rem;font-weight:600;color:#58a6ff}
+.dot{width:8px;height:8px;border-radius:50%;background:#3fb950;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:14px 16px}
+.card label{font-size:.72rem;color:#6e7681;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:4px}
+.val{font-size:1.35rem;font-weight:600}
+.green{color:#3fb950}.red{color:#f85149}.blue{color:#58a6ff}
+.section{padding:0 16px 8px;font-size:.75rem;color:#6e7681;text-transform:uppercase;letter-spacing:.06em}
+.pos-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;margin:0 16px 8px;display:flex;justify-content:space-between;align-items:center}
+.pos-card .name{font-weight:600;font-size:1rem}
+.pos-card .meta{font-size:.8rem;color:#6e7681;margin-top:2px}
+.chart-wrap{margin:0 16px 16px;background:#161b22;border:1px solid #21262d;border-radius:8px;overflow:hidden}
+.chart-wrap img{width:100%;display:block}
+footer{text-align:center;padding:16px;color:#6e7681;font-size:.72rem}
+@media(max-width:600px){.grid{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div class="dot"></div>
+  <h1>&#9679; CryptoBot Live</h1>
+  <span style="margin-left:auto;font-size:.75rem;color:#6e7681" id="ts">Loading…</span>
+</header>
+
+<div class="grid">
+  <div class="card"><label>Balance</label><div class="val blue" id="balance">—</div></div>
+  <div class="card"><label>Today P&L</label><div class="val" id="day_pnl">—</div></div>
+  <div class="card"><label>Win Rate</label><div class="val" id="wr">—</div></div>
+  <div class="card"><label>Positions</label><div class="val" id="pos_count">—</div></div>
+  <div class="card"><label>Trades</label><div class="val" id="trades">—</div></div>
+  <div class="card"><label>Watching</label><div class="val blue" id="coin">—</div></div>
+</div>
+
+<div class="section" id="pos_title"></div>
+<div id="pos_list"></div>
+
+<div class="section">Live Chart</div>
+<div class="chart-wrap"><img id="chart" src="/chart.png" alt="chart"></div>
+
+<footer>Auto-refreshes every 30 s &nbsp;&middot;&nbsp; CryptoBot</footer>
+<script>
+async function fetchStatus(){
+  try{
+    const d=await(await fetch('/status')).json();
+    document.getElementById('balance').textContent='$'+d.balance.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    const el=document.getElementById('day_pnl');
+    el.textContent=(d.day_pnl>=0?'+':'')+d.day_pnl.toFixed(2)+'$';
+    el.className='val '+(d.day_pnl>=0?'green':'red');
+    document.getElementById('wr').textContent=d.win_rate.toFixed(0)+'%';
+    document.getElementById('pos_count').textContent=d.positions;
+    document.getElementById('trades').textContent=d.trades;
+    document.getElementById('coin').textContent=d.coin;
+    document.getElementById('ts').textContent='Updated '+new Date().toLocaleTimeString();
+    const title=document.getElementById('pos_title');
+    const list=document.getElementById('pos_list');
+    if(d.open_positions&&d.open_positions.length){
+      title.textContent='Open Positions';
+      list.innerHTML=d.open_positions.map(p=>{
+        const cls=p.unrealized_pnl>=0?'green':'red';
+        const icon=p.side==='LONG'?'&#x1F7E2; L':'&#x1F534; S';
+        return'<div class="pos-card"><div><div class="name">'+icon+' '+p.name+'</div>'
+          +'<div class="meta">Entry $'+p.entry.toFixed(4)+' &middot; '+p.leverage+'x</div></div>'
+          +'<div class="val '+cls+'">'+(p.unrealized_pnl>=0?'+':'')+p.unrealized_pnl.toFixed(2)+'$</div></div>';
+      }).join('');
+    }else{title.textContent='';list.innerHTML='';}
+  }catch(e){console.warn('status error',e);}
+}
+function refreshChart(){
+  document.getElementById('chart').src='/chart.png?t='+Date.now();
+}
+fetchStatus();
+setInterval(fetchStatus,30000);
+setInterval(refreshChart,30000);
+</script>
+</body>
+</html>"""
+
+@_flask_app.route("/")
+def _web_index():
+    return _DASHBOARD_HTML
+
+@_flask_app.route("/chart.png")
+def _web_chart_png():
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    pair = entry = entry_side = trail_stop = None
+    if trader and trader.positions:
+        pair = next(iter(trader.positions))
+        pos  = trader.positions[pair]
+        entry      = pos["entry"]
+        entry_side = pos["side"]
+        trail_stop = pos.get("trail_stop")
+    if not pair:
+        pair = _current_coin.get("pair")
+    if not pair:
+        return _Response("No data yet — bot is still starting up.", status=503, mimetype="text/plain")
+    buf = _make_price_chart(pair, entry=entry, entry_side=entry_side, trail_stop=trail_stop)
+    if not buf:
+        return _Response("Chart unavailable.", status=503, mimetype="text/plain")
+    return _Response(buf.read(), mimetype="image/png",
+                     headers={"Cache-Control": "no-store, no-cache"})
+
+@_flask_app.route("/status")
+def _web_status():
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    if not trader:
+        return _Response('{"error":"not ready"}', status=503, mimetype="application/json")
+    try:
+        day_pnl = round(trader.balance - trader.day_start_bal, 2)
+    except Exception:
+        day_pnl = 0.0
+    open_pos = []
+    for pr, p in dict(trader.positions).items():
+        try:
+            upnl = round(trader.unrealized_pnl(get_price(pr), pr), 2)
+        except Exception:
+            upnl = 0.0
+        open_pos.append({
+            "name":           p["name"],
+            "side":           p["side"],
+            "entry":          p["entry"],
+            "leverage":       p.get("leverage", 1),
+            "unrealized_pnl": upnl,
+        })
+    payload = {
+        "balance":        round(trader.balance, 2),
+        "day_pnl":        day_pnl,
+        "win_rate":       round(trader.win_rate, 1),
+        "trades":         len(trader.trades),
+        "positions":      len(trader.positions),
+        "coin":           _current_coin.get("name", "—"),
+        "open_positions": open_pos,
+    }
+    return _Response(json.dumps(payload), mimetype="application/json")
+
+def _start_web_server(trader):
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
+    _web_trader_ref.append(trader)
+    port = int(os.environ.get("PORT", 8080))
+    log("WEB", f"Dashboard → http://0.0.0.0:{port}")
+    _flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     global _current_coin
@@ -3862,6 +4020,7 @@ def main():
         ("Open interest",     _oi_loop,             ()),
         ("Econ calendar",     _econ_calendar_loop,  ()),
         ("Price alerts",      _alert_loop,          (trader,)),
+        ("Web dashboard",     _start_web_server,    (trader,)),
     ]
     for name, fn, args in threads:
         threading.Thread(target=fn, args=args, daemon=True).start()
