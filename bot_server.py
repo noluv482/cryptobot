@@ -1635,6 +1635,11 @@ class PaperTrader:
                          margin=margin, fee=fee,
                          balance=self.balance,
                          stop_type=stop_label)
+        _p = self.positions[pair]
+        threading.Thread(target=_send_position_chart,
+                         args=(pair, _p["entry"], _p["side"],
+                               _p.get("trail_stop")),
+                         daemon=True).start()
 
     def _close(self, price, name, reason, pair):
         global _paused
@@ -1720,6 +1725,11 @@ class PaperTrader:
                f"_{new_rank['unlock']}_\nNext: {nxt['emoji']} {nxt['name']} @ `${nxt['min']:,.0f}`")
             self.current_rank = new_rank["name"]
 
+        threading.Thread(target=_send_position_chart,
+                         args=(pair, p["entry"], p["side"],
+                               p.get("trail_stop")),
+                         kwargs={"exit_price": fill, "exit_pnl": pnl},
+                         daemon=True).start()
         del self.positions[pair]
         self._save()
 
@@ -2385,6 +2395,7 @@ _TEXT_ACTION: dict = {
     "/learn":      "learn",
     "/why":        "why",
     "/chart":      "chart",
+    "/equity":     "equity",
     "/pause":      "pause",
     "/resume":     "resume",
     "/close":      "force_close",
@@ -2536,74 +2547,286 @@ def _readiness_score(trader):
     ]
     return score, breakdown
 
+_CHART_COLORS = {
+    "BG_DARK":  "#0d1117",
+    "BG_PANEL": "#161b22",
+    "GREEN":    "#3fb950",
+    "RED":      "#f85149",
+    "ACCENT":   "#58a6ff",
+    "YELLOW":   "#e3b341",
+    "GRID":     "#21262d",
+    "TEXT":     "#c9d1d9",
+    "MUTED":    "#8b949e",
+}
+
+def _make_price_chart(pair, entry=None, entry_side=None,
+                      trail_stop=None, exit_price=None, exit_pnl=None):
+    """Generate a dark-theme candlestick + RSI chart for a pair.
+    Optionally marks an open/closed trade position.
+    Returns a BytesIO PNG buffer, or None on failure."""
+    try:
+        closes, highs, lows, volumes, opens = get_klines(pair, limit=60)
+    except Exception as e:
+        log("CHART", f"klines failed {pair}: {e}", "ERR")
+        return None
+    try:
+        n   = len(closes)
+        x   = list(range(n))
+        col = _CHART_COLORS
+        price = closes[-1]
+        pair_name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+
+        # ── EMA series ────────────────────────────────────────────────────────
+        ema_series = []
+        if n >= EMA_PERIOD:
+            k   = 2.0 / (EMA_PERIOD + 1)
+            ema = sum(closes[:EMA_PERIOD]) / EMA_PERIOD
+            ema_series = [None] * EMA_PERIOD
+            for c2 in closes[EMA_PERIOD:]:
+                ema = c2 * k + ema * (1 - k)
+                ema_series.append(ema)
+
+        # ── Rolling RSI series ────────────────────────────────────────────────
+        rsi_series = []
+        if n >= RSI_PERIOD + 1:
+            g_list, l_list = [], []
+            for i in range(1, RSI_PERIOD + 1):
+                d = closes[i] - closes[i-1]
+                g_list.append(max(d, 0)); l_list.append(max(-d, 0))
+            ag = sum(g_list) / RSI_PERIOD
+            al = sum(l_list) / RSI_PERIOD
+            for i in range(RSI_PERIOD, n):
+                d  = closes[i] - closes[i-1]
+                ag = (ag*(RSI_PERIOD-1) + max(d, 0)) / RSI_PERIOD
+                al = (al*(RSI_PERIOD-1) + max(-d, 0)) / RSI_PERIOD
+                if al == 0 and ag == 0: rsi_series.append(50.0)
+                elif al == 0: rsi_series.append(100.0)
+                else: rsi_series.append(round(100 - 100 / (1 + ag / al), 1))
+
+        # ── Figure layout ─────────────────────────────────────────────────────
+        has_rsi = len(rsi_series) > 0
+        if has_rsi:
+            fig, (ax1, ax2) = plt.subplots(
+                2, 1, figsize=(11, 7),
+                gridspec_kw={"height_ratios": [3, 1]}, sharex=True)
+        else:
+            fig, ax1 = plt.subplots(figsize=(11, 6))
+            ax2 = None
+        fig.patch.set_facecolor(col["BG_DARK"])
+
+        for ax in ([ax1, ax2] if ax2 else [ax1]):
+            ax.set_facecolor(col["BG_PANEL"])
+            ax.tick_params(colors=col["MUTED"], labelsize=7.5)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(col["GRID"])
+            ax.grid(color=col["GRID"], linewidth=0.5, zorder=0)
+
+        # ── Candlesticks ──────────────────────────────────────────────────────
+        for i in x:
+            o, c2, h, l = opens[i], closes[i], highs[i], lows[i]
+            color = col["GREEN"] if c2 >= o else col["RED"]
+            ax1.plot([i, i], [l, h], color=color, linewidth=0.8, zorder=2)
+            height = max(abs(c2 - o), price * 0.00005)
+            ax1.bar(i, height, bottom=min(o, c2), color=color,
+                    width=0.6, zorder=3, alpha=0.85)
+
+        # ── EMA overlay ───────────────────────────────────────────────────────
+        if ema_series:
+            ex = [i for i, v in enumerate(ema_series) if v is not None]
+            ey = [v for v in ema_series if v is not None]
+            ax1.plot(ex, ey, color=col["ACCENT"], linewidth=1.2,
+                     alpha=0.80, zorder=4, label="EMA")
+
+        # ── Position markers ──────────────────────────────────────────────────
+        right = n + 1  # x coord for right-side labels
+        if entry is not None and entry_side:
+            ec = col["GREEN"] if entry_side == "LONG" else col["RED"]
+            ax1.axhline(entry, color=ec, linewidth=1.3, alpha=0.9, zorder=5)
+            ax1.annotate(f" Entry ${entry:.4f}", xy=(right, entry),
+                         color=ec, fontsize=7.5, va="center", fontweight="bold",
+                         annotation_clip=False)
+        if trail_stop is not None:
+            ax1.axhline(trail_stop, color=col["RED"], linewidth=0.9,
+                        linestyle=":", alpha=0.75, zorder=5)
+            ax1.annotate(f" Stop ${trail_stop:.4f}", xy=(right, trail_stop),
+                         color=col["RED"], fontsize=7, va="center",
+                         annotation_clip=False)
+        if exit_price is not None:
+            ec2 = col["GREEN"] if (exit_pnl or 0) >= 0 else col["RED"]
+            ax1.axhline(exit_price, color=ec2, linewidth=1.3,
+                        linestyle="--", alpha=0.9, zorder=5)
+            pnl_str = f"  {exit_pnl:+.2f}$" if exit_pnl is not None else ""
+            ax1.annotate(f" Exit ${exit_price:.4f}{pnl_str}", xy=(right, exit_price),
+                         color=ec2, fontsize=7.5, va="center", fontweight="bold",
+                         annotation_clip=False)
+
+        # Shade between entry and current/exit
+        if entry is not None and entry_side:
+            ref = exit_price if exit_price is not None else price
+            profitable = (ref > entry and entry_side == "LONG") or \
+                         (ref < entry and entry_side == "SHORT")
+            ax1.fill_between(x, min(entry, ref), max(entry, ref),
+                             alpha=0.09,
+                             color=col["GREEN"] if profitable else col["RED"],
+                             zorder=1)
+
+        ax1.annotate(f" ${price:.4f}", xy=(right, price),
+                     color=col["TEXT"], fontsize=8, va="center",
+                     annotation_clip=False)
+        ax1.set_ylabel(f"{pair_name}", color=col["MUTED"], fontsize=9)
+        ax1.set_xlim(-0.5, n + 7)
+
+        # ── RSI subplot ───────────────────────────────────────────────────────
+        if ax2 and rsi_series:
+            rsi_x = list(range(RSI_PERIOD, n))
+            ax2.plot(rsi_x, rsi_series, color=col["ACCENT"],
+                     linewidth=1.0, zorder=2)
+            ax2.fill_between(rsi_x, 30, 70, alpha=0.05,
+                             color=col["MUTED"], zorder=1)
+            ax2.axhline(70, color=col["RED"],   linewidth=0.6,
+                        linestyle="--", alpha=0.5)
+            ax2.axhline(30, color=col["GREEN"], linewidth=0.6,
+                        linestyle="--", alpha=0.5)
+            cur_rsi = rsi_series[-1]
+            rc = col["RED"] if cur_rsi >= 70 else \
+                 col["GREEN"] if cur_rsi <= 30 else col["MUTED"]
+            ax2.annotate(f" {cur_rsi:.0f}", xy=(n - 1 + 1, cur_rsi),
+                         color=rc, fontsize=7.5, va="center",
+                         annotation_clip=False)
+            ax2.set_ylim(0, 100)
+            ax2.set_yticks([30, 50, 70])
+            ax2.set_ylabel("RSI", color=col["MUTED"], fontsize=8)
+        if ax2:
+            ax2.set_xticks([])
+        ax1.set_xticks([])
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        itvl = f"{INTERVAL}m"
+        if entry is not None and entry_side:
+            side_icon = "🟢 LONG" if entry_side == "LONG" else "🔴 SHORT"
+            if exit_price is None:
+                move = (price - entry) / entry * 100
+                if entry_side == "SHORT": move = -move
+                title = (f"{pair_name} {itvl}  |  {side_icon} @ ${entry:.4f}"
+                         f"  |  {'+'if move>=0 else ''}{move:.2f}%")
+            else:
+                pnl_str = f"{exit_pnl:+.2f}$" if exit_pnl is not None else ""
+                ok = "✅" if (exit_pnl or 0) >= 0 else "❌"
+                title = f"{pair_name} {itvl}  |  CLOSED {ok}  {pnl_str}"
+        else:
+            title = f"{pair_name}  {itvl}  |  ${price:.4f}"
+
+        fig.suptitle(title, color=col["TEXT"], fontsize=10,
+                     x=0.02, y=0.998, ha="left")
+        fig.tight_layout(rect=[0, 0, 1, 0.98])
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+    except Exception as e:
+        log("CHART", f"_make_price_chart {pair}: {e}", "ERR")
+        try: plt.close("all")
+        except Exception: pass
+        return None
+
+def _send_position_chart(pair, entry, entry_side, trail_stop,
+                         exit_price=None, exit_pnl=None):
+    """Fire-and-forget: generate and send a price chart for a pair/position.
+    All position data passed explicitly to avoid race with position deletion."""
+    try:
+        buf = _make_price_chart(pair,
+                                entry=entry, entry_side=entry_side,
+                                trail_stop=trail_stop,
+                                exit_price=exit_price, exit_pnl=exit_pnl)
+        if buf:
+            pair_name = next((c["name"] for c in SCAN_UNIVERSE
+                              if c["pair"] == pair), pair)
+            if exit_price is None:
+                caption = f"📂 *{pair_name}* — position open"
+            else:
+                ok = "✅" if (exit_pnl or 0) >= 0 else "❌"
+                pnl_str = f"{exit_pnl:+.2f}$" if exit_pnl is not None else ""
+                caption = f"{ok} *{pair_name}* closed  {pnl_str}"
+            tg_photo(buf, caption)
+    except Exception as e:
+        log("CHART", f"_send_position_chart {pair}: {e}", "ERR")
+
 def _cmd_chart(trader):
-    """Handler for /chart — sends an equity curve graph as a Telegram photo."""
+    """Handler for /chart — live candlestick chart of current coin or open position."""
+    # Prefer the first open position; fall back to the current top coin
+    pair = None
+    if trader.positions:
+        pair = next(iter(trader.positions))
+    if not pair:
+        pair = _current_coin.get("pair")
+    if not pair:
+        tg("📊 No coin selected yet — bot hasn't scanned yet. Try again in a moment.")
+        return
+
+    pos = trader.positions.get(pair)
+    entry      = pos["entry"]           if pos else None
+    entry_side = pos["side"]            if pos else None
+    trail_stop = pos.get("trail_stop")  if pos else None
+    buf = _make_price_chart(pair, entry=entry, entry_side=entry_side,
+                            trail_stop=trail_stop)
+    if not buf:
+        tg("⚠️ Couldn't fetch chart data right now — try again in a moment.")
+        return
+    pair_name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+    status = "📂 position open" if pos else "📡 scanning"
+    tg_photo(buf, f"📊 *{pair_name}* — {status}")
+
+def _cmd_equity(trader):
+    """Handler for /equity — account balance equity curve."""
     trades = trader.trades
     if not trades:
         tg("📊 No trade history yet — make some trades first and then check back!")
         return
 
-    # Build equity curve: balance after each closed trade
-    balances  = [PAPER_START]
-    timestamps = [trades[0]["ts"] - 60]  # synthetic start point 1 min before first trade
+    balances   = [PAPER_START]
+    timestamps = [trades[0]["ts"] - 60]
     for t in trades:
         balances.append(round(balances[-1] + t["pnl"], 2))
         timestamps.append(t["ts"])
     dates = [datetime.utcfromtimestamp(ts) for ts in timestamps]
 
-    wins    = sum(1 for t in trades if t["pnl"] > 0)
-    wr      = wins / len(trades) * 100
+    wins      = sum(1 for t in trades if t["pnl"] > 0)
+    wr        = wins / len(trades) * 100
     total_pnl = trader.balance - PAPER_START
     pnl_sign  = "+" if total_pnl >= 0 else ""
-
-    # ── Dark-theme chart ───────────────────────────────────────────────────────
-    BG_DARK  = "#0d1117"
-    BG_PANEL = "#161b22"
-    ACCENT   = "#58a6ff"
-    GREEN    = "#3fb950"
-    RED      = "#f85149"
-    GRID     = "#21262d"
-    TEXT     = "#c9d1d9"
-    MUTED    = "#8b949e"
+    col = _CHART_COLORS
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    fig.patch.set_facecolor(BG_DARK)
-    ax.set_facecolor(BG_PANEL)
+    fig.patch.set_facecolor(col["BG_DARK"])
+    ax.set_facecolor(col["BG_PANEL"])
 
-    # Equity line
-    ax.plot(dates, balances, color=ACCENT, linewidth=2, zorder=2)
-
-    # Shaded area: green above start, red below
+    ax.plot(dates, balances, color=col["ACCENT"], linewidth=2, zorder=2)
     ax.fill_between(dates, PAPER_START, balances,
                     where=[b >= PAPER_START for b in balances],
-                    alpha=0.20, color=GREEN, interpolate=True)
+                    alpha=0.20, color=col["GREEN"], interpolate=True)
     ax.fill_between(dates, PAPER_START, balances,
                     where=[b < PAPER_START for b in balances],
-                    alpha=0.20, color=RED, interpolate=True)
-
-    # Trade dots (skip the synthetic start point)
+                    alpha=0.20, color=col["RED"], interpolate=True)
     for i, t in enumerate(trades):
-        dt    = datetime.utcfromtimestamp(t["ts"])
-        bal   = balances[i + 1]
-        color = GREEN if t["pnl"] > 0 else RED
-        ax.scatter(dt, bal, color=color, s=22, zorder=3, edgecolors="none")
+        ax.scatter(datetime.utcfromtimestamp(t["ts"]), balances[i + 1],
+                   color=col["GREEN"] if t["pnl"] > 0 else col["RED"],
+                   s=22, zorder=3, edgecolors="none")
+    ax.axhline(PAPER_START, color=col["MUTED"], linestyle="--",
+               linewidth=0.8, alpha=0.6)
 
-    # Starting balance reference line
-    ax.axhline(PAPER_START, color=MUTED, linestyle="--", linewidth=0.8, alpha=0.6)
-
-    # Axis formatting
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
     fig.autofmt_xdate(rotation=30, ha="right")
-    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.tick_params(colors=col["MUTED"], labelsize=8)
     for spine in ax.spines.values():
-        spine.set_edgecolor(GRID)
-    ax.grid(color=GRID, linewidth=0.5, zorder=0)
-    ax.set_ylabel("Balance ($)", color=MUTED, fontsize=9)
-
-    # Title
-    title = (f"Balance: ${trader.balance:,.2f}  ({pnl_sign}{total_pnl:.2f}$)   "
-             f"WR {wr:.0f}%   {len(trades)} trades")
-    ax.set_title(title, color=TEXT, fontsize=10, pad=10)
+        spine.set_edgecolor(col["GRID"])
+    ax.grid(color=col["GRID"], linewidth=0.5, zorder=0)
+    ax.set_ylabel("Balance ($)", color=col["MUTED"], fontsize=9)
+    ax.set_title(f"Balance: ${trader.balance:,.2f}  ({pnl_sign}{total_pnl:.2f}$)"
+                 f"   WR {wr:.0f}%   {len(trades)} trades",
+                 color=col["TEXT"], fontsize=10, pad=10)
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -2611,7 +2834,6 @@ def _cmd_chart(trader):
                 facecolor=fig.get_facecolor())
     buf.seek(0)
     plt.close(fig)
-
     tg_photo(buf, f"📈 *Equity Curve* — `{len(trades)}` trades | WR `{wr:.0f}%` | `{pnl_sign}{total_pnl:.2f}$`")
 
 def _cmd_learn(trader):
@@ -3022,6 +3244,9 @@ def _dispatch_callback(data, query, trader):
 
     elif data == "chart":
         _cmd_chart(trader)
+
+    elif data == "equity":
+        _cmd_equity(trader)
 
     elif data == "news":
         active = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] != "NEUTRAL"]
