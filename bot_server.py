@@ -235,7 +235,7 @@ RSI_PERIOD    = 14
 CANDLE_LIMIT  = 60
 INTERVAL      = 5
 REFRESH_SEC   = 30
-CONFIRM_TICKS = 1
+CONFIRM_TICKS = 3      # consecutive candles past EMA required before signalling
 
 PAPER_START    = 100.0
 PAPER_TARGET   = 50000.0
@@ -267,6 +267,11 @@ MAX_SESSION_DD    = 0.12     # auto-pause if balance drops 12% from session peak
 VOLUME_FILTER_MULT= 1.5      # require 1.5× average volume before entering
 EXTREME_FUNDING   = 0.001    # 0.1% / 8h = overcrowded → use as contrarian booster
 ECON_BLACKOUT_MINS= 15       # block new entries this many minutes around high-impact events
+MIN_CONFIDENCE    = 0.50     # hard entry floor regardless of DB state (books: no weak bets)
+ADX_PERIOD        = 14       # Wilder ADX period
+ADX_MIN           = 20       # below this = no trend, skip entry
+ER_PERIOD         = 10       # Kaufman Efficiency Ratio lookback
+ER_MIN            = 0.25     # below this = random walk, skip entry
 
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 
@@ -710,6 +715,7 @@ _gate_counters = {
     "funding": 0, "divergence": 0, "nasdaq": 0, "fear_greed": 0,
     "btc_dom": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
     "pullback": 0, "momentum": 0, "rr_ratio": 0, "vwap": 0, "spike": 0, "daily_gain": 0,
+    "adx": 0, "efficiency": 0, "min_conf": 0,
 }
 _gate_counter_lock = threading.Lock()
 
@@ -857,6 +863,75 @@ def calc_atr(highs, lows, closes, period=ATR_PERIOD):
                    abs(lows[i]  - closes[i-1]))
                for i in range(1, len(closes))]
     return sum(tr_vals[-period:]) / period
+
+def calc_adx(highs, lows, closes, period=ADX_PERIOD):
+    """Wilder's Average Directional Index — trend strength 0-100.
+    ADX > 25 = strong trend; < 20 = weak/ranging (avoid entries)."""
+    if len(closes) < period * 2 + 1:
+        return 0.0
+    try:
+        plus_dm, minus_dm, tr_vals = [], [], []
+        for i in range(1, len(closes)):
+            up   = highs[i]  - highs[i-1]
+            down = lows[i-1] - lows[i]
+            plus_dm.append(up   if up > down and up > 0 else 0.0)
+            minus_dm.append(down if down > up and down > 0 else 0.0)
+            tr_vals.append(max(highs[i]-lows[i],
+                               abs(highs[i]-closes[i-1]),
+                               abs(lows[i]-closes[i-1])))
+        def _wilder_smooth(vals, p):
+            s = sum(vals[:p])
+            out = [s]
+            for v in vals[p:]:
+                s = s - s/p + v
+                out.append(s)
+            return out
+        atr14 = _wilder_smooth(tr_vals,  period)
+        pdm14 = _wilder_smooth(plus_dm,  period)
+        mdm14 = _wilder_smooth(minus_dm, period)
+        pdi   = [100*p/max(a,1e-9) for p, a in zip(pdm14, atr14)]
+        mdi   = [100*m/max(a,1e-9) for m, a in zip(mdm14, atr14)]
+        dx    = [100*abs(p-m)/max(p+m,1e-9) for p, m in zip(pdi, mdi)]
+        adx   = sum(dx[:period]) / period
+        for v in dx[period:]:
+            adx = (adx*(period-1) + v) / period
+        return round(adx, 1)
+    except Exception:
+        return 0.0
+
+def calc_efficiency_ratio(closes, period=ER_PERIOD):
+    """Kaufman Efficiency Ratio: |net price move| / sum(|bar moves|).
+    0.0 = random walk, 1.0 = perfectly directional. Only trade above ER_MIN."""
+    if len(closes) < period + 1:
+        return 0.0
+    try:
+        window     = closes[-(period+1):]
+        net_move   = abs(window[-1] - window[0])
+        total_move = sum(abs(window[i]-window[i-1]) for i in range(1, len(window)))
+        return round(net_move / max(total_move, 1e-9), 3)
+    except Exception:
+        return 0.0
+
+def calc_obv_trend(closes, volumes, period=10):
+    """On-Balance Volume trend over last `period` candles.
+    Returns 'RISING', 'FALLING', or 'FLAT'."""
+    if len(closes) < period + 2 or len(volumes) < period + 2:
+        return "FLAT"
+    try:
+        obv_vals = []
+        running  = 0.0
+        for i in range(1, len(closes)):
+            if   closes[i] > closes[i-1]: running += volumes[i]
+            elif closes[i] < closes[i-1]: running -= volumes[i]
+            obv_vals.append(running)
+        n = max(period // 2, 2)
+        recent_avg = sum(obv_vals[-n:])   / n
+        older_avg  = sum(obv_vals[-2*n:-n]) / n
+        if recent_avg > older_avg * 1.03:  return "RISING"
+        if recent_avg < older_avg * 0.97:  return "FALLING"
+        return "FLAT"
+    except Exception:
+        return "FLAT"
 
 def _in_active_hours():
     """Return True during the 07:00–21:00 UTC trading window."""
@@ -1589,10 +1664,15 @@ class PaperTrader:
             if _dgain >= DAILY_GAIN_HARD:
                 with _gate_counter_lock: _gate_counters["daily_gain"] += 1
                 return
-            min_conf = max(self._min_conf_threshold(pair), self._dynamic_conf_gate())
-            if sig == "BUY"  and self.can_open_new() and confidence >= min_conf:
+            min_conf = max(MIN_CONFIDENCE,
+                           self._min_conf_threshold(pair),
+                           self._dynamic_conf_gate())
+            if sig in ("BUY", "SELL") and confidence < min_conf:
+                with _gate_counter_lock: _gate_counters["min_conf"] += 1
+                return
+            if sig == "BUY"  and self.can_open_new():
                 self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
-            elif sig == "SELL" and self.can_open_new() and confidence >= min_conf:
+            elif sig == "SELL" and self.can_open_new():
                 self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
 
     def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None):
@@ -1872,6 +1952,15 @@ class SignalEngine:
             macd_bull = macd_bear = False
             macd_hist = 0.0
 
+        # ADX — Wilder's trend strength (Wilder 1978; Chan "Algorithmic Trading")
+        adx = calc_adx(highs, lows, closes)
+
+        # Kaufman Efficiency Ratio — directional quality of recent price movement
+        er  = calc_efficiency_ratio(closes)
+
+        # OBV trend — Granville's volume precedes price rule
+        obv_trend = calc_obv_trend(closes, volumes)
+
         # Volume confirmation — require 1.5× average; low-volume breakouts fail often
         avg_vol = sum(volumes) / len(volumes) if volumes else 1
         high_volume = volumes[-1] > avg_vol * VOLUME_FILTER_MULT if avg_vol > 0 else False
@@ -2023,6 +2112,17 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["vwap"] += 1
             sig = "HOLD"
 
+        # ADX gate — Wilder: only enter when a real trend exists (ADX > ADX_MIN)
+        # ADX measures trend *strength* without regard to direction
+        if sig in ("BUY", "SELL") and adx < ADX_MIN:
+            with _gate_counter_lock: _gate_counters["adx"] += 1
+            sig = "HOLD"
+
+        # Kaufman Efficiency Ratio gate — skip entries when price is moving randomly
+        if sig in ("BUY", "SELL") and er < ER_MIN:
+            with _gate_counter_lock: _gate_counters["efficiency"] += 1
+            sig = "HOLD"
+
         # Economic calendar blackout — skip entries around high-impact events
         if sig in ("BUY", "SELL") and _near_econ_event():
             with _gate_counter_lock: _gate_counters["econ"] += 1
@@ -2069,6 +2169,12 @@ class SignalEngine:
                               (sig == "SELL" and not above_vwap))
                       else 0.5 if vwap is None else 0.0)
 
+        # OBV pillar (Granville): volume must lead/confirm price direction
+        obv_pts = (1.0 if (sig == "BUY"  and obv_trend == "RISING")  or
+                          (sig == "SELL" and obv_trend == "FALLING")
+                   else 0.5 if obv_trend == "FLAT"
+                   else 0.0)
+
         pts = (rsi_pts    * pw.get("rsi_zone",       1.0) +
                news_pts   * pw.get("news_align",     1.0) +
                nasdaq_pts * pw.get("nasdaq_align",   1.0) +
@@ -2076,7 +2182,8 @@ class SignalEngine:
                macd_pts   * pw.get("macd_align",     1.0) +
                vol_pts    * pw.get("high_volume",    1.0) +
                candle_pts * pw.get("candle_pattern", 1.0) +
-               vwap_pts   * pw.get("vwap_align",     1.0))
+               vwap_pts   * pw.get("vwap_align",     1.0) +
+               obv_pts    * pw.get("obv_trend",      1.0))
         max_pts = (1.0 * pw.get("rsi_zone",       1.0) +
                    1.0 * pw.get("news_align",     1.0) +
                    1.0 * pw.get("nasdaq_align",   1.0) +
@@ -2084,7 +2191,8 @@ class SignalEngine:
                    1.0 * pw.get("macd_align",     1.0) +
                    1.0 * pw.get("high_volume",    1.0) +
                    1.0 * pw.get("candle_pattern", 1.0) +
-                   1.0 * pw.get("vwap_align",     1.0))
+                   1.0 * pw.get("vwap_align",     1.0) +
+                   1.0 * pw.get("obv_trend",      1.0))
         confidence = round(pts / max(max_pts, 0.1), 2) if sig in ("BUY", "SELL") else 0.0
 
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
@@ -2159,6 +2267,7 @@ class SignalEngine:
             "high_volume":   high_volume,
             "candle_pattern":candle_pts >= 1.0,
             "vwap_align":    vwap_pts >= 1.0,
+            "obv_trend":     obv_pts >= 1.0,
         }
 
         # ── Feature fingerprint key ──────────────────────────────────────────
@@ -3068,6 +3177,9 @@ def _cmd_why():
         "btc_dom":      "₿ BTC dominance rising",
         "news":         "📰 News opposing signal",
         "macd":         "📈 MACD fighting signal",
+        "adx":          "📉 Weak trend (ADX < 20)",
+        "efficiency":   "〰️ Random walk (Kaufman ER)",
+        "min_conf":     "🔒 Below confidence floor",
     }
     rows = [(gate_labels.get(k, k), v) for k, v in sorted(counts.items(), key=lambda x: -x[1]) if v > 0]
     if rows:
@@ -3489,6 +3601,7 @@ def _daily_summary_loop(trader):
                     "btc_dom": "BTC dom", "news": "News", "macd": "MACD",
                     "rr_ratio": "Bad R:R", "vwap": "VWAP side",
                     "spike": "Candle spike", "daily_gain": "Day profit cap",
+                    "adx": "ADX weak", "efficiency": "ER random", "min_conf": "Low conf",
                 }
                 top_gates = sorted(gate_snap.items(), key=lambda x: -x[1])[:5]
                 gate_lines = "  ".join(f"{gate_labels.get(k, k)}: `{v}`" for k, v in top_gates if v > 0)
