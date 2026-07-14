@@ -562,6 +562,24 @@ class Database:
             log("DB", f"feature_win_rates error: {e}", "ERR")
             return {}
 
+    def hourly_win_rates(self):
+        """Per-UTC-hour win rate (min 5 trades). Reveals which hours trade best."""
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT hour,
+                           COUNT(*) AS n,
+                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::float/COUNT(*)*100 AS wr
+                    FROM trades
+                    WHERE hour IS NOT NULL
+                    GROUP BY hour HAVING COUNT(*) >= 5
+                """)
+                return {int(r[0]): {"n": r[1], "wr": float(r[2])} for r in cur.fetchall()}
+        except Exception as e:
+            log("DB", f"hourly_win_rates error: {e}", "ERR")
+            return {}
+
     def log_pillars(self, pillars: dict, won: bool):
         """Store per-pillar outcome for adaptive weight learning."""
         if not self.conn or not pillars: return
@@ -667,6 +685,7 @@ _gate_counters = {
     "choppy": 0, "volume": 0, "active_hours": 0, "econ": 0,
     "funding": 0, "divergence": 0, "nasdaq": 0, "fear_greed": 0,
     "btc_dom": 0, "news": 0, "macd": 0, "1h_trend": 0, "pullback": 0,
+    "momentum": 0,
 }
 _gate_counter_lock = threading.Lock()
 
@@ -727,11 +746,12 @@ def get_klines(pair, interval=None, limit=None):
         raise ValueError(f"Kraken OHLC error: {payload['error']}")
     rkey = next(k for k in payload["result"] if k != "last")
     data = payload["result"][rkey][-lm:]
+    opens   = [float(c[1]) for c in data]
     closes  = [float(c[4]) for c in data]
     highs   = [float(c[2]) for c in data]
     lows    = [float(c[3]) for c in data]
     volumes = [float(c[6]) for c in data]
-    return closes, highs, lows, volumes
+    return closes, highs, lows, volumes, opens
 
 def get_price(pair):
     r = requests.get(f"{BASE_URL}/Ticker", params={"pair": pair}, timeout=10)
@@ -845,6 +865,43 @@ def detect_regime(closes, highs, lows, lookback=20):
     return "NEUTRAL"
 
 
+def detect_candle_pattern(opens, closes, highs, lows):
+    """Detect single-candle and two-candle reversal patterns on the last bar.
+    Returns 'BULL', 'BEAR', or 'NONE'."""
+    if opens is None or len(opens) < 2 or len(closes) < 2:
+        return "NONE"
+    try:
+        o, c, h, l   = opens[-1], closes[-1], highs[-1], lows[-1]
+        po, pc        = opens[-2], closes[-2]
+        body          = abs(c - o)
+        full_range    = h - l or 1e-9
+        upper_wick    = h - max(o, c)
+        lower_wick    = min(o, c) - l
+
+        # Doji — indecision, treat as neutral
+        if body / full_range < 0.10:
+            return "NONE"
+
+        # Bullish engulfing: current bullish body fully wraps previous bearish body
+        if c > o and pc < po and o <= pc and c >= po:
+            return "BULL"
+
+        # Bearish engulfing: current bearish body fully wraps previous bullish body
+        if c < o and pc > po and o >= pc and c <= po:
+            return "BEAR"
+
+        # Hammer: long lower wick (≥2× body), tiny upper wick → bullish reversal
+        if lower_wick >= 2 * body and upper_wick <= body * 0.5 and body > 0:
+            return "BULL"
+
+        # Shooting star: long upper wick (≥2× body), tiny lower wick → bearish reversal
+        if upper_wick >= 2 * body and lower_wick <= body * 0.5 and body > 0:
+            return "BEAR"
+    except Exception:
+        pass
+    return "NONE"
+
+
 # ── Rank coins ────────────────────────────────────────────────────────────────
 def rank_coins():
     scores    = []
@@ -852,7 +909,7 @@ def rank_coins():
     for coin in SCAN_UNIVERSE:
         pair = coin["pair"]
         try:
-            closes, highs, lows, _ = get_klines(pair)
+            closes, highs, lows, _, _ = get_klines(pair)
             volatility = (max(highs) - min(lows)) / closes[-1] * 100
             ema        = calc_ema(closes)
             rsi        = calc_rsi(closes)
@@ -1049,6 +1106,8 @@ class PaperTrader:
         # Per-pair win-rate cache for stake sizing
         self._wr_cache     = {}   # pair → {"n": n, "wr": wr}
         self._wr_ts        = 0.0
+        # Loss streak global entry cooldown (30-min pause after ≥3 consecutive losses)
+        self._streak_cool_until = 0.0
         self._load()
 
     @property
@@ -1167,6 +1226,22 @@ class PaperTrader:
         if losses >= 5: return 0.25
         if losses >= 3: return 0.50
         return 1.0
+
+    def _dynamic_conf_gate(self):
+        """Raise confidence gate when recent performance is poor.
+        Looks at the last 10 trades; needs ≥5 to activate."""
+        recent = self.trades[-10:]
+        if len(recent) < 5:
+            return 0.0
+        wr = sum(1 for t in recent if t["pnl"] > 0) / len(recent)
+        losses = self.consecutive_losses
+        if wr < 0.30:
+            return 0.65   # <30% WR → only very high-confidence entries
+        if wr < 0.40:
+            return 0.55   # <40% WR → raise bar meaningfully
+        if wr < 0.50 and losses >= 3:
+            return 0.50   # bad stretch + active streak → moderate caution
+        return 0.0
 
     # ── Learning method 1: signal-condition fingerprint ──────────────────────
     def _feature_multiplier(self, fkey):
@@ -1337,6 +1412,21 @@ class PaperTrader:
                         tg(f"🔒 *Breakeven — {name}*\nStop moved to entry `${p['entry']:.4f}` (up {move*100:.1f}%)")
                 p["breakeven_set"] = True
 
+            # Tier-2 trailing stop: at +10% move lock in ≥7% profit (3% trail from peak)
+            if not p.get("tier2_trail_set") and move >= 0.10:
+                lock_stop = round(p["entry"] * 1.07 if side == "LONG" else p["entry"] * 0.93, 6)
+                tight_atr = round(price * 0.03, 8)  # 3% trail going forward
+                if side == "LONG" and lock_stop > p.get("trail_stop", 0):
+                    p["trail_stop"]      = lock_stop
+                    p["atr_dist"]        = tight_atr
+                    p["tier2_trail_set"] = True
+                    tg(f"🔐 *+7% Locked — {name}*\nUp `{move*100:.1f}%` → stop `${lock_stop:.4f}` (trail tightened to 3%)")
+                elif side == "SHORT" and lock_stop < p.get("trail_stop", float("inf")):
+                    p["trail_stop"]      = lock_stop
+                    p["atr_dist"]        = tight_atr
+                    p["tier2_trail_set"] = True
+                    tg(f"🔐 *+7% Locked — {name}*\nUp `{move*100:.1f}%` → stop `${lock_stop:.4f}` (trail tightened to 3%)")
+
             if side == "LONG":
                 trail_stop = p.get("trail_stop", 0)
                 hit_trail  = price <= trail_stop
@@ -1360,7 +1450,9 @@ class PaperTrader:
         if pair not in self.positions and not closed_this_tick:
             if time.time() < self._cooldown.get(pair, 0):
                 return
-            min_conf = self._min_conf_threshold(pair)
+            if time.time() < self._streak_cool_until:
+                return   # global pause: ≥3 consecutive losses; wait for market to settle
+            min_conf = max(self._min_conf_threshold(pair), self._dynamic_conf_gate())
             if sig == "BUY"  and self.can_open_new() and confidence >= min_conf:
                 self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
             elif sig == "SELL" and self.can_open_new() and confidence >= min_conf:
@@ -1502,7 +1594,13 @@ class PaperTrader:
             cooldown = 1800 if reason in ("trailing stop", "signal flip") else 900
             self._cooldown[pair] = time.time() + cooldown
             log("PAPER", f"{name} cooldown {cooldown//60}m after {reason} loss")
+            # Loss streak global cooldown: ≥3 in a row → 30-min pause on all new entries
+            if self.consecutive_losses >= 3:
+                self._streak_cool_until = time.time() + 1800
+                log("PAPER", f"Loss streak {self.consecutive_losses} → 30-min entry pause", "WARN")
             _post_loss_analysis(p, pnl, reason, held_mins)
+        else:
+            self._streak_cool_until = 0.0   # win resets the streak cooldown
         emoji = "✅" if pnl >= 0 else "❌"
         # Trade journal — rich close message
         nasdaq_icon = "📈" if entry_nasdaq == "BULLISH" else "📉" if entry_nasdaq == "BEARISH" else "➖"
@@ -1573,12 +1671,14 @@ class SignalEngine:
         self.below_ticks      = 0
         self._pillar_weights  = {}    # pillar → float multiplier (1.0 = neutral)
         self._pillar_w_ts     = 0.0
+        self._hour_win_rates  = {}    # hour (int) → {"n": n, "wr": wr}
+        self._hour_w_ts       = 0.0
 
     def reset(self):
         self.above_ticks = 0
         self.below_ticks = 0
 
-    def evaluate(self, closes, highs, lows, volumes, price, alert_buffer, pair=None):
+    def evaluate(self, closes, highs, lows, volumes, price, alert_buffer, pair=None, opens=None):
         ema = calc_ema(closes)
         rsi = calc_rsi(closes)
 
@@ -1594,6 +1694,9 @@ class SignalEngine:
         # Volume confirmation — require 1.5× average; low-volume breakouts fail often
         avg_vol = sum(volumes) / len(volumes) if volumes else 1
         high_volume = volumes[-1] > avg_vol * VOLUME_FILTER_MULT if avg_vol > 0 else False
+
+        # Candlestick pattern (7th confidence pillar)
+        candle_pat = detect_candle_pattern(opens, closes, highs, lows)
         price_range = max(highs) - min(lows) or 1
         tolerance   = price_range * 0.005
         levels = []
@@ -1743,30 +1846,37 @@ class SignalEngine:
         # 6 pillars, each weighted by its historical effectiveness (1.0 = neutral)
         ticks = self.above_ticks if sig == "BUY" else self.below_ticks
 
-        rsi_pts   = 1.0 if 40 <= rsi <= 60 else 0.5 if 30 < rsi < 70 else 0.0
-        news_pts  = (1.0 if ((sig == "BUY"  and n_sent == "BULLISH") or
-                             (sig == "SELL" and n_sent == "BEARISH"))
-                     else 0.5 if n_sent == "NEUTRAL" else 0.0)
-        nasdaq_pts= (1.0 if ((sig == "BUY"  and nasdaq_mood == "BULLISH") or
-                             (sig == "SELL" and nasdaq_mood == "BEARISH"))
-                     else 0.5 if nasdaq_mood == "NEUTRAL" else 0.0)
-        tick_pts  = (min(ticks / 5.0, 1.0) if ticks > 0
-                     else (min(n_score / 5.0, 1.0) if sig in ("BUY","SELL") and n_score >= 3 else 0.0))
-        macd_pts  = 1.0 if (sig == "BUY" and macd_bull) or (sig == "SELL" and macd_bear) else 0.0
-        vol_pts   = 1.0 if high_volume else 0.5
+        rsi_pts    = 1.0 if 40 <= rsi <= 60 else 0.5 if 30 < rsi < 70 else 0.0
+        news_pts   = (1.0 if ((sig == "BUY"  and n_sent == "BULLISH") or
+                              (sig == "SELL" and n_sent == "BEARISH"))
+                      else 0.5 if n_sent == "NEUTRAL" else 0.0)
+        nasdaq_pts = (1.0 if ((sig == "BUY"  and nasdaq_mood == "BULLISH") or
+                              (sig == "SELL" and nasdaq_mood == "BEARISH"))
+                      else 0.5 if nasdaq_mood == "NEUTRAL" else 0.0)
+        tick_pts   = (min(ticks / 5.0, 1.0) if ticks > 0
+                      else (min(n_score / 5.0, 1.0) if sig in ("BUY","SELL") and n_score >= 3 else 0.0))
+        macd_pts   = 1.0 if (sig == "BUY" and macd_bull) or (sig == "SELL" and macd_bear) else 0.0
+        vol_pts    = 1.0 if high_volume else 0.5
+        candle_pts = (1.0 if (sig == "BUY"  and candle_pat == "BULL") or
+                             (sig == "SELL" and candle_pat == "BEAR")
+                      else 0.0 if (sig == "BUY"  and candle_pat == "BEAR") or
+                                  (sig == "SELL" and candle_pat == "BULL")
+                      else 0.5)   # NONE = neutral
 
-        pts = (rsi_pts    * pw.get("rsi_zone",      1.0) +
-               news_pts   * pw.get("news_align",    1.0) +
-               nasdaq_pts * pw.get("nasdaq_align",  1.0) +
-               tick_pts   * pw.get("tick_strength", 1.0) +
-               macd_pts   * pw.get("macd_align",    1.0) +
-               vol_pts    * pw.get("high_volume",   1.0))
-        max_pts = (1.0 * pw.get("rsi_zone",     1.0) +
-                   1.0 * pw.get("news_align",   1.0) +
-                   1.0 * pw.get("nasdaq_align", 1.0) +
-                   1.0 * pw.get("tick_strength",1.0) +
-                   1.0 * pw.get("macd_align",   1.0) +
-                   1.0 * pw.get("high_volume",  1.0))
+        pts = (rsi_pts    * pw.get("rsi_zone",       1.0) +
+               news_pts   * pw.get("news_align",     1.0) +
+               nasdaq_pts * pw.get("nasdaq_align",   1.0) +
+               tick_pts   * pw.get("tick_strength",  1.0) +
+               macd_pts   * pw.get("macd_align",     1.0) +
+               vol_pts    * pw.get("high_volume",    1.0) +
+               candle_pts * pw.get("candle_pattern", 1.0))
+        max_pts = (1.0 * pw.get("rsi_zone",       1.0) +
+                   1.0 * pw.get("news_align",     1.0) +
+                   1.0 * pw.get("nasdaq_align",   1.0) +
+                   1.0 * pw.get("tick_strength",  1.0) +
+                   1.0 * pw.get("macd_align",     1.0) +
+                   1.0 * pw.get("high_volume",    1.0) +
+                   1.0 * pw.get("candle_pattern", 1.0))
         confidence = round(pts / max(max_pts, 0.1), 2) if sig in ("BUY", "SELL") else 0.0
 
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
@@ -1788,14 +1898,30 @@ class SignalEngine:
         if regime == "TRENDING" and sig in ("BUY", "SELL"):
             confidence = min(round(confidence + 0.05, 2), 1.0)
 
+        # Hour-of-day win rate adjustment (refresh hourly from DB)
+        now_ts = time.time()
+        if now_ts - self._hour_w_ts > 3600:
+            if db.connected:
+                try:
+                    self._hour_win_rates = db.hourly_win_rates()
+                except Exception: pass
+            self._hour_w_ts = now_ts
+        hour_data = self._hour_win_rates.get(datetime.utcnow().hour)
+        if hour_data and sig in ("BUY", "SELL"):
+            if hour_data["wr"] >= 60:
+                confidence = min(round(confidence + 0.05, 2), 1.0)
+            elif hour_data["wr"] <= 35:
+                confidence = max(round(confidence - 0.10, 2), 0.0)
+
         # ── Pillar states for DB adaptive weight logging ─────────────────────
         plan["pillars"] = {
-            "rsi_zone":     40 <= rsi <= 60,
-            "news_align":   news_pts >= 1.0,
-            "nasdaq_align": nasdaq_pts >= 1.0,
-            "tick_strength":ticks > 0,
-            "macd_align":   macd_pts >= 1.0,
-            "high_volume":  high_volume,
+            "rsi_zone":      40 <= rsi <= 60,
+            "news_align":    news_pts >= 1.0,
+            "nasdaq_align":  nasdaq_pts >= 1.0,
+            "tick_strength": ticks > 0,
+            "macd_align":    macd_pts >= 1.0,
+            "high_volume":   high_volume,
+            "candle_pattern":candle_pts >= 1.0,
         }
 
         # ── Feature fingerprint key ──────────────────────────────────────────
@@ -2329,6 +2455,7 @@ def _cmd_why():
         "choppy":       "〰️ Choppy regime (softened)",
         "1h_trend":     "📊 1-hour trend filter",
         "pullback":     "⏳ Waiting for pullback",
+        "momentum":     "🚀 Counter-momentum entry",
         "nasdaq":       "🏦 Bearish NASDAQ",
         "funding":      "💸 Extreme funding rate",
         "divergence":   "⚡ RSI divergence",
@@ -2743,10 +2870,11 @@ def _daily_summary_loop(trader):
                 gate_labels = {
                     "volume": "Volume", "choppy": "Choppy(soft)",
                     "1h_trend": "1H trend", "pullback": "Pullback wait",
-                    "nasdaq": "NASDAQ", "funding": "Funding",
-                    "divergence": "RSI div", "active_hours": "Off-hours",
-                    "econ": "Econ event", "fear_greed": "Fear/Greed",
-                    "btc_dom": "BTC dom", "news": "News", "macd": "MACD",
+                    "momentum": "Counter-mom", "nasdaq": "NASDAQ",
+                    "funding": "Funding", "divergence": "RSI div",
+                    "active_hours": "Off-hours", "econ": "Econ event",
+                    "fear_greed": "Fear/Greed", "btc_dom": "BTC dom",
+                    "news": "News", "macd": "MACD",
                 }
                 top_gates = sorted(gate_snap.items(), key=lambda x: -x[1])[:5]
                 gate_lines = "  ".join(f"{gate_labels.get(k, k)}: `{v}`" for k, v in top_gates if v > 0)
@@ -2846,7 +2974,7 @@ def trading_loop(trader):
                 p = trader.positions.get(pair)
                 if not p: continue
                 try:
-                    closes, highs, lows, volumes = get_klines(pair)
+                    closes, highs, lows, volumes, _ = get_klines(pair)
                     price = get_price(pair)
                     try: atr = calc_atr(highs, lows, closes)
                     except Exception: atr = None
@@ -2863,20 +2991,21 @@ def trading_loop(trader):
                 coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
                 if not coin: continue
                 try:
-                    closes, highs, lows, volumes = get_klines(pair)
+                    closes, highs, lows, volumes, opens = get_klines(pair)
                     price = get_price(pair)
                     if pair not in engine_map:
                         engine_map[pair] = SignalEngine()
                     eng = engine_map[pair]
                     sig, plan, ema, rsi, conf = eng.evaluate(
-                        closes, highs, lows, volumes, price, coin["alert_buffer"], pair=pair)
+                        closes, highs, lows, volumes, price, coin["alert_buffer"],
+                        pair=pair, opens=opens)
                     try: atr = calc_atr(highs, lows, closes)
                     except Exception: atr = None
 
                     # 1-hour trend confirmation
                     if sig in ("BUY", "SELL"):
                         try:
-                            closes_1h, _, _, _ = get_klines(pair, interval=60, limit=24)
+                            closes_1h, _, _, _, _ = get_klines(pair, interval=60, limit=24)
                             ema_1h   = calc_ema(closes_1h)
                             trend_1h = "UP" if closes_1h[-1] > ema_1h else "DOWN"
                             if sig == "BUY"  and trend_1h != "UP":
@@ -2899,6 +3028,20 @@ def trading_loop(trader):
                                 elif sig == "SELL" and closes[-1] <= closes[-2]:
                                     with _gate_counter_lock: _gate_counters["pullback"] += 1
                                     sig = "HOLD"
+                        except Exception: pass
+
+                    # Coin momentum filter: both 5-candle and 15-candle momentum must
+                    # not both oppose the signal (prevents fighting sustained counter-moves)
+                    if sig in ("BUY", "SELL") and len(closes) >= 16:
+                        try:
+                            mom5  = closes[-1] - closes[-6]
+                            mom15 = closes[-1] - closes[-16]
+                            if sig == "BUY"  and mom5 <= 0 and mom15 <= 0:
+                                with _gate_counter_lock: _gate_counters["momentum"] += 1
+                                sig = "HOLD"
+                            elif sig == "SELL" and mom5 >= 0 and mom15 >= 0:
+                                with _gate_counter_lock: _gate_counters["momentum"] += 1
+                                sig = "HOLD"
                         except Exception: pass
 
                     sig_col  = _C.GREEN + _C.BOLD if sig == "BUY" else _C.RED + _C.BOLD if sig == "SELL" else _C.GREY
