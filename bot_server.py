@@ -11,6 +11,7 @@ import os
 import json
 import sys
 import re
+import math
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
@@ -483,15 +484,20 @@ class Database:
             log("DB", f"Save error: {e}", "ERR")
 
     def coin_win_rates(self, min_trades=3):
-        """Per-pair win rate for coins with enough history."""
+        """Per-pair recency-weighted win rate (14-day half-life, min trades threshold)."""
         if not self.conn: return {}
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
                     SELECT pair,
                            COUNT(*) AS n,
-                           ROUND(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::numeric
-                                 / COUNT(*) * 100, 1) AS wr
+                           ROUND(
+                               SUM(CASE WHEN pnl > 0
+                                   THEN EXP(-(EXTRACT(EPOCH FROM NOW()) - ts) / 1209600.0)
+                                   ELSE 0 END) /
+                               NULLIF(SUM(EXP(-(EXTRACT(EPOCH FROM NOW()) - ts) / 1209600.0)), 0)
+                               * 100
+                           , 1) AS wr
                     FROM trades
                     GROUP BY pair
                     HAVING COUNT(*) >= %s
@@ -675,6 +681,8 @@ _seen_headlines = set()
 _state_lock     = threading.Lock()   # guards _paused and _current_coin
 # Long/Short ratio from Binance Futures (liquidation pressure proxy)
 lsr_data        = {}   # pair → {"lsr": float, "bias": "LONG_HEAVY"|"SHORT_HEAVY"|"NEUTRAL"}
+# Open interest from Binance Futures (confirms real money vs short-covering)
+open_interest_data = {}  # pair → {"oi": float, "prev_oi": float, "trend": "RISING"|"FALLING"|"NEUTRAL"}
 # High-impact economic calendar events (Forex Factory feed)
 _econ_events    = []   # list of {"title": str, "date": str, "impact": str}
 # User-set price alerts  {pair: [{"target": float, "above": bool, "label": str}]}
@@ -684,8 +692,8 @@ _price_alerts   = {}
 _gate_counters = {
     "choppy": 0, "volume": 0, "active_hours": 0, "econ": 0,
     "funding": 0, "divergence": 0, "nasdaq": 0, "fear_greed": 0,
-    "btc_dom": 0, "news": 0, "macd": 0, "1h_trend": 0, "pullback": 0,
-    "momentum": 0,
+    "btc_dom": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
+    "pullback": 0, "momentum": 0,
 }
 _gate_counter_lock = threading.Lock()
 
@@ -1108,6 +1116,11 @@ class PaperTrader:
         self._wr_ts        = 0.0
         # Loss streak global entry cooldown (30-min pause after ≥3 consecutive losses)
         self._streak_cool_until = 0.0
+        # Volatility-adaptive sizing: EMA of ATR per pair to detect elevated volatility
+        self._base_atr  = {}   # pair → long-run EMA of ATR
+        # Kelly Criterion cache (refreshed every 5 min when ≥20 trades available)
+        self._kelly_sz  = 0.0
+        self._kelly_ts  = 0.0
         self._load()
 
     @property
@@ -1357,6 +1370,39 @@ class PaperTrader:
         return (self.wins / len(self.trades) * 100) if self.trades else 0.0
 
     @property
+    def recency_win_rate(self):
+        """Win rate weighted by recency — 14-day half-life so recent trades count more."""
+        now = time.time()
+        half_life = 14 * 86400
+        w_wins = sum(math.exp(-(now - t["ts"]) / half_life)
+                     for t in self.trades if t["pnl"] > 0)
+        w_total = sum(math.exp(-(now - t["ts"]) / half_life) for t in self.trades)
+        return (w_wins / w_total * 100) if w_total > 1e-9 else 0.0
+
+    def _kelly_size(self):
+        """Half-Kelly optimal risk fraction from realized win/loss stats.
+        Requires ≥20 trades; returns 0 when insufficient data."""
+        now = time.time()
+        if now - self._kelly_ts < 300:
+            return self._kelly_sz
+        self._kelly_ts = now
+        trades = self.trades
+        if len(trades) < 20:
+            self._kelly_sz = 0.0
+            return 0.0
+        wins   = [t["pnl"] for t in trades if t["pnl"] > 0]
+        losses = [abs(t["pnl"]) for t in trades if t["pnl"] < 0]
+        if not wins or not losses:
+            self._kelly_sz = 0.0
+            return 0.0
+        p      = len(wins) / len(trades)
+        q      = 1.0 - p
+        b      = (sum(wins) / len(wins)) / max(sum(losses) / len(losses), 1e-9)
+        kelly  = (p * b - q) / max(b, 1e-9)
+        self._kelly_sz = max(0.0, min(kelly * 0.5, RISK_MAX))  # half-Kelly, capped
+        return self._kelly_sz
+
+    @property
     def total_pnl(self):
         return round(sum(t["pnl"] for t in self.trades), 2)
 
@@ -1483,12 +1529,30 @@ class PaperTrader:
             elif wr <= 35: wr_mult = 0.60; log("PAPER", f"{pair} WR {wr:.0f}% → -40% stake")
             elif wr <= 45: wr_mult = 0.80; log("PAPER", f"{pair} WR {wr:.0f}% → -20% stake")
 
+        # Kelly Criterion base risk when ≥20 trades available (half-Kelly)
+        kelly = self._kelly_size()
+        if kelly > 0:
+            base_risk = kelly * (0.5 + 0.5 * confidence)  # confidence still scales within Kelly
+        else:
+            base_risk = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+
+        # Volatility-adaptive multiplier: shrink size when current ATR is elevated
+        vol_mult = 1.0
+        if atr is not None and atr > 0:
+            prev_base = self._base_atr.get(pair)
+            new_base  = prev_base * 0.85 + atr * 0.15 if prev_base else atr
+            self._base_atr[pair] = new_base
+            if prev_base and prev_base > 1e-9:
+                vol_ratio = atr / new_base
+                vol_mult  = max(0.5, min(1.0, 1.0 / max(vol_ratio, 1.0)))
+
         risk       = min(
-                        (RISK_MIN + (RISK_MAX - RISK_MIN) * confidence)
+                        base_risk
                         * self._risk_multiplier()
                         * self._calibration_multiplier(confidence)
                         * self._feature_multiplier(fkey)
-                        * wr_mult,
+                        * wr_mult
+                        * vol_mult,
                         RISK_MAX)
         leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
         fill       = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
@@ -1532,10 +1596,12 @@ class PaperTrader:
                                 "pillars": pillars or {}}
         self._save()
         mul = self._risk_multiplier()
-        dd_note = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
+        dd_note  = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
+        vol_note = f" 🌊 vol×`{vol_mult:.2f}`" if vol_mult < 0.95 else ""
+        kelly_note = " 📐 Kelly" if kelly > 0 else ""
         tg(f"📂 *Trade OPENED — {name}*\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
-           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}\n"
+           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}\n"
            f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
            f"Trail stop: `${trail_stop:.4f}` ({stop_label}) | Balance: `${self.balance:.2f}`")
         _print_trade_box("OPEN", name, side, fill,
@@ -1894,6 +1960,16 @@ class SignalEngine:
         if fr < -EXTREME_FUNDING and sig == "BUY":  confidence = min(round(confidence + 0.06, 2), 1.0)
         if fr >  EXTREME_FUNDING and sig == "SELL": confidence = min(round(confidence + 0.06, 2), 1.0)
 
+        # Open interest conviction check: rising OI confirms real new money;
+        # falling OI means moves are just liquidations/unwinding (weaker follow-through)
+        oi_info = open_interest_data.get(current_pair, {})
+        oi_trend = oi_info.get("trend", "NEUTRAL")
+        if sig in ("BUY", "SELL"):
+            if oi_trend == "RISING":
+                confidence = min(round(confidence + 0.06, 2), 1.0)
+            elif oi_trend == "FALLING":
+                confidence = max(round(confidence - 0.05, 2), 0.0)
+
         # Trending regime boosts confidence slightly (cleaner signal)
         if regime == "TRENDING" and sig in ("BUY", "SELL"):
             confidence = min(round(confidence + 0.05, 2), 1.0)
@@ -2144,6 +2220,27 @@ def _lsr_loop():
             time.sleep(0.3)
         time.sleep(300)  # refresh every 5 minutes
 
+# ── Open Interest monitor (real-money conviction vs. short-covering) ─────────
+def _oi_loop():
+    global open_interest_data
+    while True:
+        for pair, symbol in KRAKEN_TO_BINANCE.items():
+            try:
+                r = requests.get("https://fapi.binance.com/fapi/v1/openInterest",
+                                 params={"symbol": symbol}, timeout=5)
+                if r.ok:
+                    oi = float(r.json()["openInterest"])
+                    prev = open_interest_data.get(pair, {}).get("oi", oi)
+                    change_pct = (oi - prev) / max(prev, 1e-9) * 100
+                    trend = ("RISING"  if change_pct >  0.5
+                             else "FALLING" if change_pct < -0.5
+                             else "NEUTRAL")
+                    open_interest_data[pair] = {"oi": oi, "prev_oi": prev, "trend": trend}
+            except Exception:
+                pass
+            time.sleep(0.2)
+        time.sleep(300)   # refresh every 5 minutes
+
 # ── Economic calendar (Forex Factory JSON feed) ───────────────────────────────
 def _econ_calendar_loop():
     global _econ_events
@@ -2336,6 +2433,26 @@ def _post_loss_analysis(position, pnl, reason, held_mins):
        f"`{side}` | PnL `{pnl:+.2f}$` | Held `{held_mins:.0f}` min\n"
        + "\n".join(lines))
 
+def _compute_sharpe_sortino(trades):
+    """Annualised Sharpe and Sortino ratios from trade PnL as % of PAPER_START.
+    Returns (sharpe, sortino) floats, or (None, None) if not enough data."""
+    if len(trades) < 10:
+        return None, None
+    returns = [t["pnl"] / max(PAPER_START, 1) for t in trades]
+    mean_r  = sum(returns) / len(returns)
+    variance = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+    std_r   = math.sqrt(variance)
+    if std_r < 1e-9:
+        return None, None
+    annual  = math.sqrt(252)  # approximate trading-day annualisation
+    sharpe  = round((mean_r / std_r) * annual, 2)
+    # Sortino: denominator uses only downside deviations (but divided by all n)
+    down_sq = sum((r ** 2) for r in returns if r < 0)
+    sortino_std = math.sqrt(down_sq / max(len(returns), 1))
+    sortino = round((mean_r / max(sortino_std, 1e-9)) * annual, 2) if sortino_std > 1e-9 else None
+    return sharpe, sortino
+
+
 def _readiness_score(trader):
     """Compute 0-100 paper-to-live readiness score with breakdown."""
     trades  = trader.trades
@@ -2344,12 +2461,13 @@ def _readiness_score(trader):
         return 0, ["No trades yet — start accumulating history"]
     wins    = sum(1 for t in trades if t["pnl"] > 0)
     wr      = wins / total * 100
+    rwr     = trader.recency_win_rate   # recency-weighted win rate
 
     # Trade volume — max 25 pts (100 trades = full score)
     trade_pts = min(total / 4.0, 25.0)
 
-    # Win rate — max 30 pts
-    wr_pts = 30 if wr >= 60 else 20 if wr >= 55 else 10 if wr >= 50 else 0
+    # Win rate (recency-weighted) — max 30 pts
+    wr_pts = 30 if rwr >= 60 else 20 if rwr >= 55 else 10 if rwr >= 50 else 0
 
     # Profit factor — max 20 pts
     gross_win  = sum(t["pnl"] for t in trades if t["pnl"] > 0) or 0
@@ -2357,11 +2475,15 @@ def _readiness_score(trader):
     pf         = gross_win / gross_loss
     pf_pts     = 20 if pf >= 2.0 else 15 if pf >= 1.5 else 8 if pf >= 1.2 else 0
 
-    # Balance growth — max 15 pts
-    growth  = (trader.balance - PAPER_START) / PAPER_START * 100
-    g_pts   = 15 if growth >= 50 else 10 if growth >= 20 else 5 if growth >= 5 else 0
+    # Sharpe ratio — max 15 pts (replaces plain balance growth in weighting)
+    sharpe, sortino = _compute_sharpe_sortino(trades)
+    sh_pts = 15 if (sharpe or 0) >= 2.0 else 10 if (sharpe or 0) >= 1.0 else 5 if (sharpe or 0) >= 0.5 else 0
 
-    # Learning active — max 10 pts
+    # Balance growth — max 10 pts (reduced; Sharpe captures quality better)
+    growth  = (trader.balance - PAPER_START) / PAPER_START * 100
+    g_pts   = 10 if growth >= 50 else 7 if growth >= 20 else 3 if growth >= 5 else 0
+
+    # Learning active — max 10 pts (unchanged)
     l_pts = 0
     feat_count = 0
     if db.connected:
@@ -2371,12 +2493,15 @@ def _readiness_score(trader):
         except Exception:
             pass
 
-    score     = round(trade_pts + wr_pts + pf_pts + g_pts + l_pts)
+    score     = round(trade_pts + wr_pts + pf_pts + sh_pts + g_pts + l_pts)
+    sharpe_str   = f"{sharpe:.2f}" if sharpe is not None else "n/a (<10 trades)"
+    sortino_str  = f"{sortino:.2f}" if sortino is not None else "n/a"
     breakdown = [
         f"Trade count: {total}/100  ({trade_pts:.0f}/25 pts)",
-        f"Win rate: {wr:.0f}%  ({wr_pts}/30 pts — need ≥55%)",
+        f"Win rate (recent): {rwr:.0f}%  simple: {wr:.0f}%  ({wr_pts}/30 pts — need ≥55%)",
         f"Profit factor: {pf:.1f}x  ({pf_pts}/20 pts — need ≥1.5)",
-        f"Balance growth: {growth:+.0f}%  ({g_pts}/15 pts — need ≥20%)",
+        f"Sharpe: {sharpe_str}  Sortino: {sortino_str}  ({sh_pts}/15 pts — need ≥1.0)",
+        f"Balance growth: {growth:+.0f}%  ({g_pts}/10 pts — need ≥20%)",
         f"Learning patterns: {feat_count}  ({l_pts}/10 pts — need DB + 5 patterns)",
     ]
     return score, breakdown
@@ -2453,6 +2578,7 @@ def _cmd_why():
     gate_labels = {
         "volume":       "📉 Volume too low",
         "choppy":       "〰️ Choppy regime (softened)",
+        "4h_trend":     "📊 4-hour trend filter",
         "1h_trend":     "📊 1-hour trend filter",
         "pullback":     "⏳ Waiting for pullback",
         "momentum":     "🚀 Counter-momentum entry",
@@ -2869,12 +2995,12 @@ def _daily_summary_loop(trader):
             if total_blocked > 0:
                 gate_labels = {
                     "volume": "Volume", "choppy": "Choppy(soft)",
-                    "1h_trend": "1H trend", "pullback": "Pullback wait",
-                    "momentum": "Counter-mom", "nasdaq": "NASDAQ",
-                    "funding": "Funding", "divergence": "RSI div",
-                    "active_hours": "Off-hours", "econ": "Econ event",
-                    "fear_greed": "Fear/Greed", "btc_dom": "BTC dom",
-                    "news": "News", "macd": "MACD",
+                    "4h_trend": "4H trend", "1h_trend": "1H trend",
+                    "pullback": "Pullback wait", "momentum": "Counter-mom",
+                    "nasdaq": "NASDAQ", "funding": "Funding",
+                    "divergence": "RSI div", "active_hours": "Off-hours",
+                    "econ": "Econ event", "fear_greed": "Fear/Greed",
+                    "btc_dom": "BTC dom", "news": "News", "macd": "MACD",
                 }
                 top_gates = sorted(gate_snap.items(), key=lambda x: -x[1])[:5]
                 gate_lines = "  ".join(f"{gate_labels.get(k, k)}: `{v}`" for k, v in top_gates if v > 0)
@@ -3001,6 +3127,20 @@ def trading_loop(trader):
                         pair=pair, opens=opens)
                     try: atr = calc_atr(highs, lows, closes)
                     except Exception: atr = None
+
+                    # 4-hour trend confirmation (higher-timeframe confluence)
+                    if sig in ("BUY", "SELL"):
+                        try:
+                            closes_4h, _, _, _, _ = get_klines(pair, interval=240, limit=14)
+                            ema_4h   = calc_ema(closes_4h)
+                            trend_4h = "UP" if closes_4h[-1] > ema_4h else "DOWN"
+                            if sig == "BUY"  and trend_4h != "UP":
+                                with _gate_counter_lock: _gate_counters["4h_trend"] += 1
+                                sig = "HOLD"
+                            if sig == "SELL" and trend_4h != "DOWN":
+                                with _gate_counter_lock: _gate_counters["4h_trend"] += 1
+                                sig = "HOLD"
+                        except Exception: pass
 
                     # 1-hour trend confirmation
                     if sig in ("BUY", "SELL"):
@@ -3136,6 +3276,7 @@ def main():
         ("Daily summary",     _daily_summary_loop,  (trader,)),
         ("PnL updater",       _pnl_update_loop,     (trader,)),
         ("LSR monitor",       _lsr_loop,            ()),
+        ("Open interest",     _oi_loop,             ()),
         ("Econ calendar",     _econ_calendar_loop,  ()),
         ("Price alerts",      _alert_loop,          (trader,)),
     ]
