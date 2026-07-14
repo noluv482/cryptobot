@@ -259,46 +259,46 @@ _KRAKEN_MIN_VOL = {
 
 EMA_PERIOD    = 14
 RSI_PERIOD    = 14
-CANDLE_LIMIT  = 60
-INTERVAL      = 5
-REFRESH_SEC   = 30
-CONFIRM_TICKS = 3      # consecutive candles past EMA required before signalling
+CANDLE_LIMIT  = 80             # more history for 15-min chart
+INTERVAL      = 15             # 15-min candles: far less noise than 5-min
+REFRESH_SEC   = 60             # poll every 60s on 15-min chart
+CONFIRM_TICKS = 2              # 2 × 15-min bars = 30-min confirmation before signal
 
 PAPER_START    = 100.0
 PAPER_TARGET   = 50000.0
 PAPER_FLOOR    = 50.0
-LEVERAGE_MIN   = 2      # 2x at low confidence
-LEVERAGE_MAX   = 5      # 5x at high confidence
-RISK_MIN       = 0.05   # 5%  margin at low confidence
-RISK_MAX       = 0.20   # 20% margin at high confidence
-MAX_TRADE_GAIN   = 0.08  # full-close when remaining half is up 8%
-PARTIAL_TAKE_PCT = 0.05  # take 50% profit at 5% move
-TRAIL_PCT        = 0.03  # fallback trailing stop (used when ATR unavailable)
-ATR_PERIOD       = 14    # candles for ATR calculation
-ATR_MULTIPLIER   = 1.5   # trail distance = 1.5 × ATR
-MAX_TRADE_MINS   = 30    # force close after 30 min
-KRAKEN_FEE       = 0.0026   # 0.26% taker fee per side (realistic Kraken fees)
-SLIPPAGE         = 0.001    # 0.1% slippage on fills
-MAX_TRADES_DAY   = 10       # daily trade cap (when limits enabled)
-DAILY_LOSS_LIMIT = 0.10     # stop trading if down 10% today (when limits enabled)
-ACTIVE_HOURS_UTC  = (5, 23)  # trade 05:00–23:00 UTC; include Asian session momentum
-FUNDING_THRESHOLD = 0.0005   # 0.05% per 8h → overcrowded side, block new entries
-MAX_POSITIONS     = 3        # max simultaneous open positions
-MAX_TOTAL_RISK    = 0.40     # total margin across all positions ≤ 40% of balance
-BREAKEVEN_PCT     = 0.012    # move stop to entry once trade is +1.2% in profit
-MIN_RR_RATIO      = 1.5      # minimum reward-to-risk ratio; skip entries below this
-DAILY_GAIN_SOFT   = 0.03     # at +3% today: halve position size to protect the day
-DAILY_GAIN_HARD   = 0.06     # at +6% today: stop new entries entirely
-LIVE_CHART_MINS   = 10       # minutes between auto-chart updates when live mode is on
-MAX_SESSION_DD    = 0.12     # auto-pause if balance drops 12% from session peak
-VOLUME_FILTER_MULT= 1.5      # require 1.5× average volume before entering
-EXTREME_FUNDING   = 0.001    # 0.1% / 8h = overcrowded → use as contrarian booster
-ECON_BLACKOUT_MINS= 15       # block new entries this many minutes around high-impact events
-MIN_CONFIDENCE    = 0.50     # hard entry floor regardless of DB state (books: no weak bets)
-ADX_PERIOD        = 14       # Wilder ADX period
-ADX_MIN           = 20       # below this = no trend, skip entry
-ER_PERIOD         = 10       # Kaufman Efficiency Ratio lookback
-ER_MIN            = 0.25     # below this = random walk, skip entry
+LEVERAGE_MIN   = 1             # 1x (spot-like) at low confidence
+LEVERAGE_MAX   = 3             # 3x max — was 5x, high leverage amplifies stop-outs
+RISK_MIN       = 0.04          # 4% margin at low confidence
+RISK_MAX       = 0.12          # 12% max — was 20%, limits per-trade blowup size
+MAX_TRADE_GAIN   = 0.12        # full-close at 12% (was 8%) — let winners run longer
+PARTIAL_TAKE_PCT = 0.08        # take 50% profit at 8% (was 5%) — more room before harvest
+TRAIL_PCT        = 0.04        # 4% fallback trail on 15-min chart (was 3%)
+ATR_PERIOD       = 14
+ATR_MULTIPLIER   = 2.0         # 2× ATR trail (was 1.5) — gives trade room to breathe
+MAX_TRADE_MINS   = 120         # 2-hour time limit (was 30 min) — trends need time
+KRAKEN_FEE       = 0.0026
+SLIPPAGE         = 0.001
+MAX_TRADES_DAY   = 10
+DAILY_LOSS_LIMIT = 0.10
+ACTIVE_HOURS_UTC  = (5, 23)
+FUNDING_THRESHOLD = 0.0005
+MAX_POSITIONS     = 2          # max 2 simultaneous positions (was 3) — focus on quality
+MAX_TOTAL_RISK    = 0.25       # total margin ≤ 25% (was 40%) — reduce correlated exposure
+BREAKEVEN_PCT     = 0.020      # lock breakeven at +2% (was 1.2%) — 15-min moves are bigger
+MIN_RR_RATIO      = 2.0        # require 2:1 R:R minimum (was 1.5) — only asymmetric trades
+DAILY_GAIN_SOFT   = 0.03
+DAILY_GAIN_HARD   = 0.06
+LIVE_CHART_MINS   = 10
+MAX_SESSION_DD    = 0.12
+VOLUME_FILTER_MULT= 1.5
+EXTREME_FUNDING   = 0.001
+ECON_BLACKOUT_MINS= 15
+MIN_CONFIDENCE    = 0.62       # 62% confidence floor (was 50%) — far fewer but higher-quality signals
+ADX_PERIOD        = 14
+ADX_MIN           = 25         # Wilder's "real trend" threshold (was 20) — no ranging markets
+ER_PERIOD         = 10
+ER_MIN            = 0.30       # stricter efficiency ratio (was 0.25) — cleaner directional moves
 
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 
@@ -732,6 +732,10 @@ _price_alerts   = {}
 
 # Market breadth: how many scanned coins are above their EMA (updated each rank cycle)
 _market_breadth = {"above": 0, "total": 0}
+# HTF trend cache — keyed (pair, interval): (trend_str, expires_ts)
+# Avoids a Kraken API call on every 60-second tick for each coin.
+_htf_cache: dict = {}
+_HTF_CACHE_TTL = 900  # refresh 4h/1h trend every 15 minutes
 
 # Live chart mode — when True, auto-send a fresh chart every LIVE_CHART_MINS
 _live_charts_on = False
@@ -2186,18 +2190,19 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["macd"] += 1
             sig = "HOLD"
 
-        # News-triggered entry: strong news + EMA alignment → trade even without confirm ticks
-        if sig == "HOLD" and n_score >= 3:
-            if n_sent == "BULLISH" and above_ema and rsi < 65 and not macd_bear:
+        # News-triggered entry: only fire on exceptional news (score ≥ 5) + MACD alignment.
+        # Lower threshold (3) caused losses by bypassing confirm_ticks on borderline signals.
+        if sig == "HOLD" and n_score >= 5:
+            if n_sent == "BULLISH" and above_ema and rsi < 60 and macd_bull:
                 sig  = "BUY"
                 plan = {"enter": price,
-                        "exit":  nearest_r if nearest_r else price * 1.015,
-                        "stop":  nearest_s if nearest_s else price * 0.985}
-            elif n_sent == "BEARISH" and not above_ema and rsi > 35 and not macd_bull:
+                        "exit":  nearest_r if nearest_r else price * 1.020,
+                        "stop":  nearest_s if nearest_s else price * 0.980}
+            elif n_sent == "BEARISH" and not above_ema and rsi > 40 and macd_bear:
                 sig  = "SELL"
                 plan = {"enter": price,
-                        "exit":  nearest_s if nearest_s else price * 0.985,
-                        "stop":  nearest_r if nearest_r else price * 1.015}
+                        "exit":  nearest_s if nearest_s else price * 0.980,
+                        "stop":  nearest_r if nearest_r else price * 1.020}
 
         # NASDAQ gate
         nasdaq_mood = market_mood["nasdaq"]
@@ -4129,34 +4134,51 @@ def trading_loop(trader):
                     except Exception: atr = None
 
                     # 4-hour trend confirmation (higher-timeframe confluence)
+                    # Cached for _HTF_CACHE_TTL seconds to avoid extra API calls every tick.
                     if sig in ("BUY", "SELL"):
-                        try:
-                            closes_4h, _, _, _, _ = get_klines(pair, interval=240, limit=14)
-                            ema_4h   = calc_ema(closes_4h)
-                            trend_4h = "UP" if closes_4h[-1] > ema_4h else "DOWN"
+                        _now_ts = time.time()
+                        _k4 = (pair, 240)
+                        _cached4 = _htf_cache.get(_k4)
+                        if _cached4 and _now_ts < _cached4[1]:
+                            trend_4h = _cached4[0]
+                        else:
+                            try:
+                                closes_4h, _, _, _, _ = get_klines(pair, interval=240, limit=16)
+                                ema_4h   = calc_ema(closes_4h)
+                                trend_4h = "UP" if closes_4h[-1] > ema_4h else "DOWN"
+                                _htf_cache[_k4] = (trend_4h, _now_ts + _HTF_CACHE_TTL)
+                            except Exception:
+                                trend_4h = _cached4[0] if _cached4 else None
+                        if trend_4h:
                             if sig == "BUY"  and trend_4h != "UP":
                                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
                                 sig = "HOLD"
-                            if sig == "SELL" and trend_4h != "DOWN":
+                            elif sig == "SELL" and trend_4h != "DOWN":
                                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
                                 sig = "HOLD"
-                        except Exception:
-                            sig = "HOLD"  # safe-fail: can't confirm 4h trend → skip entry
 
                     # 1-hour trend confirmation
                     if sig in ("BUY", "SELL"):
-                        try:
-                            closes_1h, _, _, _, _ = get_klines(pair, interval=60, limit=24)
-                            ema_1h   = calc_ema(closes_1h)
-                            trend_1h = "UP" if closes_1h[-1] > ema_1h else "DOWN"
+                        _now_ts = time.time()
+                        _k1 = (pair, 60)
+                        _cached1 = _htf_cache.get(_k1)
+                        if _cached1 and _now_ts < _cached1[1]:
+                            trend_1h = _cached1[0]
+                        else:
+                            try:
+                                closes_1h, _, _, _, _ = get_klines(pair, interval=60, limit=24)
+                                ema_1h   = calc_ema(closes_1h)
+                                trend_1h = "UP" if closes_1h[-1] > ema_1h else "DOWN"
+                                _htf_cache[_k1] = (trend_1h, _now_ts + _HTF_CACHE_TTL)
+                            except Exception:
+                                trend_1h = _cached1[0] if _cached1 else None
+                        if trend_1h:
                             if sig == "BUY"  and trend_1h != "UP":
                                 with _gate_counter_lock: _gate_counters["1h_trend"] += 1
                                 sig = "HOLD"
-                            if sig == "SELL" and trend_1h != "DOWN":
+                            elif sig == "SELL" and trend_1h != "DOWN":
                                 with _gate_counter_lock: _gate_counters["1h_trend"] += 1
                                 sig = "HOLD"
-                        except Exception:
-                            sig = "HOLD"  # safe-fail: can't confirm 1h trend → skip entry
 
                     # Regime-adaptive pullback filter: in a TRENDING market, wait for
                     # a 1-candle pullback to get a better entry price
