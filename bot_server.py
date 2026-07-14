@@ -13,6 +13,10 @@ import sys
 import re
 import math
 import io
+import hashlib
+import hmac
+import base64
+import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import matplotlib
@@ -229,6 +233,29 @@ TG_TOKEN   = _clean_env(os.environ.get("TG_TOKEN",   ""))
 TG_CHAT_ID = _clean_env(os.environ.get("TG_CHAT_ID", ""))
 TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 BASE_URL   = "https://api.kraken.com/0/public"
+
+# ── Live trading mode (activated when Kraken API keys are present) ─────────────
+KRAKEN_API_KEY    = _clean_env(os.environ.get("KRAKEN_API_KEY",    ""))
+KRAKEN_API_SECRET = _clean_env(os.environ.get("KRAKEN_API_SECRET", ""))
+LIVE_MODE         = bool(KRAKEN_API_KEY and KRAKEN_API_SECRET)
+
+# Minimum order volumes for Kraken spot (in base-currency units)
+_KRAKEN_MIN_VOL = {
+    "XBTUSD": 0.0001, "XXBTZUSD": 0.0001,
+    "ETHUSD": 0.002,  "XETHZUSD": 0.002,
+    "SOLUSD": 0.5,    "XRPUSD":   5.0,
+    "XDGUSD": 50.0,   "ADAUSD":   5.0,
+    "AVAXUSD": 0.1,   "LINKUSD":  0.1,
+    "DOTUSD": 0.1,    "LTCUSD":   0.01,
+    "ATOMUSD": 0.1,   "UNIUSD":   0.1,
+    "AAVEUSD": 0.01,  "INJUSD":   0.1,
+    "SUIUSD": 5.0,    "APTUSD":   0.1,
+    "ARBUSD": 1.0,    "NEARUSD":  0.5,
+    "ALGOUSD": 5.0,   "FILUSD":   0.1,
+    "BCHUSD": 0.01,   "PEPEUSD":  5000000.0,
+    "BONKUSD": 100000.0, "SHIBUSD": 100000.0,
+    "WIFUSD": 0.5,    "FLOKIUSD": 100000.0,
+}
 
 EMA_PERIOD    = 14
 RSI_PERIOD    = 14
@@ -807,6 +834,78 @@ def get_price(pair):
     key = list(payload["result"].keys())[0]
     return float(payload["result"][key]["c"][0])
 
+# ── Kraken private API (live trading mode) ───────────────────────────────────
+
+def _kraken_private(method, params=None):
+    """Sign and send a Kraken private REST request. Returns result dict or raises."""
+    params = dict(params or {})
+    nonce  = str(int(time.time() * 1000))
+    params["nonce"] = nonce
+    post_data = urllib.parse.urlencode(params)
+    url_path  = f"/0/private/{method}"
+    msg       = url_path.encode() + hashlib.sha256((nonce + post_data).encode()).digest()
+    secret    = base64.b64decode(KRAKEN_API_SECRET)
+    signature = base64.b64encode(hmac.new(secret, msg, hashlib.sha512).digest()).decode()
+    headers   = {"API-Key": KRAKEN_API_KEY, "API-Sign": signature,
+                 "Content-Type": "application/x-www-form-urlencoded"}
+    r = requests.post(f"https://api.kraken.com{url_path}",
+                      headers=headers, data=post_data, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("error"):
+        raise RuntimeError(f"Kraken API error: {data['error']}")
+    return data["result"]
+
+def _kraken_get_usd_balance():
+    """Return available USD balance from Kraken. Returns 0.0 on failure."""
+    try:
+        result = _kraken_private("Balance")
+        return float(result.get("ZUSD", result.get("USD", 0)))
+    except Exception as e:
+        log("LIVE", f"balance fetch error: {e}", "ERR")
+        return 0.0
+
+def _kraken_place_order(pair, side, volume, validate=False):
+    """
+    Place a Kraken spot market order.
+    side: 'buy' or 'sell'
+    volume: base-currency units (e.g. BTC amount, not USD)
+    Returns txid string or raises on failure.
+    """
+    min_vol = _KRAKEN_MIN_VOL.get(pair, 0.0)
+    if volume < min_vol:
+        raise ValueError(f"Order volume {volume:.8f} below Kraken minimum {min_vol} for {pair}")
+    params = {
+        "pair":       pair,
+        "type":       side,
+        "ordertype":  "market",
+        "volume":     f"{volume:.8f}",
+    }
+    if validate:
+        params["validate"] = "true"
+    result = _kraken_private("AddOrder", params)
+    txids  = result.get("txid", [])
+    txid   = txids[0] if txids else "unknown"
+    log("LIVE", f"Order placed: {side.upper()} {volume:.6f} {pair}  txid={txid}")
+    return txid
+
+def _kraken_cancel_order(txid):
+    """Cancel an open Kraken order by txid. Silently ignores errors (order may already be filled)."""
+    try:
+        _kraken_private("CancelOrder", {"txid": txid})
+    except Exception as e:
+        log("LIVE", f"cancel {txid}: {e}", "WARN")
+
+def _kraken_validate_keys():
+    """Returns True if the API keys can authenticate successfully."""
+    try:
+        _kraken_private("Balance")
+        return True
+    except Exception as e:
+        log("LIVE", f"key validation failed: {e}", "ERR")
+        return False
+
+
 def calc_ema(closes):
     if len(closes) < EMA_PERIOD:
         raise ValueError(f"calc_ema needs {EMA_PERIOD} candles, got {len(closes)}")
@@ -1230,7 +1329,16 @@ class PaperTrader:
         # Kelly Criterion cache (refreshed every 5 min when ≥20 trades available)
         self._kelly_sz  = 0.0
         self._kelly_ts  = 0.0
+        self._live_orders  = {}   # pair → kraken txid (live mode only)
         self._load()
+        if LIVE_MODE:
+            real_bal = _kraken_get_usd_balance()
+            if real_bal > 0:
+                self.balance    = real_bal
+                self.peak       = max(self.peak, real_bal)
+                self.day_start_bal = real_bal
+                self.session_start = real_bal
+                log("LIVE", f"Real USD balance from Kraken: ${real_bal:.2f}")
 
     @property
     def position(self):
@@ -1674,7 +1782,10 @@ class PaperTrader:
             if sig == "BUY"  and self.can_open_new():
                 self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
             elif sig == "SELL" and self.can_open_new():
-                self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
+                if LIVE_MODE:
+                    log("LIVE", f"SHORT skipped ({name}) — live mode uses spot only")
+                else:
+                    self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
 
     def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None):
         # Correlation filter: don't pile into the same direction on correlated coins
@@ -1736,12 +1847,32 @@ class PaperTrader:
                         * session_mult
                         * gain_mult,
                         RISK_MAX)
-        leverage   = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
-        fill       = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
-        margin     = round(self.balance * risk, 4)
-        contracts  = round((margin * leverage) / fill, 6)
-        fee        = round(margin * KRAKEN_FEE, 4)
-        self.balance = round(self.balance - fee, 4)
+        if LIVE_MODE:
+            leverage = 1    # spot: no leverage
+            margin   = round(self.balance * risk, 4)
+            fill     = price   # actual fill comes from Kraken; use current price for sizing
+            contracts = round(margin / fill, 8)
+            # Place real market buy order on Kraken
+            try:
+                txid = _kraken_place_order(pair, "buy", contracts)
+                self._live_orders[pair] = txid
+            except Exception as exc:
+                log("LIVE", f"Order FAILED for {name}: {exc}", "ERR")
+                tg(f"❌ *Live order FAILED — {name}*\n`{exc}`\n_Trade skipped._")
+                return
+            # Refresh real balance after buy (USD spent = margin + fee)
+            real_usd = _kraken_get_usd_balance()
+            if real_usd > 0:
+                self.balance = real_usd
+            fee = round(margin * KRAKEN_FEE, 4)
+        else:
+            leverage  = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
+            fill      = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
+            margin    = round(self.balance * risk, 4)
+            contracts = round((margin * leverage) / fill, 6)
+            fee       = round(margin * KRAKEN_FEE, 4)
+            self.balance = round(self.balance - fee, 4)
+
         self.day_trades += 1
         conf_pct   = int(confidence * 100)
         if atr is not None:
@@ -1785,10 +1916,12 @@ class PaperTrader:
         session_note = f" 🇺🇸 US×`{session_mult:.2f}`" if session_mult > 1.0 else \
                        f" 🌙 Asia×`{session_mult:.2f}`" if session_mult < 1.0 else ""
         gain_note    = f" 🔒 gain-protect×`{gain_mult:.2f}`" if gain_mult < 1.0 else ""
-        tg(f"📂 *Trade OPENED — {name}*\n"
+        live_note    = " 🔴 *LIVE*" if LIVE_MODE else ""
+        lev_str      = "1x spot" if LIVE_MODE else f"*{leverage}x leverage*"
+        tg(f"📂 *Trade OPENED — {name}*{live_note}\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
            f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}{streak_note}{session_note}{gain_note}\n"
-           f"Margin: `${margin:.2f}` | *{leverage}x leverage*\n"
+           f"Margin: `${margin:.2f}` | {lev_str}\n"
            f"Trail stop: `${trail_stop:.4f}` ({stop_label}) | Balance: `${self.balance:.2f}`")
         _print_trade_box("OPEN", name, side, fill,
                          stop=trail_stop, target=target,
@@ -1806,12 +1939,32 @@ class PaperTrader:
         global _paused
         p = self.positions.get(pair)
         if not p: return
-        fill = price * (1 - SLIPPAGE) if p["side"] == "LONG" else price * (1 + SLIPPAGE)
-        move = (fill - p["entry"]) / p["entry"]
-        if p["side"] == "SHORT": move = -move
-        fee          = round(p["margin"] * KRAKEN_FEE, 4)
-        pnl          = round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN) - fee, 4)
-        self.balance = round(self.balance + pnl, 4)
+
+        if LIVE_MODE:
+            # Place real market sell order on Kraken for the crypto we hold
+            contracts = p.get("contracts", 0.0)
+            try:
+                _kraken_place_order(pair, "sell", contracts)
+                self._live_orders.pop(pair, None)
+            except Exception as exc:
+                log("LIVE", f"Close order FAILED for {name}: {exc}", "ERR")
+                tg(f"⚠️ *Live close FAILED — {name}*\n`{exc}`\n_Position still open on Kraken — check manually!_")
+                return
+            # Compute P&L from real price (Kraken fills at market; use current price)
+            fill = price
+            real_usd_after = _kraken_get_usd_balance()
+            pnl  = round(real_usd_after - self.balance, 4) if real_usd_after > 0 else 0.0
+            if real_usd_after > 0:
+                self.balance = real_usd_after
+            fee = round(p.get("margin", 0) * KRAKEN_FEE, 4)
+        else:
+            fill = price * (1 - SLIPPAGE) if p["side"] == "LONG" else price * (1 + SLIPPAGE)
+            move = (fill - p["entry"]) / p["entry"]
+            if p["side"] == "SHORT": move = -move
+            fee  = round(p["margin"] * KRAKEN_FEE, 4)
+            pnl  = round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN) - fee, 4)
+            self.balance = round(self.balance + pnl, 4)
+
         self.peak    = max(self.peak, self.balance)
         held_mins    = round((time.time() - p.get("opened_at", time.time())) / 60, 1)
         cs = self.coin_stats.setdefault(name, {"wins": 0, "losses": 0})
@@ -4411,12 +4564,13 @@ def main():
         pad_l = (BW - len(text)) // 2
         pad_r  = BW - len(text) - pad_l
         print(_c(_C.CYAN, "║") + " " * pad_l + _c(col, text) + " " * pad_r + _c(_C.CYAN, "║"))
+    mode_label = "LIVE TRADING · spot" if LIVE_MODE else "paper trading  ·  simulation"
     print(_c(_C.CYAN, "╔" + "═" * BW + "╗"))
     _bcenter("")
     _bcenter("◈  C R Y P T O B O T  ◈", _C.CYAN + _C.BOLD)
     _bcenter("─" * 30, _C.GREY)
-    _bcenter("paper trading  ·  multi-coin  ·  26 pairs", _C.GREY)
-    _bcenter("ATR trailing stops  ·  6-pillar confidence", _C.GREY)
+    _bcenter(f"{mode_label}  ·  26 pairs", _C.GREY)
+    _bcenter("ATR trailing stops  ·  9-pillar confidence", _C.GREY)
     _bcenter("")
     print(_c(_C.CYAN, "╠" + "═" * BW + "╣"))
     _bcenter(datetime.now().strftime("Started  %Y-%m-%d  %H:%M  UTC"), _C.GREY)
@@ -4424,6 +4578,7 @@ def main():
     print()
 
     log("BOOT", f"Chat ID: {_c(_C.CYAN, TG_CHAT_ID)}")
+    log("BOOT", f"Mode: {_c(_C.RED + _C.BOLD, 'LIVE TRADING') if LIVE_MODE else _c(_C.GREY, 'paper')}")
 
     # Remove any webhook so long-polling (getUpdates) works
     try:
@@ -4433,11 +4588,26 @@ def main():
     except Exception as e:
         log("BOOT", f"deleteWebhook error: {e}", "ERR")
 
+    # Validate Kraken live keys before anything else touches the exchange
+    if LIVE_MODE:
+        log("BOOT", "Validating Kraken API keys...")
+        if not _kraken_validate_keys():
+            log("BOOT", "KRAKEN API KEY VALIDATION FAILED — check KRAKEN_API_KEY / KRAKEN_API_SECRET", "ERR")
+            tg("🚨 *Kraken API key validation FAILED*\nCheck `KRAKEN_API_KEY` and `KRAKEN_API_SECRET` env vars.\n_Exiting._", plain=True)
+            sys.exit(1)
+        log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken API keys valid — LIVE MODE active"))
+
     # Plain-text ping — proves connectivity before any markdown
     ok = tg(f"CryptoBot booting... (chat_id={TG_CHAT_ID})", plain=True)
     log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
 
     trader = PaperTrader()
+
+    if LIVE_MODE:
+        tg(f"🔴 *LIVE TRADING MODE — real money on Kraken*\n"
+           f"Balance: `${trader.balance:.2f}` USD\n"
+           f"Strategy: spot BUY only · 9-pillar confidence · ADX+ER+VWAP gates\n"
+           f"⚠️ _This bot will place real orders. Ensure balance is intentional._")
 
     # Start background threads
     threads = [
