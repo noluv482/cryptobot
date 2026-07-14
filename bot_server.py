@@ -2552,11 +2552,10 @@ _CHART_COLORS = {
     "BG_PANEL": "#161b22",
     "GREEN":    "#3fb950",
     "RED":      "#f85149",
-    "ACCENT":   "#58a6ff",
-    "YELLOW":   "#e3b341",
+    "ACCENT":   "#58a6ff",   # EMA line and RSI line
     "GRID":     "#21262d",
     "TEXT":     "#c9d1d9",
-    "MUTED":    "#8b949e",
+    "MUTED":    "#6e7681",
 }
 
 def _make_price_chart(pair, entry=None, entry_side=None,
@@ -2607,95 +2606,105 @@ def _make_price_chart(pair, entry=None, entry_side=None,
         has_rsi = len(rsi_series) > 0
         if has_rsi:
             fig, (ax1, ax2) = plt.subplots(
-                2, 1, figsize=(11, 7),
-                gridspec_kw={"height_ratios": [3, 1]}, sharex=True)
+                2, 1, figsize=(10, 6.5),
+                gridspec_kw={"height_ratios": [3, 1], "hspace": 0.04},
+                sharex=True)
         else:
-            fig, ax1 = plt.subplots(figsize=(11, 6))
+            fig, ax1 = plt.subplots(figsize=(10, 5.5))
             ax2 = None
         fig.patch.set_facecolor(col["BG_DARK"])
 
         for ax in ([ax1, ax2] if ax2 else [ax1]):
             ax.set_facecolor(col["BG_PANEL"])
-            ax.tick_params(colors=col["MUTED"], labelsize=7.5)
+            ax.tick_params(colors=col["MUTED"], labelsize=7, length=0)
             for spine in ax.spines.values():
-                spine.set_edgecolor(col["GRID"])
-            ax.grid(color=col["GRID"], linewidth=0.5, zorder=0)
+                spine.set_visible(False)
+            ax.grid(color=col["GRID"], linewidth=0.5, linestyle="solid", zorder=0)
 
         # ── Candlesticks ──────────────────────────────────────────────────────
+        body_w = 0.55
         for i in x:
             o, c2, h, l = opens[i], closes[i], highs[i], lows[i]
-            color = col["GREEN"] if c2 >= o else col["RED"]
-            ax1.plot([i, i], [l, h], color=color, linewidth=0.8, zorder=2)
+            is_bull = c2 >= o
+            color   = col["GREEN"] if is_bull else col["RED"]
+            ax1.plot([i, i], [l, h], color=color, linewidth=0.7, zorder=2,
+                     solid_capstyle="round")
             height = max(abs(c2 - o), price * 0.00005)
             ax1.bar(i, height, bottom=min(o, c2), color=color,
-                    width=0.6, zorder=3, alpha=0.85)
+                    width=body_w, zorder=3, alpha=0.9, linewidth=0)
 
         # ── EMA overlay ───────────────────────────────────────────────────────
         if ema_series:
             ex = [i for i, v in enumerate(ema_series) if v is not None]
             ey = [v for v in ema_series if v is not None]
-            ax1.plot(ex, ey, color=col["ACCENT"], linewidth=1.2,
-                     alpha=0.80, zorder=4, label="EMA")
+            ax1.plot(ex, ey, color=col["ACCENT"], linewidth=1.5,
+                     alpha=0.85, zorder=4)
 
         # ── Position markers ──────────────────────────────────────────────────
-        right = n + 1  # x coord for right-side labels
+        # Right-side label x coord; ax1 xlim set below to leave this room
+        right = n
+        ann_kw = dict(annotation_clip=False, fontsize=8, va="center")
         if entry is not None and entry_side:
             ec = col["GREEN"] if entry_side == "LONG" else col["RED"]
-            ax1.axhline(entry, color=ec, linewidth=1.3, alpha=0.9, zorder=5)
-            ax1.annotate(f" Entry ${entry:.4f}", xy=(right, entry),
-                         color=ec, fontsize=7.5, va="center", fontweight="bold",
-                         annotation_clip=False)
+            ax1.axhline(entry, color=ec, linewidth=1.0, alpha=0.85, zorder=5)
+            ax1.annotate(f"  Entry  ${entry:.4f}", xy=(right, entry),
+                         color=ec, fontweight="bold", **ann_kw)
         if trail_stop is not None:
-            ax1.axhline(trail_stop, color=col["RED"], linewidth=0.9,
-                        linestyle=":", alpha=0.75, zorder=5)
-            ax1.annotate(f" Stop ${trail_stop:.4f}", xy=(right, trail_stop),
-                         color=col["RED"], fontsize=7, va="center",
+            ax1.axhline(trail_stop, color=col["RED"], linewidth=0.8,
+                        linestyle=(0, (3, 4)), alpha=0.70, zorder=5)
+            ax1.annotate(f"  Stop  ${trail_stop:.4f}", xy=(right, trail_stop),
+                         color=col["RED"], fontsize=7.5, va="center",
                          annotation_clip=False)
         if exit_price is not None:
             ec2 = col["GREEN"] if (exit_pnl or 0) >= 0 else col["RED"]
-            ax1.axhline(exit_price, color=ec2, linewidth=1.3,
-                        linestyle="--", alpha=0.9, zorder=5)
+            ax1.axhline(exit_price, color=ec2, linewidth=1.0, alpha=0.9, zorder=5)
             pnl_str = f"  {exit_pnl:+.2f}$" if exit_pnl is not None else ""
-            ax1.annotate(f" Exit ${exit_price:.4f}{pnl_str}", xy=(right, exit_price),
-                         color=ec2, fontsize=7.5, va="center", fontweight="bold",
-                         annotation_clip=False)
+            ax1.annotate(f"  Exit  ${exit_price:.4f}{pnl_str}", xy=(right, exit_price),
+                         color=ec2, fontweight="bold", **ann_kw)
 
-        # Shade between entry and current/exit
+        # Shade P&L band between entry and current/exit price
         if entry is not None and entry_side:
             ref = exit_price if exit_price is not None else price
             profitable = (ref > entry and entry_side == "LONG") or \
                          (ref < entry and entry_side == "SHORT")
             ax1.fill_between(x, min(entry, ref), max(entry, ref),
-                             alpha=0.09,
+                             alpha=0.08,
                              color=col["GREEN"] if profitable else col["RED"],
-                             zorder=1)
+                             zorder=1, linewidth=0)
 
-        ax1.annotate(f" ${price:.4f}", xy=(right, price),
-                     color=col["TEXT"], fontsize=8, va="center",
-                     annotation_clip=False)
-        ax1.set_ylabel(f"{pair_name}", color=col["MUTED"], fontsize=9)
-        ax1.set_xlim(-0.5, n + 7)
+        # Current price label
+        ax1.annotate(f"  ${price:.4f}", xy=(right, price),
+                     color=col["TEXT"], fontsize=8.5, va="center",
+                     annotation_clip=False, fontweight="semibold")
+        ax1.set_ylabel(pair_name, color=col["MUTED"], fontsize=8.5,
+                       labelpad=6)
+        ax1.set_xlim(-0.5, n + 9)
 
         # ── RSI subplot ───────────────────────────────────────────────────────
         if ax2 and rsi_series:
             rsi_x = list(range(RSI_PERIOD, n))
             ax2.plot(rsi_x, rsi_series, color=col["ACCENT"],
-                     linewidth=1.0, zorder=2)
-            ax2.fill_between(rsi_x, 30, 70, alpha=0.05,
-                             color=col["MUTED"], zorder=1)
-            ax2.axhline(70, color=col["RED"],   linewidth=0.6,
-                        linestyle="--", alpha=0.5)
-            ax2.axhline(30, color=col["GREEN"], linewidth=0.6,
-                        linestyle="--", alpha=0.5)
+                     linewidth=1.2, zorder=3)
+            ax2.fill_between(rsi_x, rsi_series, 50,
+                             where=[r >= 50 for r in rsi_series],
+                             alpha=0.12, color=col["GREEN"], zorder=2, linewidth=0)
+            ax2.fill_between(rsi_x, rsi_series, 50,
+                             where=[r < 50 for r in rsi_series],
+                             alpha=0.12, color=col["RED"], zorder=2, linewidth=0)
+            # Solid threshold lines (not dashed — per mark specs)
+            ax2.axhline(70, color=col["RED"],   linewidth=0.6, alpha=0.45, zorder=1)
+            ax2.axhline(30, color=col["GREEN"], linewidth=0.6, alpha=0.45, zorder=1)
+            ax2.axhline(50, color=col["MUTED"], linewidth=0.4, alpha=0.30, zorder=1)
             cur_rsi = rsi_series[-1]
-            rc = col["RED"] if cur_rsi >= 70 else \
-                 col["GREEN"] if cur_rsi <= 30 else col["MUTED"]
-            ax2.annotate(f" {cur_rsi:.0f}", xy=(n - 1 + 1, cur_rsi),
+            rc = col["RED"]   if cur_rsi >= 70 else \
+                 col["GREEN"] if cur_rsi <= 30 else col["TEXT"]
+            ax2.annotate(f"  {cur_rsi:.0f}", xy=(n, cur_rsi),
                          color=rc, fontsize=7.5, va="center",
                          annotation_clip=False)
-            ax2.set_ylim(0, 100)
-            ax2.set_yticks([30, 50, 70])
-            ax2.set_ylabel("RSI", color=col["MUTED"], fontsize=8)
+            ax2.set_ylim(5, 95)
+            ax2.set_yticks([30, 70])
+            ax2.set_ylabel("RSI", color=col["MUTED"], fontsize=7.5, labelpad=4)
+            ax2.yaxis.set_tick_params(labelsize=6.5, colors=col["MUTED"])
         if ax2:
             ax2.set_xticks([])
         ax1.set_xticks([])
@@ -2703,25 +2712,25 @@ def _make_price_chart(pair, entry=None, entry_side=None,
         # ── Title ─────────────────────────────────────────────────────────────
         itvl = f"{INTERVAL}m"
         if entry is not None and entry_side:
-            side_icon = "🟢 LONG" if entry_side == "LONG" else "🔴 SHORT"
+            side_icon = "▲ LONG" if entry_side == "LONG" else "▼ SHORT"
             if exit_price is None:
                 move = (price - entry) / entry * 100
                 if entry_side == "SHORT": move = -move
-                title = (f"{pair_name} {itvl}  |  {side_icon} @ ${entry:.4f}"
-                         f"  |  {'+'if move>=0 else ''}{move:.2f}%")
+                sign = "+" if move >= 0 else ""
+                title = f"{pair_name} · {itvl}  |  {side_icon} @ ${entry:.4f}  |  {sign}{move:.2f}%"
             else:
                 pnl_str = f"{exit_pnl:+.2f}$" if exit_pnl is not None else ""
-                ok = "✅" if (exit_pnl or 0) >= 0 else "❌"
-                title = f"{pair_name} {itvl}  |  CLOSED {ok}  {pnl_str}"
+                ok = "PROFIT" if (exit_pnl or 0) >= 0 else "LOSS"
+                title = f"{pair_name} · {itvl}  |  CLOSED · {ok}  {pnl_str}"
         else:
-            title = f"{pair_name}  {itvl}  |  ${price:.4f}"
+            title = f"{pair_name} · {itvl}  |  ${price:.4f}"
 
-        fig.suptitle(title, color=col["TEXT"], fontsize=10,
-                     x=0.02, y=0.998, ha="left")
-        fig.tight_layout(rect=[0, 0, 1, 0.98])
+        fig.text(0.012, 0.992, title, color=col["TEXT"], fontsize=9.5,
+                 va="top", ha="left", fontweight="semibold")
+        fig.subplots_adjust(left=0.07, right=0.78, top=0.93, bottom=0.03)
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+        plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
                     facecolor=fig.get_facecolor())
         buf.seek(0)
         plt.close(fig)
