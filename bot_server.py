@@ -1551,11 +1551,15 @@ class PaperTrader:
             elif wr <= 45: wr_mult = 0.80; log("PAPER", f"{pair} WR {wr:.0f}% → -20% stake")
 
         # Kelly Criterion base risk when ≥20 trades available (half-Kelly)
-        kelly = self._kelly_size()
+        # Floor at 50% of the linear formula to prevent a jarring drop when Kelly
+        # first activates on a marginal strategy (e.g., 55% WR → kelly ≈ 5%).
+        linear = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+        kelly  = self._kelly_size()
         if kelly > 0:
-            base_risk = kelly * (0.5 + 0.5 * confidence)  # confidence still scales within Kelly
+            kelly_base = kelly * (0.5 + 0.5 * confidence)
+            base_risk  = max(kelly_base, linear * 0.5)
         else:
-            base_risk = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+            base_risk = linear
 
         # Volatility-adaptive multiplier: shrink size when current ATR is elevated
         vol_mult = 1.0
@@ -2002,7 +2006,7 @@ class SignalEngine:
                 try:
                     self._hour_win_rates = db.hourly_win_rates()
                 except Exception: pass
-            self._hour_w_ts = now_ts
+                self._hour_w_ts = now_ts   # only advance if DB was reachable
         hour_data = self._hour_win_rates.get(datetime.utcnow().hour)
         if hour_data and sig in ("BUY", "SELL"):
             if hour_data["wr"] >= 60:
@@ -2477,7 +2481,7 @@ def _compute_sharpe_sortino(trades):
 
 
 def _readiness_score(trader):
-    """Compute 0-100 paper-to-live readiness score with breakdown."""
+    """Compute 0-110 paper-to-live readiness score with breakdown."""
     trades  = trader.trades
     total   = len(trades)
     if total == 0:
@@ -2490,7 +2494,10 @@ def _readiness_score(trader):
     trade_pts = min(total / 4.0, 25.0)
 
     # Win rate (recency-weighted) — max 30 pts
+    # Cap using simple WR so recent hot streak can't mask a lifetime losing record
     wr_pts = 30 if rwr >= 60 else 20 if rwr >= 55 else 10 if rwr >= 50 else 0
+    if wr < 40:
+        wr_pts = min(wr_pts, 10)
 
     # Profit factor — max 20 pts
     gross_win  = sum(t["pnl"] for t in trades if t["pnl"] > 0) or 0
@@ -2620,7 +2627,7 @@ def _cmd_learn(trader):
     lines = [
         "*🎓 Learning & Real-Money Readiness*",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Score: *{score}/100*  {bar}",
+        f"Score: *{score}/110*  {bar}",
         verdict,
         "━━━━━━━━━━━━━━━━━━━━",
         "*Score breakdown:*",
@@ -3244,7 +3251,8 @@ def trading_loop(trader):
                             if sig == "SELL" and trend_4h != "DOWN":
                                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
                                 sig = "HOLD"
-                        except Exception: pass
+                        except Exception:
+                            sig = "HOLD"  # safe-fail: can't confirm 4h trend → skip entry
 
                     # 1-hour trend confirmation
                     if sig in ("BUY", "SELL"):
@@ -3258,7 +3266,8 @@ def trading_loop(trader):
                             if sig == "SELL" and trend_1h != "DOWN":
                                 with _gate_counter_lock: _gate_counters["1h_trend"] += 1
                                 sig = "HOLD"
-                        except Exception: pass
+                        except Exception:
+                            sig = "HOLD"  # safe-fail: can't confirm 1h trend → skip entry
 
                     # Regime-adaptive pullback filter: in a TRENDING market, wait for
                     # a 1-candle pullback to get a better entry price
