@@ -261,6 +261,7 @@ BREAKEVEN_PCT     = 0.012    # move stop to entry once trade is +1.2% in profit
 MIN_RR_RATIO      = 1.5      # minimum reward-to-risk ratio; skip entries below this
 DAILY_GAIN_SOFT   = 0.03     # at +3% today: halve position size to protect the day
 DAILY_GAIN_HARD   = 0.06     # at +6% today: stop new entries entirely
+LIVE_CHART_MINS   = 10       # minutes between auto-chart updates when live mode is on
 MAX_SESSION_DD    = 0.12     # auto-pause if balance drops 12% from session peak
 VOLUME_FILTER_MULT= 1.5      # require 1.5× average volume before entering
 EXTREME_FUNDING   = 0.001    # 0.1% / 8h = overcrowded → use as contrarian booster
@@ -698,6 +699,9 @@ _price_alerts   = {}
 
 # Market breadth: how many scanned coins are above their EMA (updated each rank cycle)
 _market_breadth = {"above": 0, "total": 0}
+
+# Live chart mode — when True, auto-send a fresh chart every LIVE_CHART_MINS
+_live_charts_on = False
 
 # Gate telemetry — count how many BUY/SELL signals each gate blocked per day
 _gate_counters = {
@@ -2484,7 +2488,7 @@ _REPLY_KB = {
         [{"text": "📜 History"},  {"text": "📰 News"}],
         [{"text": "🧠 Intel"},    {"text": "🏆 Ranks"},  {"text": "🎓 Learn"}],
         [{"text": "🔄 Switch"},   {"text": "⏸ Pause"},  {"text": "▶ Resume"}],
-        [{"text": "🔍 Why"},      {"text": "📈 Chart"}, {"text": "📋 Menu"}],
+        [{"text": "🔍 Why"},      {"text": "📈 Chart"}, {"text": "📡 Live"}, {"text": "📋 Menu"}],
     ],
     "resize_keyboard": True,
 }
@@ -2503,6 +2507,7 @@ _TEXT_ACTION: dict = {
     "▶ resume":    "resume",
     "🔍 why":      "why",
     "📈 chart":    "chart",
+    "📡 live":     "live",
     "📋 menu":     "menu",
     # text commands
     "/start":      "menu",
@@ -2516,6 +2521,7 @@ _TEXT_ACTION: dict = {
     "/learn":      "learn",
     "/why":        "why",
     "/chart":      "chart",
+    "/live":       "live",
     "/equity":     "equity",
     "/pause":      "pause",
     "/resume":     "resume",
@@ -2908,6 +2914,16 @@ def _cmd_chart(trader):
     pair_name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
     status = "📂 position open" if pos else "📡 scanning"
     tg_photo(buf, f"📊 *{pair_name}* — {status}")
+
+def _cmd_live(trader):
+    """Handler for /live — toggle auto chart updates while a position is open."""
+    global _live_charts_on
+    _live_charts_on = not _live_charts_on
+    if _live_charts_on:
+        tg(f"📡 *Live charts ON* — sending a fresh chart every `{LIVE_CHART_MINS}` min while a position is open.\nSend again to turn off.")
+        _cmd_chart(trader)
+    else:
+        tg("📡 *Live charts OFF* — auto updates stopped.")
 
 def _cmd_equity(trader):
     """Handler for /equity — account balance equity curve."""
@@ -3375,6 +3391,9 @@ def _dispatch_callback(data, query, trader):
     elif data == "chart":
         _cmd_chart(trader)
 
+    elif data == "live":
+        _cmd_live(trader)
+
     elif data == "equity":
         _cmd_equity(trader)
 
@@ -3620,6 +3639,27 @@ def trading_loop(trader):
                                         p["div_tightened"] = True
                                         tg(f"⚠️ *Bullish Divergence — {p['name']}*\n"
                                            f"Price making lows, RSI rising\nTrail tightened to `1×ATR`")
+                        except Exception: pass
+
+                    # ── Live chart auto-update ──────────────────────────────
+                    if _live_charts_on:
+                        try:
+                            _now = time.time()
+                            if _now - p.get("_last_chart_ts", 0) >= LIVE_CHART_MINS * 60:
+                                p["_last_chart_ts"] = _now
+                                _buf = _make_price_chart(
+                                    pair,
+                                    entry=p["entry"],
+                                    entry_side=p["side"],
+                                    trail_stop=p.get("trail_stop"),
+                                )
+                                if _buf:
+                                    _upnl = trader.unrealized_pnl(price, pair)
+                                    _sign = "+" if _upnl >= 0 else ""
+                                    tg_photo(_buf,
+                                        f"📡 *Live — {p['name']}*  "
+                                        f"`{_sign}{_upnl:.2f}$`  "
+                                        f"{'🟢' if _upnl >= 0 else '🔴'}")
                         except Exception: pass
 
                     trader.on_signal("HOLD", price, 0, 0, p["name"], 0.0, pair, atr=atr)
