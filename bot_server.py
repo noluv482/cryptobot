@@ -742,6 +742,9 @@ _HTF_CACHE_TTL = 900  # refresh 4h/1h trend every 15 minutes
 _pattern_cache: dict = {}
 _PATTERN_TTL   = 900  # 15 minutes between rescans
 
+_activity_log: list = []   # last 30 scan events for dashboard activity feed
+_ACTIVITY_MAX  = 30
+
 # Live chart mode — when True, auto-send a fresh chart every LIVE_CHART_MINS
 _live_charts_on = False
 
@@ -4526,6 +4529,7 @@ def trading_loop(trader):
                     sig, plan, ema, rsi, conf = eng.evaluate(
                         closes, highs, lows, volumes, price, coin["alert_buffer"],
                         pair=pair, opens=opens)
+                    sig_from_eval = sig   # capture before gate filters may change it
                     try: atr = calc_atr(highs, lows, closes)
                     except Exception: atr = None
 
@@ -4701,6 +4705,26 @@ def trading_loop(trader):
                                          atr=atr, fkey=fkey, pillars=pillars)
 
                     last_sigs[pair] = sig
+
+                    # ── Activity log entry ────────────────────────────────
+                    _act_pillars = plan.get("pillars", {})
+                    _act_entry = {
+                        "ts":       int(time.time() * 1000),
+                        "coin":     coin["name"],
+                        "price":    round(price, 4),
+                        "eval_sig": sig_from_eval,
+                        "final_sig": sig,
+                        "conf":     round(conf * 100),
+                        "pillars_ok":    sum(1 for v in _act_pillars.values() if v),
+                        "pillars_total": len(_act_pillars),
+                        "chart":    plan.get("chart_name", ""),
+                        "candle":   plan.get("candle_name", ""),
+                        "in_pos":   pair in trader.positions,
+                    }
+                    _activity_log.append(_act_entry)
+                    if len(_activity_log) > _ACTIVITY_MAX:
+                        _activity_log.pop(0)
+
                 except Exception as e:
                     log("TRADE", f"scan {pair}: {e}", "ERR")
 
@@ -5032,6 +5056,11 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       </div>
     </div>
 
+    <div class="sh"><span>Bot Activity</span><span style="font-size:.58rem;color:var(--mu);font-weight:400">live scan feed</span></div>
+    <div id="activity_feed" style="padding:0 12px 4px">
+      <div class="no-data" style="padding:16px 0">Waiting for first scan…</div>
+    </div>
+
     <div class="sh"><span>Equity Curve</span></div>
     <div class="eq-wrap"><canvas id="eq_cv" class="cvc" style="display:block;width:100%" height="110"></canvas></div>
   </div>
@@ -5271,6 +5300,7 @@ async function fetchStatus(){
     pb.className='icon-btn'+(_paused?' paused':'');
     pb.title=_paused?'Resume bot':'Pause bot';
     renderPositions(d.open_positions||[]);
+    renderActivity(d.activity_log||[]);
     renderTrades(recent);
     renderCoinTable(d.coin_stats||{});
     renderRank(d);
@@ -5329,6 +5359,55 @@ function renderTrades(recent){
         '<div class="tr-pnl '+(w?'c-g':'c-r')+'">'+msign(t.pnl)+'</div>'+
         '<div class="tr-time">'+ts+'</div>'+
       '</div></div>';
+  }).join('');
+}
+
+/* ── ACTIVITY FEED ── */
+function renderActivity(log){
+  const el=$('activity_feed');
+  if(!el)return;
+  if(!log||!log.length){el.innerHTML='<div class="no-data" style="padding:16px 0">Waiting for first scan…</div>';return;}
+  const fmtTime=ts=>{
+    const d=new Date(ts);
+    return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  };
+  el.innerHTML=log.map(e=>{
+    const isBuy=e.eval_sig==='BUY', isSell=e.eval_sig==='SELL';
+    const blocked=isBuy||isSell?e.final_sig==='HOLD':false;
+    const inPos=e.in_pos;
+
+    // Determine action label + color
+    let ico, label, acol, abg;
+    if(inPos && (isBuy||isSell) && !blocked){
+      ico='📂'; label='IN TRADE'; acol='var(--b)'; abg='rgba(70,130,255,.1)';
+    } else if(blocked){
+      ico='⛔'; label='BLOCKED'; acol='var(--mu)'; abg='rgba(128,128,128,.07)';
+    } else if(isBuy){
+      ico='📊'; label='BUY SIG'; acol='var(--g)'; abg='rgba(0,204,116,.07)';
+    } else if(isSell){
+      ico='📊'; label='SELL SIG'; acol='var(--r)'; abg='rgba(255,51,82,.07)';
+    } else {
+      ico='🔍'; label='WATCH'; acol='var(--mu)'; abg='transparent';
+    }
+
+    const confCol=e.conf>=70?'var(--g)':e.conf>=55?'var(--b)':'var(--mu)';
+    const pillStr=e.pillars_total?e.pillars_ok+'/'+e.pillars_total+' ✓':'';
+    const patStr=[e.chart?'📐'+e.chart:'',e.candle?'🕯️'+e.candle:''].filter(Boolean).join('  ');
+
+    return '<div style="display:flex;align-items:flex-start;gap:9px;padding:7px 10px;margin-bottom:4px;'+
+      'border-radius:9px;background:'+abg+'">'+
+      '<div style="font-size:1rem;line-height:1.4;flex-shrink:0">'+ico+'</div>'+
+      '<div style="flex:1;min-width:0">'+
+        '<div style="display:flex;align-items:baseline;gap:7px;flex-wrap:wrap">'+
+          '<span style="font-weight:700;font-size:.8rem;color:var(--tx)">'+e.coin+'</span>'+
+          '<span style="font-size:.65rem;font-weight:700;color:'+acol+'">'+label+'</span>'+
+          '<span style="font-family:var(--fn);font-size:.65rem;color:'+confCol+'">'+e.conf+'%</span>'+
+          (pillStr?'<span style="font-size:.58rem;color:var(--mu)">'+pillStr+'</span>':'')+
+        '</div>'+
+        (patStr?'<div style="font-size:.58rem;color:var(--mu);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+patStr+'</div>':'')+
+      '</div>'+
+      '<div style="font-size:.55rem;color:var(--mu);flex-shrink:0;margin-top:2px">'+fmtTime(e.ts)+'</div>'+
+    '</div>';
   }).join('');
 }
 
@@ -5827,6 +5906,7 @@ def _web_status():
             for p, v in _pattern_cache.items()
             if v.get("name") or v.get("candle_name")
         },
+        "activity_log": list(reversed(_activity_log[-20:])),
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
