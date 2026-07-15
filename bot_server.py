@@ -1124,7 +1124,14 @@ def detect_candle_pattern(opens, closes, highs, lows):
 # ── Rank coins ────────────────────────────────────────────────────────────────
 def rank_coins():
     scores    = []
-    db_rates  = db.coin_win_rates()   # {} if DB not connected
+    if db.connected:
+        db_rates = db.coin_win_rates()
+    else:
+        # Fall back to in-memory rates computed from saved trades
+        _t = _web_trader_ref[0] if _web_trader_ref else None
+        db_rates = _t.memory_coin_rates() if _t else {}
+        if db_rates:
+            log("RANK", f"Using memory learning ({len(db_rates)} coins)")
     for coin in SCAN_UNIVERSE:
         pair = coin["pair"]
         try:
@@ -1518,13 +1525,16 @@ class PaperTrader:
     # ── Learning method 1: signal-condition fingerprint ──────────────────────
     def _feature_multiplier(self, fkey):
         """Scale stake up/down based on realized win rate of this signal fingerprint.
-        Needs ≥5 samples; safe to boost proven patterns up to 1.15×."""
-        if self._no_persist or not db.connected or not fkey:
+        Needs ≥5 samples; uses DB when available, in-memory trades otherwise."""
+        if self._no_persist or not fkey:
             return 1.0
         now = time.time()
         if now - self._feat_ts > 600:
             try:
-                self._feat_cache = db.feature_win_rates()
+                if db.connected:
+                    self._feat_cache = db.feature_win_rates()
+                else:
+                    self._feat_cache = self.memory_feature_rates()
             except Exception as e:
                 log("PAPER", f"feature cache: {e}", "ERR")
             self._feat_ts = now
@@ -1623,6 +1633,44 @@ class PaperTrader:
     @property
     def wins(self):
         return sum(1 for t in self.trades if t["pnl"] > 0)
+
+    def memory_coin_rates(self, min_trades=3):
+        """Per-coin win rates computed from in-memory trades — no DB required.
+        Used as fallback when db.connected is False."""
+        rates: dict = {}
+        for t in self.trades:
+            cn = t.get("coin", "")
+            if not cn:
+                continue
+            if cn not in rates:
+                rates[cn] = {"wins": 0, "n": 0, "pnl": 0.0}
+            rates[cn]["n"] += 1
+            rates[cn]["pnl"] += t["pnl"]
+            if t["pnl"] > 0:
+                rates[cn]["wins"] += 1
+        return {
+            cn: {"wr": v["wins"] / v["n"] * 100, "n": v["n"], "pnl": round(v["pnl"], 2)}
+            for cn, v in rates.items()
+            if v["n"] >= min_trades
+        }
+
+    def memory_feature_rates(self, min_trades=5):
+        """Signal-fingerprint win rates from in-memory trades — no DB required."""
+        rates: dict = {}
+        for t in self.trades:
+            fk = t.get("fkey", "")
+            if not fk:
+                continue
+            if fk not in rates:
+                rates[fk] = {"wins": 0, "n": 0}
+            rates[fk]["n"] += 1
+            if t["pnl"] > 0:
+                rates[fk]["wins"] += 1
+        return {
+            fk: {"wr": v["wins"] / v["n"] * 100, "n": v["n"]}
+            for fk, v in rates.items()
+            if v["n"] >= min_trades
+        }
 
     @property
     def win_rate(self):
@@ -4549,6 +4597,28 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       </div>
     </div>
 
+    <div class="sh"><span>Rank Progress</span></div>
+    <div style="margin:0 16px 16px;background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:15px 16px" id="rank_card">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+        <div style="font-size:1.6rem;line-height:1" id="rank_emoji">🟤</div>
+        <div style="flex:1">
+          <div style="font-weight:700;font-size:.95rem;line-height:1.2" id="rank_name">Rookie</div>
+          <div style="font-size:.6rem;color:var(--mu);margin-top:2px" id="rank_unlock">You're just getting started. Every trade is a lesson.</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div style="font-family:var(--fn);font-size:.72rem;font-weight:700;color:var(--b)" id="rank_pct">0%</div>
+          <div style="font-size:.55rem;color:var(--mu);margin-top:1px" id="rank_next_lbl">to next</div>
+        </div>
+      </div>
+      <div style="height:6px;background:var(--bd2);border-radius:3px;overflow:hidden">
+        <div id="rank_bar" style="height:100%;border-radius:3px;background:linear-gradient(90deg,var(--b),#7ab4ff);width:0%;transition:width 1s ease"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:.57rem;color:var(--mu);font-family:var(--fn)">
+        <span id="rank_cur_bal">$100</span>
+        <span id="rank_next_info">Next: ⚪ Trader @ $250</span>
+      </div>
+    </div>
+
     <div class="sh"><span>Quick Stats</span></div>
     <div class="qrow">
       <div class="qcard ac-b">
@@ -4630,6 +4700,21 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="scard-val" id="s_pnl">—</div>
         <div class="scard-sub" id="s_pnl_sub"></div>
       </div>
+    </div>
+    <div class="sh"><span>Rank Progress</span></div>
+    <div style="margin:0 16px 14px;background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:14px 15px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <div style="font-size:1.45rem;line-height:1" id="s_rank_emoji">🟤</div>
+        <div style="flex:1">
+          <div style="font-weight:700;font-size:.9rem" id="s_rank_name">Rookie</div>
+          <div style="font-size:.58rem;color:var(--mu);margin-top:1px" id="s_rank_next">Next: ⚪ Trader @ $250</div>
+        </div>
+        <div style="font-family:var(--fn);font-size:.82rem;font-weight:700;color:var(--b)" id="s_rank_pct">0%</div>
+      </div>
+      <div style="height:5px;background:var(--bd2);border-radius:3px;overflow:hidden">
+        <div id="s_rank_bar" style="height:100%;border-radius:3px;background:linear-gradient(90deg,var(--b),#7ab4ff);width:0%;transition:width 1s ease"></div>
+      </div>
+      <div style="font-size:.57rem;color:var(--mu);margin-top:5px;font-family:var(--fn)" id="s_learn_status"></div>
     </div>
     <div class="sh"><span>Coin Breakdown</span></div>
     <div class="coin-box" id="coin_table"><div class="no-data">No trades yet</div></div>
@@ -4777,6 +4862,7 @@ async function fetchStatus(){
     renderPositions(d.open_positions||[]);
     renderTrades(recent);
     renderCoinTable(d.coin_stats||{});
+    renderRank(d);
   }catch(e){console.warn('status',e);}
 }
 
@@ -4850,6 +4936,45 @@ function renderCoinTable(cs){
         '<div class="ct-cnt">'+tot+'</div>'+
         '<div class="ct-pnl '+(s.pnl>=0?'c-g':'c-r')+'">'+msign(s.pnl)+'</div></div>';
     }).join('');
+}
+
+/* ── RANK PROGRESS ── */
+function renderRank(d){
+  const pct=d.rank_progress||0;
+  const bar=pct.toFixed(1)+'%';
+  const nextInfo='Next: '+(d.next_rank_emoji||'')+' '+(d.next_rank||'—')+' @ $'+(d.next_rank_min||0).toLocaleString();
+  const unlock={
+    'Rookie':'Every trade is a lesson.',
+    'Trader':'You proved you can grow.',
+    'Pro':'Skill, not luck.',
+    'Expert':'Rare territory.',
+    'Elite':'Top 1%.',
+    'Legend':'Built different.',
+    'GOAT':'$10k hit.',
+    'Diamond':'$15k strong.',
+    'Immortal':'$25k mastered.',
+    'Mythic':'$35k and rising.',
+    'OVERLORD':'OVERLORD status.'
+  }[d.rank]||'';
+  // Home tab rank card
+  const re=$('rank_emoji'),rn=$('rank_name'),ru=$('rank_unlock');
+  const rp=$('rank_pct'),rb=$('rank_bar'),rcb=$('rank_cur_bal'),rni=$('rank_next_info');
+  if(re){re.textContent=d.rank_emoji||'🟤';}
+  if(rn){rn.textContent=d.rank||'Rookie';}
+  if(ru){ru.textContent=unlock;}
+  if(rp){rp.textContent=bar;}
+  if(rb){rb.style.width=Math.min(pct,100)+'%';}
+  if(rcb){rcb.textContent='$'+(d.balance||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+  if(rni){rni.textContent=nextInfo;}
+  // Stats tab rank card
+  const se=$('s_rank_emoji'),sn=$('s_rank_name'),snx=$('s_rank_next');
+  const sp=$('s_rank_pct'),sb=$('s_rank_bar'),sl=$('s_learn_status');
+  if(se){se.textContent=d.rank_emoji||'🟤';}
+  if(sn){sn.textContent=d.rank||'Rookie';}
+  if(snx){snx.textContent=nextInfo;}
+  if(sp){sp.textContent=bar;}
+  if(sb){sb.style.width=Math.min(pct,100)+'%';}
+  if(sl){sl.textContent=d.learning?'Learning from trades: ON ✓':'Need more trades to activate learning';}
 }
 
 /* ── HISTORY / EQUITY CURVE ── */
@@ -5151,6 +5276,11 @@ def _web_status():
     with _state_lock:
         paused_now = _paused
 
+    rank     = get_rank(trader.balance)
+    next_rnk = get_next_rank(trader.balance)
+    rank_range = next_rnk["min"] - rank["min"]
+    rank_pct   = round(min(100.0, (trader.balance - rank["min"]) / max(rank_range, 0.01) * 100), 1)
+
     payload = {
         "balance":        round(trader.balance, 2),
         "peak":           round(trader.peak, 2),
@@ -5169,6 +5299,13 @@ def _web_status():
         "mode":           "LIVE" if LIVE_MODE else "PAPER",
         "paused":         paused_now,
         "coin_stats":     coin_stats,
+        "rank":           rank["name"],
+        "rank_emoji":     rank["emoji"],
+        "next_rank":      next_rnk["name"],
+        "next_rank_emoji": next_rnk["emoji"],
+        "next_rank_min":  next_rnk["min"],
+        "rank_progress":  rank_pct,
+        "learning":       db.connected or len(trader.trades) >= 3,
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
