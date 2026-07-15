@@ -1090,40 +1090,191 @@ def detect_regime(closes, highs, lows, lookback=20):
 
 
 def detect_candle_pattern(opens, closes, highs, lows):
-    """Detect single-candle and two-candle reversal patterns on the last bar.
-    Returns 'BULL', 'BEAR', or 'NONE'."""
-    if opens is None or len(opens) < 2 or len(closes) < 2:
-        return "NONE"
+    """Detect 35+ candlestick patterns (single, two-candle, three-candle).
+    Returns {"signal": "BULL"|"BEAR"|"NONE", "name": str}.
+    Patterns: Doji family, Marubozu, Hammer/Star family, Engulfing, Kicker,
+    Piercing/Dark Cloud, Harami, Tweezer, Morning/Evening Star, Abandoned Baby,
+    Three Soldiers/Crows, Three Inside/Outside Up/Down, Three Line Strike,
+    Rising/Falling Window, Spinning Top.
+    """
+    _N = {"signal": "NONE", "name": ""}
+    if opens is None or len(opens) < 3 or len(closes) < 3:
+        return _N
     try:
-        o, c, h, l   = opens[-1], closes[-1], highs[-1], lows[-1]
-        po, pc        = opens[-2], closes[-2]
-        body          = abs(c - o)
-        full_range    = h - l or 1e-9
-        upper_wick    = h - max(o, c)
-        lower_wick    = min(o, c) - l
+        # ── Candle geometry ───────────────────────────────────────────
+        o,  c,  h,  l  = opens[-1], closes[-1], highs[-1], lows[-1]
+        po, pc, ph, pl = opens[-2], closes[-2], highs[-2], lows[-2]
+        o3, c3, h3, l3 = opens[-3], closes[-3], highs[-3], lows[-3]
 
-        # Doji — indecision, treat as neutral
-        if body / full_range < 0.10:
-            return "NONE"
+        body   = c - o;     ab   = abs(body)
+        pbody  = pc - po;   pab  = abs(pbody)
+        body3  = c3 - o3;   ab3  = abs(body3)
 
-        # Bullish engulfing: current bullish body fully wraps previous bearish body
-        if c > o and pc < po and o <= pc and c >= po:
-            return "BULL"
+        fr   = h  - l  or 1e-9    # full range current
+        pfr  = ph - pl or 1e-9    # full range previous
+        sfr  = h3 - l3 or 1e-9
 
-        # Bearish engulfing: current bearish body fully wraps previous bullish body
-        if c < o and pc > po and o >= pc and c <= po:
-            return "BEAR"
+        uw  = h  - max(o,  c)     # upper wick current
+        lw  = min(o,  c)  - l
+        puw = ph - max(po, pc)
+        plw = min(po, pc) - pl
 
-        # Hammer: long lower wick (≥2× body), tiny upper wick → bullish reversal
-        if lower_wick >= 2 * body and upper_wick <= body * 0.5 and body > 0:
-            return "BULL"
+        br  = ab  / fr             # body ratio 0=doji 1=marubozu
+        pbr = pab / pfr
 
-        # Shooting star: long upper wick (≥2× body), tiny lower wick → bearish reversal
-        if upper_wick >= 2 * body and lower_wick <= body * 0.5 and body > 0:
-            return "BEAR"
+        ref = (c + pc + c3) / 3 or 1
+        gap = ref * 0.001          # 0.1% minimum gap
+
+        # ── SINGLE-CANDLE ─────────────────────────────────────────────
+
+        # Dragonfly Doji: body tiny, long lower wick → BULL
+        if br < 0.10 and lw >= fr * 0.60 and uw <= fr * 0.10:
+            return {"signal": "BULL", "name": "Dragonfly Doji"}
+
+        # Gravestone Doji: body tiny, long upper wick → BEAR
+        if br < 0.10 and uw >= fr * 0.60 and lw <= fr * 0.10:
+            return {"signal": "BEAR", "name": "Gravestone Doji"}
+
+        # Neutral Doji
+        if br < 0.10:
+            return _N
+
+        # Bullish Marubozu: large green, wicks ≤5% of range
+        if c > o and br >= 0.90 and uw <= fr * 0.05 and lw <= fr * 0.05:
+            return {"signal": "BULL", "name": "Bullish Marubozu"}
+
+        # Bearish Marubozu
+        if c < o and br >= 0.90 and uw <= fr * 0.05 and lw <= fr * 0.05:
+            return {"signal": "BEAR", "name": "Bearish Marubozu"}
+
+        # Spinning Top: small body, notable wicks both sides
+        if br < 0.35 and uw >= fr * 0.20 and lw >= fr * 0.20:
+            return {"signal": "BULL" if c > o else "BEAR",
+                    "name":   "Bullish Spinning Top" if c > o else "Bearish Spinning Top"}
+
+        # Hammer / Hanging Man: long lower wick (≥2× body), tiny upper wick
+        if lw >= 2 * ab and uw <= ab * 0.5 and ab > 0:
+            # After bearish prev → Hammer (bullish reversal)
+            # After bullish prev → Hanging Man (bearish reversal)
+            return ({"signal": "BULL", "name": "Hammer"}
+                    if pbody < 0 else {"signal": "BEAR", "name": "Hanging Man"})
+
+        # Inverted Hammer / Shooting Star: long upper wick (≥2× body), tiny lower wick
+        if uw >= 2 * ab and lw <= ab * 0.5 and ab > 0:
+            return ({"signal": "BULL", "name": "Inverted Hammer"}
+                    if pbody < 0 else {"signal": "BEAR", "name": "Shooting Star"})
+
+        # ── TWO-CANDLE ────────────────────────────────────────────────
+
+        # Bullish Engulfing
+        if c > o and pbody < 0 and o <= pc and c >= po:
+            return {"signal": "BULL", "name": "Bullish Engulfing"}
+
+        # Bearish Engulfing
+        if c < o and pbody > 0 and o >= pc and c <= po:
+            return {"signal": "BEAR", "name": "Bearish Engulfing"}
+
+        # Bullish Kicker: gap-up open after bearish candle, current bullish
+        if pbody < 0 and c > o and o > po + gap:
+            return {"signal": "BULL", "name": "Bullish Kicker"}
+
+        # Bearish Kicker: gap-down open after bullish candle, current bearish
+        if pbody > 0 and c < o and o < po - gap:
+            return {"signal": "BEAR", "name": "Bearish Kicker"}
+
+        # Piercing Line: bearish prev → bullish current opens below prev low, closes > prev midpoint
+        if pbody < 0 and c > o and o < pl and c > (po + pc) / 2 and c < po:
+            return {"signal": "BULL", "name": "Piercing Line"}
+
+        # Dark Cloud Cover: bullish prev → bearish current opens above prev high, closes < prev midpoint
+        if pbody > 0 and c < o and o > ph and c < (po + pc) / 2 and c > po:
+            return {"signal": "BEAR", "name": "Dark Cloud Cover"}
+
+        # Tweezer Bottom: equal lows, previous bearish
+        if abs(l - pl) / ref < 0.002 and pbody < 0:
+            return {"signal": "BULL", "name": "Tweezer Bottom"}
+
+        # Tweezer Top: equal highs, previous bullish
+        if abs(h - ph) / ref < 0.002 and pbody > 0:
+            return {"signal": "BEAR", "name": "Tweezer Top"}
+
+        # Bullish Harami: small green inside large bearish prev
+        if pbody < 0 and c > o and o > pc and c < po and ab < pab * 0.5:
+            return {"signal": "BULL", "name": "Bullish Harami"}
+
+        # Bearish Harami: small red inside large bullish prev
+        if pbody > 0 and c < o and o < pc and c > po and ab < pab * 0.5:
+            return {"signal": "BEAR", "name": "Bearish Harami"}
+
+        # Rising Window: gap up (current low > previous high)
+        if l > ph + gap:
+            return {"signal": "BULL", "name": "Rising Window"}
+
+        # Falling Window: gap down (current high < previous low)
+        if h < pl - gap:
+            return {"signal": "BEAR", "name": "Falling Window"}
+
+        # ── THREE-CANDLE ──────────────────────────────────────────────
+
+        star_br = pab / pfr   # previous bar body ratio (star = small body)
+
+        # Morning Star: bearish → small/doji → bullish, current closes > bar-3 midpoint
+        if body3 < 0 and c > o and star_br < 0.35 and c > (o3 + c3) / 2:
+            return {"signal": "BULL", "name": "Morning Star"}
+
+        # Evening Star: bullish → small/doji → bearish, current closes < bar-3 midpoint
+        if body3 > 0 and c < o and star_br < 0.35 and c < (o3 + c3) / 2:
+            return {"signal": "BEAR", "name": "Evening Star"}
+
+        # Three White Soldiers: three rising green candles
+        if c > o and pc > po and c3 > o3 and c > pc > c3 and o > po > o3:
+            return {"signal": "BULL", "name": "Three White Soldiers"}
+
+        # Three Black Crows: three falling red candles
+        if c < o and pc < po and c3 < o3 and c < pc < c3 and o < po < o3:
+            return {"signal": "BEAR", "name": "Three Black Crows"}
+
+        # Three Inside Up: bearish → bullish harami → confirmation
+        if (body3 < 0 and pbody > 0 and body > 0 and
+                po > c3 and pc < o3 and c > pc):
+            return {"signal": "BULL", "name": "Three Inside Up"}
+
+        # Three Inside Down: bullish → bearish harami → confirmation
+        if (body3 > 0 and pbody < 0 and body < 0 and
+                po < c3 and pc > o3 and c < pc):
+            return {"signal": "BEAR", "name": "Three Inside Down"}
+
+        # Three Outside Up: bearish → bullish engulfing → confirmation
+        if (body3 < 0 and pbody > 0 and body > 0 and
+                po <= c3 and pc >= o3 and c > pc):
+            return {"signal": "BULL", "name": "Three Outside Up"}
+
+        # Three Outside Down: bullish → bearish engulfing → confirmation
+        if (body3 > 0 and pbody < 0 and body < 0 and
+                po >= c3 and pc <= o3 and c < pc):
+            return {"signal": "BEAR", "name": "Three Outside Down"}
+
+        # Bullish Abandoned Baby: bearish → doji gapped below → bullish gapped up
+        if (body3 < 0 and star_br < 0.10 and
+                ph < l3 - gap and o > ph + gap and c > o):
+            return {"signal": "BULL", "name": "Bullish Abandoned Baby"}
+
+        # Bearish Abandoned Baby: bullish → doji gapped above → bearish gapped down
+        if (body3 > 0 and star_br < 0.10 and
+                pl > h3 + gap and o < pl - gap and c < o):
+            return {"signal": "BEAR", "name": "Bearish Abandoned Baby"}
+
+        # Three Line Strike — needs 4 bars
+        if len(opens) >= 4:
+            o4, c4 = opens[-4], closes[-4]
+            if c4 < o4 and c3 < o3 and pc < po and c > o and c > o4:
+                return {"signal": "BULL", "name": "Three Line Strike"}
+            if c4 > o4 and c3 > o3 and pc > po and c < o and c < o4:
+                return {"signal": "BEAR", "name": "Three Line Strike"}
+
     except Exception:
         pass
-    return "NONE"
+    return _N
 
 
 def _find_swings(highs, lows, window=3):
@@ -2531,10 +2682,11 @@ class SignalEngine:
                       else (min(n_score / 5.0, 1.0) if sig in ("BUY","SELL") and n_score >= 3 else 0.0))
         macd_pts   = 1.0 if (sig == "BUY" and macd_bull) or (sig == "SELL" and macd_bear) else 0.0
         vol_pts    = 1.0 if high_volume else 0.5
-        candle_pts = (1.0 if (sig == "BUY"  and candle_pat == "BULL") or
-                             (sig == "SELL" and candle_pat == "BEAR")
-                      else 0.0 if (sig == "BUY"  and candle_pat == "BEAR") or
-                                  (sig == "SELL" and candle_pat == "BULL")
+        _cp_sig    = candle_pat["signal"]
+        candle_pts = (1.0 if (sig == "BUY"  and _cp_sig == "BULL") or
+                             (sig == "SELL" and _cp_sig == "BEAR")
+                      else 0.0 if (sig == "BUY"  and _cp_sig == "BEAR") or
+                                  (sig == "SELL" and _cp_sig == "BULL")
                       else 0.5)   # NONE = neutral
         # VWAP pillar: being on the right side of VWAP boosts confidence;
         # unknown (no volume data) scores neutral
@@ -2659,9 +2811,12 @@ class SignalEngine:
             "chart_struct":  chart_pts >= 0.7,
         }
         if chart_pat["name"]:
-            plan["chart_name"]   = chart_pat["name"]
-            plan["chart_signal"] = chart_pat["signal"]
+            plan["chart_name"]     = chart_pat["name"]
+            plan["chart_signal"]   = chart_pat["signal"]
             plan["chart_strength"] = chart_pat.get("strength", 0.0)
+        if candle_pat["name"]:
+            plan["candle_name"]   = candle_pat["name"]
+            plan["candle_signal"] = candle_pat["signal"]
 
         # ── Feature fingerprint key ──────────────────────────────────────────
         rsi_bin  = min(int(rsi / 20), 4)
@@ -4359,9 +4514,10 @@ def trading_loop(trader):
                     try: atr = calc_atr(highs, lows, closes)
                     except Exception: atr = None
 
-                    # ── Pattern cache refresh (every 15 min per coin) ─────────
-                    _now_p = time.time()
+                    # ── Pattern cache refresh ─────────────────────────────────
+                    _now_p  = time.time()
                     _prev_p = _pattern_cache.get(pair, {})
+                    # Chart structure: re-detect every 15 min (changes with candle close)
                     if _now_p - _prev_p.get("ts", 0) >= _PATTERN_TTL:
                         try:
                             _cp = detect_chart_pattern(closes, highs, lows)
@@ -4371,9 +4527,26 @@ def trading_loop(trader):
                                 "strength": round(_cp.get("strength", 0.0), 2),
                                 "coin":     coin["name"],
                                 "ts":       _now_p,
+                                "candle_name":   "",
+                                "candle_signal": "NONE",
                             }
                         except Exception:
                             pass
+                    # Candle pattern: update every scan (cheap, uses last 4 bars)
+                    try:
+                        _cdp = detect_candle_pattern(opens, closes, highs, lows)
+                        if pair in _pattern_cache:
+                            _pattern_cache[pair]["candle_name"]   = _cdp["name"]
+                            _pattern_cache[pair]["candle_signal"] = _cdp["signal"]
+                        elif _cdp["name"]:
+                            _pattern_cache[pair] = {
+                                "name": "", "signal": "NONE", "strength": 0.0,
+                                "coin": coin["name"], "ts": 0,
+                                "candle_name":   _cdp["name"],
+                                "candle_signal": _cdp["signal"],
+                            }
+                    except Exception:
+                        pass
 
                     # 4-hour trend confirmation (higher-timeframe confluence)
                     # Cached for _HTF_CACHE_TTL seconds to avoid extra API calls every tick.
@@ -4500,8 +4673,11 @@ def trading_loop(trader):
                                        f"R:R {_rr_str}  "
                                        f"conf {_c(conf_col, conf_pct)}  {leverage}x"))
                         emoji    = "🟢" if sig == "BUY" else "🔴"
-                        _cpn     = plan.get("chart_name", "")
-                        _pat_note = f"\n📐 Pattern: `{_cpn}`" if _cpn else ""
+                        _cpn  = plan.get("chart_name", "")
+                        _cdn  = plan.get("candle_name", "")
+                        _pat_note = ""
+                        if _cpn: _pat_note += f"\n📐 Chart: `{_cpn}`"
+                        if _cdn: _pat_note += f"\n🕯️ Candle: `{_cdn}`"
                         tg(f"{emoji} *{sig} Signal — {coin['name']}*\n"
                            f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
                            f"R:R: `{_rr_str}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
@@ -4857,15 +5033,23 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       <div class="ci-chg fl" id="ci_chg">—</div>
     </div>
     <div id="pat_badge_wrap" style="padding:0 12px 8px;display:none">
-      <div id="pat_badge" style="display:inline-flex;align-items:center;gap:6px;
-           padding:5px 12px;border-radius:8px;font-size:.7rem;font-weight:700;
-           letter-spacing:.04em;border:1px solid;transition:all .3s">
-        <span id="pat_ico" style="font-size:.85rem"></span>
-        <span id="pat_name"></span>
-        <span id="pat_str" style="opacity:.6;font-weight:500;font-size:.62rem"></span>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <div id="pat_badge" style="display:none;align-items:center;gap:6px;
+             padding:5px 12px;border-radius:8px;font-size:.7rem;font-weight:700;
+             letter-spacing:.04em;border:1px solid;transition:all .3s">
+          <span id="pat_ico" style="font-size:.85rem"></span>
+          <span id="pat_name"></span>
+          <span id="pat_str" style="opacity:.6;font-weight:500;font-size:.62rem"></span>
+        </div>
+        <div id="candle_badge" style="display:none;align-items:center;gap:6px;
+             padding:5px 12px;border-radius:8px;font-size:.7rem;font-weight:700;
+             letter-spacing:.04em;border:1px solid;transition:all .3s">
+          <span id="candle_ico" style="font-size:.85rem"></span>
+          <span id="candle_name_el"></span>
+        </div>
       </div>
-      <div style="font-size:.54rem;color:var(--mu);margin-top:4px;padding-left:2px">
-        📐 Detected pattern · refreshes every 15 min
+      <div style="font-size:.54rem;color:var(--mu);margin-top:5px;padding-left:2px">
+        📐 Chart structure · 15 min &nbsp;|&nbsp; 🕯️ Candle · live
       </div>
     </div>
     <div class="chart-wrap">
@@ -5190,63 +5374,90 @@ function renderRank(d){
   if(sl){sl.textContent=d.learning?'Learning from trades: ON ✓':'Need more trades to activate learning';}
 }
 
+/* ── PATTERN BADGE HELPER ── */
+function _applyBadge(el,sig,label,str){
+  if(!el)return;
+  if(!label||sig==='NONE'){el.style.display='none';return;}
+  const bull=sig==='BULL';
+  const col=bull?'var(--g)':'var(--r)';
+  el.style.display='inline-flex';
+  el.style.background=bull?'rgba(0,204,116,.08)':'rgba(255,51,82,.08)';
+  el.style.borderColor=bull?'rgba(0,204,116,.25)':'rgba(255,51,82,.25)';
+  el.style.color=col;
+  return col;
+}
+
 /* ── CHART PATTERN BADGE + SCAN LIST ── */
 function renderPattern(d){
-  // ── Chart tab badge ──────────────────────────────────────────
   const wrap=$('pat_badge_wrap');
-  const name=d.chart_pattern||'';
-  const sig=d.chart_pattern_signal||'NONE';
-  if(name && sig!=='NONE'){
-    const isBull=sig==='BULL';
-    const ico=isBull?'▲':'▼';
-    const col=isBull?'var(--g)':'var(--r)';
-    const bg=isBull?'rgba(0,204,116,.08)':'rgba(255,51,82,.08)';
-    const bdr=isBull?'rgba(0,204,116,.25)':'rgba(255,51,82,.25)';
-    const b=$('pat_badge');
-    b.style.background=bg; b.style.borderColor=bdr; b.style.color=col;
-    $('pat_ico').textContent=ico;
-    $('pat_name').textContent=name;
-    // find strength from all_patterns for current pair
+  const hasChart=d.chart_pattern&&d.chart_pattern_signal!=='NONE';
+  const hasCandle=d.candle_pattern&&d.candle_pattern_signal!=='NONE';
+  if(wrap){wrap.style.display=(hasChart||hasCandle)?'block':'none';}
+
+  // Chart structure badge
+  const pb=$('pat_badge');
+  if(hasChart){
+    _applyBadge(pb,d.chart_pattern_signal);
+    const bull=d.chart_pattern_signal==='BULL';
+    $('pat_ico').textContent=bull?'▲':'▼';
+    $('pat_name').textContent=d.chart_pattern;
     const ap=d.all_patterns||{};
-    const cp=Object.values(ap).find(p=>p.name===name);
-    const str=cp?Math.round(cp.strength*100)+'%':'';
-    $('pat_str').textContent=str?str+' conf':'';
-    if(wrap){wrap.style.display='block';}
-  } else {
-    if(wrap){wrap.style.display='none';}
-  }
+    const cp=Object.values(ap).find(p=>p.name===d.chart_pattern);
+    $('pat_str').textContent=cp?Math.round(cp.strength*100)+'% conf':'';
+    pb.style.display='inline-flex';
+  } else if(pb){pb.style.display='none';}
+
+  // Candle pattern badge
+  const cb=$('candle_badge');
+  if(hasCandle){
+    _applyBadge(cb,d.candle_pattern_signal);
+    const bull=d.candle_pattern_signal==='BULL';
+    $('candle_ico').textContent=bull?'🕯️▲':'🕯️▼';
+    $('candle_name_el').textContent=d.candle_pattern;
+    cb.style.display='inline-flex';
+  } else if(cb){cb.style.display='none';}
 
   // ── Stats tab pattern scan list ──────────────────────────────
   const el=$('pattern_scan_list');
-  if(!el) return;
+  if(!el)return;
   const ap=d.all_patterns||{};
-  const entries=Object.entries(ap).filter(([,v])=>v.name);
+  const entries=Object.entries(ap).filter(([,v])=>v.name||v.candle_name);
   if(!entries.length){
-    el.innerHTML='<div class="no-data">No patterns detected yet — scan runs every 15 min</div>';
+    el.innerHTML='<div class="no-data">Scanning — first results appear after 15 min</div>';
     return;
   }
-  // Sort: BULL first, then BEAR, then NONE; within each group by strength desc
-  const order={'BULL':0,'BEAR':1,'NONE':2};
-  entries.sort((a,b)=>(order[a[1].signal]||2)-(order[b[1].signal]||2)||(b[1].strength-a[1].strength));
+  // Priority: chart signal first (BULL before BEAR), then candle, then strength
+  const sigOrd=s=>s==='BULL'?0:s==='BEAR'?1:2;
+  entries.sort((a,b)=>{
+    const as=sigOrd(a[1].signal||'NONE'), bs=sigOrd(b[1].signal||'NONE');
+    if(as!==bs)return as-bs;
+    return (b[1].strength||0)-(a[1].strength||0);
+  });
   el.innerHTML=entries.map(([pair,v])=>{
-    const isBull=v.signal==='BULL';
-    const col=isBull?'var(--g)':'var(--r)';
-    const bg=isBull?'rgba(0,204,116,.07)':'rgba(255,51,82,.07)';
-    const bdr=isBull?'rgba(0,204,116,.2)':'rgba(255,51,82,.2)';
-    const ico=isBull?'▲':'▼';
-    const str=Math.round(v.strength*100);
+    const cs=v.signal||'NONE', cn=v.candle_signal||'NONE';
+    const sig=cs!=='NONE'?cs:cn;
+    const bull=sig==='BULL';
+    const col=bull?'var(--g)':'var(--r)';
+    const bg=bull?'rgba(0,204,116,.07)':'rgba(255,51,82,.07)';
+    const bdr=bull?'rgba(0,204,116,.2)':'rgba(255,51,82,.2)';
+    const ico=bull?'▲':'▼';
+    const str=v.strength?Math.round(v.strength*100)+'%':'—';
+    const chartLine=v.name?
+      '<div style="font-weight:700;font-size:.78rem;color:var(--tx)">📐 '+v.name+'</div>':'';
+    const candleLine=v.candle_name?
+      '<div style="font-size:.72rem;color:var(--mu);margin-top:2px">🕯️ '+v.candle_name+'</div>':'';
     return '<div style="display:flex;align-items:center;gap:10px;'+
       'padding:9px 12px;margin-bottom:6px;border-radius:10px;'+
-      'background:'+bg+';border:1px solid '+bdr+';">'+
+      'background:'+bg+';border:1px solid '+bdr+'">'+
       '<div style="font-size:.95rem;line-height:1;color:'+col+'">'+ico+'</div>'+
       '<div style="flex:1;min-width:0">'+
-        '<div style="font-weight:700;font-size:.8rem;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+v.name+'</div>'+
-        '<div style="font-size:.6rem;color:var(--mu);margin-top:2px">'+v.coin+' · '+pair+'</div>'+
+        chartLine+candleLine+
+        '<div style="font-size:.58rem;color:var(--mu);margin-top:3px">'+v.coin+' · '+pair+'</div>'+
       '</div>'+
-      '<div style="text-align:right;flex-shrink:0">'+
-        '<div style="font-family:var(--fn);font-size:.75rem;font-weight:700;color:'+col+'">'+str+'%</div>'+
-        '<div style="font-size:.55rem;color:var(--mu)">confidence</div>'+
-      '</div></div>';
+      (v.name?'<div style="text-align:right;flex-shrink:0">'+
+        '<div style="font-family:var(--fn);font-size:.75rem;font-weight:700;color:'+col+'">'+str+'</div>'+
+        '<div style="font-size:.53rem;color:var(--mu)">conf</div></div>':'')
+      +'</div>';
   }).join('');
 }
 
@@ -5579,13 +5790,21 @@ def _web_status():
         "next_rank_min":  next_rnk["min"],
         "rank_progress":  rank_pct,
         "learning":       db.connected or len(trader.trades) >= 3,
-        "chart_pattern":  _pattern_cache.get(_current_coin.get("pair",""), {}).get("name", ""),
+        "chart_pattern":        _pattern_cache.get(_current_coin.get("pair",""), {}).get("name", ""),
         "chart_pattern_signal": _pattern_cache.get(_current_coin.get("pair",""), {}).get("signal", "NONE"),
-        "all_patterns":   {
-            p: {"name": v["name"], "signal": v["signal"],
-                "strength": v["strength"], "coin": v["coin"]}
+        "candle_pattern":       _pattern_cache.get(_current_coin.get("pair",""), {}).get("candle_name", ""),
+        "candle_pattern_signal":_pattern_cache.get(_current_coin.get("pair",""), {}).get("candle_signal", "NONE"),
+        "all_patterns": {
+            p: {
+                "name":          v.get("name",""),
+                "signal":        v.get("signal","NONE"),
+                "strength":      v.get("strength", 0.0),
+                "coin":          v.get("coin",""),
+                "candle_name":   v.get("candle_name",""),
+                "candle_signal": v.get("candle_signal","NONE"),
+            }
             for p, v in _pattern_cache.items()
-            if v.get("name")
+            if v.get("name") or v.get("candle_name")
         },
     }
     return _Response(json.dumps(payload), mimetype="application/json")
