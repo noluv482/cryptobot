@@ -773,6 +773,11 @@ open_interest_data = {}  # pair → {"oi": float, "prev_oi": float, "trend": "RI
 _econ_events    = []   # list of {"title": str, "date": str, "impact": str}
 # User-set price alerts  {pair: [{"target": float, "above": bool, "label": str}]}
 _price_alerts   = {}
+# Web Push (VAPID) — optional; gracefully skipped when keys not set
+VAPID_PUBLIC_KEY   = os.environ.get("VAPID_PUBLIC_KEY",   "")
+VAPID_PRIVATE_KEY  = os.environ.get("VAPID_PRIVATE_KEY",  "")
+VAPID_CLAIMS_EMAIL = os.environ.get("VAPID_CLAIMS_EMAIL", "admin@cryptobot.app")
+_push_subscriptions: list = []   # [{endpoint, keys:{p256dh, auth}}]
 
 # Market breadth: how many scanned coins are above their EMA (updated each rank cycle)
 _market_breadth = {"above": 0, "total": 0}
@@ -2717,6 +2722,7 @@ class PaperTrader:
         _push_sse("trade_open", {"name": name, "side": side,
                                   "entry": fill, "pair": pair,
                                   "confidence": int(confidence * 100)})
+        _send_web_push(f"Trade Opened ⚡", f"{side} {name} @ ${fill:.4f} ({int(confidence*100)}% conf)")
         mul = self._risk_multiplier()
         dd_note      = f" ⚠️ `{int(mul*100)}%` size (losing streak)" if mul < 1.0 else ""
         vol_note     = f" 🌊 vol×`{vol_mult:.2f}`" if vol_mult < 0.95 else ""
@@ -2819,6 +2825,10 @@ class PaperTrader:
         _push_sse("trade_close", {"name": name, "side": p["side"],
                                    "pnl": pnl, "reason": reason,
                                    "balance": self.balance, "win": pnl >= 0})
+        _send_web_push(
+            f"{'Trade Won ✓' if pnl >= 0 else 'Trade Lost ✗'}",
+            f"{name}: {'+$' if pnl >= 0 else '-$'}{abs(pnl):.2f} · {reason.replace('_', ' ')}"
+        )
         # Max session drawdown: auto-pause if down MAX_SESSION_DD from peak
         if self.peak > 0 and (self.peak - self.balance) / self.peak >= MAX_SESSION_DD:
             with _state_lock:
@@ -5265,6 +5275,30 @@ def _push_sse(event_type: str, data: dict):
             try: q.put_nowait(msg)
             except _queue.Full: pass
 
+def _send_web_push(title: str, body: str, tag: str = "trade"):
+    """Send a Web Push notification to all subscribed browsers (needs VAPID keys)."""
+    if not VAPID_PRIVATE_KEY or not _push_subscriptions:
+        return
+    try:
+        from pywebpush import webpush, WebPushException
+        payload = json.dumps({"title": title, "body": body, "tag": tag})
+        for sub in list(_push_subscriptions):
+            try:
+                webpush(
+                    subscription_info=sub,
+                    data=payload,
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={"sub": f"mailto:{VAPID_CLAIMS_EMAIL}"},
+                )
+            except WebPushException as exc:
+                if exc.response and exc.response.status_code in (404, 410):
+                    try: _push_subscriptions.remove(sub)
+                    except ValueError: pass
+            except Exception:
+                pass
+    except ImportError:
+        pass
+
 _DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -5546,6 +5580,56 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   transition:background .4s;display:inline-block;margin-left:5px;
   vertical-align:middle;margin-bottom:1px}
 .conn-dot.live{background:var(--g);animation:blink 2.5s ease-in-out infinite}
+/* ── RISK GAUGE ── */
+.rg-wrap{margin:0 16px 16px;background:var(--s0);border:1px solid var(--bd);
+  border-radius:12px;padding:14px 15px}
+.rg-row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+.rg-lbl{font-size:.52rem;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)}
+.rg-val{font-family:var(--fn);font-size:.82rem;font-weight:700;font-variant-numeric:tabular-nums}
+.rg-track{height:8px;background:var(--bd2);border-radius:4px;overflow:hidden;position:relative}
+.rg-fill{height:100%;border-radius:4px;transition:width .6s ease,background .4s}
+.rg-marks{display:flex;justify-content:space-between;margin-top:4px;
+  font-size:.5rem;color:var(--mu);font-family:var(--fn)}
+/* ── HOURLY HEATMAP ── */
+.hr-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;padding:0 16px 16px}
+.hr-cell{aspect-ratio:1.1;border-radius:7px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;background:var(--bd2)}
+.hr-cell.profit{background:rgba(0,204,116,.22)}
+.hr-cell.loss{background:rgba(255,51,82,.18)}
+.hr-h{font-size:.58rem;font-weight:700;font-family:var(--fn);line-height:1}
+.hr-p{font-size:.48rem;font-family:var(--fn);margin-top:2px;font-variant-numeric:tabular-nums}
+/* ── PRICE ALERT SHEET ── */
+.alert-sheet{position:fixed;inset:0;z-index:300;display:none}
+.alert-sheet.open{display:block}
+.alert-overlay{position:absolute;inset:0;background:rgba(0,0,0,.6)}
+.alert-panel{position:absolute;bottom:0;left:0;right:0;background:var(--s0);
+  border-radius:20px 20px 0 0;padding:20px 20px calc(20px + var(--sb));
+  border-top:1px solid var(--bd2)}
+.alert-title{font-weight:700;font-size:1rem;margin-bottom:14px}
+.alert-dir{display:flex;gap:8px;margin-bottom:12px}
+.alert-dir-btn{flex:1;padding:9px;border-radius:10px;border:1px solid var(--bd2);
+  background:var(--bg);color:var(--mu);font-size:.75rem;font-weight:700;
+  cursor:pointer;transition:all .15s}
+.alert-dir-btn.sel{background:rgba(74,143,255,.15);border-color:rgba(74,143,255,.4);color:var(--b)}
+.alert-input{width:100%;background:var(--bg);border:1px solid var(--bd2);
+  border-radius:10px;padding:11px 14px;color:var(--tx);font-size:.95rem;
+  font-family:var(--fn);margin-bottom:12px;outline:none}
+.alert-input:focus{border-color:var(--b)}
+.alert-set-btn{width:100%;padding:12px;border-radius:12px;background:var(--b);
+  border:none;color:#fff;font-size:.85rem;font-weight:700;cursor:pointer}
+.alert-set-btn:active{opacity:.85}
+/* active alerts list */
+.alert-list-item{display:flex;align-items:center;gap:8px;
+  padding:9px 14px;border-bottom:1px solid var(--bd)}
+.alert-list-item:last-child{border-bottom:none}
+.alert-coin-lbl{flex:1;font-size:.78rem;font-weight:600}
+.alert-dir-lbl{font-size:.65rem;color:var(--mu);font-family:var(--fn)}
+.alert-del{font-size:.7rem;padding:3px 9px;border-radius:6px;border:1px solid rgba(255,51,82,.3);
+  background:rgba(255,51,82,.07);color:var(--r);cursor:pointer}
+/* bell on heatmap cells */
+.hm-bell{font-size:.7rem;cursor:pointer;opacity:.5;float:right;padding:1px 3px;
+  transition:opacity .15s}
+.hm-bell:hover,.hm-bell:active{opacity:1}
 </style>
 </head>
 <body>
@@ -5652,6 +5736,18 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="qcard-val" id="avgwl_val" style="font-size:.88rem">—</div>
         <div class="qcard-sub" id="avgwl_sub"></div>
       </div>
+    </div>
+
+    <div class="sh"><span>Risk Exposure</span></div>
+    <div class="rg-wrap">
+      <div class="rg-row">
+        <div class="rg-lbl">Margin Deployed</div>
+        <div class="rg-val" id="rg_val">$0.00 / $0.00</div>
+      </div>
+      <div class="rg-track">
+        <div class="rg-fill" id="rg_fill" style="width:0%;background:var(--g)"></div>
+      </div>
+      <div class="rg-marks"><span>0%</span><span id="rg_pct_lbl" style="color:var(--g)">0%</span><span>Max 25%</span></div>
     </div>
 
     <div class="sh"><span>Market Conditions</span></div>
@@ -5803,6 +5899,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       <div class="cal-hdr-cell">Sa</div>
     </div>
     <div class="cal-grid" id="cal_grid"><div class="no-data" style="grid-column:1/-1">No trades yet</div></div>
+    <div class="sh"><span>Hour of Day</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">UTC · best trading hours</span></div>
+    <div class="hr-grid" id="hr_grid">
+      <div class="no-data" style="grid-column:1/-1">No trades yet</div>
+    </div>
     <div class="sh"><span>Gate Filters</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">blocked trades</span></div>
     <div id="gate_bars" style="padding-bottom:12px"><div class="no-data">No blocks yet</div></div>
   </div>
@@ -5810,6 +5910,11 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   <!-- MARKET -->
   <div class="page" id="pg-market">
     <div class="ptr" id="ptr-market">&#8635; Refreshing&#8230;</div>
+    <div class="sh"><span>Price Alerts</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">tap &#128276; on any coin to set</span></div>
+    <div id="alert_list_wrap" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;overflow:hidden">
+      <div class="no-data" id="alert_list_empty">No alerts set</div>
+      <div id="alert_list_items"></div>
+    </div>
     <div class="sh"><span>Market Heatmap</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">26 coins · 15-min signals</span></div>
     <div class="hm-grid" id="hm_grid">
       <div class="no-data" style="grid-column:1/-1">Loading&#8230;</div>
@@ -5889,7 +5994,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -5993,6 +6098,7 @@ async function fetchStatus(){
     renderPattern(d);
     if(d.market_conditions)renderConditions(d.market_conditions);
     if(d.gate_counters)renderGates(d.gate_counters);
+    renderRiskGauge(d);
   }catch(e){console.warn('status',e);}
 }
 
@@ -6522,13 +6628,14 @@ async function closePosition(pair,name){
 }
 
 /* ── MARKET HEATMAP ── */
+let _hmCoins=[];
 async function fetchMarket(){
   try{
     const d=await(await fetch('/market')).json();
     const el=$('hm_grid');if(!el)return;
-    const coins=d.coins||[];
-    if(!coins.length){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No data yet</div>';return;}
-    el.innerHTML=coins.map(c=>{
+    _hmCoins=d.coins||[];
+    if(!_hmCoins.length){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No data yet</div>';return;}
+    el.innerHTML=_hmCoins.map(c=>{
       const sig=c.signal||'NONE';
       const bull=sig==='BULL',bear=sig==='BEAR';
       const cls=bull?'bull':bear?'bear':'';
@@ -6536,11 +6643,15 @@ async function fetchMarket(){
       const sigTxt=bull?'▲ BULL':bear?'▼ BEAR':'— NONE';
       const str=c.strength>0?Math.round(c.strength*100)+'%':'';
       return '<div class="hm-cell '+cls+'">'+
-        '<div class="hm-name">'+c.name+'</div>'+
+        '<div style="display:flex;align-items:flex-start;justify-content:space-between">'+
+          '<div class="hm-name">'+c.name+'</div>'+
+          '<span class="hm-bell" onclick="openAlertSheet(\''+c.pair+'\',\''+c.name+'\')">&#128276;</span>'+
+        '</div>'+
         '<div class="hm-sig" style="color:'+sigCol+'">'+sigTxt+'</div>'+
         (str?'<div class="hm-str">'+str+' conf'+(c.pattern?' · '+c.pattern:'')+'</div>':'')
         +'</div>';
     }).join('');
+    fetchAlerts();
   }catch(e){console.warn('market',e);}
 }
 
@@ -6593,22 +6704,177 @@ function renderCalendar(days){
 function tick(){
   if(--_tick<=0){
     fetchStatus();fetchCandles();fetchHistory();
-    if(_tab==='market')fetchMarket();
+    if(_tab==='market'){fetchMarket();}
+    if(_tab==='stats'){fetchHourly();}
     _tick=30;
   }
   const td=$('hdr_tick');if(td)td.textContent='↻ '+_tick+'s';
 }
 
+/* ── RISK GAUGE ── */
+function renderRiskGauge(d){
+  const deployed=d.margin_deployed||0,maxM=d.max_margin||1;
+  const pct=Math.min((deployed/maxM)*100,100);
+  const fill=$('rg_fill'),lbl=$('rg_pct_lbl'),val=$('rg_val');
+  if(!fill)return;
+  fill.style.width=pct.toFixed(1)+'%';
+  const col=pct>=80?'var(--r)':pct>=50?'var(--y)':'var(--g)';
+  fill.style.background=col;
+  if(lbl){lbl.textContent=pct.toFixed(0)+'%';lbl.style.color=col;}
+  if(val)val.textContent='$'+fmt(deployed)+' / $'+fmt(maxM);
+}
+
+/* ── HOURLY HEATMAP ── */
+async function fetchHourly(){
+  try{
+    const d=await(await fetch('/hourly_pnl')).json();
+    renderHourly(d.hours||[]);
+  }catch(e){console.warn('hourly',e);}
+}
+function renderHourly(hours){
+  const el=$('hr_grid');if(!el)return;
+  const hasData=hours.some(h=>h.wins+h.losses>0);
+  if(!hasData){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No trades yet</div>';return;}
+  el.innerHTML=hours.map(h=>{
+    const tot=h.wins+h.losses;
+    const cls=tot===0?'':h.pnl>0?'profit':'loss';
+    const pnlStr=tot?'$'+Math.abs(h.pnl).toFixed(2):'';
+    const tip=`${h.hour}:00 UTC — ${tot} trades, $${h.pnl.toFixed(2)}`;
+    return '<div class="hr-cell '+cls+'" title="'+tip+'">'+
+      '<div class="hr-h">'+String(h.hour).padStart(2,'0')+'</div>'+
+      (pnlStr?'<div class="hr-p" style="color:'+(h.pnl>=0?'var(--g)':'var(--r)')+'">'+pnlStr+'</div>':'')+
+      '</div>';
+  }).join('');
+}
+
+/* ── PRICE ALERTS ── */
+let _alertPair='',_alertAbove=true;
+async function fetchAlerts(){
+  try{
+    const d=await(await fetch('/alerts')).json();
+    renderAlertList(d.alerts||[]);
+  }catch(e){console.warn('alerts',e);}
+}
+function renderAlertList(alerts){
+  const empty=$('alert_list_empty'),items=$('alert_list_items');
+  if(!empty||!items)return;
+  if(!alerts.length){empty.style.display='';items.innerHTML='';return;}
+  empty.style.display='none';
+  items.innerHTML=alerts.map(a=>{
+    const dirn=a.above?'&#9650; above':'&#9660; below';
+    return '<div class="alert-list-item">'+
+      '<div class="alert-coin-lbl">'+a.name+
+        '<span class="alert-dir-lbl">&nbsp;'+dirn+' $'+a.target.toFixed(4)+'</span></div>'+
+      '<button class="alert-del" onclick="deleteAlert(\''+a.pair+'\')">&#10005;</button>'+
+    '</div>';
+  }).join('');
+}
+async function deleteAlert(pair){
+  await fetch('/alert/'+encodeURIComponent(pair),{method:'DELETE'});
+  fetchAlerts();
+}
+function openAlertSheet(pair,name,currentPrice){
+  _alertPair=pair;_alertAbove=true;
+  $('as_title').textContent='Alert: '+name;
+  $('as_price').value=currentPrice?currentPrice.toFixed(4):'';
+  selectDir(true);
+  $('alert_sheet').classList.add('open');
+  setTimeout(()=>$('as_price').focus(),200);
+}
+function closeAlertSheet(){$('alert_sheet').classList.remove('open');}
+function selectDir(above){
+  _alertAbove=above;
+  $('as_above').className='alert-dir-btn'+(above?' sel':'');
+  $('as_below').className='alert-dir-btn'+(above?'':' sel');
+}
+async function submitAlert(){
+  const price=parseFloat($('as_price').value);
+  if(!_alertPair||!price||isNaN(price)){showToast('Missing price','Enter a target price','loss',2500);return;}
+  await fetch('/alert',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({pair:_alertPair,target:price,above:_alertAbove})});
+  closeAlertSheet();
+  fetchAlerts();
+  showToast('Alert Set &#128276;','You\'ll get a Telegram message when it hits','open',3000);
+}
+
+/* ── WEB PUSH ── */
+let _swReg=null,_pushActive=false;
+async function initWebPush(){
+  if(!('serviceWorker' in navigator)||!('PushManager' in window))return;
+  try{
+    const kr=await(await fetch('/push/vapid_key')).json();
+    if(!kr.key)return; // VAPID not configured
+    _swReg=await navigator.serviceWorker.ready;
+    const existing=await _swReg.pushManager.getSubscription();
+    if(existing){_pushActive=true;updateNotifBtn();}
+  }catch(e){}
+}
+async function requestNotifs(){
+  if(!('Notification' in window))return;
+  if(Notification.permission==='denied'){showToast('Blocked','Enable notifications in Safari Settings','loss',3500);return;}
+  // Try Web Push first (background notifications)
+  if(_swReg&&('PushManager' in window)){
+    try{
+      const kr=await(await fetch('/push/vapid_key')).json();
+      if(kr.key){
+        const perm=await Notification.requestPermission();
+        if(perm!=='granted'){_notif=false;_pushActive=false;updateNotifBtn();return;}
+        const sub=await _swReg.pushManager.subscribe({
+          userVisibleOnly:true,
+          applicationServerKey:_urlB64ToUint8Array(kr.key)
+        });
+        await fetch('/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(sub.toJSON())});
+        _pushActive=true;_notif=true;updateNotifBtn();
+        showToast('Push On &#128276;','You\'ll get alerts even when the app is closed','win',3500);
+        return;
+      }
+    }catch(e){console.warn('push sub',e);}
+  }
+  // Fallback: in-tab notifications only
+  if(Notification.permission==='granted'){_notif=true;updateNotifBtn();return;}
+  _notif=(await Notification.requestPermission())==='granted';
+  updateNotifBtn();
+}
+function _urlB64ToUint8Array(b64){
+  const pad='='.repeat((4-b64.length%4)%4);
+  const b=atob((b64+pad).replace(/-/g,'+').replace(/_/g,'/'));
+  const arr=new Uint8Array(b.length);
+  for(let i=0;i<b.length;i++)arr[i]=b.charCodeAt(i);
+  return arr;
+}
+function updateNotifBtn(){
+  const b=$('notif_btn');if(!b)return;
+  const on=_notif||_pushActive;
+  b.innerHTML=on?'&#128276;':'&#128277;';
+  b.className='icon-btn'+(on?' notif-on':'');
+  b.title=_pushActive?'Push notifications on (background)':on?'In-tab notifications on':'Enable notifications';
+}
+
 /* ── INIT ── */
 initCandleHover();
-fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();
-initSSE();
+fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
+initSSE();initWebPush();
 setInterval(tick,1000);
 window.addEventListener('resize',()=>{drawEquity();drawCandles();});
 if('Notification' in window&&Notification.permission==='granted'){_notif=true;updateNotifBtn();}
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script>
 <div class="toast-stack" id="toast_stack"></div>
+
+<!-- Alert sheet -->
+<div class="alert-sheet" id="alert_sheet">
+  <div class="alert-overlay" onclick="closeAlertSheet()"></div>
+  <div class="alert-panel">
+    <div class="alert-title" id="as_title">Set Alert</div>
+    <div class="alert-dir">
+      <button class="alert-dir-btn sel" id="as_above" onclick="selectDir(true)">&#9650; Above</button>
+      <button class="alert-dir-btn" id="as_below" onclick="selectDir(false)">&#9660; Below</button>
+    </div>
+    <input class="alert-input" id="as_price" type="number" step="any" placeholder="Target price (USD)" inputmode="decimal">
+    <button class="alert-set-btn" onclick="submitAlert()">Set Alert &#128276;</button>
+  </div>
+</div>
 </body>
 </html>"""
 
@@ -6647,6 +6913,10 @@ def _web_status():
         session_pnl = round(trader.balance - trader.session_start, 2)
     except Exception:
         day_pnl = session_pnl = 0.0
+
+    margin_deployed = round(sum(p["margin"] for p in trader.positions.values()), 2)
+    max_margin      = round(MAX_TOTAL_RISK * trader.balance, 2)
+    risk_pct        = round(margin_deployed / max(max_margin, 0.01) * 100, 1)
 
     open_pos = []
     for pr, p in dict(trader.positions).items():
@@ -6774,7 +7044,10 @@ def _web_status():
             "btc_dom_rising": btc_dominance["rising"],
             "avg_funding": round(sum(funding_rates.values()) / max(len(funding_rates), 1) * 100, 4) if funding_rates else 0.0,
         },
-        "gate_counters": dict(_gate_counters),
+        "gate_counters":    dict(_gate_counters),
+        "margin_deployed":  margin_deployed,
+        "max_margin":       max_margin,
+        "risk_pct":         risk_pct,
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
@@ -6912,6 +7185,69 @@ def _web_daily_pnl():
         days[day] = round(days.get(day, 0.0) + t["pnl"], 2)
     result = [{"date": d, "pnl": p} for d, p in sorted(days.items())]
     return _Response(json.dumps({"days": result}), mimetype="application/json")
+
+@_flask_app.route("/hourly_pnl")
+def _web_hourly_pnl():
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    if not trader:
+        return _Response('{"hours":[]}', mimetype="application/json")
+    hours = [{"hour": h, "pnl": 0.0, "wins": 0, "losses": 0} for h in range(24)]
+    for t in trader.trades:
+        ts = t.get("closed_at", t.get("ts", 0))
+        if ts:
+            h = datetime.utcfromtimestamp(ts).hour
+            hours[h]["pnl"]    = round(hours[h]["pnl"] + t["pnl"], 2)
+            hours[h]["wins"]   += 1 if t["pnl"] > 0 else 0
+            hours[h]["losses"] += 1 if t["pnl"] <= 0 else 0
+    return _Response(json.dumps({"hours": hours}), mimetype="application/json")
+
+@_flask_app.route("/alerts")
+def _web_alerts_get():
+    result = []
+    for pair, alerts in _price_alerts.items():
+        name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+        for a in alerts:
+            result.append({"pair": pair, "name": name,
+                           "target": a["target"], "above": a["above"],
+                           "label": a.get("label", "")})
+    return _Response(json.dumps({"alerts": result}), mimetype="application/json")
+
+@_flask_app.route("/alert", methods=["POST"])
+def _web_alert_post():
+    data = _flask_request.json or {}
+    pair   = data.get("pair", "")
+    target = float(data.get("target", 0))
+    above  = bool(data.get("above", True))
+    label  = str(data.get("label", ""))
+    if not pair or not target:
+        return _Response('{"error":"pair and target required"}', status=400, mimetype="application/json")
+    _price_alerts.setdefault(pair, []).append({"target": target, "above": above, "label": label})
+    name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+    tg(f"🔔 Web alert set: {name} {'above' if above else 'below'} ${target:,.4f}", plain=True)
+    return _Response('{"ok":true}', mimetype="application/json")
+
+@_flask_app.route("/alert/<pair>", methods=["DELETE"])
+def _web_alert_delete(pair):
+    _price_alerts.pop(pair, None)
+    return _Response('{"ok":true}', mimetype="application/json")
+
+@_flask_app.route("/push/vapid_key")
+def _web_vapid_key():
+    return _Response(json.dumps({"key": VAPID_PUBLIC_KEY}), mimetype="application/json")
+
+@_flask_app.route("/push/subscribe", methods=["POST"])
+def _web_push_subscribe():
+    sub = _flask_request.json
+    if sub and sub not in _push_subscriptions:
+        _push_subscriptions.append(sub)
+    return _Response('{"ok":true}', mimetype="application/json")
+
+@_flask_app.route("/push/unsubscribe", methods=["POST"])
+def _web_push_unsubscribe():
+    sub = _flask_request.json
+    try: _push_subscriptions.remove(sub)
+    except (ValueError, TypeError): pass
+    return _Response('{"ok":true}', mimetype="application/json")
 
 _ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 <rect width="512" height="512" fill="#060e1c"/>
@@ -7055,7 +7391,7 @@ def _web_manifest():
 @_flask_app.route("/sw.js")
 def _web_sw():
     sw = r"""
-const CACHE='cryptobot-v3';
+const CACHE='cryptobot-v4';
 const STATIC=['/manifest.json','/icon/svg'];
 
 self.addEventListener('install',e=>e.waitUntil(
@@ -7068,12 +7404,12 @@ self.addEventListener('activate',e=>e.waitUntil(
 ));
 self.addEventListener('fetch',e=>{
   const url=e.request.url;
-  /* always bypass API / SSE / data routes */
   if(url.includes('/status')||url.includes('/events')||
      url.includes('/candles')||url.includes('/history')||
      url.includes('/control')||url.includes('/market')||
-     url.includes('/daily_pnl')||url.includes('/close/'))return;
-  /* network-first for the HTML shell — always load the latest UI */
+     url.includes('/daily_pnl')||url.includes('/hourly_pnl')||
+     url.includes('/alerts')||url.includes('/alert')||
+     url.includes('/push/')||url.includes('/close/'))return;
   if(e.request.mode==='navigate'||url.endsWith('/')){
     e.respondWith(
       fetch(e.request).then(r=>{
@@ -7084,8 +7420,23 @@ self.addEventListener('fetch',e=>{
     );
     return;
   }
-  /* cache-first for static assets (icons, manifest) */
   e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request)));
+});
+
+/* ── Web Push ── */
+self.addEventListener('push',e=>{
+  const d=e.data?JSON.parse(e.data.text()):{title:'CryptoBot',body:'Trade update',tag:'trade'};
+  e.waitUntil(self.registration.showNotification(d.title,{
+    body:d.body,tag:d.tag||'trade',icon:'/icon/192',badge:'/icon/96',
+    requireInteraction:false,vibrate:[150,80,150],
+  }));
+});
+self.addEventListener('notificationclick',e=>{
+  e.notification.close();
+  e.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(cs=>{
+    for(const c of cs)if('focus' in c)return c.focus();
+    if(clients.openWindow)return clients.openWindow('/');
+  }));
 });
 """
     return _Response(sw.strip(), mimetype="application/javascript",
