@@ -4757,11 +4757,19 @@ _DASHBOARD_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="CryptoBot">
+<meta name="application-name" content="CryptoBot">
+<meta name="theme-color" content="#060e1c" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#060e1c">
 <link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon/180">
+<link rel="apple-touch-icon" sizes="167x167" href="/icon/167">
+<link rel="apple-touch-icon" sizes="152x152" href="/icon/152">
+<link rel="apple-touch-icon" href="/icon/180">
+<link rel="icon" type="image/svg+xml" href="/icon/svg">
 <title>CryptoBot</title>
 <style>
 :root{
@@ -4772,7 +4780,10 @@ _DASHBOARD_HTML = """<!doctype html>
   --fn:'SF Mono','Fira Mono','Cascadia Code',ui-monospace,monospace;
   --fu:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
   --tab-h:62px;--hdr-h:54px;
+  --st:env(safe-area-inset-top,0px);
   --sb:env(safe-area-inset-bottom,0px);
+  --sl:env(safe-area-inset-left,0px);
+  --sr:env(safe-area-inset-right,0px);
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;overflow:hidden}
@@ -4780,9 +4791,11 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
      -webkit-font-smoothing:antialiased;display:flex;flex-direction:column;
      overscroll-behavior:none;user-select:none}
 
-/* ── HEADER ── */
-.hdr{height:var(--hdr-h);display:flex;align-items:center;gap:8px;
-     padding:0 14px;background:var(--s0);border-bottom:1px solid var(--bd);
+/* ── HEADER — grows to clear status bar / Dynamic Island ── */
+.hdr{height:calc(var(--hdr-h) + var(--st));display:flex;align-items:flex-end;gap:8px;
+     padding:0 calc(14px + var(--sr)) var(--hdr-pad,10px) calc(14px + var(--sl));
+     padding-top:var(--st);
+     background:var(--s0);border-bottom:1px solid var(--bd);
      flex-shrink:0;z-index:10}
 .hdr-logo{font-family:var(--fn);font-size:.62rem;font-weight:700;
            letter-spacing:.22em;text-transform:uppercase;color:var(--b);flex-shrink:0}
@@ -5994,19 +6007,141 @@ def _web_control():
     _push_sse("control", {"paused": now_paused})
     return _Response(json.dumps({"paused": now_paused}), mimetype="application/json")
 
+_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<rect width="512" height="512" fill="#060e1c"/>
+<defs><linearGradient id="gb" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#0d2040"/><stop offset="1" stop-color="#060e1c"/>
+</linearGradient></defs>
+<rect width="512" height="512" fill="url(#gb)"/>
+<!-- trend line -->
+<polyline points="60,400 140,340 220,310 300,240 380,190 460,130"
+  fill="none" stroke="#4a8fff" stroke-width="4" stroke-linecap="round"
+  stroke-linejoin="round" opacity="0.45"/>
+<!-- candle 1 bearish -->
+<line x1="100" y1="290" x2="100" y2="320" stroke="#ff3352" stroke-width="6" stroke-linecap="round"/>
+<rect x="78" y="320" width="44" height="80" rx="5" fill="#ff3352"/>
+<line x1="100" y1="400" x2="100" y2="420" stroke="#ff3352" stroke-width="6" stroke-linecap="round"/>
+<!-- candle 2 bullish -->
+<line x1="188" y1="260" x2="188" y2="300" stroke="#00cc74" stroke-width="6" stroke-linecap="round"/>
+<rect x="166" y="300" width="44" height="70" rx="5" fill="#00cc74"/>
+<line x1="188" y1="370" x2="188" y2="395" stroke="#00cc74" stroke-width="6" stroke-linecap="round"/>
+<!-- candle 3 bullish small -->
+<line x1="276" y1="230" x2="276" y2="265" stroke="#00cc74" stroke-width="6" stroke-linecap="round"/>
+<rect x="254" y="265" width="44" height="55" rx="5" fill="#00cc74"/>
+<line x1="276" y1="320" x2="276" y2="345" stroke="#00cc74" stroke-width="6" stroke-linecap="round"/>
+<!-- candle 4 big bullish -->
+<line x1="364" y1="175" x2="364" y2="210" stroke="#00cc74" stroke-width="6" stroke-linecap="round"/>
+<rect x="342" y="210" width="44" height="100" rx="5" fill="#00cc74"/>
+<line x1="364" y1="310" x2="364" y2="335" stroke="#00cc74" stroke-width="6" stroke-linecap="round"/>
+<!-- candle 5 tallest bullish -->
+<line x1="452" y1="130" x2="452" y2="165" stroke="#00cc74" stroke-width="6" stroke-linecap="round"/>
+<rect x="430" y="165" width="44" height="115" rx="5" fill="#00cc74"/>
+<line x1="452" y1="280" x2="452" y2="310" stroke="#00cc74" stroke-width="6" stroke-linecap="round"/>
+</svg>"""
+
+def _render_icon_png(size: int) -> bytes:
+    """Generate a minimal PNG of the icon at the requested size using stdlib only."""
+    import struct, zlib as _zlib
+    # Rasterise via simple pixel mapping from the SVG design
+    bg = (6, 14, 28)          # --bg
+    green = (0, 204, 116)     # --g
+    red   = (255, 51, 82)     # --r
+    blue  = (74, 143, 255)    # --b
+
+    def lerp(a, b, t): return int(a + (b - a) * t)
+    def gradient_bg(y, h):
+        t = y / max(h - 1, 1)
+        return (lerp(13, 6, t), lerp(32, 14, t), lerp(64, 28, t))
+
+    s = size
+    pixels = []
+    for py in range(s):
+        row = []
+        for px in range(s):
+            fx = px / s  # 0..1
+            fy = py / s
+
+            # Normalise to 512-space
+            x512 = px * 512 / s
+            y512 = py * 512 / s
+
+            # Background gradient
+            col = gradient_bg(py, s)
+
+            # Trend line (approximate as a thick diagonal band)
+            # Line from (60,400)→(460,130) in 512 space
+            tx = 60 + (460 - 60) * fx
+            ty = 400 + (130 - 400) * fx
+            if abs(y512 - ty) < 512 / s * 3:
+                col = (lerp(col[0], blue[0], 0.35), lerp(col[1], blue[1], 0.35), lerp(col[2], blue[2], 0.35))
+
+            # Candles: (cx, body_top, body_bot, wick_top, wick_bot, color)
+            candles = [
+                (100, 320, 400, 290, 420, red),
+                (188, 300, 370, 260, 395, green),
+                (276, 265, 320, 230, 345, green),
+                (364, 210, 310, 175, 335, green),
+                (452, 165, 280, 130, 310, green),
+            ]
+            hw = 22  # half-body width in 512 space
+            hw2 = 3  # half-wick width
+
+            for (cx, bt, bb, wt, wb, cc) in candles:
+                # Body
+                if abs(x512 - cx) <= hw and bt <= y512 <= bb:
+                    col = cc
+                # Wick
+                elif abs(x512 - cx) <= hw2 and wt <= y512 <= wb:
+                    col = cc
+
+            row.append(col)
+        pixels.append(row)
+
+    # Encode as PNG
+    def make_chunk(tag, data):
+        crc = _zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    raw_rows = b"".join(
+        b"\x00" + bytes(c for px in row for c in px)
+        for row in pixels
+    )
+    idat = _zlib.compress(raw_rows, 6)
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + make_chunk(b"IHDR", struct.pack(">IIBBBBB", s, s, 8, 2, 0, 0, 0))
+           + make_chunk(b"IDAT", idat)
+           + make_chunk(b"IEND", b""))
+    return png
+
+@_flask_app.route("/icon/svg")
+def _web_icon_svg():
+    return _Response(_ICON_SVG, mimetype="image/svg+xml",
+                     headers={"Cache-Control": "public,max-age=86400"})
+
+@_flask_app.route("/icon/<int:size>")
+def _web_icon_png(size):
+    size = min(max(size, 16), 512)
+    png = _render_icon_png(size)
+    return _Response(png, mimetype="image/png",
+                     headers={"Cache-Control": "public,max-age=86400"})
+
 @_flask_app.route("/manifest.json")
 def _web_manifest():
     manifest = {
-        "name": "CryptoBot Dashboard",
+        "name": "CryptoBot",
         "short_name": "CryptoBot",
+        "description": "Live crypto trading bot dashboard",
         "start_url": "/",
+        "id": "/",
         "display": "standalone",
+        "orientation": "portrait",
         "background_color": "#060e1c",
         "theme_color": "#060e1c",
-        "description": "Live crypto trading bot dashboard",
         "icons": [
-            {"src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>₿</text></svg>",
-             "sizes": "any", "type": "image/svg+xml"}
+            {"src": "/icon/192", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon/512", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon/svg", "sizes": "any",     "type": "image/svg+xml"},
         ],
     }
     return _Response(json.dumps(manifest), mimetype="application/manifest+json")
