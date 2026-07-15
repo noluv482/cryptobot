@@ -1121,6 +1121,159 @@ def detect_candle_pattern(opens, closes, highs, lows):
     return "NONE"
 
 
+def _find_swings(highs, lows, window=3):
+    """Return (peaks, troughs) as (index, value) pairs from interior candles."""
+    peaks, troughs = [], []
+    n = len(highs)
+    for i in range(window, n - window):
+        if highs[i] >= max(highs[i - window: i + window + 1]):
+            peaks.append((i, highs[i]))
+        if lows[i] <= min(lows[i - window: i + window + 1]):
+            troughs.append((i, lows[i]))
+    return peaks, troughs
+
+
+def _linreg_slope(vals):
+    """Least-squares slope (rise per bar) of a value series."""
+    n = len(vals)
+    if n < 3:
+        return 0.0
+    x_bar = (n - 1) / 2.0
+    y_bar = sum(vals) / n
+    num = sum((i - x_bar) * (vals[i] - y_bar) for i in range(n))
+    den = sum((i - x_bar) ** 2 for i in range(n))
+    return num / max(den, 1e-9)
+
+
+def detect_chart_pattern(closes, highs, lows, lookback=40):
+    """Detect classical chart patterns (reversal, continuation, bilateral).
+    Returns {"signal": "BULL"|"BEAR"|"NONE", "name": str, "strength": float}.
+    Covers: Double Top/Bottom, Head & Shoulders, Inv. H&S, Rising/Falling Wedge,
+    Ascending/Descending/Sym Triangle, Bull/Bear Rectangle, Bull/Bear Pennant.
+    """
+    _NONE = {"signal": "NONE", "name": "", "strength": 0.0}
+    if len(closes) < 20:
+        return _NONE
+    n = min(lookback, len(closes))
+    c = list(closes[-n:])
+    h = list(highs[-n:])
+    l = list(lows[-n:])
+    price = c[-1]
+    if price <= 0:
+        return _NONE
+
+    tol = 0.025  # 2.5% "same level" tolerance
+
+    try:
+        peaks, troughs = _find_swings(h, l, window=3)
+    except Exception:
+        return _NONE
+
+    # ── Double Top (bearish reversal) ────────────────────────────
+    # Requires: prior uptrend → two peaks at same level → price at/below neckline
+    if len(peaks) >= 2:
+        p1, p2 = peaks[-2], peaks[-1]
+        if p1[1] > 0 and abs(p1[1] - p2[1]) / p1[1] <= tol:
+            mid = [t for t in troughs if p1[0] < t[0] < p2[0]]
+            if mid and c[p1[0]] > c[0] * (1 + tol):  # prior uptrend required
+                neckline = max(t[1] for t in mid)
+                if price <= neckline * (1 + tol):
+                    return {"signal": "BEAR", "name": "Double Top", "strength": 0.85}
+
+    # ── Double Bottom (bullish reversal) ─────────────────────────
+    # Requires: prior downtrend → two troughs at same level → price at/above neckline
+    if len(troughs) >= 2:
+        t1, t2 = troughs[-2], troughs[-1]
+        if t1[1] > 0 and abs(t1[1] - t2[1]) / t1[1] <= tol:
+            mid = [p for p in peaks if t1[0] < p[0] < t2[0]]
+            if mid and c[t1[0]] < c[0] * (1 - tol):  # prior downtrend required
+                neckline = min(p[1] for p in mid)
+                if price >= neckline * (1 - tol):
+                    return {"signal": "BULL", "name": "Double Bottom", "strength": 0.85}
+
+    # ── Head & Shoulders (bearish reversal) ──────────────────────
+    if len(peaks) >= 3:
+        ls_, hd_, rs_ = peaks[-3], peaks[-2], peaks[-1]
+        if (hd_[1] > ls_[1] and hd_[1] > rs_[1]
+                and ls_[1] > 0 and abs(ls_[1] - rs_[1]) / ls_[1] <= tol * 2):
+            nt = [t for t in troughs if ls_[0] < t[0] < rs_[0]]
+            if len(nt) >= 2:
+                neckline = (nt[0][1] + nt[-1][1]) / 2
+                if price <= neckline * (1 + tol):
+                    return {"signal": "BEAR", "name": "Head & Shoulders", "strength": 0.90}
+
+    # ── Inverse Head & Shoulders (bullish reversal) ───────────────
+    if len(troughs) >= 3:
+        ls_, hd_, rs_ = troughs[-3], troughs[-2], troughs[-1]
+        if (hd_[1] < ls_[1] and hd_[1] < rs_[1]
+                and ls_[1] > 0 and abs(ls_[1] - rs_[1]) / ls_[1] <= tol * 2):
+            np_ = [p for p in peaks if ls_[0] < p[0] < rs_[0]]
+            if len(np_) >= 2:
+                neckline = (np_[0][1] + np_[-1][1]) / 2
+                if price >= neckline * (1 - tol):
+                    return {"signal": "BULL", "name": "Inv. Head & Shoulders", "strength": 0.90}
+
+    # ── Wedge / Triangle via linear regression on all highs & lows ─
+    # Checked before Pennant: a wedge has significant slope throughout,
+    # whereas a pennant consolidates flat after a pole.
+    flat = 5e-5
+    hs_all = _linreg_slope(h) / price   # slope of highs normalised by price
+    ls_all = _linreg_slope(l) / price   # slope of lows  normalised by price
+
+    # Rising Wedge (bearish): both upward, lows rising faster → narrowing top
+    if hs_all > flat and ls_all > flat and ls_all > hs_all * 1.1:
+        return {"signal": "BEAR", "name": "Rising Wedge", "strength": 0.75}
+
+    # Falling Wedge (bullish): both downward, lows falling faster → narrowing bottom
+    if hs_all < -flat and ls_all < -flat and ls_all < hs_all * 1.1:
+        return {"signal": "BULL", "name": "Falling Wedge", "strength": 0.75}
+
+    # Ascending Triangle: highs flat, lows rising → bullish breakout
+    if abs(hs_all) < flat and ls_all > flat * 2:
+        return {"signal": "BULL", "name": "Ascending Triangle", "strength": 0.75}
+
+    # Descending Triangle: highs falling, lows flat → bearish breakdown
+    if hs_all < -flat * 2 and abs(ls_all) < flat:
+        return {"signal": "BEAR", "name": "Descending Triangle", "strength": 0.75}
+
+    # Symmetrical Triangle: highs falling AND lows rising → trade with momentum
+    if hs_all < -flat and ls_all > flat:
+        sym_sig = "BULL" if c[-1] > c[max(0, len(c) - 10)] else "BEAR"
+        return {"signal": sym_sig, "name": "Sym. Triangle", "strength": 0.60}
+
+    # ── Pennant (strong pole → tight horizontal consolidation) ───────────────
+    # Only fires when wedge/triangle slopes were not significant above.
+    if n > 18:
+        pole_st  = c[0]
+        pole_en  = c[-8]
+        pole_pct = abs(pole_en - pole_st) / max(abs(pole_st), 1e-9)
+        if pole_pct >= 0.03:
+            rec_h    = max(h[-8:])
+            rec_l    = min(l[-8:])
+            cons_pct = (rec_h - rec_l) / max(rec_h, 1e-9)
+            if cons_pct < pole_pct * 0.40:
+                if pole_en > pole_st:
+                    return {"signal": "BULL", "name": "Bullish Pennant", "strength": 0.72}
+                else:
+                    return {"signal": "BEAR", "name": "Bearish Pennant", "strength": 0.72}
+
+    # ── Rectangle / channel (flat highs AND flat lows, no clear wedge) ───────
+    if peaks and troughs:
+        hp = [p[1] for p in peaks[-3:]]
+        ht = [t[1] for t in troughs[-3:]]
+        if len(hp) >= 2 and len(ht) >= 2:
+            peak_spread   = (max(hp) - min(hp)) / max(hp)
+            trough_spread = (max(ht) - min(ht)) / max(ht)
+            if peak_spread < tol and trough_spread < tol:
+                mid_ch = (sum(hp) / len(hp) + sum(ht) / len(ht)) / 2
+                if price > mid_ch:
+                    return {"signal": "BULL", "name": "Bullish Rectangle", "strength": 0.65}
+                else:
+                    return {"signal": "BEAR", "name": "Bearish Rectangle", "strength": 0.65}
+
+    return _NONE
+
+
 # ── Rank coins ────────────────────────────────────────────────────────────────
 def rank_coins():
     scores    = []
@@ -2179,6 +2332,8 @@ class SignalEngine:
 
         # Candlestick pattern (7th confidence pillar)
         candle_pat = detect_candle_pattern(opens, closes, highs, lows)
+        # Classical chart pattern (10th confidence pillar)
+        chart_pat  = detect_chart_pattern(closes, highs, lows)
         price_range = max(highs) - min(lows) or 1
         tolerance   = price_range * 0.005
         levels = []
@@ -2389,6 +2544,17 @@ class SignalEngine:
                    else 0.5 if obv_trend == "FLAT"
                    else 0.0)
 
+        # Chart-pattern pillar: classical structure detection (10th pillar)
+        # Strength scales the point value (0.60–0.90) so stronger patterns weigh more
+        _cp_sig = chart_pat["signal"]
+        _cp_str = chart_pat.get("strength", 1.0)
+        if (sig == "BUY"  and _cp_sig == "BULL") or (sig == "SELL" and _cp_sig == "BEAR"):
+            chart_pts = 1.0 * _cp_str          # pattern confirms signal
+        elif (sig == "BUY" and _cp_sig == "BEAR") or (sig == "SELL" and _cp_sig == "BULL"):
+            chart_pts = 0.0                     # pattern contradicts signal
+        else:
+            chart_pts = 0.5                     # no pattern = neutral
+
         pts = (rsi_pts    * pw.get("rsi_zone",       1.0) +
                news_pts   * pw.get("news_align",     1.0) +
                nasdaq_pts * pw.get("nasdaq_align",   1.0) +
@@ -2397,7 +2563,8 @@ class SignalEngine:
                vol_pts    * pw.get("high_volume",    1.0) +
                candle_pts * pw.get("candle_pattern", 1.0) +
                vwap_pts   * pw.get("vwap_align",     1.0) +
-               obv_pts    * pw.get("obv_trend",      1.0))
+               obv_pts    * pw.get("obv_trend",      1.0) +
+               chart_pts  * pw.get("chart_struct",   1.0))
         max_pts = (1.0 * pw.get("rsi_zone",       1.0) +
                    1.0 * pw.get("news_align",     1.0) +
                    1.0 * pw.get("nasdaq_align",   1.0) +
@@ -2406,7 +2573,8 @@ class SignalEngine:
                    1.0 * pw.get("high_volume",    1.0) +
                    1.0 * pw.get("candle_pattern", 1.0) +
                    1.0 * pw.get("vwap_align",     1.0) +
-                   1.0 * pw.get("obv_trend",      1.0))
+                   1.0 * pw.get("obv_trend",      1.0) +
+                   1.0 * pw.get("chart_struct",   1.0))
         confidence = round(pts / max(max_pts, 0.1), 2) if sig in ("BUY", "SELL") else 0.0
 
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
@@ -2483,7 +2651,10 @@ class SignalEngine:
             "candle_pattern":candle_pts >= 1.0,
             "vwap_align":    vwap_pts >= 1.0,
             "obv_trend":     obv_pts >= 1.0,
+            "chart_struct":  chart_pts >= 0.7,
         }
+        if chart_pat["name"]:
+            plan["chart_name"] = chart_pat["name"]
 
         # ── Feature fingerprint key ──────────────────────────────────────────
         rsi_bin  = min(int(rsi / 20), 4)
@@ -4306,10 +4477,12 @@ def trading_loop(trader):
                                        f"R:R {_rr_str}  "
                                        f"conf {_c(conf_col, conf_pct)}  {leverage}x"))
                         emoji    = "🟢" if sig == "BUY" else "🔴"
+                        _cpn     = plan.get("chart_name", "")
+                        _pat_note = f"\n📐 Pattern: `{_cpn}`" if _cpn else ""
                         tg(f"{emoji} *{sig} Signal — {coin['name']}*\n"
                            f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
                            f"R:R: `{_rr_str}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
-                           f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*")
+                           f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*{_pat_note}")
                         trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
                                          atr=atr, fkey=fkey, pillars=pillars)
 
