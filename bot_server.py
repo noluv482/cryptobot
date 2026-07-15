@@ -759,6 +759,7 @@ btc_dominance   = {"pct": 50.0, "prev_pct": 50.0, "rising": False}
 funding_rates   = {}   # pair → last funding rate float (from Binance futures)
 trending_boost  = {}   # pair → bonus score from social/trending sources
 _paused         = False
+_paper_mode     = False   # when True: forces paper trading even if live keys are loaded
 _daily_limits   = False   # off by default — enable for real-money discipline
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
@@ -803,6 +804,10 @@ _gate_counters = {
     "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
 }
 _gate_counter_lock = threading.Lock()
+
+def is_live():
+    """True when real orders should be placed — keys present AND paper override is off."""
+    return LIVE_MODE and not _paper_mode
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 def tg(msg, plain=False):
@@ -2036,10 +2041,12 @@ class PaperTrader:
         return (used / max(self.balance, 0.01)) < MAX_TOTAL_RISK
 
     def _apply_state(self, d):
+        global _paper_mode
         self.balance      = d.get("balance", PAPER_START)
         self.peak         = d.get("peak", self.balance)
         self.trades       = d.get("trades", [])
         self.current_rank = d.get("current_rank", RANKS[0]["name"])
+        _paper_mode       = d.get("paper_mode", False)
         pos_data = d.get("positions")
         if pos_data is None:
             old = d.get("position")
@@ -2080,7 +2087,8 @@ class PaperTrader:
     def _state_dict(self):
         return {"balance": self.balance, "peak": self.peak,
                 "trades": self.trades[-1000:], "positions": self.positions,
-                "current_rank": self.current_rank}
+                "current_rank": self.current_rank,
+                "paper_mode": _paper_mode}
 
     def _save_file(self):
         try:
@@ -2523,7 +2531,7 @@ class PaperTrader:
             if sig == "BUY"  and self.can_open_new():
                 self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
             elif sig == "SELL" and self.can_open_new():
-                if LIVE_MODE and LIVE_EXCHANGE != "kraken_futures":
+                if is_live() and LIVE_EXCHANGE != "kraken_futures":
                     log("LIVE", f"SHORT skipped ({name}) — spot trading, no short selling")
                 else:
                     self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
@@ -2588,7 +2596,7 @@ class PaperTrader:
                         * session_mult
                         * gain_mult,
                         RISK_MAX)
-        if LIVE_MODE:
+        if is_live():
             margin = round(self.balance * risk, 4)
             fill   = price
             if LIVE_EXCHANGE == "kraken_futures":
@@ -2717,9 +2725,9 @@ class PaperTrader:
         session_note = f" 🇺🇸 US×`{session_mult:.2f}`" if session_mult > 1.0 else \
                        f" 🌙 Asia×`{session_mult:.2f}`" if session_mult < 1.0 else ""
         gain_note    = f" 🔒 gain-protect×`{gain_mult:.2f}`" if gain_mult < 1.0 else ""
-        live_note    = f" 🔴 *LIVE ({LIVE_EXCHANGE.upper()})*" if LIVE_MODE else ""
+        live_note    = f" 🔴 *LIVE ({LIVE_EXCHANGE.upper()})*" if is_live() else ""
         _tier_emoji  = {"Cautious": "🔵", "Moderate": "🟡", "Confident": "🟠", "Max Bet": "🔴"}.get(contract_tier, "⚪")
-        _is_spot_live = LIVE_MODE and LIVE_EXCHANGE != "kraken_futures"
+        _is_spot_live = is_live() and LIVE_EXCHANGE != "kraken_futures"
         lev_str      = "1x spot" if _is_spot_live else f"*{leverage}× {contract_tier}* {_tier_emoji}"
         tg(f"📂 *Trade OPENED — {name}*{live_note}\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
@@ -2743,7 +2751,7 @@ class PaperTrader:
         p = self.positions.get(pair)
         if not p: return
 
-        if LIVE_MODE:
+        if is_live():
             contracts = p.get("contracts", 0.0)
             fill      = price
             try:
@@ -3614,17 +3622,22 @@ def _switcher_loop(trader):
 # Tapping a reply-keyboard button sends a plain text message — handled by the
 # message branch of _poll_loop — so buttons work even when callback_query
 # delivery is broken.
-_REPLY_KB = {
-    "keyboard": [
-        [{"text": "💰 Balance"},  {"text": "📊 Rankings"}],
-        [{"text": "📜 History"},  {"text": "📰 News"}],
-        [{"text": "🧠 Intel"},    {"text": "🏆 Ranks"},  {"text": "🎓 Learn"}],
-        [{"text": "🔄 Switch"},   {"text": "⏸ Pause"},  {"text": "▶ Resume"}],
-        [{"text": "🔍 Why"},      {"text": "📈 Chart"}, {"text": "📡 Live"}, {"text": "📋 Menu"}],
-        [{"text": "🔬 Backtest"}],
-    ],
-    "resize_keyboard": True,
-}
+def _build_reply_kb():
+    """Build the Telegram reply keyboard — mode button changes based on current state."""
+    mode_btn = {"text": "📄 Paper"} if (LIVE_MODE and not _paper_mode) else {"text": "🔴 Go Live"}
+    return {
+        "keyboard": [
+            [{"text": "💰 Balance"},  {"text": "📊 Rankings"}],
+            [{"text": "📜 History"},  {"text": "📰 News"}],
+            [{"text": "🧠 Intel"},    {"text": "🏆 Ranks"},  {"text": "🎓 Learn"}],
+            [{"text": "🔄 Switch"},   {"text": "⏸ Pause"},  {"text": "▶ Resume"}],
+            [{"text": "🔍 Why"},      {"text": "📈 Chart"}, {"text": "📡 Live"}, {"text": "📋 Menu"}],
+            [{"text": "🔬 Backtest"}, mode_btn],
+        ],
+        "resize_keyboard": True,
+    }
+
+_REPLY_KB = _build_reply_kb()  # fallback static instance
 
 # Maps incoming text (lower-cased) to the same action strings _dispatch_callback uses.
 _TEXT_ACTION: dict = {
@@ -3643,6 +3656,8 @@ _TEXT_ACTION: dict = {
     "📡 live":     "live",
     "🔬 backtest": "backtest",
     "📋 menu":     "menu",
+    "📄 paper":    "toggle_mode",
+    "🔴 go live":  "toggle_mode",
     # text commands
     "/start":      "menu",
     "/menu":       "menu",
@@ -4399,7 +4414,8 @@ def _tg_with_kb(msg, kb):
 def send_menu(trader=None):
     with _state_lock:
         paused = _paused
-    status = "🟢 LIVE" if not paused else "⏸ PAUSED"
+    _mode_live = is_live()
+    status = ("🔴 LIVE" if _mode_live else "📄 PAPER") + (" ⏸" if paused else "")
     bal    = f"${trader.balance:,.2f}" if trader else "—"
     coin   = _current_coin["name"]
     nasdaq = market_mood["nasdaq"]
@@ -4418,7 +4434,7 @@ def send_menu(trader=None):
     if trader and trader.positions:
         n = len(trader.positions)
         pos_close = f"\n🚨 *{n} open position{'s' if n > 1 else ''}* — tap 💰 Balance to close"
-    _tg_with_kb(header + pos_close, _REPLY_KB)
+    _tg_with_kb(header + pos_close, _build_reply_kb())
 
 def _handle_callback(query, trader):
     global _paused, _current_coin
@@ -4433,9 +4449,25 @@ def _handle_callback(query, trader):
         tg(f"Error: {e}", plain=True)
 
 def _dispatch_callback(data, query, trader):
-    global _paused, _current_coin, _daily_limits
+    global _paused, _current_coin, _daily_limits, _paper_mode
 
     if data == "menu":
+        send_menu(trader)
+
+    elif data == "toggle_mode":
+        if not LIVE_MODE:
+            tg("⚠️ No live API keys loaded — bot always runs in paper mode.\n"
+               "Add `KRAKEN_API_KEY` and `KRAKEN_API_SECRET` to Railway to enable live trading.")
+            return
+        _paper_mode = not _paper_mode
+        if _paper_mode:
+            tg("📄 *Switched to PAPER trading*\n"
+               "Bot will simulate trades — no real orders will be placed.\n"
+               "Tap *🔴 Go Live* to switch back.")
+        else:
+            tg("🔴 *Switched to LIVE trading*\n"
+               f"Real orders will now be placed on *{LIVE_EXCHANGE.upper()}*.\n"
+               "Tap *📄 Paper* to switch back to simulation.")
         send_menu(trader)
 
     elif data == "balance":
@@ -5461,7 +5493,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 
 <header class="hdr">
   <div class="hdr-logo">CB</div>
-  <div id="mode_badge" class="badge badge-paper">
+  <div id="mode_badge" class="badge badge-paper" onclick="toggleMode()" title="Tap to switch Paper / Live" style="cursor:pointer">
     <div id="mode_dot" class="dot dot-paper"></div>
     <span id="mode_txt">PAPER</span>
   </div>
@@ -6292,6 +6324,23 @@ async function togglePause(){
   }catch(e){console.warn('control',e);}
 }
 
+async function toggleMode(){
+  const currentlyLive=$('mode_txt').textContent.startsWith('LIVE');
+  const msg=currentlyLive
+    ?'Switch to PAPER trading? No real orders will be placed.'
+    :'Switch to LIVE trading? Real money will be used!';
+  if(!confirm(msg))return;
+  try{
+    const d=await(await fetch('/control',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'toggle_mode'})})).json();
+    const live=d.mode==='LIVE';
+    $('mode_badge').className='badge '+(live?'badge-live':'badge-paper');
+    $('mode_dot').className='dot '+(live?'dot-live':'dot-paper');
+    $('mode_txt').textContent=live?'LIVE':'PAPER';
+  }catch(e){console.warn('toggleMode',e);}
+}
+
 /* ── TICK ── */
 function tick(){if(--_tick<=0){fetchStatus();fetchCandles();fetchHistory();_tick=30;}}
 
@@ -6429,7 +6478,9 @@ def _web_status():
         "open_positions": open_pos,
         "streak":         streak,
         "recent_trades":  recent,
-        "mode":           "LIVE" if LIVE_MODE else "PAPER",
+        "mode":           "LIVE" if is_live() else "PAPER",
+        "paper_mode":     _paper_mode,
+        "keys_loaded":    LIVE_MODE,
         "exchange":       LIVE_EXCHANGE if LIVE_MODE else EXCHANGE,
         "paused":         paused_now,
         "coin_stats":     coin_stats,
@@ -6527,7 +6578,7 @@ def _web_history():
 
 @_flask_app.route("/control", methods=["POST"])
 def _web_control():
-    global _paused
+    global _paused, _paper_mode
     try:
         body = _flask_request.get_json(silent=True) or {}
         action = body.get("action", "toggle")
@@ -6538,11 +6589,20 @@ def _web_control():
             _paused = True
         elif action == "resume":
             _paused = False
+        elif action == "paper":
+            _paper_mode = True
+        elif action == "live":
+            _paper_mode = False
+        elif action == "toggle_mode":
+            _paper_mode = not _paper_mode
         else:
             _paused = not _paused
-        now_paused = _paused
-    _push_sse("control", {"paused": now_paused})
-    return _Response(json.dumps({"paused": now_paused}), mimetype="application/json")
+        now_paused  = _paused
+        now_paper   = _paper_mode
+    _push_sse("control", {"paused": now_paused, "paper_mode": now_paper})
+    return _Response(json.dumps({"paused": now_paused, "paper_mode": now_paper,
+                                  "mode": "PAPER" if now_paper else "LIVE"}),
+                     mimetype="application/json")
 
 _ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 <rect width="512" height="512" fill="#060e1c"/>
