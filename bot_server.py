@@ -5522,12 +5522,36 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   border:1px solid rgba(255,51,82,.35);background:rgba(255,51,82,.08);
   color:var(--r);cursor:pointer;touch-action:manipulation;margin-top:8px;width:100%}
 .close-btn:active{background:rgba(255,51,82,.2)}
+/* ── TOASTS ── */
+.toast-stack{position:fixed;bottom:calc(var(--tab-h) + var(--sb) + 12px);
+  left:50%;transform:translateX(-50%);z-index:200;display:flex;
+  flex-direction:column-reverse;align-items:center;gap:6px;
+  pointer-events:none;width:calc(100% - 32px);max-width:360px}
+.toast{padding:11px 14px;border-radius:12px;display:flex;align-items:center;gap:10px;
+  pointer-events:auto;box-shadow:0 8px 32px rgba(0,0,0,.5);
+  opacity:0;transform:translateY(14px);
+  transition:opacity .22s ease,transform .22s ease;width:100%;
+  background:var(--s0);border:1px solid var(--bd2)}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.toast-win{background:rgba(0,204,116,.12);border-color:rgba(0,204,116,.3)}
+.toast.toast-loss{background:rgba(255,51,82,.09);border-color:rgba(255,51,82,.28)}
+.toast.toast-open{background:rgba(74,143,255,.1);border-color:rgba(74,143,255,.28)}
+.toast-ico{font-size:1.15rem;flex-shrink:0;line-height:1}
+.toast-body{flex:1;min-width:0}
+.toast-title{font-size:.73rem;font-weight:700;color:var(--tx);line-height:1.2}
+.toast-sub{font-size:.62rem;color:var(--mu);margin-top:2px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* ── CONNECTION DOT ── */
+.conn-dot{width:5px;height:5px;border-radius:50%;background:var(--mu);
+  transition:background .4s;display:inline-block;margin-left:5px;
+  vertical-align:middle;margin-bottom:1px}
+.conn-dot.live{background:var(--g);animation:blink 2.5s ease-in-out infinite}
 </style>
 </head>
 <body>
 
 <header class="hdr">
-  <div class="hdr-logo">CB</div>
+  <div class="hdr-logo">CB<span id="conn_dot" class="conn-dot"></span></div>
   <div id="mode_badge" class="badge badge-paper" onclick="toggleMode()" title="Tap to switch Paper / Live" style="cursor:pointer">
     <div id="mode_dot" class="dot dot-paper"></div>
     <span id="mode_txt">PAPER</span>
@@ -5535,6 +5559,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   <div class="hdr-mid">
     <div class="hdr-coin" id="hdr_coin">—</div>
     <div class="hdr-price c-tx" id="hdr_price">—</div>
+    <div id="hdr_tick" style="font-size:.44rem;color:var(--mu);font-family:var(--fn);line-height:1;margin-top:1px">↻ 30s</div>
   </div>
   <div class="hdr-actions">
     <button class="icon-btn" id="pause_btn" onclick="togglePause()" title="Pause bot">&#9208;</button>
@@ -5871,9 +5896,18 @@ function goTab(t){
 })();
 
 /* ── BALANCE ── */
+let _lastBal=null;
 function setBal(n,cls){
   const p=fmt(Math.abs(n)).split('.');
-  $('bal_int').textContent=(n<0?'\u2212':'')+'$'+p[0];
+  const intEl=$('bal_int');
+  if(_lastBal!==null&&_lastBal!==n){
+    const flash=n>_lastBal?'var(--g)':'var(--r)';
+    intEl.style.transition='color .35s ease';
+    intEl.style.color=flash;
+    setTimeout(()=>{intEl.style.color='';intEl.style.transition='';},700);
+  }
+  _lastBal=n;
+  intEl.textContent=(n<0?'\u2212':'')+'$'+p[0];
   $('bal_dec').textContent='.'+( p[1]||'00');
   $('hero_num').className='hero-num '+cls;
 }
@@ -6358,16 +6392,40 @@ function initCandleHover(){
   cv.addEventListener('touchend',()=>{_cdHover=-1;tip.style.display='none';drawCandles();});
 }
 
+/* ── TOAST ── */
+function showToast(title,sub,type,dur=4200){
+  const stack=$('toast_stack');if(!stack)return;
+  const t=document.createElement('div');
+  t.className='toast toast-'+type;
+  const ico=type==='win'?'\u2713':type==='loss'?'\u2717':type==='open'?'\u26a1':'\u2139\ufe0f';
+  t.innerHTML='<div class="toast-ico">'+ico+'</div>'+
+    '<div class="toast-body">'+
+      '<div class="toast-title">'+title+'</div>'+
+      (sub?'<div class="toast-sub">'+sub+'</div>':'')+
+    '</div>';
+  stack.appendChild(t);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>t.classList.add('show')));
+  setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),280);},dur);
+}
+
 /* ── SSE ── */
+let _sseTimer=null;
 function initSSE(){
   const es=new EventSource('/events');
+  es.onopen=()=>{
+    const d=$('conn_dot');if(d)d.className='conn-dot live';
+    clearTimeout(_sseTimer);
+  };
   es.addEventListener('trade_open',e=>{
     const d=JSON.parse(e.data);
+    showToast('Trade Opened',d.side+' '+d.name+' @ $'+d.entry+' ('+d.confidence+'% conf)','open');
     notify('Trade Opened',d.side+' '+d.name+' @ $'+d.entry+' ('+d.confidence+'% conf)');
     fetchStatus();
   });
   es.addEventListener('trade_close',e=>{
     const d=JSON.parse(e.data);
+    const type=d.win?'win':'loss';
+    showToast(d.win?'Trade Won \u2713':'Trade Lost \u2717',d.name+': '+(d.pnl>=0?'+$':'-$')+Math.abs(d.pnl).toFixed(2),type);
     notify('Trade Closed',d.name+': '+(d.pnl>=0?'+':'')+d.pnl.toFixed(2)+' '+(d.win?'\u2713':'\u2717'),d.win);
     fetchStatus();fetchHistory();
   });
@@ -6377,7 +6435,11 @@ function initSSE(){
     pb.innerHTML=_paused?'&#9654;':'&#9208;';
     pb.className='icon-btn'+(_paused?' paused':'');
   });
-  es.onerror=()=>{};
+  es.onerror=()=>{
+    const d=$('conn_dot');if(d)d.className='conn-dot';
+    clearTimeout(_sseTimer);
+    _sseTimer=setTimeout(()=>{es.close();initSSE();},5000);
+  };
 }
 
 /* ── NOTIFICATIONS ── */
@@ -6534,6 +6596,7 @@ function tick(){
     if(_tab==='market')fetchMarket();
     _tick=30;
   }
+  const td=$('hdr_tick');if(td)td.textContent='↻ '+_tick+'s';
 }
 
 /* ── INIT ── */
@@ -6545,6 +6608,7 @@ window.addEventListener('resize',()=>{drawEquity();drawCandles();});
 if('Notification' in window&&Notification.permission==='granted'){_notif=true;updateNotifBtn();}
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script>
+<div class="toast-stack" id="toast_stack"></div>
 </body>
 </html>"""
 
