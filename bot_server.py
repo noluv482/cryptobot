@@ -232,12 +232,27 @@ def _clean_env(val):
 TG_TOKEN   = _clean_env(os.environ.get("TG_TOKEN",   ""))
 TG_CHAT_ID = _clean_env(os.environ.get("TG_CHAT_ID", ""))
 TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-BASE_URL   = "https://api.kraken.com/0/public"
+BASE_URL         = "https://api.kraken.com/0/public"
+BINANCE_BASE_URL = "https://api.binance.com"
 
-# ── Live trading mode (activated when Kraken API keys are present) ─────────────
+# ── Live trading mode ─────────────────────────────────────────────────────────
+# Set EXCHANGE=binance (or EXCHANGE=kraken, the default) to choose the exchange.
+# Provide matching API keys — the bot auto-detects live mode from their presence.
 KRAKEN_API_KEY    = _clean_env(os.environ.get("KRAKEN_API_KEY",    ""))
 KRAKEN_API_SECRET = _clean_env(os.environ.get("KRAKEN_API_SECRET", ""))
-LIVE_MODE         = bool(KRAKEN_API_KEY and KRAKEN_API_SECRET)
+BINANCE_API_KEY   = _clean_env(os.environ.get("BINANCE_API_KEY",   ""))
+BINANCE_API_SECRET= _clean_env(os.environ.get("BINANCE_API_SECRET",""))
+EXCHANGE          = _clean_env(os.environ.get("EXCHANGE", "kraken")).lower()
+USE_BINANCE       = EXCHANGE == "binance"
+LIVE_MODE         = bool(
+    (USE_BINANCE and BINANCE_API_KEY and BINANCE_API_SECRET) or
+    (not USE_BINANCE and KRAKEN_API_KEY and KRAKEN_API_SECRET)
+)
+LIVE_EXCHANGE     = "binance" if (USE_BINANCE and BINANCE_API_KEY) else "kraken"
+BINANCE_FEE       = 0.001   # 0.10% per trade (vs Kraken's 0.26%)
+
+# Binance kline interval strings
+_BINANCE_IV = {1:"1m",3:"3m",5:"5m",15:"15m",30:"30m",60:"1h",120:"2h",240:"4h",1440:"1d"}
 
 # Minimum order volumes for Kraken spot (in base-currency units)
 _KRAKEN_MIN_VOL = {
@@ -826,6 +841,8 @@ def tg_answer(cb_id, text=""):
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 def get_klines(pair, interval=None, limit=None):
+    if USE_BINANCE:
+        return _bn_get_klines(pair, interval, limit)
     iv = interval or INTERVAL
     lm = limit or CANDLE_LIMIT
     r = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair, "interval": iv}, timeout=10)
@@ -842,6 +859,8 @@ def get_klines(pair, interval=None, limit=None):
     return closes, highs, lows, volumes, opens
 
 def get_price(pair):
+    if USE_BINANCE:
+        return _bn_get_price(pair)
     r = requests.get(f"{BASE_URL}/Ticker", params={"pair": pair}, timeout=10)
     payload = r.json()
     if payload.get("error"):
@@ -920,6 +939,116 @@ def _kraken_validate_keys():
         log("LIVE", f"key validation failed: {e}", "ERR")
         return False
 
+
+# ── Binance public helpers ───────────────────────────────────────────────────
+
+def _bn_pair(kraken_pair):
+    """Translate Kraken pair name → Binance symbol (e.g. XBTUSD → BTCUSDT)."""
+    return KRAKEN_TO_BINANCE.get(kraken_pair, kraken_pair)
+
+def _bn_get_klines(pair, interval=None, limit=None):
+    iv  = _BINANCE_IV.get(interval or INTERVAL, "15m")
+    lm  = limit or CANDLE_LIMIT
+    sym = _bn_pair(pair)
+    r   = requests.get(f"{BINANCE_BASE_URL}/api/v3/klines",
+                       params={"symbol": sym, "interval": iv, "limit": lm}, timeout=10)
+    r.raise_for_status()
+    data    = r.json()
+    opens   = [float(c[1]) for c in data]
+    highs   = [float(c[2]) for c in data]
+    lows    = [float(c[3]) for c in data]
+    closes  = [float(c[4]) for c in data]
+    volumes = [float(c[5]) for c in data]
+    return closes, highs, lows, volumes, opens
+
+def _bn_get_price(pair):
+    r = requests.get(f"{BINANCE_BASE_URL}/api/v3/ticker/price",
+                     params={"symbol": _bn_pair(pair)}, timeout=10)
+    r.raise_for_status()
+    return float(r.json()["price"])
+
+def _bn_get_ob_imbalance(pair):
+    """Binance order book imbalance — bid_vol / ask_vol at top 10 levels."""
+    try:
+        r = requests.get(f"{BINANCE_BASE_URL}/api/v3/depth",
+                         params={"symbol": _bn_pair(pair), "limit": 10}, timeout=5)
+        if not r.ok: return None
+        d = r.json()
+        bid_vol = sum(float(b[1]) for b in d.get("bids", []))
+        ask_vol = sum(float(a[1]) for a in d.get("asks", []))
+        return bid_vol / ask_vol if ask_vol > 0 else None
+    except Exception:
+        return None
+
+# ── Binance private API ──────────────────────────────────────────────────────
+
+def _binance_private(path, http_method="GET", params=None):
+    """Sign and send a Binance private REST request. Returns parsed JSON."""
+    params = dict(params or {})
+    params["timestamp"] = int(time.time() * 1000)
+    query  = urllib.parse.urlencode(params)
+    sig    = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = sig
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    url = f"{BINANCE_BASE_URL}{path}"
+    r   = (requests.get(url, params=params, headers=headers, timeout=20) if http_method == "GET"
+           else requests.post(url, params=params, headers=headers, timeout=20))
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and "code" in data and data["code"] != 200:
+        raise RuntimeError(f"Binance API error: {data}")
+    return data
+
+def _binance_get_usdt_balance():
+    """Return free USDT balance from Binance. Returns 0.0 on failure."""
+    try:
+        result = _binance_private("/api/v3/account")
+        for b in result.get("balances", []):
+            if b["asset"] == "USDT":
+                return float(b["free"])
+        return 0.0
+    except Exception as e:
+        log("LIVE", f"Binance balance error: {e}", "ERR")
+        return 0.0
+
+def _binance_place_order(pair, side, usdt_amount=None, base_qty=None):
+    """
+    Place a Binance spot market order.
+    BUY:  pass usdt_amount  — spends that many USDT (quoteOrderQty)
+    SELL: pass base_qty     — sells that many base-currency units
+    Returns (order_id_str, filled_base_qty, avg_fill_price).
+    """
+    sym    = _bn_pair(pair)
+    params = {"symbol": sym, "side": side, "type": "MARKET"}
+    if side == "BUY" and usdt_amount is not None:
+        params["quoteOrderQty"] = f"{usdt_amount:.2f}"
+    elif base_qty is not None:
+        # Round to Binance step size (8 dp is safe for most pairs)
+        params["quantity"] = f"{base_qty:.8f}"
+    else:
+        raise ValueError("_binance_place_order: need usdt_amount (BUY) or base_qty (SELL)")
+    result     = _binance_private("/api/v3/order", http_method="POST", params=params)
+    order_id   = str(result["orderId"])
+    filled_qty = float(result.get("executedQty", 0))
+    fills      = result.get("fills", [])
+    if fills:
+        total_cost = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+        total_qty  = sum(float(f["qty"]) for f in fills)
+        avg_price  = total_cost / total_qty if total_qty > 0 else 0.0
+    else:
+        quote_qty  = float(result.get("cummulativeQuoteQty", 0))
+        avg_price  = quote_qty / filled_qty if filled_qty > 0 else 0.0
+    log("LIVE", f"Binance {side} {sym}  qty={filled_qty:.6f}  avg=${avg_price:.4f}  id={order_id}")
+    return order_id, filled_qty, avg_price
+
+def _binance_validate_keys():
+    """Returns True if Binance API keys authenticate successfully."""
+    try:
+        _binance_private("/api/v3/account")
+        return True
+    except Exception as e:
+        log("LIVE", f"Binance key validation failed: {e}", "ERR")
+        return False
 
 def calc_ema(closes):
     if len(closes) < EMA_PERIOD:
@@ -1113,8 +1242,11 @@ def calc_bb_squeeze(closes, period=20, std_dev=2.0):
     return avg > 0 and current < avg * 0.55  # current < 55% of recent average = squeeze
 
 def _get_ob_imbalance(pair):
-    """Fetch top-10 Kraken order book levels and return bid_vol / ask_vol ratio.
+    """Fetch top-10 order book levels and return bid_vol / ask_vol ratio.
+    Routes to Binance or Kraken depending on EXCHANGE setting.
     Returns None on error. Ratio > 1 = more bid pressure; < 1 = more ask pressure."""
+    if USE_BINANCE:
+        return _bn_get_ob_imbalance(pair)
     try:
         r = requests.get(f"{BASE_URL}/Depth", params={"pair": pair, "count": 10}, timeout=5)
         if not r.ok:
@@ -1695,13 +1827,18 @@ class PaperTrader:
         self._live_orders  = {}   # pair → kraken txid (live mode only)
         self._load()
         if LIVE_MODE:
-            real_bal = _kraken_get_usd_balance()
+            if LIVE_EXCHANGE == "binance":
+                real_bal = _binance_get_usdt_balance()
+                exch_label = "Binance"
+            else:
+                real_bal = _kraken_get_usd_balance()
+                exch_label = "Kraken"
             if real_bal > 0:
-                self.balance    = real_bal
-                self.peak       = max(self.peak, real_bal)
+                self.balance       = real_bal
+                self.peak          = max(self.peak, real_bal)
                 self.day_start_bal = real_bal
                 self.session_start = real_bal
-                log("LIVE", f"Real USD balance from Kraken: ${real_bal:.2f}")
+                log("LIVE", f"Real USD balance from {exch_label}: ${real_bal:.2f}")
 
     @property
     def position(self):
@@ -2267,24 +2404,27 @@ class PaperTrader:
                         * gain_mult,
                         RISK_MAX)
         if LIVE_MODE:
-            leverage = 1    # spot: no leverage
+            leverage = 1    # spot only — no leverage on live exchanges
             contract_tier = "Spot"
-            margin   = round(self.balance * risk, 4)
-            fill     = price   # actual fill comes from Kraken; use current price for sizing
-            contracts = round(margin / fill, 8)
-            # Place real market buy order on Kraken
+            margin    = round(self.balance * risk, 4)
+            fill      = price
             try:
-                txid = _kraken_place_order(pair, "buy", contracts)
-                self._live_orders[pair] = txid
+                if LIVE_EXCHANGE == "binance":
+                    _oid, contracts, fill = _binance_place_order(pair, "BUY", usdt_amount=margin)
+                    self._live_orders[pair] = _oid
+                    real_usd = _binance_get_usdt_balance()
+                else:
+                    contracts = round(margin / fill, 8)
+                    txid = _kraken_place_order(pair, "buy", contracts)
+                    self._live_orders[pair] = txid
+                    real_usd = _kraken_get_usd_balance()
             except Exception as exc:
                 log("LIVE", f"Order FAILED for {name}: {exc}", "ERR")
                 tg(f"❌ *Live order FAILED — {name}*\n`{exc}`\n_Trade skipped._")
                 return
-            # Refresh real balance after buy (USD spent = margin + fee)
-            real_usd = _kraken_get_usd_balance()
             if real_usd > 0:
                 self.balance = real_usd
-            fee = round(margin * KRAKEN_FEE, 4)
+            fee = round(margin * (BINANCE_FEE if LIVE_EXCHANGE == "binance" else KRAKEN_FEE), 4)
         else:
             # Tiered contracts — leverage and label scale with bot's conviction
             if confidence >= 0.84:
@@ -2302,7 +2442,8 @@ class PaperTrader:
             fill      = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
             margin    = round(self.balance * risk, 4)
             contracts = round((margin * leverage) / fill, 6)
-            fee       = round(margin * KRAKEN_FEE, 4)
+            _sim_fee  = BINANCE_FEE if USE_BINANCE else KRAKEN_FEE
+            fee       = round(margin * _sim_fee, 4)
             self.balance = round(self.balance - fee, 4)
 
         self.day_trades += 1
@@ -2352,7 +2493,7 @@ class PaperTrader:
         session_note = f" 🇺🇸 US×`{session_mult:.2f}`" if session_mult > 1.0 else \
                        f" 🌙 Asia×`{session_mult:.2f}`" if session_mult < 1.0 else ""
         gain_note    = f" 🔒 gain-protect×`{gain_mult:.2f}`" if gain_mult < 1.0 else ""
-        live_note    = " 🔴 *LIVE*" if LIVE_MODE else ""
+        live_note    = f" 🔴 *LIVE ({LIVE_EXCHANGE.upper()})*" if LIVE_MODE else ""
         _tier_emoji  = {"Cautious": "🔵", "Moderate": "🟡", "Confident": "🟠", "Max Bet": "🔴"}.get(contract_tier, "⚪")
         lev_str      = "1x spot" if LIVE_MODE else f"*{leverage}× {contract_tier}* {_tier_emoji}"
         tg(f"📂 *Trade OPENED — {name}*{live_note}\n"
@@ -2378,27 +2519,32 @@ class PaperTrader:
         if not p: return
 
         if LIVE_MODE:
-            # Place real market sell order on Kraken for the crypto we hold
             contracts = p.get("contracts", 0.0)
             try:
-                _kraken_place_order(pair, "sell", contracts)
-                self._live_orders.pop(pair, None)
+                if LIVE_EXCHANGE == "binance":
+                    _oid, _qty, fill = _binance_place_order(pair, "SELL", base_qty=contracts)
+                    self._live_orders.pop(pair, None)
+                    real_usd_after = _binance_get_usdt_balance()
+                else:
+                    _kraken_place_order(pair, "sell", contracts)
+                    self._live_orders.pop(pair, None)
+                    fill = price
+                    real_usd_after = _kraken_get_usd_balance()
             except Exception as exc:
+                exch = LIVE_EXCHANGE.capitalize()
                 log("LIVE", f"Close order FAILED for {name}: {exc}", "ERR")
-                tg(f"⚠️ *Live close FAILED — {name}*\n`{exc}`\n_Position still open on Kraken — check manually!_")
+                tg(f"⚠️ *Live close FAILED — {name}*\n`{exc}`\n_Position still open on {exch} — check manually!_")
                 return
-            # Compute P&L from real price (Kraken fills at market; use current price)
-            fill = price
-            real_usd_after = _kraken_get_usd_balance()
             pnl  = round(real_usd_after - self.balance, 4) if real_usd_after > 0 else 0.0
             if real_usd_after > 0:
                 self.balance = real_usd_after
-            fee = round(p.get("margin", 0) * KRAKEN_FEE, 4)
+            fee = round(p.get("margin", 0) * (BINANCE_FEE if LIVE_EXCHANGE == "binance" else KRAKEN_FEE), 4)
         else:
             fill = price * (1 - SLIPPAGE) if p["side"] == "LONG" else price * (1 + SLIPPAGE)
             move = (fill - p["entry"]) / p["entry"]
             if p["side"] == "SHORT": move = -move
-            fee  = round(p["margin"] * KRAKEN_FEE, 4)
+            _sim_fee = BINANCE_FEE if USE_BINANCE else KRAKEN_FEE
+            fee  = round(p["margin"] * _sim_fee, 4)
             pnl  = round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN) - fee, 4)
             self.balance = round(self.balance + pnl, 4)
 
@@ -5390,7 +5536,7 @@ async function fetchStatus(){
     const live=d.mode==='LIVE';
     $('mode_badge').className='badge '+(live?'badge-live':'badge-paper');
     $('mode_dot').className='dot '+(live?'dot-live':'dot-paper');
-    $('mode_txt').textContent=d.mode||'PAPER';
+    $('mode_txt').textContent=(d.mode||'PAPER')+(live&&d.exchange?' · '+d.exchange.toUpperCase():'');
     setBal(d.balance,pc(d.day_pnl));
     const dp=d.day_pnl||0;
     const pill=$('hero_pill');
@@ -6049,6 +6195,7 @@ def _web_status():
         "streak":         streak,
         "recent_trades":  recent,
         "mode":           "LIVE" if LIVE_MODE else "PAPER",
+        "exchange":       LIVE_EXCHANGE if LIVE_MODE else EXCHANGE,
         "paused":         paused_now,
         "coin_stats":     coin_stats,
         "rank":           rank["name"],
@@ -6369,12 +6516,20 @@ def main():
 
     # Validate Kraken live keys before anything else touches the exchange
     if LIVE_MODE:
-        log("BOOT", "Validating Kraken API keys...")
-        if not _kraken_validate_keys():
-            log("BOOT", "KRAKEN API KEY VALIDATION FAILED — check KRAKEN_API_KEY / KRAKEN_API_SECRET", "ERR")
-            tg("🚨 *Kraken API key validation FAILED*\nCheck `KRAKEN_API_KEY` and `KRAKEN_API_SECRET` env vars.\n_Exiting._", plain=True)
-            sys.exit(1)
-        log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken API keys valid — LIVE MODE active"))
+        if LIVE_EXCHANGE == "binance":
+            log("BOOT", "Validating Binance API keys...")
+            if not _binance_validate_keys():
+                log("BOOT", "BINANCE API KEY VALIDATION FAILED — check BINANCE_API_KEY / BINANCE_API_SECRET", "ERR")
+                tg("🚨 *Binance API key validation FAILED*\nCheck `BINANCE_API_KEY` and `BINANCE_API_SECRET` env vars.\n_Exiting._", plain=True)
+                sys.exit(1)
+            log("BOOT", _c(_C.GREEN + _C.BOLD, "Binance API keys valid — LIVE MODE active"))
+        else:
+            log("BOOT", "Validating Kraken API keys...")
+            if not _kraken_validate_keys():
+                log("BOOT", "KRAKEN API KEY VALIDATION FAILED — check KRAKEN_API_KEY / KRAKEN_API_SECRET", "ERR")
+                tg("🚨 *Kraken API key validation FAILED*\nCheck `KRAKEN_API_KEY` and `KRAKEN_API_SECRET` env vars.\n_Exiting._", plain=True)
+                sys.exit(1)
+            log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken API keys valid — LIVE MODE active"))
 
     # Plain-text ping — proves connectivity before any markdown
     ok = tg(f"CryptoBot booting... (chat_id={TG_CHAT_ID})", plain=True)
@@ -6383,9 +6538,12 @@ def main():
     trader = PaperTrader()
 
     if LIVE_MODE:
-        tg(f"🔴 *LIVE TRADING MODE — real money on Kraken*\n"
+        _exch_disp = "Binance" if LIVE_EXCHANGE == "binance" else "Kraken"
+        _fee_disp  = "0.10%" if LIVE_EXCHANGE == "binance" else "0.26%"
+        tg(f"🔴 *LIVE TRADING MODE — real money on {_exch_disp}*\n"
            f"Balance: `${trader.balance:.2f}` USD\n"
-           f"Strategy: spot BUY only · 9-pillar confidence · ADX+ER+VWAP gates\n"
+           f"Exchange fee: `{_fee_disp}` per trade\n"
+           f"Strategy: spot BUY only · 11-pillar confidence · 15+ entry gates\n"
            f"⚠️ _This bot will place real orders. Ensure balance is intentional._")
 
     # Start background threads
