@@ -5487,6 +5487,41 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 /* color helpers */
 .c-g{color:var(--g)}.c-r{color:var(--r)}.c-b{color:var(--b)}.c-y{color:var(--y)}.c-tx{color:var(--tx)}.c-mu{color:var(--mu)}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+/* ── MARKET CONDITIONS ── */
+.mc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:0 16px 10px}
+.mc-tile{background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:12px 13px}
+.mc-lbl{font-size:.52rem;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:5px}
+.mc-val{font-family:var(--fn);font-size:1.1rem;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+.mc-sub{font-size:.6rem;color:var(--mu);margin-top:4px}
+/* ── MARKET HEATMAP ── */
+.hm-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:0 16px 16px}
+.hm-cell{background:var(--s0);border:1px solid var(--bd);border-radius:10px;padding:10px 12px}
+.hm-cell.bull{background:rgba(0,204,116,.08);border-color:rgba(0,204,116,.2)}
+.hm-cell.bear{background:rgba(255,51,82,.08);border-color:rgba(255,51,82,.2)}
+.hm-name{font-weight:700;font-size:.78rem}
+.hm-sig{font-size:.58rem;font-weight:800;letter-spacing:.06em;margin-top:2px}
+.hm-str{font-size:.58rem;color:var(--mu);margin-top:2px;font-family:var(--fn)}
+/* ── GATE BARS ── */
+.gate-row{display:flex;align-items:center;gap:8px;padding:5px 16px}
+.gate-lbl{font-size:.62rem;color:var(--mu);width:88px;flex-shrink:0;text-align:right;font-family:var(--fn)}
+.gate-bar-wrap{flex:1;height:7px;background:var(--bd2);border-radius:4px;overflow:hidden}
+.gate-bar-fill{height:100%;border-radius:4px;background:var(--r);transition:width .5s}
+.gate-cnt{font-family:var(--fn);font-size:.62rem;color:var(--tx);width:26px;flex-shrink:0;text-align:right}
+/* ── DAILY P&L CALENDAR ── */
+.cal-hdr-row{display:grid;grid-template-columns:repeat(7,1fr);gap:3px;padding:0 16px 3px}
+.cal-hdr-cell{font-size:.48rem;text-align:center;color:var(--mu);letter-spacing:.04em;text-transform:uppercase}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px;padding:0 16px 16px}
+.cal-day{aspect-ratio:1;border-radius:5px;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative}
+.cal-day.profit{background:rgba(0,204,116,.2)}
+.cal-day.loss{background:rgba(255,51,82,.15)}
+.cal-day.empty{background:var(--bd2);opacity:.4}
+.cal-day.blank{background:transparent}
+.cal-dn{font-weight:700;font-size:.6rem;line-height:1;color:var(--tx)}
+/* ── CLOSE POSITION BTN ── */
+.close-btn{font-size:.56rem;font-weight:700;padding:4px 10px;border-radius:6px;
+  border:1px solid rgba(255,51,82,.35);background:rgba(255,51,82,.08);
+  color:var(--r);cursor:pointer;touch-action:manipulation;margin-top:8px;width:100%}
+.close-btn:active{background:rgba(255,51,82,.2)}
 </style>
 </head>
 <body>
@@ -5591,6 +5626,30 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="qcard-lbl">Avg Win / Loss</div>
         <div class="qcard-val" id="avgwl_val" style="font-size:.88rem">—</div>
         <div class="qcard-sub" id="avgwl_sub"></div>
+      </div>
+    </div>
+
+    <div class="sh"><span>Market Conditions</span></div>
+    <div class="mc-grid">
+      <div class="mc-tile">
+        <div class="mc-lbl">Fear &amp; Greed</div>
+        <div class="mc-val c-mu" id="mc_fg_val">—</div>
+        <div class="mc-sub" id="mc_fg_lbl">—</div>
+      </div>
+      <div class="mc-tile">
+        <div class="mc-lbl">NASDAQ</div>
+        <div class="mc-val c-mu" id="mc_nas_val">—</div>
+        <div class="mc-sub" id="mc_nas_sub">—</div>
+      </div>
+      <div class="mc-tile">
+        <div class="mc-lbl">BTC Dom</div>
+        <div class="mc-val c-mu" id="mc_btc_val">—</div>
+        <div class="mc-sub" id="mc_btc_sub">—</div>
+      </div>
+      <div class="mc-tile">
+        <div class="mc-lbl">Avg Funding</div>
+        <div class="mc-val c-mu" id="mc_fund_val">—</div>
+        <div class="mc-sub">funding rate</div>
       </div>
     </div>
 
@@ -5711,6 +5770,25 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     </div>
     <div class="sh"><span>Coin Breakdown</span></div>
     <div class="coin-box" id="coin_table"><div class="no-data">No trades yet</div></div>
+    <div class="sh"><span>Daily P&amp;L</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">last 30 days</span></div>
+    <div class="cal-hdr-row">
+      <div class="cal-hdr-cell">Su</div><div class="cal-hdr-cell">Mo</div>
+      <div class="cal-hdr-cell">Tu</div><div class="cal-hdr-cell">We</div>
+      <div class="cal-hdr-cell">Th</div><div class="cal-hdr-cell">Fr</div>
+      <div class="cal-hdr-cell">Sa</div>
+    </div>
+    <div class="cal-grid" id="cal_grid"><div class="no-data" style="grid-column:1/-1">No trades yet</div></div>
+    <div class="sh"><span>Gate Filters</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">blocked trades</span></div>
+    <div id="gate_bars" style="padding-bottom:12px"><div class="no-data">No blocks yet</div></div>
+  </div>
+
+  <!-- MARKET -->
+  <div class="page" id="pg-market">
+    <div class="ptr" id="ptr-market">&#8635; Refreshing&#8230;</div>
+    <div class="sh"><span>Market Heatmap</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">26 coins · 15-min signals</span></div>
+    <div class="hm-grid" id="hm_grid">
+      <div class="no-data" style="grid-column:1/-1">Loading&#8230;</div>
+    </div>
   </div>
 
 </div><!-- /pages -->
@@ -5732,11 +5810,15 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="tab-ico">&#128202;</div>
     <div class="tab-lbl">Stats</div>
   </button>
+  <button class="tab" id="tab-market" onclick="goTab('market')">
+    <div class="tab-ico">&#127760;</div>
+    <div class="tab-lbl">Market</div>
+  </button>
 </nav>
 
 <script>
 const $=id=>document.getElementById(id);
-const TAB_ORDER=['home','chart','pos','stats'];
+const TAB_ORDER=['home','chart','pos','stats','market'];
 let _tab='home',_paused=false,_notif=false;
 let _eqData=[],_cdData=[],_cdHover=-1,_tick=30;
 
@@ -5754,6 +5836,7 @@ function goTab(t){
   $('tab-'+t).classList.add('active');
   if(t==='chart'){drawCandles();}
   if(t==='home'){drawEquity();}
+  if(t==='market'){fetchMarket();}
 }
 
 /* ── SWIPE ── */
@@ -5781,7 +5864,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -5874,6 +5957,8 @@ async function fetchStatus(){
     renderCoinTable(d.coin_stats||{});
     renderRank(d);
     renderPattern(d);
+    if(d.market_conditions)renderConditions(d.market_conditions);
+    if(d.gate_counters)renderGates(d.gate_counters);
   }catch(e){console.warn('status',e);}
 }
 
@@ -5907,7 +5992,9 @@ function renderPositions(ps){
         '<div class="pc-move '+mc+'">' +(p.move_pct>=0?'+':'')+p.move_pct.toFixed(2)+'%</div>'+
       '</div></div>'+
       '<div class="mb-track"><div class="mb-fill" style="width:'+bw+'%;background:'+mbg+'"></div></div>'+
-      '<div class="mb-labels"><span>Entry $'+p.entry.toFixed(4)+'</span><span>'+stop+'</span></div></div>';
+      '<div class="mb-labels"><span>Entry $'+p.entry.toFixed(4)+'</span><span>'+stop+'</span></div>'+
+      (p.pair?'<button class="close-btn" data-pair="'+p.pair+'" data-name="'+p.name+'" onclick="closePosition(this.dataset.pair,this.dataset.name)">✕ Close</button>':'')+
+      '</div>';
   }).join('');
 }
 
@@ -6341,12 +6428,117 @@ async function toggleMode(){
   }catch(e){console.warn('toggleMode',e);}
 }
 
+/* ── MARKET CONDITIONS ── */
+function renderConditions(mc){
+  const fg=mc.fear_greed||50;
+  const fgCls=fg<25?'c-r':fg<45?'c-y':fg<55?'c-mu':fg<75?'c-g':'c-g';
+  const fgEl=$('mc_fg_val');if(fgEl){fgEl.textContent=fg;fgEl.className='mc-val '+fgCls;}
+  const fgLbl=$('mc_fg_lbl');if(fgLbl)fgLbl.textContent=mc.fear_greed_label||'—';
+  const nas=(mc.nasdaq||'NEUTRAL');
+  const nasCls=nas==='BULLISH'?'c-g':nas==='BEARISH'?'c-r':'c-mu';
+  const nasEl=$('mc_nas_val');if(nasEl){nasEl.textContent=nas;nasEl.className='mc-val '+nasCls;}
+  const nasSub=$('mc_nas_sub');
+  if(nasSub){const chg=mc.nasdaq_chg||0;nasSub.textContent=(chg>=0?'+':'')+chg.toFixed(2)+'% today';}
+  const dom=mc.btc_dom||50;
+  const rising=!!mc.btc_dom_rising;
+  const domCls=rising?'c-r':'c-g';
+  const domEl=$('mc_btc_val');if(domEl){domEl.textContent=dom.toFixed(1)+'%';domEl.className='mc-val '+domCls;}
+  const domSub=$('mc_btc_sub');if(domSub)domSub.textContent=rising?'Rising ↑ (bad for alts)':'Falling ↓ (good for alts)';
+  const fund=mc.avg_funding||0;
+  const fundCls=Math.abs(fund)>0.02?'c-y':'c-mu';
+  const fundEl=$('mc_fund_val');if(fundEl){fundEl.textContent=(fund>=0?'+':'')+fund.toFixed(4)+'%';fundEl.className='mc-val '+fundCls;}
+}
+
+/* ── CLOSE POSITION ── */
+async function closePosition(pair,name){
+  if(!confirm('Close '+name+' position? This will place a market close order.'))return;
+  try{
+    const r=await fetch('/close/'+encodeURIComponent(pair),{method:'POST'});
+    const d=await r.json();
+    if(d.error){alert('Error: '+d.error);}else{setTimeout(fetchStatus,800);}
+  }catch(e){alert('Failed to close: '+e);}
+}
+
+/* ── MARKET HEATMAP ── */
+async function fetchMarket(){
+  try{
+    const d=await(await fetch('/market')).json();
+    const el=$('hm_grid');if(!el)return;
+    const coins=d.coins||[];
+    if(!coins.length){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No data yet</div>';return;}
+    el.innerHTML=coins.map(c=>{
+      const sig=c.signal||'NONE';
+      const bull=sig==='BULL',bear=sig==='BEAR';
+      const cls=bull?'bull':bear?'bear':'';
+      const sigCol=bull?'var(--g)':bear?'var(--r)':'var(--mu)';
+      const sigTxt=bull?'▲ BULL':bear?'▼ BEAR':'— NONE';
+      const str=c.strength>0?Math.round(c.strength*100)+'%':'';
+      return '<div class="hm-cell '+cls+'">'+
+        '<div class="hm-name">'+c.name+'</div>'+
+        '<div class="hm-sig" style="color:'+sigCol+'">'+sigTxt+'</div>'+
+        (str?'<div class="hm-str">'+str+' conf'+(c.pattern?' · '+c.pattern:'')+'</div>':'')
+        +'</div>';
+    }).join('');
+  }catch(e){console.warn('market',e);}
+}
+
+/* ── GATE TELEMETRY ── */
+function renderGates(counters){
+  const el=$('gate_bars');if(!el)return;
+  const entries=Object.entries(counters).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
+  if(!entries.length){el.innerHTML='<div class="no-data">No blocks yet</div>';return;}
+  const max=entries[0][1]||1;
+  el.innerHTML=entries.map(([k,v])=>{
+    const pct=(v/max*100).toFixed(1);
+    return '<div class="gate-row">'+
+      '<div class="gate-lbl">'+k+'</div>'+
+      '<div class="gate-bar-wrap"><div class="gate-bar-fill" style="width:'+pct+'%"></div></div>'+
+      '<div class="gate-cnt">'+v+'</div></div>';
+  }).join('');
+}
+
+/* ── DAILY P&L CALENDAR ── */
+async function fetchDailyPnl(){
+  try{
+    const d=await(await fetch('/daily_pnl')).json();
+    renderCalendar(d.days||[]);
+  }catch(e){console.warn('daily_pnl',e);}
+}
+function renderCalendar(days){
+  const el=$('cal_grid');if(!el)return;
+  if(!days.length){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No trades yet</div>';return;}
+  const map={};days.forEach(d=>{map[d.date]=d.pnl;});
+  const today=new Date();
+  const cells=[];
+  for(let i=29;i>=0;i--){
+    const dt=new Date(today);dt.setDate(today.getDate()-i);
+    const key=dt.toISOString().slice(0,10);
+    cells.push({key,day:dt.getDate(),pnl:map.hasOwnProperty(key)?map[key]:null});
+  }
+  const firstDow=new Date(cells[0].key+'T00:00:00Z').getUTCDay();
+  const blanks=Array(firstDow).fill(null);
+  const allCells=[...blanks,...cells];
+  el.innerHTML=allCells.map(c=>{
+    if(!c)return '<div class="cal-day blank"></div>';
+    const cls=c.pnl===null?'empty':c.pnl>0?'profit':'loss';
+    const pnlStr=c.pnl!==null?(c.pnl>=0?'+$':'-$')+Math.abs(c.pnl).toFixed(2):'';
+    const tip=c.key+(pnlStr?' · '+pnlStr:'');
+    return '<div class="cal-day '+cls+'" title="'+tip+'"><div class="cal-dn">'+c.day+'</div></div>';
+  }).join('');
+}
+
 /* ── TICK ── */
-function tick(){if(--_tick<=0){fetchStatus();fetchCandles();fetchHistory();_tick=30;}}
+function tick(){
+  if(--_tick<=0){
+    fetchStatus();fetchCandles();fetchHistory();
+    if(_tab==='market')fetchMarket();
+    _tick=30;
+  }
+}
 
 /* ── INIT ── */
 initCandleHover();
-fetchStatus();fetchCandles();fetchHistory();
+fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();
 initSSE();
 setInterval(tick,1000);
 window.addEventListener('resize',()=>{drawEquity();drawCandles();});
@@ -6403,6 +6595,7 @@ def _web_status():
             upnl = 0.0; move_pct = 0.0; cur_price = p["entry"]
         held = round((time.time() - p.get("opened_at", time.time())) / 60, 0)
         open_pos.append({
+            "pair":           pr,
             "name":           p["name"],
             "side":           p["side"],
             "entry":          p["entry"],
@@ -6508,6 +6701,16 @@ def _web_status():
             if v.get("name") or v.get("candle_name")
         },
         "activity_log": list(reversed(_activity_log[-20:])),
+        "market_conditions": {
+            "nasdaq": market_mood["nasdaq"],
+            "nasdaq_chg": market_mood.get("change_pct", 0.0),
+            "fear_greed": fear_greed["value"],
+            "fear_greed_label": fear_greed["label"],
+            "btc_dom": round(btc_dominance["pct"], 1),
+            "btc_dom_rising": btc_dominance["rising"],
+            "avg_funding": round(sum(funding_rates.values()) / max(len(funding_rates), 1) * 100, 4) if funding_rates else 0.0,
+        },
+        "gate_counters": dict(_gate_counters),
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
@@ -6603,6 +6806,48 @@ def _web_control():
     return _Response(json.dumps({"paused": now_paused, "paper_mode": now_paper,
                                   "mode": "PAPER" if now_paper else "LIVE"}),
                      mimetype="application/json")
+
+@_flask_app.route("/market")
+def _web_market():
+    coins = []
+    for c in SCAN_UNIVERSE:
+        pat = _pattern_cache.get(c["pair"], {})
+        coins.append({
+            "name": c["name"],
+            "pair": c["pair"],
+            "signal": pat.get("signal", "NONE"),
+            "strength": round(pat.get("strength", 0.0), 2),
+            "pattern": pat.get("name", ""),
+            "candle": pat.get("candle_name", ""),
+        })
+    return _Response(json.dumps({"coins": coins}), mimetype="application/json")
+
+@_flask_app.route("/close/<pair>", methods=["POST"])
+def _web_close_position(pair):
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    if not trader:
+        return _Response('{"error":"not ready"}', status=503, mimetype="application/json")
+    p = trader.positions.get(pair)
+    if not p:
+        return _Response('{"error":"no position"}', status=404, mimetype="application/json")
+    try:
+        price = get_price(pair)
+        trader._close(price, p.get("name", pair), "web close", pair)
+        return _Response('{"ok":true}', mimetype="application/json")
+    except Exception as e:
+        return _Response(json.dumps({"error": str(e)}), status=500, mimetype="application/json")
+
+@_flask_app.route("/daily_pnl")
+def _web_daily_pnl():
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    if not trader:
+        return _Response('{"days":[]}', mimetype="application/json")
+    days: dict = {}
+    for t in trader.trades:
+        day = datetime.utcfromtimestamp(t["ts"]).strftime("%Y-%m-%d")
+        days[day] = round(days.get(day, 0.0) + t["pnl"], 2)
+    result = [{"date": d, "pnl": p} for d, p in sorted(days.items())]
+    return _Response(json.dumps({"days": result}), mimetype="application/json")
 
 _ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 <rect width="512" height="512" fill="#060e1c"/>
