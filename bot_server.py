@@ -737,6 +737,11 @@ _market_breadth = {"above": 0, "total": 0}
 _htf_cache: dict = {}
 _HTF_CACHE_TTL = 900  # refresh 4h/1h trend every 15 minutes
 
+# Chart-pattern cache — keyed by pair, refreshed every 15 minutes per coin
+# {"name": str, "signal": "BULL"|"BEAR"|"NONE", "strength": float, "ts": float}
+_pattern_cache: dict = {}
+_PATTERN_TTL   = 900  # 15 minutes between rescans
+
 # Live chart mode — when True, auto-send a fresh chart every LIVE_CHART_MINS
 _live_charts_on = False
 
@@ -2654,7 +2659,9 @@ class SignalEngine:
             "chart_struct":  chart_pts >= 0.7,
         }
         if chart_pat["name"]:
-            plan["chart_name"] = chart_pat["name"]
+            plan["chart_name"]   = chart_pat["name"]
+            plan["chart_signal"] = chart_pat["signal"]
+            plan["chart_strength"] = chart_pat.get("strength", 0.0)
 
         # ── Feature fingerprint key ──────────────────────────────────────────
         rsi_bin  = min(int(rsi / 20), 4)
@@ -4352,6 +4359,22 @@ def trading_loop(trader):
                     try: atr = calc_atr(highs, lows, closes)
                     except Exception: atr = None
 
+                    # ── Pattern cache refresh (every 15 min per coin) ─────────
+                    _now_p = time.time()
+                    _prev_p = _pattern_cache.get(pair, {})
+                    if _now_p - _prev_p.get("ts", 0) >= _PATTERN_TTL:
+                        try:
+                            _cp = detect_chart_pattern(closes, highs, lows)
+                            _pattern_cache[pair] = {
+                                "name":     _cp["name"],
+                                "signal":   _cp["signal"],
+                                "strength": round(_cp.get("strength", 0.0), 2),
+                                "coin":     coin["name"],
+                                "ts":       _now_p,
+                            }
+                        except Exception:
+                            pass
+
                     # 4-hour trend confirmation (higher-timeframe confluence)
                     # Cached for _HTF_CACHE_TTL seconds to avoid extra API calls every tick.
                     if sig in ("BUY", "SELL"):
@@ -4833,6 +4856,18 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       <div class="ci-price c-tx" id="ci_price">—</div>
       <div class="ci-chg fl" id="ci_chg">—</div>
     </div>
+    <div id="pat_badge_wrap" style="padding:0 12px 8px;display:none">
+      <div id="pat_badge" style="display:inline-flex;align-items:center;gap:6px;
+           padding:5px 12px;border-radius:8px;font-size:.7rem;font-weight:700;
+           letter-spacing:.04em;border:1px solid;transition:all .3s">
+        <span id="pat_ico" style="font-size:.85rem"></span>
+        <span id="pat_name"></span>
+        <span id="pat_str" style="opacity:.6;font-weight:500;font-size:.62rem"></span>
+      </div>
+      <div style="font-size:.54rem;color:var(--mu);margin-top:4px;padding-left:2px">
+        📐 Detected pattern · refreshes every 15 min
+      </div>
+    </div>
     <div class="chart-wrap">
       <canvas id="cd_cv" style="display:block;width:100%" height="290"></canvas>
       <div class="cv-tip" id="cv_tip"></div>
@@ -4888,6 +4923,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div id="s_rank_bar" style="height:100%;border-radius:3px;background:linear-gradient(90deg,var(--b),#7ab4ff);width:0%;transition:width 1s ease"></div>
       </div>
       <div style="font-size:.57rem;color:var(--mu);margin-top:5px;font-family:var(--fn)" id="s_learn_status"></div>
+    </div>
+    <div class="sh"><span>Pattern Scan</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">updates every 15 min</span></div>
+    <div id="pattern_scan_list" style="padding:0 12px 16px">
+      <div class="no-data">Scanning…</div>
     </div>
     <div class="sh"><span>Coin Breakdown</span></div>
     <div class="coin-box" id="coin_table"><div class="no-data">No trades yet</div></div>
@@ -5036,6 +5075,7 @@ async function fetchStatus(){
     renderTrades(recent);
     renderCoinTable(d.coin_stats||{});
     renderRank(d);
+    renderPattern(d);
   }catch(e){console.warn('status',e);}
 }
 
@@ -5148,6 +5188,66 @@ function renderRank(d){
   if(sp){sp.textContent=bar;}
   if(sb){sb.style.width=Math.min(pct,100)+'%';}
   if(sl){sl.textContent=d.learning?'Learning from trades: ON ✓':'Need more trades to activate learning';}
+}
+
+/* ── CHART PATTERN BADGE + SCAN LIST ── */
+function renderPattern(d){
+  // ── Chart tab badge ──────────────────────────────────────────
+  const wrap=$('pat_badge_wrap');
+  const name=d.chart_pattern||'';
+  const sig=d.chart_pattern_signal||'NONE';
+  if(name && sig!=='NONE'){
+    const isBull=sig==='BULL';
+    const ico=isBull?'▲':'▼';
+    const col=isBull?'var(--g)':'var(--r)';
+    const bg=isBull?'rgba(0,204,116,.08)':'rgba(255,51,82,.08)';
+    const bdr=isBull?'rgba(0,204,116,.25)':'rgba(255,51,82,.25)';
+    const b=$('pat_badge');
+    b.style.background=bg; b.style.borderColor=bdr; b.style.color=col;
+    $('pat_ico').textContent=ico;
+    $('pat_name').textContent=name;
+    // find strength from all_patterns for current pair
+    const ap=d.all_patterns||{};
+    const cp=Object.values(ap).find(p=>p.name===name);
+    const str=cp?Math.round(cp.strength*100)+'%':'';
+    $('pat_str').textContent=str?str+' conf':'';
+    if(wrap){wrap.style.display='block';}
+  } else {
+    if(wrap){wrap.style.display='none';}
+  }
+
+  // ── Stats tab pattern scan list ──────────────────────────────
+  const el=$('pattern_scan_list');
+  if(!el) return;
+  const ap=d.all_patterns||{};
+  const entries=Object.entries(ap).filter(([,v])=>v.name);
+  if(!entries.length){
+    el.innerHTML='<div class="no-data">No patterns detected yet — scan runs every 15 min</div>';
+    return;
+  }
+  // Sort: BULL first, then BEAR, then NONE; within each group by strength desc
+  const order={'BULL':0,'BEAR':1,'NONE':2};
+  entries.sort((a,b)=>(order[a[1].signal]||2)-(order[b[1].signal]||2)||(b[1].strength-a[1].strength));
+  el.innerHTML=entries.map(([pair,v])=>{
+    const isBull=v.signal==='BULL';
+    const col=isBull?'var(--g)':'var(--r)';
+    const bg=isBull?'rgba(0,204,116,.07)':'rgba(255,51,82,.07)';
+    const bdr=isBull?'rgba(0,204,116,.2)':'rgba(255,51,82,.2)';
+    const ico=isBull?'▲':'▼';
+    const str=Math.round(v.strength*100);
+    return '<div style="display:flex;align-items:center;gap:10px;'+
+      'padding:9px 12px;margin-bottom:6px;border-radius:10px;'+
+      'background:'+bg+';border:1px solid '+bdr+';">'+
+      '<div style="font-size:.95rem;line-height:1;color:'+col+'">'+ico+'</div>'+
+      '<div style="flex:1;min-width:0">'+
+        '<div style="font-weight:700;font-size:.8rem;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+v.name+'</div>'+
+        '<div style="font-size:.6rem;color:var(--mu);margin-top:2px">'+v.coin+' · '+pair+'</div>'+
+      '</div>'+
+      '<div style="text-align:right;flex-shrink:0">'+
+        '<div style="font-family:var(--fn);font-size:.75rem;font-weight:700;color:'+col+'">'+str+'%</div>'+
+        '<div style="font-size:.55rem;color:var(--mu)">confidence</div>'+
+      '</div></div>';
+  }).join('');
 }
 
 /* ── HISTORY / EQUITY CURVE ── */
@@ -5479,6 +5579,14 @@ def _web_status():
         "next_rank_min":  next_rnk["min"],
         "rank_progress":  rank_pct,
         "learning":       db.connected or len(trader.trades) >= 3,
+        "chart_pattern":  _pattern_cache.get(_current_coin.get("pair",""), {}).get("name", ""),
+        "chart_pattern_signal": _pattern_cache.get(_current_coin.get("pair",""), {}).get("signal", "NONE"),
+        "all_patterns":   {
+            p: {"name": v["name"], "signal": v["signal"],
+                "strength": v["strength"], "coin": v["coin"]}
+            for p, v in _pattern_cache.items()
+            if v.get("name")
+        },
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
