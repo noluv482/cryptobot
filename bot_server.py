@@ -757,7 +757,7 @@ _gate_counters = {
     "funding": 0, "divergence": 0, "nasdaq": 0, "fear_greed": 0,
     "btc_dom": 0, "btc_momentum": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
     "pullback": 0, "momentum": 0, "rr_ratio": 0, "vwap": 0, "spike": 0, "daily_gain": 0,
-    "adx": 0, "efficiency": 0, "min_conf": 0,
+    "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
 }
 _gate_counter_lock = threading.Lock()
 
@@ -1094,6 +1094,43 @@ def detect_regime(closes, highs, lows, lookback=20):
         pass
     return "NEUTRAL"
 
+
+def calc_bb_squeeze(closes, period=20, std_dev=2.0):
+    """True when Bollinger Band width is at a local low — direction unknown, breakout pending."""
+    if len(closes) < period + 10:
+        return False
+    widths = []
+    for i in range(len(closes) - period + 1):
+        window = closes[i:i + period]
+        mid    = sum(window) / period
+        std    = (sum((x - mid) ** 2 for x in window) / period) ** 0.5
+        widths.append(2 * std_dev * std)
+    if len(widths) < 10:
+        return False
+    current  = widths[-1]
+    lookback = widths[-20:] if len(widths) >= 20 else widths
+    avg      = sum(lookback) / len(lookback)
+    return avg > 0 and current < avg * 0.55  # current < 55% of recent average = squeeze
+
+def _get_ob_imbalance(pair):
+    """Fetch top-10 Kraken order book levels and return bid_vol / ask_vol ratio.
+    Returns None on error. Ratio > 1 = more bid pressure; < 1 = more ask pressure."""
+    try:
+        r = requests.get(f"{BASE_URL}/Depth", params={"pair": pair, "count": 10}, timeout=5)
+        if not r.ok:
+            return None
+        result = r.json().get("result", {})
+        key    = next(iter(result), None)
+        if not key:
+            return None
+        data   = result[key]
+        bid_vol = sum(float(b[1]) for b in data.get("bids", []))
+        ask_vol = sum(float(a[1]) for a in data.get("asks", []))
+        if ask_vol <= 0:
+            return None
+        return bid_vol / ask_vol
+    except Exception:
+        return None
 
 def detect_candle_pattern(opens, closes, highs, lows):
     """Detect 35+ candlestick patterns (single, two-candle, three-candle).
@@ -2681,6 +2718,16 @@ class SignalEngine:
         if sig == "SELL" and vwap and above_vwap:
             with _gate_counter_lock: _gate_counters["vwap"] += 1
             sig = "HOLD"
+
+        # Bollinger Band squeeze — bands are narrowest in 20 candles = breakout forming
+        # but direction is unknown; wait until price picks a side and bands expand
+        if sig in ("BUY", "SELL"):
+            try:
+                if calc_bb_squeeze(closes):
+                    with _gate_counter_lock: _gate_counters["bb_squeeze"] += 1
+                    sig = "HOLD"
+            except Exception:
+                pass
 
         # ADX gate — Wilder: only enter when a real trend exists (ADX > ADX_MIN)
         # ADX measures trend *strength* without regard to direction
@@ -4719,6 +4766,21 @@ def trading_loop(trader):
                             with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
                             last_sigs[pair] = sig
                             continue
+
+                        # Order book imbalance gate — only enter when real money lines up
+                        # with the signal; skips false breakouts where big sellers wait above
+                        try:
+                            _ob = _get_ob_imbalance(pair)
+                            if _ob is not None:
+                                _ob_block = (sig == "BUY"  and _ob < 0.80) or \
+                                            (sig == "SELL" and _ob > 1.25)
+                                if _ob_block:
+                                    with _gate_counter_lock: _gate_counters["ob_imbalance"] += 1
+                                    last_sigs[pair] = sig
+                                    log("GATE", f"{cname} OB imbalance {_ob:.2f} → blocked {sig}")
+                                    continue
+                        except Exception:
+                            pass
 
                         risk     = RISK_MIN + (RISK_MAX - RISK_MIN) * conf
                         leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * conf)
