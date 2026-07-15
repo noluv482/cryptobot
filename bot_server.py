@@ -745,6 +745,9 @@ _PATTERN_TTL   = 900  # 15 minutes between rescans
 _activity_log: list = []   # last 30 scan events for dashboard activity feed
 _ACTIVITY_MAX  = 30
 
+_btc_price_hist: list = []  # (timestamp, price) — rolling 35-min BTC tick history for momentum gate
+_BTC_HIST_SECS  = 2100      # 35 minutes kept
+
 # Live chart mode — when True, auto-send a fresh chart every LIVE_CHART_MINS
 _live_charts_on = False
 
@@ -752,7 +755,7 @@ _live_charts_on = False
 _gate_counters = {
     "choppy": 0, "volume": 0, "active_hours": 0, "econ": 0,
     "funding": 0, "divergence": 0, "nasdaq": 0, "fear_greed": 0,
-    "btc_dom": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
+    "btc_dom": 0, "btc_momentum": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
     "pullback": 0, "momentum": 0, "rr_ratio": 0, "vwap": 0, "spike": 0, "daily_gain": 0,
     "adx": 0, "efficiency": 0, "min_conf": 0,
 }
@@ -1834,6 +1837,20 @@ class PaperTrader:
             return 0.50   # bad stretch + active streak → moderate caution
         return 0.0
 
+    def _hourly_conf_gate(self):
+        """Raise confidence floor during hours of the day that historically lose.
+        Uses the last 60 closed trades; needs ≥4 trades in the current hour to activate."""
+        cur_hour = datetime.utcnow().hour
+        hour_trades = [t for t in self.trades[-60:] if t.get("hour") == cur_hour]
+        if len(hour_trades) < 4:
+            return 0.0
+        wr = sum(1 for t in hour_trades if t["pnl"] > 0) / len(hour_trades)
+        if wr < 0.30:
+            return 0.70  # this hour historically loses badly → require high confidence
+        if wr < 0.40:
+            return 0.65  # this hour is below-average → raise the bar moderately
+        return 0.0
+
     # ── Learning method 1: signal-condition fingerprint ──────────────────────
     def _feature_multiplier(self, fkey):
         """Scale stake up/down based on realized win rate of this signal fingerprint.
@@ -2139,7 +2156,8 @@ class PaperTrader:
                 return
             min_conf = max(MIN_CONFIDENCE,
                            self._min_conf_threshold(pair),
-                           self._dynamic_conf_gate())
+                           self._dynamic_conf_gate(),
+                           self._hourly_conf_gate())
             if sig in ("BUY", "SELL") and confidence < min_conf:
                 with _gate_counter_lock: _gate_counters["min_conf"] += 1
                 return
@@ -2600,6 +2618,16 @@ class SignalEngine:
         if btc_dominance["rising"] and sig == "BUY" and current_pair != "XBTUSD":
             with _gate_counter_lock: _gate_counters["btc_dom"] += 1
             sig = "HOLD"
+
+        # BTC price momentum gate — if BTC drops ≥2% in the last 30 min, pause altcoin longs
+        if sig == "BUY" and current_pair != "XBTUSD":
+            _now_m = time.time()
+            _hist_30 = [p for ts, p in _btc_price_hist if ts >= _now_m - 1800]
+            if len(_hist_30) >= 3:
+                _btc_move = (_hist_30[-1] - _hist_30[0]) / _hist_30[0]
+                if _btc_move <= -0.02:
+                    with _gate_counter_lock: _gate_counters["btc_momentum"] += 1
+                    sig = "HOLD"
 
         # Funding rate gate — extreme funding = overcrowded side, flush risk
         fr = funding_rates.get(current_pair, 0.0)
@@ -4430,6 +4458,16 @@ def trading_loop(trader):
                     }
                 except Exception as e:
                     log("TRADE", f"rank_coins: {e}", "ERR")
+
+            # Track BTC price for the momentum gate (one call per tick, ~60 s)
+            try:
+                _btc_tick = get_price("XBTUSD")
+                _btc_price_hist.append((now_ts, _btc_tick))
+                _btc_cutoff = now_ts - _BTC_HIST_SECS
+                while _btc_price_hist and _btc_price_hist[0][0] < _btc_cutoff:
+                    _btc_price_hist.pop(0)
+            except Exception:
+                pass
 
             # ── Manage every open position every tick ──────────────────────
             for pair in list(trader.positions.keys()):
