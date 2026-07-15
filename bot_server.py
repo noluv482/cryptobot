@@ -5168,6 +5168,18 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="qcard-sub" id="watching_sub">—</div>
       </div>
     </div>
+    <div class="qrow" style="padding-top:0">
+      <div class="qcard ac-m" id="pf_card">
+        <div class="qcard-lbl">Profit Factor</div>
+        <div class="qcard-val" id="pf_val">—</div>
+        <div class="qcard-sub" id="pf_sub">wins ÷ losses</div>
+      </div>
+      <div class="qcard ac-m">
+        <div class="qcard-lbl">Avg Win / Loss</div>
+        <div class="qcard-val" id="avgwl_val" style="font-size:.88rem">—</div>
+        <div class="qcard-sub" id="avgwl_sub"></div>
+      </div>
+    </div>
 
     <div class="sh"><span>Bot Activity</span><span style="font-size:.58rem;color:var(--mu);font-weight:400">live scan feed</span></div>
     <div id="activity_feed" style="padding:0 12px 4px">
@@ -5248,6 +5260,21 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="scard-lbl">Session P&amp;L</div>
         <div class="scard-val" id="s_pnl">—</div>
         <div class="scard-sub" id="s_pnl_sub"></div>
+      </div>
+      <div class="scard" id="s_pf_card">
+        <div class="scard-lbl">Profit Factor</div>
+        <div class="scard-val" id="s_pf">—</div>
+        <div class="scard-sub" id="s_pf_sub">need &gt;1.5 to scale up</div>
+      </div>
+      <div class="scard">
+        <div class="scard-lbl">Avg Win</div>
+        <div class="scard-val c-g" id="s_avg_win">—</div>
+        <div class="scard-sub" id="s_avg_win_sub"></div>
+      </div>
+      <div class="scard">
+        <div class="scard-lbl">Avg Loss</div>
+        <div class="scard-val c-r" id="s_avg_loss">—</div>
+        <div class="scard-sub" id="s_avg_loss_sub"></div>
       </div>
     </div>
     <div class="sh"><span>Rank Progress</span></div>
@@ -5400,6 +5427,22 @@ async function fetchStatus(){
     $('s_pnl').textContent=(sp>=0?'+':'')+msign(sp);
     $('s_pnl').className='scard-val '+(sp>0?'c-g':sp<0?'c-r':'c-mu');
     $('s_pnl_sub').textContent='this session';
+    // Profit factor
+    const pf=d.profit_factor;
+    const pfStr=pf!=null?pf.toFixed(2):'—';
+    const pfCls=pf==null?'c-mu':pf>=1.5?'c-g':pf>=1.0?'c-y':'c-r';
+    const pfNote=pf==null?'need trades':pf>=1.5?'edge confirmed ✓':pf>=1.0?'marginal edge':'losing edge ✗';
+    [$('pf_val'),$('s_pf')].forEach(e=>{if(e){e.textContent=pfStr;e.className=(e.id==='pf_val'?'qcard-val ':'scard-val ')+pfCls;}});
+    [$('pf_card')].forEach(e=>{if(e)e.className='qcard '+(pf>=1.5?'ac-g':pf>=1.0?'ac-m':'ac-r');});
+    [$('s_pf_card')].forEach(e=>{if(e)e.className='scard';});
+    [$('pf_sub'),$('s_pf_sub')].forEach(e=>{if(e)e.textContent=pfNote;});
+    // Avg win / loss
+    const aw=d.avg_win,al=d.avg_loss;
+    if($('avgwl_val'))$('avgwl_val').textContent=(aw!=null?'+$'+aw.toFixed(2):'—')+' / '+(al!=null?'$'+al.toFixed(2):'—');
+    if($('avgwl_sub'))$('avgwl_sub').textContent=aw&&al?'ratio '+(aw/Math.max(al,0.01)).toFixed(2)+'×':'';
+    if($('s_avg_win')){$('s_avg_win').textContent=aw!=null?'+$'+aw.toFixed(2):'—';$('s_avg_win_sub').textContent=aw&&al?'vs $'+al.toFixed(2)+' loss':'';}
+    if($('s_avg_loss')){$('s_avg_loss').textContent=al!=null?'$'+al.toFixed(2):'—';$('s_avg_loss_sub').textContent=aw&&al?'ratio '+(aw/Math.max(al,0.01)).toFixed(2)+'×':'';}
+
     const recent=(d.recent_trades||[]).slice(0,10);
     $('sparks').innerHTML=recent.map(t=>'<div class="spark '+(t.pnl>0?'spark-w':'spark-l')+'" title="'+(t.pnl>0?'+':'')+t.pnl.toFixed(2)+'"></div>').join('');
     const coin=d.coin||'—',pair=d.pair||coin;
@@ -5987,6 +6030,18 @@ def _web_status():
         "trades":         len(trader.trades),
         "wins":           trader.wins,
         "losses":         len(trader.trades) - trader.wins,
+        "profit_factor":  round(
+            sum(t["pnl"] for t in trader.trades if t["pnl"] > 0) /
+            max(abs(sum(t["pnl"] for t in trader.trades if t["pnl"] < 0)), 0.01), 2
+        ) if trader.trades else None,
+        "avg_win":        round(
+            sum(t["pnl"] for t in trader.trades if t["pnl"] > 0) /
+            max(sum(1 for t in trader.trades if t["pnl"] > 0), 1), 2
+        ) if trader.trades else None,
+        "avg_loss":       round(
+            abs(sum(t["pnl"] for t in trader.trades if t["pnl"] < 0)) /
+            max(sum(1 for t in trader.trades if t["pnl"] < 0), 1), 2
+        ) if trader.trades else None,
         "positions":      len(trader.positions),
         "coin":           _current_coin.get("name", "—"),
         "pair":           _current_coin.get("pair", ""),
