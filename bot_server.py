@@ -244,15 +244,43 @@ BINANCE_API_KEY   = _clean_env(os.environ.get("BINANCE_API_KEY",   ""))
 BINANCE_API_SECRET= _clean_env(os.environ.get("BINANCE_API_SECRET",""))
 EXCHANGE          = _clean_env(os.environ.get("EXCHANGE", "kraken")).lower()
 USE_BINANCE       = EXCHANGE == "binance"
+USE_FUTURES       = EXCHANGE == "kraken_futures"
+KRAKEN_FUTURES_API_KEY    = _clean_env(os.environ.get("KRAKEN_FUTURES_API_KEY",    ""))
+KRAKEN_FUTURES_API_SECRET = _clean_env(os.environ.get("KRAKEN_FUTURES_API_SECRET", ""))
+KRAKEN_FUTURES_BASE_URL   = "https://futures.kraken.com"
+KRAKEN_FUTURES_FEE        = 0.0005  # 0.05% taker fee (5× cheaper than Kraken spot)
 LIVE_MODE         = bool(
     (USE_BINANCE and BINANCE_API_KEY and BINANCE_API_SECRET) or
-    (not USE_BINANCE and KRAKEN_API_KEY and KRAKEN_API_SECRET)
+    (USE_FUTURES and KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_API_SECRET) or
+    (not USE_BINANCE and not USE_FUTURES and KRAKEN_API_KEY and KRAKEN_API_SECRET)
 )
-LIVE_EXCHANGE     = "binance" if (USE_BINANCE and BINANCE_API_KEY) else "kraken"
+LIVE_EXCHANGE     = ("binance"         if (USE_BINANCE and BINANCE_API_KEY) else
+                     "kraken_futures"  if (USE_FUTURES and KRAKEN_FUTURES_API_KEY) else
+                     "kraken")
 BINANCE_FEE       = 0.001   # 0.10% per trade (vs Kraken's 0.26%)
 
 # Binance kline interval strings
 _BINANCE_IV = {1:"1m",3:"3m",5:"5m",15:"15m",30:"30m",60:"1h",120:"2h",240:"4h",1440:"1d"}
+
+# Kraken Futures kline resolution strings
+_KF_IV = {1:"1m",5:"5m",15:"15m",30:"30m",60:"1h",240:"4h",1440:"1d"}
+
+# Kraken Futures perpetual symbol mapping (spot pair → futures symbol)
+KRAKEN_TO_FUTURES = {
+    "XBTUSD":  "PF_XBTUSD",
+    "ETHUSD":  "PF_ETHUSD",
+    "SOLUSD":  "PF_SOLUSD",
+    "XRPUSD":  "PF_XRPUSD",
+    "LTCUSD":  "PF_LTCUSD",
+    "XDGUSD":  "PF_DOGEUSD",
+    "ADAUSD":  "PF_ADAUSD",
+    "LINKUSD": "PF_LINKUSD",
+    "DOTUSD":  "PF_DOTUSD",
+    "BCHUSD":  "PF_BCHUSD",
+    "UNIUSD":  "PF_UNIUSD",
+    "AVAXUSD": "PF_AVAXUSD",
+    "ATOMUSD": "PF_ATOMUSD",
+}
 
 # Minimum order volumes for Kraken spot (in base-currency units)
 _KRAKEN_MIN_VOL = {
@@ -843,6 +871,8 @@ def tg_answer(cb_id, text=""):
 def get_klines(pair, interval=None, limit=None):
     if USE_BINANCE:
         return _bn_get_klines(pair, interval, limit)
+    if USE_FUTURES:
+        return _kf_get_klines(pair, interval, limit)
     iv = interval or INTERVAL
     lm = limit or CANDLE_LIMIT
     r = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair, "interval": iv}, timeout=10)
@@ -861,6 +891,8 @@ def get_klines(pair, interval=None, limit=None):
 def get_price(pair):
     if USE_BINANCE:
         return _bn_get_price(pair)
+    if USE_FUTURES:
+        return _kf_get_price(pair)
     r = requests.get(f"{BASE_URL}/Ticker", params={"pair": pair}, timeout=10)
     payload = r.json()
     if payload.get("error"):
@@ -1048,6 +1080,157 @@ def _binance_validate_keys():
         return True
     except Exception as e:
         log("LIVE", f"Binance key validation failed: {e}", "ERR")
+        return False
+
+# ── Kraken Futures helpers ────────────────────────────────────────────────────
+
+def _kf_pair(kraken_pair):
+    """Translate Kraken spot pair → Kraken Futures perpetual symbol."""
+    return KRAKEN_TO_FUTURES.get(kraken_pair)
+
+def _kf_get_klines(pair, interval=None, limit=None):
+    """Fetch OHLCV candles from Kraken Futures charts API."""
+    sym = _kf_pair(pair)
+    if not sym:
+        raise ValueError(f"No Kraken Futures contract for {pair}")
+    iv  = _KF_IV.get(interval or INTERVAL, "15m")
+    lm  = limit or CANDLE_LIMIT
+    url = f"{KRAKEN_FUTURES_BASE_URL}/api/charts/v1/trade/{sym}/{iv}"
+    r   = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data    = r.json().get("candles", [])[-lm:]
+    opens   = [float(c["open"])   for c in data]
+    highs   = [float(c["high"])   for c in data]
+    lows    = [float(c["low"])    for c in data]
+    closes  = [float(c["close"])  for c in data]
+    volumes = [float(c["volume"]) for c in data]
+    return closes, highs, lows, volumes, opens
+
+def _kf_get_price(pair):
+    """Fetch mark price from Kraken Futures tickers endpoint."""
+    sym = _kf_pair(pair)
+    if not sym:
+        raise ValueError(f"No Kraken Futures contract for {pair}")
+    r = requests.get(f"{KRAKEN_FUTURES_BASE_URL}/derivatives/api/v3/tickers", timeout=10)
+    r.raise_for_status()
+    for t in r.json().get("tickers", []):
+        if t.get("symbol") == sym:
+            return float(t.get("markPrice") or t.get("last") or 0)
+    raise ValueError(f"Kraken Futures: ticker not found for {sym}")
+
+def _kf_get_ob_imbalance(pair):
+    """Kraken Futures order book imbalance — top-10 bid_vol / ask_vol."""
+    try:
+        sym = _kf_pair(pair)
+        if not sym:
+            return None
+        r = requests.get(f"{KRAKEN_FUTURES_BASE_URL}/derivatives/api/v3/orderbook",
+                         params={"symbol": sym}, timeout=5)
+        if not r.ok:
+            return None
+        ob      = r.json().get("orderBook", {})
+        bid_vol = sum(float(b[1]) for b in ob.get("bids", [])[:10])
+        ask_vol = sum(float(a[1]) for a in ob.get("asks", [])[:10])
+        return bid_vol / ask_vol if ask_vol > 0 else None
+    except Exception:
+        return None
+
+def _kf_private(endpoint, method="GET", params=None):
+    """Sign and send a Kraken Futures private REST request."""
+    params   = dict(params or {})
+    nonce    = str(int(time.time() * 1000))
+    postbody = urllib.parse.urlencode(params) if method == "POST" else ""
+    message  = postbody + nonce + endpoint
+    sha_hash = hashlib.sha256(message.encode()).digest()
+    secret   = base64.b64decode(KRAKEN_FUTURES_API_SECRET)
+    signature= base64.b64encode(hmac.new(secret, sha_hash, hashlib.sha512).digest()).decode()
+    headers  = {"APIKey": KRAKEN_FUTURES_API_KEY, "Nonce": nonce, "Authent": signature}
+    url      = f"{KRAKEN_FUTURES_BASE_URL}{endpoint}"
+    if method == "POST":
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        r = requests.post(url, data=postbody, headers=headers, timeout=20)
+    else:
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("result") == "error":
+        raise RuntimeError(f"Kraken Futures error: {data.get('error', data)}")
+    return data
+
+def _kf_get_balance():
+    """Return available USD balance from Kraken Futures flex account. Returns 0.0 on failure."""
+    try:
+        data = _kf_private("/derivatives/api/v3/accounts")
+        flex = data.get("accounts", {}).get("flex", {})
+        usd  = flex.get("currencies", {}).get("USD", {})
+        return float(usd.get("quantity", 0))
+    except Exception as e:
+        log("LIVE", f"KF balance error: {e}", "ERR")
+        return 0.0
+
+def _kf_place_order(pair, side, size_usd, leverage):
+    """
+    Place a Kraken Futures market order.
+    size_usd: notional exposure in USD (margin × leverage).
+    PF_ contracts are 1 USD each, so size = whole number of USD.
+    Returns (order_id_str, contracts_int, fill_price).
+    """
+    sym  = _kf_pair(pair)
+    if not sym:
+        raise ValueError(f"No Kraken Futures contract for {pair} — pair not supported")
+    size = max(1, int(round(size_usd)))
+    params = {
+        "orderType": "mkt",
+        "symbol":    sym,
+        "side":      "buy" if side == "LONG" else "sell",
+        "size":      str(size),
+    }
+    data   = _kf_private("/derivatives/api/v3/sendorder", method="POST", params=params)
+    status = data.get("sendStatus", {})
+    oid    = str(status.get("order_id", status.get("orderId", "unknown")))
+    fill   = float(status.get("price") or 0)
+    log("LIVE", f"KF {side} {sym}  size={size} USD contracts  lev={leverage}x  id={oid}")
+    return oid, size, fill
+
+def _kf_close_position(pair):
+    """
+    Close an open Kraken Futures position with a reduce-only market order.
+    Fetches current position size from the API to ensure correct quantity.
+    Returns (order_id_str, fill_price).
+    """
+    sym  = _kf_pair(pair)
+    if not sym:
+        raise ValueError(f"No Kraken Futures contract for {pair}")
+    data      = _kf_private("/derivatives/api/v3/openpositions")
+    positions = data.get("openPositions", [])
+    for pos in positions:
+        if pos.get("symbol") == sym:
+            size = abs(int(round(float(pos.get("size", 0)))))
+            if size == 0:
+                return "none", 0.0
+            close_side = "sell" if str(pos.get("side", "")).lower() == "long" else "buy"
+            params = {
+                "orderType":  "mkt",
+                "symbol":     sym,
+                "side":       close_side,
+                "size":       str(size),
+                "reduceOnly": "true",
+            }
+            result = _kf_private("/derivatives/api/v3/sendorder", method="POST", params=params)
+            status = result.get("sendStatus", {})
+            oid    = str(status.get("order_id", "unknown"))
+            fill   = float(status.get("price") or 0)
+            log("LIVE", f"KF close {sym}  size={size}  id={oid}")
+            return oid, fill
+    return "none", 0.0
+
+def _kf_validate_keys():
+    """Returns True if Kraken Futures API keys authenticate successfully."""
+    try:
+        _kf_private("/derivatives/api/v3/accounts")
+        return True
+    except Exception as e:
+        log("LIVE", f"KF key validation failed: {e}", "ERR")
         return False
 
 def calc_ema(closes):
@@ -1243,10 +1426,12 @@ def calc_bb_squeeze(closes, period=20, std_dev=2.0):
 
 def _get_ob_imbalance(pair):
     """Fetch top-10 order book levels and return bid_vol / ask_vol ratio.
-    Routes to Binance or Kraken depending on EXCHANGE setting.
+    Routes to Binance, Kraken Futures, or Kraken spot depending on EXCHANGE setting.
     Returns None on error. Ratio > 1 = more bid pressure; < 1 = more ask pressure."""
     if USE_BINANCE:
         return _bn_get_ob_imbalance(pair)
+    if USE_FUTURES:
+        return _kf_get_ob_imbalance(pair)
     try:
         r = requests.get(f"{BASE_URL}/Depth", params={"pair": pair, "count": 10}, timeout=5)
         if not r.ok:
@@ -2338,8 +2523,8 @@ class PaperTrader:
             if sig == "BUY"  and self.can_open_new():
                 self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
             elif sig == "SELL" and self.can_open_new():
-                if LIVE_MODE:
-                    log("LIVE", f"SHORT skipped ({name}) — live mode uses spot only")
+                if LIVE_MODE and LIVE_EXCHANGE != "kraken_futures":
+                    log("LIVE", f"SHORT skipped ({name}) — spot trading, no short selling")
                 else:
                     self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
 
@@ -2404,27 +2589,64 @@ class PaperTrader:
                         * gain_mult,
                         RISK_MAX)
         if LIVE_MODE:
-            leverage = 1    # spot only — no leverage on live exchanges
-            contract_tier = "Spot"
-            margin    = round(self.balance * risk, 4)
-            fill      = price
-            try:
-                if LIVE_EXCHANGE == "binance":
+            margin = round(self.balance * risk, 4)
+            fill   = price
+            if LIVE_EXCHANGE == "kraken_futures":
+                # Real leverage tiers — same confidence thresholds as paper trading
+                if confidence >= 0.84:
+                    leverage      = 20
+                    contract_tier = "Max Bet"
+                elif confidence >= 0.76:
+                    leverage      = 10
+                    contract_tier = "Confident"
+                elif confidence >= 0.68:
+                    leverage      = 5
+                    contract_tier = "Moderate"
+                else:
+                    leverage      = 2
+                    contract_tier = "Cautious"
+                size_usd = round(margin * leverage, 2)
+                try:
+                    _oid, contracts, _fp = _kf_place_order(pair, side, size_usd, leverage)
+                    if _fp > 0: fill = _fp
+                    self._live_orders[pair] = _oid
+                    real_usd = _kf_get_balance()
+                except Exception as exc:
+                    log("LIVE", f"KF Order FAILED for {name}: {exc}", "ERR")
+                    tg(f"❌ *KF order FAILED — {name}*\n`{exc}`\n_Trade skipped._")
+                    return
+                if real_usd > 0:
+                    self.balance = real_usd
+                fee = round(margin * KRAKEN_FUTURES_FEE, 4)
+            elif LIVE_EXCHANGE == "binance":
+                leverage      = 1
+                contract_tier = "Spot"
+                try:
                     _oid, contracts, fill = _binance_place_order(pair, "BUY", usdt_amount=margin)
                     self._live_orders[pair] = _oid
                     real_usd = _binance_get_usdt_balance()
-                else:
+                except Exception as exc:
+                    log("LIVE", f"Order FAILED for {name}: {exc}", "ERR")
+                    tg(f"❌ *Live order FAILED — {name}*\n`{exc}`\n_Trade skipped._")
+                    return
+                if real_usd > 0:
+                    self.balance = real_usd
+                fee = round(margin * BINANCE_FEE, 4)
+            else:
+                leverage      = 1
+                contract_tier = "Spot"
+                try:
                     contracts = round(margin / fill, 8)
                     txid = _kraken_place_order(pair, "buy", contracts)
                     self._live_orders[pair] = txid
                     real_usd = _kraken_get_usd_balance()
-            except Exception as exc:
-                log("LIVE", f"Order FAILED for {name}: {exc}", "ERR")
-                tg(f"❌ *Live order FAILED — {name}*\n`{exc}`\n_Trade skipped._")
-                return
-            if real_usd > 0:
-                self.balance = real_usd
-            fee = round(margin * (BINANCE_FEE if LIVE_EXCHANGE == "binance" else KRAKEN_FEE), 4)
+                except Exception as exc:
+                    log("LIVE", f"Order FAILED for {name}: {exc}", "ERR")
+                    tg(f"❌ *Live order FAILED — {name}*\n`{exc}`\n_Trade skipped._")
+                    return
+                if real_usd > 0:
+                    self.balance = real_usd
+                fee = round(margin * KRAKEN_FEE, 4)
         else:
             # Tiered contracts — leverage and label scale with bot's conviction
             if confidence >= 0.84:
@@ -2442,7 +2664,9 @@ class PaperTrader:
             fill      = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
             margin    = round(self.balance * risk, 4)
             contracts = round((margin * leverage) / fill, 6)
-            _sim_fee  = BINANCE_FEE if USE_BINANCE else KRAKEN_FEE
+            _sim_fee  = (BINANCE_FEE if USE_BINANCE else
+                         KRAKEN_FUTURES_FEE if USE_FUTURES else
+                         KRAKEN_FEE)
             fee       = round(margin * _sim_fee, 4)
             self.balance = round(self.balance - fee, 4)
 
@@ -2495,7 +2719,8 @@ class PaperTrader:
         gain_note    = f" 🔒 gain-protect×`{gain_mult:.2f}`" if gain_mult < 1.0 else ""
         live_note    = f" 🔴 *LIVE ({LIVE_EXCHANGE.upper()})*" if LIVE_MODE else ""
         _tier_emoji  = {"Cautious": "🔵", "Moderate": "🟡", "Confident": "🟠", "Max Bet": "🔴"}.get(contract_tier, "⚪")
-        lev_str      = "1x spot" if LIVE_MODE else f"*{leverage}× {contract_tier}* {_tier_emoji}"
+        _is_spot_live = LIVE_MODE and LIVE_EXCHANGE != "kraken_futures"
+        lev_str      = "1x spot" if _is_spot_live else f"*{leverage}× {contract_tier}* {_tier_emoji}"
         tg(f"📂 *Trade OPENED — {name}*{live_note}\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
            f"Confidence: `{conf_pct}%` | Contract: {lev_str}\n"
@@ -2520,30 +2745,40 @@ class PaperTrader:
 
         if LIVE_MODE:
             contracts = p.get("contracts", 0.0)
+            fill      = price
             try:
-                if LIVE_EXCHANGE == "binance":
+                if LIVE_EXCHANGE == "kraken_futures":
+                    _oid, _fp = _kf_close_position(pair)
+                    self._live_orders.pop(pair, None)
+                    if _fp and _fp > 0: fill = _fp
+                    real_usd_after = _kf_get_balance()
+                elif LIVE_EXCHANGE == "binance":
                     _oid, _qty, fill = _binance_place_order(pair, "SELL", base_qty=contracts)
                     self._live_orders.pop(pair, None)
                     real_usd_after = _binance_get_usdt_balance()
                 else:
                     _kraken_place_order(pair, "sell", contracts)
                     self._live_orders.pop(pair, None)
-                    fill = price
                     real_usd_after = _kraken_get_usd_balance()
             except Exception as exc:
-                exch = LIVE_EXCHANGE.capitalize()
+                exch = LIVE_EXCHANGE.replace("_", " ").title()
                 log("LIVE", f"Close order FAILED for {name}: {exc}", "ERR")
                 tg(f"⚠️ *Live close FAILED — {name}*\n`{exc}`\n_Position still open on {exch} — check manually!_")
                 return
             pnl  = round(real_usd_after - self.balance, 4) if real_usd_after > 0 else 0.0
             if real_usd_after > 0:
                 self.balance = real_usd_after
-            fee = round(p.get("margin", 0) * (BINANCE_FEE if LIVE_EXCHANGE == "binance" else KRAKEN_FEE), 4)
+            _live_fee = (KRAKEN_FUTURES_FEE if LIVE_EXCHANGE == "kraken_futures" else
+                         BINANCE_FEE        if LIVE_EXCHANGE == "binance" else
+                         KRAKEN_FEE)
+            fee = round(p.get("margin", 0) * _live_fee, 4)
         else:
             fill = price * (1 - SLIPPAGE) if p["side"] == "LONG" else price * (1 + SLIPPAGE)
             move = (fill - p["entry"]) / p["entry"]
             if p["side"] == "SHORT": move = -move
-            _sim_fee = BINANCE_FEE if USE_BINANCE else KRAKEN_FEE
+            _sim_fee = (BINANCE_FEE if USE_BINANCE else
+                        KRAKEN_FUTURES_FEE if USE_FUTURES else
+                        KRAKEN_FEE)
             fee  = round(p["margin"] * _sim_fee, 4)
             pnl  = round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN) - fee, 4)
             self.balance = round(self.balance + pnl, 4)
