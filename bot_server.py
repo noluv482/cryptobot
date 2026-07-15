@@ -2210,6 +2210,7 @@ class PaperTrader:
                         RISK_MAX)
         if LIVE_MODE:
             leverage = 1    # spot: no leverage
+            contract_tier = "Spot"
             margin   = round(self.balance * risk, 4)
             fill     = price   # actual fill comes from Kraken; use current price for sizing
             contracts = round(margin / fill, 8)
@@ -2227,7 +2228,19 @@ class PaperTrader:
                 self.balance = real_usd
             fee = round(margin * KRAKEN_FEE, 4)
         else:
-            leverage  = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * confidence)
+            # Tiered contracts — leverage and label scale with bot's conviction
+            if confidence >= 0.84:
+                leverage      = 5
+                contract_tier = "Max Bet"
+            elif confidence >= 0.76:
+                leverage      = 3
+                contract_tier = "Confident"
+            elif confidence >= 0.68:
+                leverage      = 2
+                contract_tier = "Moderate"
+            else:
+                leverage      = 1
+                contract_tier = "Cautious"
             fill      = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
             margin    = round(self.balance * risk, 4)
             contracts = round((margin * leverage) / fill, 6)
@@ -2262,6 +2275,7 @@ class PaperTrader:
                                 "contracts": contracts, "margin": margin,
                                 "target": effective_target, "opened_at": time.time(),
                                 "confidence": confidence, "leverage": leverage,
+                                "contract_tier": contract_tier,
                                 "pair": pair, "name": name,
                                 "trail_stop": trail_stop, "trail_peak": fill,
                                 "atr_dist": atr_dist, "fkey": fkey,
@@ -2281,11 +2295,12 @@ class PaperTrader:
                        f" 🌙 Asia×`{session_mult:.2f}`" if session_mult < 1.0 else ""
         gain_note    = f" 🔒 gain-protect×`{gain_mult:.2f}`" if gain_mult < 1.0 else ""
         live_note    = " 🔴 *LIVE*" if LIVE_MODE else ""
-        lev_str      = "1x spot" if LIVE_MODE else f"*{leverage}x leverage*"
+        _tier_emoji  = {"Cautious": "🔵", "Moderate": "🟡", "Confident": "🟠", "Max Bet": "🔴"}.get(contract_tier, "⚪")
+        lev_str      = "1x spot" if LIVE_MODE else f"*{leverage}× {contract_tier}* {_tier_emoji}"
         tg(f"📂 *Trade OPENED — {name}*{live_note}\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
-           f"Confidence: `{conf_pct}%` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}{streak_note}{session_note}{gain_note}\n"
-           f"Margin: `${margin:.2f}` | {lev_str}\n"
+           f"Confidence: `{conf_pct}%` | Contract: {lev_str}\n"
+           f"Margin: `${margin:.2f}` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}{streak_note}{session_note}{gain_note}\n"
            f"Trail stop: `${trail_stop:.4f}` ({stop_label}) | Balance: `${self.balance:.2f}`")
         _print_trade_box("OPEN", name, side, fill,
                          stop=trail_stop, target=target,
@@ -5276,13 +5291,18 @@ function renderPositions(ps){
     const mc=(p.move_pct||0)>=0?'c-g':'c-r';
     const mbg=(p.move_pct||0)>=0?'var(--g)':'var(--r)';
     const bw=Math.min(Math.abs(p.move_pct||0)*8,100).toFixed(0);
-    const lev=p.leverage>1?p.leverage+'x':'spot';
-    const conf=p.confidence?' · '+p.confidence+'% conf':'';
     const stop=p.trail_stop?'Stop $'+p.trail_stop.toFixed(4):'';
+    // Contract tier badge
+    const tierEmoji={'Cautious':'🔵','Moderate':'🟡','Confident':'🟠','Max Bet':'🔴'};
+    const tierCol={'Cautious':'#4fc3f7','Moderate':'#ffd54f','Confident':'#ff9800','Max Bet':'#ef5350'};
+    const tier=p.contract_tier||'';
+    const tierBadge=tier?'<span style="font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:5px;background:'+
+      (tierCol[tier]||'var(--mu)')+'22;color:'+(tierCol[tier]||'var(--mu)')+';border:1px solid '+
+      (tierCol[tier]||'var(--mu)')+'44;margin-left:5px">'+(tierEmoji[tier]||'')+'&nbsp;'+tier+'&nbsp;'+p.leverage+'×</span>':'';
     return '<div class="pc">'+
       '<div class="pc-r1"><div>'+
-        '<div class="pc-name">'+chip+' '+p.name+'</div>'+
-        '<div class="pc-meta">$'+p.entry.toFixed(4)+' · '+lev+conf+' · '+(p.held_mins||0)+'m</div>'+
+        '<div class="pc-name">'+chip+' '+p.name+tierBadge+'</div>'+
+        '<div class="pc-meta">Entry $'+p.entry.toFixed(4)+' · '+p.confidence+'% conf · '+(p.held_mins||0)+'m</div>'+
       '</div><div class="pc-right">'+
         '<div class="pc-pnl '+pc(p.unrealized_pnl)+'">'+msign(p.unrealized_pnl)+'</div>'+
         '<div class="pc-move '+mc+'">' +(p.move_pct>=0?'+':'')+p.move_pct.toFixed(2)+'%</div>'+
@@ -5722,6 +5742,7 @@ def _web_status():
             "side":           p["side"],
             "entry":          p["entry"],
             "leverage":       p.get("leverage", 1),
+            "contract_tier":  p.get("contract_tier", ""),
             "unrealized_pnl": upnl,
             "move_pct":       move_pct,
             "trail_stop":     round(p.get("trail_stop", 0), 4),
