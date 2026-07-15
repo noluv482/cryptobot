@@ -6991,9 +6991,11 @@ def _web_manifest():
 @_flask_app.route("/sw.js")
 def _web_sw():
     sw = r"""
-const CACHE='cryptobot-v1';
+const CACHE='cryptobot-v3';
+const STATIC=['/manifest.json','/icon/svg'];
+
 self.addEventListener('install',e=>e.waitUntil(
-  caches.open(CACHE).then(c=>c.addAll(['/'])).then(()=>self.skipWaiting())
+  caches.open(CACHE).then(c=>c.addAll(STATIC)).then(()=>self.skipWaiting())
 ));
 self.addEventListener('activate',e=>e.waitUntil(
   caches.keys().then(keys=>Promise.all(
@@ -7002,9 +7004,23 @@ self.addEventListener('activate',e=>e.waitUntil(
 ));
 self.addEventListener('fetch',e=>{
   const url=e.request.url;
+  /* always bypass API / SSE / data routes */
   if(url.includes('/status')||url.includes('/events')||
      url.includes('/candles')||url.includes('/history')||
-     url.includes('/control'))return;
+     url.includes('/control')||url.includes('/market')||
+     url.includes('/daily_pnl')||url.includes('/close/'))return;
+  /* network-first for the HTML shell — always load the latest UI */
+  if(e.request.mode==='navigate'||url.endsWith('/')){
+    e.respondWith(
+      fetch(e.request).then(r=>{
+        const clone=r.clone();
+        caches.open(CACHE).then(c=>c.put(e.request,clone));
+        return r;
+      }).catch(()=>caches.match(e.request))
+    );
+    return;
+  }
+  /* cache-first for static assets (icons, manifest) */
   e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request)));
 });
 """
