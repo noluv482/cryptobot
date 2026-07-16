@@ -7869,7 +7869,7 @@ def main():
             log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken API keys valid — LIVE MODE active"))
 
     # Plain-text ping — proves connectivity before any markdown
-    ok = tg(f"CryptoBot booting... (chat_id={TG_CHAT_ID})", plain=True)
+    ok = tg(f"CryptoBot booting... v2.1 (chat_id={TG_CHAT_ID})", plain=True)
     log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
 
     trader = PaperTrader()
