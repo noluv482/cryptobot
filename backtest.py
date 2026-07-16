@@ -121,7 +121,8 @@ def run(candles, pair, name):
         if sig in ("BUY", "SELL") and sig != last_sig:
             stop   = plan.get("stop",   price * 0.985 if sig == "BUY" else price * 1.015)
             target = plan.get("exit",   price * 1.015 if sig == "BUY" else price * 0.985)
-            trader.on_signal(sig, price, stop, target, name, conf, pair, atr=atr)
+            fkey   = plan.get("fkey",   "")
+            trader.on_signal(sig, price, stop, target, name, conf, pair, atr=atr, fkey=fkey)
         last_sig = sig
 
         equity.append(trader.balance)
