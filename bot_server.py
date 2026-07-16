@@ -6540,8 +6540,7 @@ function renderCoinStrip(){
     const col=_COIN_COLORS[c.pair]||'#888';
     const badge=isTrading?'<div class="coin-ico-badge">&#36;</div>':(isBot?'<div class="coin-ico-badge" style="background:#ffd54f;font-size:.45rem">&#128270;</div>':'');
     const cls='coin-chip'+(isView?' viewing':'')+(isTrading?' trading':'');
-    return '<div class="'+cls+'" data-pair="'+c.pair+'" onclick="selectCoin('+
-      JSON.stringify(c.pair)+','+JSON.stringify(c.sym)+')">'+
+    return '<div class="'+cls+'" data-pair="'+c.pair+'" data-sym="'+c.sym+'" onclick="selectCoin(this.dataset.pair,this.dataset.sym)">'+
       '<div class="coin-ico" style="background:'+col+'">'+c.sym+badge+'</div>'+
       '<div class="coin-chip-sym">'+c.sym+'</div>'+
       '<div class="coin-chip-price">'+_fmtPrice(cp.price)+'</div>'+
