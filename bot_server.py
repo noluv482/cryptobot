@@ -311,7 +311,7 @@ CONFIRM_TICKS = 2              # 2 × 15-min bars = 30-min confirmation before s
 
 PAPER_START    = 100.0
 PAPER_TARGET   = 50000.0
-PAPER_FLOOR    = 50.0
+PAPER_FLOOR    = 5.0
 LEVERAGE_MIN   = 1             # 1x (spot-like) at low confidence
 LEVERAGE_MAX   = 3             # 3x max — was 5x, high leverage amplifies stop-outs
 RISK_MIN       = 0.04          # 4% margin at low confidence
