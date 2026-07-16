@@ -794,6 +794,10 @@ _PATTERN_TTL   = 900  # 15 minutes between rescans
 _activity_log: list = []   # last 30 scan events for dashboard activity feed
 _ACTIVITY_MAX  = 30
 
+_prices_cache: dict = {}   # pair → {price, pct} for coin strip
+_prices_cache_ts: float = 0.0
+_PRICES_TTL = 30  # seconds
+
 _btc_price_hist: list = []  # (timestamp, price) — rolling 35-min BTC tick history for momentum gate
 _BTC_HIST_SECS  = 2100      # 35 minutes kept
 
@@ -5463,6 +5467,32 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         font-weight:600;transition:background .15s,color .15s,border-color .15s}
 .iv-btn.active{background:var(--b);color:#000;border-color:var(--b)}
 
+/* ── COIN STRIP ── */
+.coin-strip{display:flex;gap:8px;padding:10px 12px 4px;overflow-x:auto;
+            scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.coin-strip::-webkit-scrollbar{display:none}
+.coin-chip{display:flex;flex-direction:column;align-items:center;gap:3px;
+           cursor:pointer;min-width:62px;padding:5px 4px 6px;border-radius:12px;
+           transition:background .15s;-webkit-tap-highlight-color:transparent;flex-shrink:0}
+.coin-chip:active,.coin-chip.viewing{background:var(--s1)}
+.coin-ico{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;
+          justify-content:center;font-size:.65rem;font-weight:900;color:#fff;
+          position:relative;box-sizing:border-box;
+          border:2.5px solid transparent;transition:box-shadow .2s,border-color .2s}
+.coin-chip.viewing .coin-ico{border-color:rgba(255,255,255,.5)}
+.coin-chip.trading .coin-ico{border-color:var(--b);
+  box-shadow:0 0 0 3px rgba(88,166,255,.22),0 0 14px rgba(88,166,255,.35)}
+.coin-ico-badge{position:absolute;top:-2px;right:-2px;width:16px;height:16px;
+  border-radius:50%;background:var(--b);display:flex;align-items:center;
+  justify-content:center;font-size:.38rem;font-weight:800;color:#000;
+  border:1.5px solid var(--bg)}
+.coin-chip-sym{font-size:.52rem;font-weight:700;color:var(--tx);letter-spacing:.02em;
+               margin-top:1px;max-width:58px;text-align:center;overflow:hidden;
+               white-space:nowrap;text-overflow:ellipsis}
+.coin-chip-price{font-size:.55rem;font-weight:600;color:var(--tx);
+                 font-variant-numeric:tabular-nums;white-space:nowrap}
+.coin-chip-pct{font-size:.5rem;font-weight:700;font-variant-numeric:tabular-nums}
+
 /* ── POSITIONS TAB ── */
 .pos-empty{display:flex;flex-direction:column;align-items:center;
             padding:40px 24px;gap:10px;color:var(--mu)}
@@ -5791,6 +5821,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   <!-- CHART -->
   <div class="page" id="pg-chart">
     <div class="ptr" id="ptr-chart">&#8635; Refreshing…</div>
+    <div class="coin-strip" id="coin_strip"></div>
     <div class="chart-info-row">
       <div>
         <div class="ci-name" id="ci_name">—</div>
@@ -5964,6 +5995,27 @@ const TAB_ORDER=['home','chart','pos','stats','market'];
 let _tab='home',_paused=false,_notif=false;
 let _eqData=[],_cdData=[],_cdHover=-1,_tick=30;
 let _ema20=[],_ema50=[],_cdTrades=[],_cdOpenPos=[],_cdPatSig='NONE',_cdPair='',_cdIv=15;
+let _botPair='',_coinPrices={},_openPairs=new Set();
+const _COIN_COLORS={
+  SOLUSD:'#9945FF',XBTUSD:'#F7931A',ETHUSD:'#627EEA',XRPUSD:'#00AAE4',
+  XDGUSD:'#C2A633',ADAUSD:'#0033AD',AVAXUSD:'#E84142',LINKUSD:'#2A5ADA',
+  DOTUSD:'#E6007A',LTCUSD:'#345D9D',ATOMUSD:'#6F4BE8',UNIUSD:'#FF007A',
+  AAVEUSD:'#B6509E',INJUSD:'#00B2FF',SUIUSD:'#6FBCF0',APTUSD:'#00C4FF',
+  ARBUSD:'#12AAFF',NEARUSD:'#00C08B',ALGOUSD:'#00B4D8',FILUSD:'#0090FF',
+  BCHUSD:'#8DC351',PEPEUSD:'#3D9970',BONKUSD:'#FF6B35',SHIBUSD:'#FF6B00',
+  WIFUSD:'#7B2FBE',FLOKIUSD:'#F0B90B'
+};
+const _SCAN_PAIRS=[
+  {pair:'SOLUSD',sym:'SOL'},{pair:'XBTUSD',sym:'BTC'},{pair:'ETHUSD',sym:'ETH'},
+  {pair:'XRPUSD',sym:'XRP'},{pair:'XDGUSD',sym:'DOGE'},{pair:'ADAUSD',sym:'ADA'},
+  {pair:'AVAXUSD',sym:'AVAX'},{pair:'LINKUSD',sym:'LINK'},{pair:'DOTUSD',sym:'DOT'},
+  {pair:'LTCUSD',sym:'LTC'},{pair:'ATOMUSD',sym:'ATOM'},{pair:'UNIUSD',sym:'UNI'},
+  {pair:'AAVEUSD',sym:'AAVE'},{pair:'INJUSD',sym:'INJ'},{pair:'SUIUSD',sym:'SUI'},
+  {pair:'APTUSD',sym:'APT'},{pair:'ARBUSD',sym:'ARB'},{pair:'NEARUSD',sym:'NEAR'},
+  {pair:'ALGOUSD',sym:'ALGO'},{pair:'FILUSD',sym:'FIL'},{pair:'BCHUSD',sym:'BCH'},
+  {pair:'PEPEUSD',sym:'PEPE'},{pair:'BONKUSD',sym:'BONK'},{pair:'SHIBUSD',sym:'SHIB'},
+  {pair:'WIFUSD',sym:'WIF'},{pair:'FLOKIUSD',sym:'FLOKI'}
+];
 
 const fmt=(n,d=2)=>Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const msign=n=>(n>=0?'+$':'\u2212$')+fmt(Math.abs(n));
@@ -6112,10 +6164,13 @@ async function fetchStatus(){
     if(d.market_conditions)renderConditions(d.market_conditions);
     if(d.gate_counters)renderGates(d.gate_counters);
     renderRiskGauge(d);
-    _cdPair=d.pair||'';
+    _botPair=d.pair||'';
+    _openPairs=new Set((d.open_positions||[]).map(p=>p.pair));
+    if(!_cdPair)_cdPair=_botPair;
     _cdOpenPos=(d.open_positions||[]).filter(p=>p.pair===_cdPair);
     _cdTrades=(d.recent_trades||[]).filter(t=>t.pair===_cdPair);
     _cdPatSig=d.chart_pattern_signal||'NONE';
+    renderCoinStrip();
     if(_tab==='chart')drawCandles();
   }catch(e){console.warn('status',e);}
 }
@@ -6421,7 +6476,9 @@ function drawEquity(){
 /* ── CANDLES ── */
 async function fetchCandles(){
   try{
-    const data=await(await fetch('/candles?interval='+_cdIv)).json();
+    const pair=_cdPair||_botPair||'';
+    const url='/candles?interval='+_cdIv+(pair?'&pair='+pair:'');
+    const data=await(await fetch(url)).json();
     if(Array.isArray(data)&&data.length){
       _cdData=data;
       _ema20=_ema(data,20);
@@ -6430,14 +6487,85 @@ async function fetchCandles(){
       const pct=(last.c-first.c)/first.c*100;
       const pf=last.c>=100?last.c.toFixed(2):last.c.toPrecision(6);
       [$('hdr_price'),$('ci_price')].forEach(el=>el.textContent='$'+pf);
+      const sym=(_SCAN_PAIRS.find(c=>c.pair===(_cdPair||_botPair))||{}).sym||'';
+      $('ci_name').textContent=sym?(sym+'/USD'):((_cdPair||_botPair)||'—');
       const chg=$('ci_chg');
       chg.textContent=(pct>=0?'+':'')+pct.toFixed(2)+'%';
       chg.className='ci-chg '+(pct>0.05?'up':pct<-0.05?'dn':'fl');
       const ivNames={1:'1m',5:'5m',15:'15m',30:'30m',60:'1h',240:'4h',1440:'1D'};
       const lbl=$('ci_iv_lbl');if(lbl)lbl.textContent=(ivNames[_cdIv]||_cdIv+'m')+' · '+data.length+' bars';
+      const cp=_coinPrices[_cdPair||_botPair];
+      if(cp){const c=_SCAN_PAIRS.find(x=>x.pair===(_cdPair||_botPair));if(c)_updateStripChip(c.pair,cp);}
       if(_tab==='chart')drawCandles();
     }
   }catch(e){console.warn('candles',e);}
+}
+
+/* ── COIN STRIP ── */
+async function fetchPrices(){
+  try{
+    const d=await(await fetch('/prices')).json();
+    _coinPrices=d;
+    renderCoinStrip();
+  }catch(e){console.warn('prices',e);}
+}
+function _fmtPrice(p){
+  if(!p&&p!==0)return '—';
+  if(p>=1000)return '$'+p.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,',');
+  if(p>=1)return '$'+p.toFixed(2);
+  if(p>=0.01)return '$'+p.toFixed(4);
+  return '$'+p.toPrecision(3);
+}
+function _updateStripChip(pair,cp){
+  const chip=document.querySelector('.coin-chip[data-pair="'+pair+'"]');
+  if(!chip)return;
+  const pp=chip.querySelector('.coin-chip-price');
+  const pc2=chip.querySelector('.coin-chip-pct');
+  if(pp)pp.textContent=_fmtPrice(cp.price);
+  if(pc2){
+    const pct=cp.pct||0;
+    pc2.textContent=(pct>=0?'+':'')+pct.toFixed(2)+'%';
+    pc2.className='coin-chip-pct '+(pct>0?'c-g':pct<0?'c-r':'c-mu');
+  }
+}
+function renderCoinStrip(){
+  const el=$('coin_strip');if(!el)return;
+  const viewing=_cdPair||_botPair;
+  el.innerHTML=_SCAN_PAIRS.map(c=>{
+    const cp=_coinPrices[c.pair]||{};
+    const pct=cp.pct||0;
+    const isTrading=_openPairs.has(c.pair);
+    const isBot=c.pair===_botPair&&!isTrading;
+    const isView=c.pair===viewing;
+    const col=_COIN_COLORS[c.pair]||'#888';
+    const badge=isTrading?'<div class="coin-ico-badge">&#36;</div>':(isBot?'<div class="coin-ico-badge" style="background:#ffd54f;font-size:.45rem">&#128270;</div>':'');
+    const cls='coin-chip'+(isView?' viewing':'')+(isTrading?' trading':'');
+    return '<div class="'+cls+'" data-pair="'+c.pair+'" onclick="selectCoin('+
+      JSON.stringify(c.pair)+','+JSON.stringify(c.sym)+')">'+
+      '<div class="coin-ico" style="background:'+col+'">'+c.sym+badge+'</div>'+
+      '<div class="coin-chip-sym">'+c.sym+'</div>'+
+      '<div class="coin-chip-price">'+_fmtPrice(cp.price)+'</div>'+
+      '<div class="coin-chip-pct '+(pct>0?'c-g':pct<0?'c-r':'c-mu')+'">'+
+        (cp.price?((pct>=0?'+':'')+pct.toFixed(2)+'%'):'')+'</div>'+
+      '</div>';
+  }).join('');
+  const viewing_chip=el.querySelector('.coin-chip.viewing');
+  if(viewing_chip&&el.scrollWidth>el.clientWidth){
+    const stripRect=el.getBoundingClientRect();
+    const chipRect=viewing_chip.getBoundingClientRect();
+    if(chipRect.left<stripRect.left||chipRect.right>stripRect.right){
+      viewing_chip.scrollIntoView({inline:'center',behavior:'smooth',block:'nearest'});
+    }
+  }
+}
+function selectCoin(pair,sym){
+  _cdPair=pair;
+  _cdOpenPos=(_openPairs.has(pair)?[]:[]); // will update on next status
+  _cdTrades=[];
+  renderCoinStrip();
+  const name=sym?sym+'/USD':pair;
+  $('ci_name').textContent=name;
+  fetchCandles();
 }
 function _ema(data,period){
   const closes=data.map(c=>c.c);
@@ -6975,6 +7103,7 @@ function updateNotifBtn(){
 /* ── INIT ── */
 initCandleHover();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
+fetchPrices();setInterval(fetchPrices,30000);
 initSSE();initWebPush();
 setInterval(tick,1000);
 window.addEventListener('resize',()=>{drawEquity();drawCandles();});
@@ -7226,6 +7355,38 @@ def _web_candles():
                          headers={"Cache-Control": "no-store"})
     except Exception as e:
         return _Response(json.dumps({"error": str(e)}), status=503, mimetype="application/json")
+
+@_flask_app.route("/prices")
+def _web_prices():
+    global _prices_cache, _prices_cache_ts
+    now = time.time()
+    if now - _prices_cache_ts < _PRICES_TTL and _prices_cache:
+        return _Response(json.dumps(_prices_cache), mimetype="application/json",
+                         headers={"Cache-Control": "no-store"})
+    try:
+        pairs = ",".join(c["pair"] for c in SCAN_UNIVERSE)
+        r = requests.get(f"{BASE_URL}/Ticker", params={"pair": pairs}, timeout=12)
+        result = r.json().get("result", {})
+        out: dict = {}
+        for coin in SCAN_UNIVERSE:
+            pair = coin["pair"]
+            row = result.get(pair)
+            if row is None:
+                row = next((v for k, v in result.items() if pair in k or k.replace("X","",1).replace("Z","",1) == pair), None)
+            if row:
+                try:
+                    price = float(row["c"][0])
+                    open_ = float(row["o"])
+                    pct   = round((price - open_) / open_ * 100, 2) if open_ else 0.0
+                    out[pair] = {"price": price, "pct": pct}
+                except Exception:
+                    pass
+        _prices_cache    = out
+        _prices_cache_ts = now
+    except Exception:
+        pass
+    return _Response(json.dumps(_prices_cache), mimetype="application/json",
+                     headers={"Cache-Control": "no-store"})
 
 @_flask_app.route("/history")
 def _web_history():
