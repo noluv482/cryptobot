@@ -942,9 +942,25 @@ def _kraken_get_usd_balance():
     """Return available USD balance from Kraken. Returns 0.0 on failure."""
     try:
         result = _kraken_private("Balance")
-        return float(result.get("ZUSD", result.get("USD", 0)))
+        log("LIVE", f"Balance keys from Kraken: {list(result.keys())}")
+        # Try known USD key names first, then any key containing USD
+        for key in ("ZUSD", "USD", "USD.M", "USD.HOLD"):
+            if key in result and float(result[key]) > 0:
+                return float(result[key])
+        for key, val in result.items():
+            if "USD" in key.upper():
+                try:
+                    v = float(val)
+                    if v > 0:
+                        log("LIVE", f"USD balance found under key '{key}': ${v:.2f}")
+                        return v
+                except (ValueError, TypeError):
+                    pass
+        log("LIVE", f"No USD balance found. Full result: {result}", "WARN")
+        return 0.0
     except Exception as e:
         log("LIVE", f"balance fetch error: {e}", "ERR")
+        tg(f"⚠️ Kraken balance error: `{e}`")
         return 0.0
 
 def _kraken_place_order(pair, side, volume, validate=False, leverage=None):
@@ -7861,10 +7877,16 @@ def main():
     if LIVE_MODE:
         _exch_disp = "Binance" if LIVE_EXCHANGE == "binance" else "Kraken"
         _fee_disp  = "0.10%" if LIVE_EXCHANGE == "binance" else "0.26%"
+        # Diagnostic: show raw balance keys so we can debug $0 issues
+        try:
+            _raw_bal = _kraken_private("Balance")
+            _bal_keys = ", ".join(f"{k}={v}" for k, v in _raw_bal.items()) or "empty"
+        except Exception as _be:
+            _bal_keys = f"error: {_be}"
         tg(f"🔴 *LIVE TRADING MODE — real money on {_exch_disp}*\n"
            f"Balance: `${trader.balance:.2f}` USD\n"
+           f"Raw Kraken balance: `{_bal_keys}`\n"
            f"Exchange fee: `{_fee_disp}` per trade\n"
-           f"Strategy: spot BUY only · 11-pillar confidence · 15+ entry gates\n"
            f"⚠️ _This bot will place real orders. Ensure balance is intentional._")
 
     # Start background threads
