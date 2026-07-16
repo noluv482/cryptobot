@@ -334,14 +334,14 @@ DAILY_GAIN_SOFT   = 0.03
 DAILY_GAIN_HARD   = 0.06
 LIVE_CHART_MINS   = 10
 MAX_SESSION_DD    = 0.12
-VOLUME_FILTER_MULT= 1.5
+VOLUME_FILTER_MULT= 1.2
 EXTREME_FUNDING   = 0.001
 ECON_BLACKOUT_MINS= 15
-MIN_CONFIDENCE    = 0.62       # 62% confidence floor (was 50%) — far fewer but higher-quality signals
+MIN_CONFIDENCE    = 0.55       # 55% confidence floor — balanced signal quality vs. frequency
 ADX_PERIOD        = 14
-ADX_MIN           = 25         # Wilder's "real trend" threshold (was 20) — no ranging markets
+ADX_MIN           = 18         # allow mildly trending markets (Wilder's neutral zone starts ~20)
 ER_PERIOD         = 10
-ER_MIN            = 0.30       # stricter efficiency ratio (was 0.25) — cleaner directional moves
+ER_MIN            = 0.15       # realistic efficiency floor (most real moves sit 0.10–0.25)
 
 SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 
@@ -3014,10 +3014,10 @@ class SignalEngine:
                 sig = "HOLD"
 
         # MACD gate — block signals that fight the momentum
-        if sig == "BUY"  and macd_bear and macd_hist < -0.005 * price / 1000:
+        if sig == "BUY"  and macd_bear and macd_hist / max(price, 1e-9) < -0.001:
             with _gate_counter_lock: _gate_counters["macd"] += 1
             sig = "HOLD"
-        if sig == "SELL" and macd_bull and macd_hist >  0.005 * price / 1000:
+        if sig == "SELL" and macd_bull and macd_hist / max(price, 1e-9) >  0.001:
             with _gate_counter_lock: _gate_counters["macd"] += 1
             sig = "HOLD"
 
@@ -5099,7 +5099,9 @@ def trading_loop(trader):
                                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
                                 sig = "HOLD"
 
-                    # 1-hour trend confirmation
+                    # 1-hour trend — tracked for telemetry but no longer a hard block.
+                    # The 4H gate already provides higher-timeframe confluence; the
+                    # evaluate() EMA captures the 15m/1H medium trend.
                     if sig in ("BUY", "SELL"):
                         _now_ts = time.time()
                         _k1 = (pair, 60)
@@ -5117,10 +5119,8 @@ def trading_loop(trader):
                         if trend_1h:
                             if sig == "BUY"  and trend_1h != "UP":
                                 with _gate_counter_lock: _gate_counters["1h_trend"] += 1
-                                sig = "HOLD"
                             elif sig == "SELL" and trend_1h != "DOWN":
                                 with _gate_counter_lock: _gate_counters["1h_trend"] += 1
-                                sig = "HOLD"
 
                     # Regime-adaptive pullback filter: in a TRENDING market, wait for
                     # a 1-candle pullback to get a better entry price
