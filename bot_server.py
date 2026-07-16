@@ -6766,7 +6766,7 @@ async function fetchMarket(){
       return '<div class="hm-cell '+cls+'">'+
         '<div style="display:flex;align-items:flex-start;justify-content:space-between">'+
           '<div class="hm-name">'+c.name+'</div>'+
-          '<span class="hm-bell" onclick="openAlertSheet(\''+c.pair+'\',\''+c.name+'\')">&#128276;</span>'+
+          '<span class="hm-bell" data-pair="'+c.pair+'" data-name="'+c.name+'" onclick="openAlertSheet(this.dataset.pair,this.dataset.name)">&#128276;</span>'+
         '</div>'+
         '<div class="hm-sig" style="color:'+sigCol+'">'+sigTxt+'</div>'+
         (str?'<div class="hm-str">'+str+' conf'+(c.pattern?' · '+c.pattern:'')+'</div>':'')
@@ -6886,7 +6886,7 @@ function renderAlertList(alerts){
     return '<div class="alert-list-item">'+
       '<div class="alert-coin-lbl">'+a.name+
         '<span class="alert-dir-lbl">&nbsp;'+dirn+' $'+a.target.toFixed(4)+'</span></div>'+
-      '<button class="alert-del" onclick="deleteAlert(\''+a.pair+'\')">&#10005;</button>'+
+      '<button class="alert-del" data-pair="'+a.pair+'" onclick="deleteAlert(this.dataset.pair)">&#10005;</button>'+
     '</div>';
   }).join('');
 }
@@ -6915,7 +6915,7 @@ async function submitAlert(){
     body:JSON.stringify({pair:_alertPair,target:price,above:_alertAbove})});
   closeAlertSheet();
   fetchAlerts();
-  showToast('Alert Set &#128276;','You\'ll get a Telegram message when it hits','open',3000);
+  showToast('Alert Set &#128276;','You will get a Telegram message when it hits','open',3000);
 }
 
 /* ── WEB PUSH ── */
@@ -6947,7 +6947,7 @@ async function requestNotifs(){
         await fetch('/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify(sub.toJSON())});
         _pushActive=true;_notif=true;updateNotifBtn();
-        showToast('Push On &#128276;','You\'ll get alerts even when the app is closed','win',3500);
+        showToast('Push On &#128276;','Alerts will arrive even when the app is closed','win',3500);
         return;
       }
     }catch(e){console.warn('push sub',e);}
