@@ -258,6 +258,8 @@ LIVE_EXCHANGE     = ("binance"         if (USE_BINANCE and BINANCE_API_KEY) else
                      "kraken_futures"  if (USE_FUTURES and KRAKEN_FUTURES_API_KEY) else
                      "kraken")
 BINANCE_FEE       = 0.001   # 0.10% per trade (vs Kraken's 0.26%)
+KRAKEN_MARGIN     = os.environ.get("KRAKEN_MARGIN", "0") in ("1", "true", "yes")
+KRAKEN_LEVERAGE   = max(2, min(5, int(os.environ.get("KRAKEN_LEVERAGE", "2"))))
 
 # Binance kline interval strings
 _BINANCE_IV = {1:"1m",3:"3m",5:"5m",15:"15m",30:"30m",60:"1h",120:"2h",240:"4h",1440:"1d"}
@@ -945,11 +947,12 @@ def _kraken_get_usd_balance():
         log("LIVE", f"balance fetch error: {e}", "ERR")
         return 0.0
 
-def _kraken_place_order(pair, side, volume, validate=False):
+def _kraken_place_order(pair, side, volume, validate=False, leverage=None):
     """
-    Place a Kraken spot market order.
+    Place a Kraken spot or margin market order.
     side: 'buy' or 'sell'
     volume: base-currency units (e.g. BTC amount, not USD)
+    leverage: integer ≥2 for margin order; None for spot
     Returns txid string or raises on failure.
     """
     min_vol = _KRAKEN_MIN_VOL.get(pair, 0.0)
@@ -961,12 +964,15 @@ def _kraken_place_order(pair, side, volume, validate=False):
         "ordertype":  "market",
         "volume":     f"{volume:.8f}",
     }
+    if leverage and leverage >= 2:
+        params["leverage"] = str(leverage)
     if validate:
         params["validate"] = "true"
     result = _kraken_private("AddOrder", params)
     txids  = result.get("txid", [])
     txid   = txids[0] if txids else "unknown"
-    log("LIVE", f"Order placed: {side.upper()} {volume:.6f} {pair}  txid={txid}")
+    lev_str = f" {leverage}×margin" if leverage else " spot"
+    log("LIVE", f"Order placed: {side.upper()}{lev_str} {volume:.6f} {pair}  txid={txid}")
     return txid
 
 def _kraken_cancel_order(txid):
@@ -2540,8 +2546,9 @@ class PaperTrader:
             if sig == "BUY"  and self.can_open_new():
                 self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
             elif sig == "SELL" and self.can_open_new():
-                if is_live() and LIVE_EXCHANGE != "kraken_futures":
-                    log("LIVE", f"SHORT skipped ({name}) — spot trading, no short selling")
+                _spot_no_short = is_live() and LIVE_EXCHANGE == "kraken" and not KRAKEN_MARGIN
+                if _spot_no_short:
+                    log("LIVE", f"SHORT skipped ({name}) — spot mode; set KRAKEN_MARGIN=1 to enable")
                 else:
                     self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
 
@@ -2650,11 +2657,17 @@ class PaperTrader:
                     self.balance = real_usd
                 fee = round(margin * BINANCE_FEE, 4)
             else:
-                leverage      = 1
-                contract_tier = "Spot"
+                if KRAKEN_MARGIN:
+                    leverage      = KRAKEN_LEVERAGE
+                    contract_tier = f"Margin {leverage}×"
+                else:
+                    leverage      = 1
+                    contract_tier = "Spot"
                 try:
-                    contracts = round(margin / fill, 8)
-                    txid = _kraken_place_order(pair, "buy", contracts)
+                    order_side = "buy" if side == "LONG" else "sell"
+                    lev_arg    = leverage if KRAKEN_MARGIN else None
+                    contracts  = round(margin * (leverage if KRAKEN_MARGIN else 1) / fill, 8)
+                    txid = _kraken_place_order(pair, order_side, contracts, leverage=lev_arg)
                     self._live_orders[pair] = txid
                     real_usd = _kraken_get_usd_balance()
                 except Exception as exc:
@@ -2775,7 +2788,9 @@ class PaperTrader:
                     self._live_orders.pop(pair, None)
                     real_usd_after = _binance_get_usdt_balance()
                 else:
-                    _kraken_place_order(pair, "sell", contracts)
+                    close_side = "sell" if p["side"] == "LONG" else "buy"
+                    lev_arg    = KRAKEN_LEVERAGE if KRAKEN_MARGIN else None
+                    _kraken_place_order(pair, close_side, contracts, leverage=lev_arg)
                     self._live_orders.pop(pair, None)
                     real_usd_after = _kraken_get_usd_balance()
             except Exception as exc:
