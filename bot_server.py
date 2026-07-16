@@ -578,13 +578,13 @@ class Database:
                 cur.execute("""
                     SELECT pair,
                            COUNT(*) AS n,
-                           ROUND(
+                           ROUND((
                                SUM(CASE WHEN pnl > 0
                                    THEN EXP(-(EXTRACT(EPOCH FROM NOW()) - ts) / 1209600.0)
                                    ELSE 0 END) /
                                NULLIF(SUM(EXP(-(EXTRACT(EPOCH FROM NOW()) - ts) / 1209600.0)), 0)
                                * 100
-                           , 1) AS wr
+                           )::numeric, 1) AS wr
                     FROM trades
                     GROUP BY pair
                     HAVING COUNT(*) >= %s
