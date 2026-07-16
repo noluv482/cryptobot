@@ -2810,10 +2810,11 @@ class PaperTrader:
         entry_nasdaq = p.get("entry_nasdaq", market_mood["nasdaq"])
         entry_news   = p.get("entry_news",   news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"))
         trade_rec = {"side": p["side"], "entry": p["entry"], "exit": fill,
-                     "pnl": pnl, "coin": p.get("name", name),
+                     "pnl": pnl, "coin": p.get("name", name), "pair": pair,
                      "confidence": p.get("confidence", 0.0),
                      "held_mins": held_mins, "reason": reason, "ts": time.time(),
-                     "fkey": p.get("fkey", ""), "hour": datetime.utcnow().hour}
+                     "fkey": p.get("fkey", ""), "hour": datetime.utcnow().hour,
+                     "pillars": p.get("pillars", {})}
         db.log_feature(fkey, pair, pnl > 0)
         db.log_pillars(p.get("pillars", {}), pnl > 0)
         self.trades.append(trade_rec)
@@ -2921,6 +2922,25 @@ class PaperTrader:
         self.session_start = PAPER_START
         self._save()
         send_menu(self)
+
+def _compute_pillar_weights(trades, weights_out):
+    """Recompute pillar weights in-place from in-memory trade history.
+    Pillar that fires on winning trades gets weight > 1.0; losing pillar < 1.0.
+    Requires ≥5 samples per pillar; falls back to current value otherwise."""
+    counts: dict = {}
+    for t in trades[-200:]:
+        pils = t.get("pillars", {})
+        won  = t.get("pnl", 0) > 0
+        for pil, active in pils.items():
+            if active:
+                rec = counts.setdefault(pil, [0, 0])
+                rec[0] += 1
+                if won:
+                    rec[1] += 1
+    for pil, (n, w) in counts.items():
+        if n >= 5:
+            wr = w / n
+            weights_out[pil] = round(max(0.4, min(1.5, wr / 0.50)), 2)
 
 # ── Signal engine ─────────────────────────────────────────────────────────────
 class SignalEngine:
@@ -3148,7 +3168,7 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["econ"] += 1
             sig = "HOLD"
 
-        # ── Refresh adaptive pillar weights (from DB, cached 10 min) ──────────
+        # ── Refresh adaptive pillar weights (DB preferred, in-memory fallback) ──
         now_ts = time.time()
         if now_ts - self._pillar_w_ts > 600:
             if db.connected:
@@ -3160,6 +3180,10 @@ class SignalEngine:
                     }
                 except Exception:
                     pass
+            else:
+                _trader = _web_trader_ref[0] if _web_trader_ref else None
+                if _trader and len(_trader.trades) >= 10:
+                    _compute_pillar_weights(list(_trader.trades), self._pillar_weights)
             self._pillar_w_ts = now_ts
         pw = self._pillar_weights
 
@@ -3241,9 +3265,18 @@ class SignalEngine:
         if sig == "BUY"  and lsr.get("bias") == "SHORT_HEAVY": confidence = min(round(confidence + 0.08, 2), 1.0)
         if sig == "SELL" and lsr.get("bias") == "LONG_HEAVY":  confidence = min(round(confidence + 0.08, 2), 1.0)
 
-        # Bonus: extreme funding = contrarian squeeze setup
-        if fr < -EXTREME_FUNDING and sig == "BUY":  confidence = min(round(confidence + 0.06, 2), 1.0)
-        if fr >  EXTREME_FUNDING and sig == "SELL": confidence = min(round(confidence + 0.06, 2), 1.0)
+        # Graduated funding rate signal:
+        #   extreme funding → strong contrarian boost (crowd about to get squeezed)
+        #   moderate funding → mild boost (overcrowded side, mean-reversion bias)
+        if sig in ("BUY", "SELL"):
+            if fr < -EXTREME_FUNDING and sig == "BUY":
+                confidence = min(round(confidence + 0.09, 2), 1.0)   # extreme short squeeze setup
+            elif fr > EXTREME_FUNDING and sig == "SELL":
+                confidence = min(round(confidence + 0.09, 2), 1.0)   # extreme long squeeze setup
+            elif fr < -FUNDING_THRESHOLD and sig == "BUY":
+                confidence = min(round(confidence + 0.04, 2), 1.0)   # moderate short overcrowd
+            elif fr > FUNDING_THRESHOLD and sig == "SELL":
+                confidence = min(round(confidence + 0.04, 2), 1.0)   # moderate long overcrowd
 
         # Open interest conviction check: rising OI confirms real new money;
         # falling OI means moves are just liquidations/unwinding (weaker follow-through)
@@ -5079,8 +5112,9 @@ def trading_loop(trader):
                     except Exception:
                         pass
 
-                    # 4-hour trend confirmation (higher-timeframe confluence)
-                    # Cached for _HTF_CACHE_TTL seconds to avoid extra API calls every tick.
+                    # 4-hour trend: soft scoring instead of hard block.
+                    # Alignment adds confidence; opposition subtracts. A strong enough
+                    # 15m signal can still fire against the 4H trend (mean-reversion).
                     if sig in ("BUY", "SELL"):
                         _now_ts = time.time()
                         _k4 = (pair, 240)
@@ -5096,12 +5130,13 @@ def trading_loop(trader):
                             except Exception:
                                 trend_4h = _cached4[0] if _cached4 else None
                         if trend_4h:
-                            if sig == "BUY"  and trend_4h != "UP":
+                            _4h_ok = (sig == "BUY" and trend_4h == "UP") or \
+                                     (sig == "SELL" and trend_4h == "DOWN")
+                            if _4h_ok:
+                                conf = min(round(conf + 0.07, 2), 1.0)
+                            else:
+                                conf = max(round(conf - 0.10, 2), 0.0)
                                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
-                                sig = "HOLD"
-                            elif sig == "SELL" and trend_4h != "DOWN":
-                                with _gate_counter_lock: _gate_counters["4h_trend"] += 1
-                                sig = "HOLD"
 
                     # 1-hour trend — tracked for telemetry but no longer a hard block.
                     # The 4H gate already provides higher-timeframe confluence; the
@@ -5194,18 +5229,26 @@ def trading_loop(trader):
                             last_sigs[pair] = sig
                             continue
 
-                        # Order book imbalance gate — only enter when real money lines up
-                        # with the signal; skips false breakouts where big sellers wait above
+                        # Order book imbalance: bid_vol/ask_vol ratio scores confidence.
+                        # Strong bid wall on a BUY → boost; heavy asks → penalty.
+                        # Only hard-blocks on very extreme opposing flow (> 2σ from neutral).
                         try:
                             _ob = _get_ob_imbalance(pair)
                             if _ob is not None:
-                                _ob_block = (sig == "BUY"  and _ob < 0.80) or \
-                                            (sig == "SELL" and _ob > 1.25)
-                                if _ob_block:
-                                    with _gate_counter_lock: _gate_counters["ob_imbalance"] += 1
-                                    last_sigs[pair] = sig
-                                    log("GATE", f"{cname} OB imbalance {_ob:.2f} → blocked {sig}")
-                                    continue
+                                if sig == "BUY":
+                                    if   _ob >= 1.50: conf = min(round(conf + 0.07, 2), 1.0)
+                                    elif _ob >= 1.20: conf = min(round(conf + 0.03, 2), 1.0)
+                                    elif _ob <  0.65:
+                                        conf = max(round(conf - 0.08, 2), 0.0)
+                                        with _gate_counter_lock: _gate_counters["ob_imbalance"] += 1
+                                    elif _ob <  0.80: conf = max(round(conf - 0.04, 2), 0.0)
+                                else:  # SELL
+                                    if   _ob <= 0.67: conf = min(round(conf + 0.07, 2), 1.0)
+                                    elif _ob <= 0.83: conf = min(round(conf + 0.03, 2), 1.0)
+                                    elif _ob >  1.55:
+                                        conf = max(round(conf - 0.08, 2), 0.0)
+                                        with _gate_counter_lock: _gate_counters["ob_imbalance"] += 1
+                                    elif _ob >  1.25: conf = max(round(conf - 0.04, 2), 0.0)
                         except Exception:
                             pass
 
