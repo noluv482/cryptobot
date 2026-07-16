@@ -2667,6 +2667,10 @@ class PaperTrader:
                     order_side = "buy" if side == "LONG" else "sell"
                     lev_arg    = leverage if KRAKEN_MARGIN else None
                     contracts  = round(margin * (leverage if KRAKEN_MARGIN else 1) / fill, 8)
+                    min_vol    = _KRAKEN_MIN_VOL.get(pair, 0.0)
+                    if contracts < min_vol:
+                        log("LIVE", f"Skipping {name} — size {contracts:.8f} < min {min_vol} (balance too small)")
+                        return
                     txid = _kraken_place_order(pair, order_side, contracts, leverage=lev_arg)
                     self._live_orders[pair] = txid
                     real_usd = _kraken_get_usd_balance()
