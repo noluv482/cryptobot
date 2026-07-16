@@ -661,12 +661,12 @@ class Database:
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
-                    SELECT hour,
+                    SELECT EXTRACT(HOUR FROM to_timestamp(ts))::int AS hour,
                            COUNT(*) AS n,
                            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::float/COUNT(*)*100 AS wr
                     FROM trades
-                    WHERE hour IS NOT NULL
-                    GROUP BY hour HAVING COUNT(*) >= 5
+                    WHERE ts IS NOT NULL
+                    GROUP BY 1 HAVING COUNT(*) >= 5
                 """)
                 return {int(r[0]): {"n": r[1], "wr": float(r[2])} for r in cur.fetchall()}
         except Exception as e:
