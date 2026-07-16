@@ -5457,6 +5457,11 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
          color:var(--tx);white-space:nowrap;z-index:5;top:8px;left:8px;
          box-shadow:0 4px 16px rgba(0,0,0,.5)}
 .cv-tip b{color:var(--b)}
+.iv-row{display:flex;gap:5px;padding:0 14px 8px}
+.iv-btn{font-size:.62rem;font-family:var(--fn);padding:4px 10px;border-radius:6px;
+        border:1px solid var(--bd2);background:var(--s0);color:var(--mu);cursor:pointer;
+        font-weight:600;transition:background .15s,color .15s,border-color .15s}
+.iv-btn.active{background:var(--b);color:#000;border-color:var(--b)}
 
 /* ── POSITIONS TAB ── */
 .pos-empty{display:flex;flex-direction:column;align-items:center;
@@ -5789,7 +5794,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="chart-info-row">
       <div>
         <div class="ci-name" id="ci_name">—</div>
-        <div class="ci-interval">15-min candles · 80 bars</div>
+        <div class="ci-interval" id="ci_iv_lbl">15m · 80 bars</div>
       </div>
       <div class="ci-price c-tx" id="ci_price">—</div>
       <div class="ci-chg fl" id="ci_chg">—</div>
@@ -5814,8 +5819,15 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         📐 Chart structure · 15 min &nbsp;|&nbsp; 🕯️ Candle · live
       </div>
     </div>
+    <div class="iv-row">
+      <button class="iv-btn" data-iv="1" onclick="setCdInterval(1)">1m</button>
+      <button class="iv-btn" data-iv="5" onclick="setCdInterval(5)">5m</button>
+      <button class="iv-btn active" data-iv="15" onclick="setCdInterval(15)">15m</button>
+      <button class="iv-btn" data-iv="60" onclick="setCdInterval(60)">1h</button>
+      <button class="iv-btn" data-iv="240" onclick="setCdInterval(240)">4h</button>
+    </div>
     <div class="chart-wrap">
-      <canvas id="cd_cv" style="display:block;width:100%" height="290"></canvas>
+      <canvas id="cd_cv" style="display:block;width:100%" height="320"></canvas>
       <div class="cv-tip" id="cv_tip"></div>
     </div>
   </div>
@@ -5951,6 +5963,7 @@ const $=id=>document.getElementById(id);
 const TAB_ORDER=['home','chart','pos','stats','market'];
 let _tab='home',_paused=false,_notif=false;
 let _eqData=[],_cdData=[],_cdHover=-1,_tick=30;
+let _ema20=[],_ema50=[],_cdTrades=[],_cdOpenPos=[],_cdPatSig='NONE',_cdPair='',_cdIv=15;
 
 const fmt=(n,d=2)=>Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const msign=n=>(n>=0?'+$':'\u2212$')+fmt(Math.abs(n));
@@ -6099,6 +6112,11 @@ async function fetchStatus(){
     if(d.market_conditions)renderConditions(d.market_conditions);
     if(d.gate_counters)renderGates(d.gate_counters);
     renderRiskGauge(d);
+    _cdPair=d.pair||'';
+    _cdOpenPos=(d.open_positions||[]).filter(p=>p.pair===_cdPair);
+    _cdTrades=(d.recent_trades||[]).filter(t=>t.pair===_cdPair);
+    _cdPatSig=d.chart_pattern_signal||'NONE';
+    if(_tab==='chart')drawCandles();
   }catch(e){console.warn('status',e);}
 }
 
@@ -6403,9 +6421,11 @@ function drawEquity(){
 /* ── CANDLES ── */
 async function fetchCandles(){
   try{
-    const data=await(await fetch('/candles')).json();
+    const data=await(await fetch('/candles?interval='+_cdIv)).json();
     if(Array.isArray(data)&&data.length){
       _cdData=data;
+      _ema20=_ema(data,20);
+      _ema50=_ema(data,50);
       const last=data[data.length-1],first=data[0];
       const pct=(last.c-first.c)/first.c*100;
       const pf=last.c>=100?last.c.toFixed(2):last.c.toPrecision(6);
@@ -6413,29 +6433,59 @@ async function fetchCandles(){
       const chg=$('ci_chg');
       chg.textContent=(pct>=0?'+':'')+pct.toFixed(2)+'%';
       chg.className='ci-chg '+(pct>0.05?'up':pct<-0.05?'dn':'fl');
+      const ivNames={1:'1m',5:'5m',15:'15m',30:'30m',60:'1h',240:'4h',1440:'1D'};
+      const lbl=$('ci_iv_lbl');if(lbl)lbl.textContent=(ivNames[_cdIv]||_cdIv+'m')+' · '+data.length+' bars';
       if(_tab==='chart')drawCandles();
     }
   }catch(e){console.warn('candles',e);}
 }
+function _ema(data,period){
+  const closes=data.map(c=>c.c);
+  const k=2/(period+1);
+  const out=new Array(data.length).fill(null);
+  let acc=0;
+  for(let i=0;i<data.length;i++){
+    if(i<period-1){acc+=closes[i];continue;}
+    if(i===period-1){acc+=closes[i];out[i]=acc/period;continue;}
+    out[i]=closes[i]*k+out[i-1]*(1-k);
+  }
+  return out;
+}
+function setCdInterval(iv){
+  _cdIv=iv;
+  document.querySelectorAll('.iv-btn').forEach(b=>{b.classList.toggle('active',+b.dataset.iv===iv);});
+  fetchCandles();
+}
 function drawCandles(){
   const cv=$('cd_cv');
   const W=cv.parentElement.clientWidth||320;
-  const H=290,PR=devicePixelRatio||1;
+  const H=320,PR=devicePixelRatio||1;
   cv.width=W*PR;cv.height=H*PR;cv.style.width=W+'px';cv.style.height=H+'px';
   const ctx=cv.getContext('2d');ctx.scale(PR,PR);
   const data=_cdData;if(!data.length)return;
-  const P={t:8,r:10,b:22,l:54};
-  const VH=44,cw=W-P.l-P.r,ch=H-P.t-P.b-VH-4;
+  const P={t:10,r:10,b:22,l:56};
+  const VH=40,cw=W-P.l-P.r,ch=H-P.t-P.b-VH-6;
   const n=data.length;
   const slotW=cw/n,barW=Math.max(2,Math.floor(slotW*.72));
   const prices=data.flatMap(c=>[c.h,c.l]);
   let lo=Math.min(...prices),hi=Math.max(...prices);
+  _cdOpenPos.forEach(p=>{lo=Math.min(lo,p.entry);hi=Math.max(hi,p.entry);});
+  _ema20.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
+  _ema50.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
+  const rng=(hi-lo)*0.04;lo-=rng;hi+=rng;
   if(hi===lo){hi*=1.001;lo*=0.999;}
   const xC=i=>P.l+(i+.5)*slotW;
   const yP=v=>P.t+ch-(v-lo)/(hi-lo)*ch;
   const vMax=Math.max(...data.map(c=>c.v))||1;
   const yV=v=>H-P.b-(v/vMax)*VH;
-  ctx.strokeStyle='#162540';ctx.lineWidth=.7;
+  // Pattern tint on last ~10 bars
+  if(_cdPatSig==='BULLISH'||_cdPatSig==='BEARISH'){
+    const ts=Math.max(0,n-10);
+    ctx.fillStyle=_cdPatSig==='BULLISH'?'rgba(0,204,116,.055)':'rgba(255,51,82,.055)';
+    ctx.fillRect(xC(ts)-slotW/2,P.t,(n-ts)*slotW,ch);
+  }
+  // Grid
+  ctx.strokeStyle='rgba(22,37,64,.8)';ctx.lineWidth=.6;
   for(let i=0;i<=4;i++){
     const v=lo+(hi-lo)*(i/4),y=yP(v);
     ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();
@@ -6443,20 +6493,87 @@ function drawCandles(){
     ctx.fillStyle='#4d6f94';ctx.font='8.5px monospace';ctx.textAlign='right';
     ctx.fillText('$'+lbl,P.l-3,y+3);
   }
+  // Volume bars
+  data.forEach((c,i)=>{
+    const bull=c.c>=c.o,x=xC(i),h=barW/2;
+    ctx.fillStyle=bull?'rgba(0,204,116,.18)':'rgba(255,51,82,.14)';
+    ctx.fillRect(x-h,yV(c.v),barW,H-P.b-yV(c.v));
+  });
+  // Candles
   data.forEach((c,i)=>{
     const bull=c.c>=c.o,gc=bull?'#00cc74':'#ff3352';
     const x=xC(i),h=barW/2;
     const yO=yP(c.o),yC=yP(c.c),yHi=yP(c.h),yLo=yP(c.l);
     const bT=Math.min(yO,yC),bH=Math.max(1.5,Math.abs(yC-yO));
-    const alpha=i===_cdHover?.95:.72;
-    ctx.strokeStyle=gc;ctx.lineWidth=1;
+    const alpha=i===_cdHover?.95:.75;
+    ctx.strokeStyle=gc;ctx.lineWidth=.9;
     ctx.beginPath();ctx.moveTo(x,yHi);ctx.lineTo(x,bT);ctx.stroke();
     ctx.beginPath();ctx.moveTo(x,bT+bH);ctx.lineTo(x,yLo);ctx.stroke();
     ctx.fillStyle=bull?`rgba(0,204,116,${alpha})`:`rgba(255,51,82,${alpha})`;
     ctx.fillRect(x-h,bT,barW,bH);
-    ctx.fillStyle=bull?'rgba(0,204,116,.25)':'rgba(255,51,82,.18)';
-    ctx.fillRect(x-h,yV(c.v),barW,H-P.b-yV(c.v));
   });
+  // EMA 20 (blue)
+  ctx.save();ctx.lineJoin='round';
+  const drawEmaLine=(arr,color)=>{
+    if(arr.length!==n)return;
+    ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1.4;
+    let started=false;
+    arr.forEach((v,i)=>{
+      if(v===null)return;
+      if(!started){ctx.moveTo(xC(i),yP(v));started=true;}else ctx.lineTo(xC(i),yP(v));
+    });
+    if(started)ctx.stroke();
+  };
+  drawEmaLine(_ema20,'#58a6ff');
+  drawEmaLine(_ema50,'#f0883e');
+  ctx.restore();
+  // EMA legend
+  ctx.font='7.5px monospace';ctx.textAlign='left';
+  ctx.fillStyle='#58a6ff';ctx.fillText('EMA20',P.l+2,P.t+9);
+  ctx.fillStyle='#f0883e';ctx.fillText('EMA50',P.l+44,P.t+9);
+  // Open position entry line
+  _cdOpenPos.forEach(pos=>{
+    const ey=yP(pos.entry);
+    const lc=pos.side==='LONG'?'#58a6ff':'#f0883e';
+    ctx.save();ctx.strokeStyle=lc;ctx.lineWidth=1;ctx.setLineDash([5,4]);
+    ctx.beginPath();ctx.moveTo(P.l,ey);ctx.lineTo(W-P.r,ey);ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle=lc;ctx.font='bold 7px monospace';ctx.textAlign='left';
+    const ep=pos.entry>=100?pos.entry.toFixed(2):pos.entry.toPrecision(6);
+    ctx.fillText((pos.side==='LONG'?'L ':'S ')+'$'+ep,W-P.r-50,ey-2);
+  });
+  // Trade markers
+  const tsToIdx=ts=>{
+    const sec=ts/1000;
+    let best=-1,bestDiff=Infinity;
+    data.forEach((c,i)=>{const d=Math.abs(c.t-sec);if(d<bestDiff){bestDiff=d;best=i;}});
+    return bestDiff<7200?best:-1;
+  };
+  _cdTrades.forEach(tr=>{
+    const ei=tsToIdx(tr.entry_ts),xi=tsToIdx(tr.ts);
+    const isLong=tr.side==='LONG'||tr.side==='BUY';
+    const win=tr.pnl>0;
+    if(ei>=0&&data[ei]){
+      const x=xC(ei);
+      if(isLong){
+        const y=yP(data[ei].l)+9;
+        ctx.fillStyle='rgba(88,166,255,.85)';
+        ctx.beginPath();ctx.moveTo(x,y-7);ctx.lineTo(x-4.5,y+1);ctx.lineTo(x+4.5,y+1);ctx.closePath();ctx.fill();
+      }else{
+        const y=yP(data[ei].h)-9;
+        ctx.fillStyle='rgba(240,136,62,.85)';
+        ctx.beginPath();ctx.moveTo(x,y+7);ctx.lineTo(x-4.5,y-1);ctx.lineTo(x+4.5,y-1);ctx.closePath();ctx.fill();
+      }
+    }
+    if(xi>=0&&data[xi]){
+      const x=xC(xi);
+      const y=isLong?yP(data[xi].h)-11:yP(data[xi].l)+11;
+      ctx.fillStyle=win?'rgba(0,204,116,.9)':'rgba(255,51,82,.9)';
+      ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,.35)';ctx.lineWidth=1;ctx.stroke();
+    }
+  });
+  // Time axis
   ctx.fillStyle='#4d6f94';ctx.font='8px monospace';ctx.textAlign='center';
   const stride=Math.max(1,Math.ceil(n/7));
   data.forEach((c,i)=>{
@@ -6465,6 +6582,7 @@ function drawCandles(){
       ctx.fillText(dd.getHours().toString().padStart(2,'0')+':'+dd.getMinutes().toString().padStart(2,'0'),xC(i),H-P.b+10);
     }
   });
+  // Crosshair
   if(_cdHover>=0){
     const x=xC(_cdHover);
     ctx.save();ctx.strokeStyle='rgba(200,218,240,.2)';ctx.lineWidth=1;
@@ -6485,10 +6603,13 @@ function initCandleHover(){
     const c=_cdData[i],bull=c.c>=c.o;
     const ts=new Date(c.t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
     const f6=v=>v>=100?v.toFixed(2):v.toPrecision(6);
+    const e20=_ema20[i],e50=_ema50[i];
     tip.innerHTML='<b>'+ts+'</b>&nbsp; O&nbsp;'+f6(c.o)+
       '&nbsp; H&nbsp;<span style="color:var(--g)">'+f6(c.h)+'</span>'+
       '&nbsp; L&nbsp;<span style="color:var(--r)">'+f6(c.l)+'</span>'+
-      '&nbsp; C&nbsp;<span style="color:'+(bull?'var(--g)':'var(--r)')+'">'+f6(c.c)+'</span>';
+      '&nbsp; C&nbsp;<span style="color:'+(bull?'var(--g)':'var(--r)')+'">'+f6(c.c)+'</span>'+
+      (e20!==null?'<br><span style="color:#58a6ff">EMA20 '+f6(e20)+'</span>':'')+
+      (e50!==null?'&nbsp;<span style="color:#f0883e">EMA50 '+f6(e50)+'</span>':'');
     tip.style.display='block';
   };
   cv.addEventListener('mousemove',e=>show(idx(e.clientX)));
@@ -6947,14 +7068,18 @@ def _web_status():
     streak = wins_streak if wins_streak > 0 else -losses_streak
 
     recent = []
-    for t in reversed(trader.trades[-10:]):
+    for t in reversed(trader.trades[-20:]):
         recent.append({
-            "coin":      t.get("coin", ""),
-            "side":      t.get("side", ""),
-            "pnl":       round(t.get("pnl", 0), 2),
-            "held_mins": round(t.get("held_mins", 0)),
-            "reason":    t.get("reason", ""),
-            "ts":        int(t.get("closed_at", t.get("ts", 0)) * 1000),
+            "coin":        t.get("coin", ""),
+            "pair":        t.get("pair", ""),
+            "side":        t.get("side", ""),
+            "pnl":         round(t.get("pnl", 0), 2),
+            "held_mins":   round(t.get("held_mins", 0)),
+            "reason":      t.get("reason", ""),
+            "ts":          int(t.get("closed_at", t.get("ts", 0)) * 1000),
+            "entry_ts":    int(t.get("opened_at", 0) * 1000),
+            "entry_price": round(t.get("entry", 0), 6),
+            "exit_price":  round(t.get("exit", 0), 6),
         })
 
     coin_stats: dict = {}
@@ -7084,8 +7209,11 @@ def _web_candles():
     if not pair:
         return _Response('{"error":"no pair"}', status=503, mimetype="application/json")
     try:
+        iv = int(_flask_request.args.get("interval", INTERVAL))
+        if iv not in (1, 5, 15, 30, 60, 240, 1440):
+            iv = INTERVAL
         r = requests.get(f"{BASE_URL}/OHLC",
-                         params={"pair": pair, "interval": INTERVAL}, timeout=10)
+                         params={"pair": pair, "interval": iv}, timeout=10)
         payload = r.json()
         if payload.get("error"):
             raise ValueError(str(payload["error"]))
