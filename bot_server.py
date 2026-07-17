@@ -6018,6 +6018,29 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .cal-day.empty{background:var(--bd2);opacity:.4}
 .cal-day.blank{background:transparent}
 .cal-dn{font-weight:700;font-size:.6rem;line-height:1;color:var(--tx)}
+.cal-pnl{font-size:.45rem;font-family:var(--fn);font-weight:700;line-height:1;margin-top:1px}
+.cal-day.profit .cal-pnl{color:rgba(0,204,116,.9)}
+.cal-day.loss .cal-pnl{color:rgba(255,51,82,.9)}
+/* ── LOSS STREAK WARNING ── */
+.streak-warn{margin:0 16px 10px;border-radius:10px;padding:9px 13px;
+  background:rgba(255,152,0,.08);border:1px solid rgba(255,152,0,.22);
+  font-size:.71rem;color:var(--y);display:none;line-height:1.5}
+.streak-warn.show{display:block}
+.streak-warn strong{font-weight:700}
+/* ── PILLAR ROW (position cards) ── */
+.p-row{display:flex;gap:3px;margin-top:8px;padding-top:8px;border-top:1px solid var(--bd2)}
+.p-dot{height:6px;border-radius:3px;flex:1}
+.p-dot.on{background:rgba(0,204,116,.75)}
+.p-dot.off{background:var(--bd2)}
+/* ── EXIT REASON BARS ── */
+.er-row{display:flex;align-items:center;gap:8px;padding:3px 16px}
+.er-lbl{font-size:.6rem;color:var(--mu);width:88px;flex-shrink:0;text-align:right;font-family:var(--fn);text-transform:capitalize}
+.er-bar-wrap{flex:1;height:7px;background:var(--bd2);border-radius:4px;overflow:hidden}
+.er-bar-fill{height:100%;border-radius:4px;background:var(--b);transition:width .5s}
+.er-bar-fill.stale{background:#ff9800}
+.er-cnt{font-family:var(--fn);font-size:.6rem;color:var(--tx);width:44px;flex-shrink:0;text-align:right}
+/* ── GATE TOTAL LABEL ── */
+.gate-total{padding:4px 16px 2px;font-size:.62rem;color:var(--mu);font-family:var(--fn)}
 /* ── CLOSE POSITION BTN ── */
 .close-btn{font-size:.56rem;font-weight:700;padding:4px 10px;border-radius:6px;
   border:1px solid rgba(255,51,82,.35);background:rgba(255,51,82,.08);
@@ -6584,6 +6607,9 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="sh"><span>Open Positions</span></div>
     <div class="dd-alert" id="dd_alert">&#128683; Drawdown limit reached — new trades paused</div>
     <div class="corr-warn" id="corr_warn">&#9888; Correlated exposure</div>
+    <div class="streak-warn" id="streak_warn">
+      &#9888; <strong><span id="sw_count">0</span> consecutive losses</strong> &#8212; conf gate raised +<span id="sw_floor">0</span>% &middot; only take high-confidence setups
+    </div>
     <div class="upnl-banner hidden" id="upnl_banner">
       <div class="upnl-ico" id="upnl_ico">&#128200;</div>
       <div class="upnl-body">
@@ -6595,6 +6621,8 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div id="pos_list"></div>
     <div class="sh"><span>Recent Trades</span></div>
     <div class="trade-box" id="trades_box"><div class="no-data">No trades yet</div></div>
+    <div class="sh" id="er_hdr" style="display:none"><span>Exit Reasons</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">last 20 trades</span></div>
+    <div id="exit_reasons" style="padding-bottom:14px"></div>
   </div>
 
   <!-- STATS -->
@@ -6678,7 +6706,8 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="hr-grid" id="hr_grid">
       <div class="no-data" style="grid-column:1/-1">No trades yet</div>
     </div>
-    <div class="sh"><span>Gate Filters</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">blocked trades</span></div>
+    <div class="sh"><span>Gate Filters</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">blocked signals today</span></div>
+    <div class="gate-total" id="gate_total"></div>
     <div id="gate_bars" style="padding-bottom:12px"><div class="no-data">No blocks yet</div></div>
     <div class="sh"><span>Backtest</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">60h replay · live signal engine</span></div>
     <div class="bt-form">
@@ -6935,15 +6964,21 @@ async function fetchStatus(){
     const s=d.streak||0;
     const [sv,sc,ssb]=[$('streak_val'),$('streak_card'),$('streak_sub')];
     const [ss,ssc,ssbs]=[$('s_streak'),$('s_streak_card'),$('s_streak_sub')];
+    const lossStreak=s<0?Math.abs(s):0;
+    const gateFloor=Math.min(lossStreak*3,15);
+    const sw=$('streak_warn'),swc=$('sw_count'),swf=$('sw_floor');
+    if(sw){sw.className='streak-warn'+(lossStreak>=2?' show':'');if(swc)swc.textContent=lossStreak;if(swf)swf.textContent=gateFloor;}
     if(s>0){
       sv.textContent='+'+s+' \u2191';sv.className='qcard-val c-g';sc.className='qcard ac-g';ssb.textContent=s+' wins in a row';
       ss.textContent='+'+s+' wins';ss.className='scard-val c-g';ssc.className='scard';ssbs.textContent='Keep it up!';
     }else if(s<0){
-      sv.textContent=s+' \u2193';sv.className='qcard-val c-r';sc.className='qcard ac-r';ssb.textContent=Math.abs(s)+' losses in a row';
-      ss.textContent=s+' losses';ss.className='scard-val c-r';ssc.className='scard';ssbs.textContent='Be careful';
+      sv.textContent=s+' \u2193';sv.className='qcard-val c-r';sc.className='qcard ac-r';
+      ssb.textContent=lossStreak+' losses in a row'+(gateFloor?' \u2191gate +'+gateFloor+'%':'');
+      ss.textContent=s+' losses';ss.className='scard-val c-r';ssc.className='scard';
+      ssbs.textContent=gateFloor?'Conf floor raised +'+gateFloor+'%':'Be careful';
     }else{
-      sv.textContent='—';sv.className='qcard-val c-mu';sc.className='qcard ac-m';ssb.textContent='No streak yet';
-      ss.textContent='—';ss.className='scard-val c-mu';ssc.className='scard';ssbs.textContent='';
+      sv.textContent='\u2014';sv.className='qcard-val c-mu';sc.className='qcard ac-m';ssb.textContent='No streak yet';
+      ss.textContent='\u2014';ss.className='scard-val c-mu';ssc.className='scard';ssbs.textContent='';
     }
     const tot=d.trades||0,w=d.wins||0,l=d.losses||0;
     $('trades_val').textContent=tot.toLocaleString();
@@ -6992,6 +7027,7 @@ async function fetchStatus(){
     renderPositions(d.open_positions||[]);
     renderActivity(d.activity_log||[]);
     renderTrades(recent);
+    renderExitReasons(d.recent_trades||[]);
     renderCoinTable(d.coin_stats||{});
     renderRank(d);
     renderPattern(d);
@@ -7057,6 +7093,13 @@ function renderPositions(ps){
       (tierCol[tier]||'var(--mu)')+'22;color:'+(tierCol[tier]||'var(--mu)')+';border:1px solid '+
       (tierCol[tier]||'var(--mu)')+'44;margin-left:5px">'+(tierEmoji[tier]||'')+'&nbsp;'+tier+'&nbsp;'+p.leverage+'×</span>':'';
     if(p.opened_at)_posTimerData[p.pair]=p.opened_at;
+    const PKEYS=['rsi_zone','news_align','nasdaq_align','tick_strength','macd_align',
+      'high_volume','candle_pattern','vwap_align','obv_trend','chart_struct','stoch_rsi'];
+    const PLBLS=['RSI','News','NQ','Tick','MACD','Vol','Candle','VWAP','OBV','Chart','StochRSI'];
+    const pd=p.pillars||{};
+    const pillarRow='<div class="p-row">'+PKEYS.map((k,i)=>
+      '<div class="p-dot '+(pd[k]?'on':'off')+'" title="'+PLBLS[i]+': '+(pd[k]?'active':'off')+'"></div>'
+    ).join('')+'</div>';
     return '<div class="pc">'+
       '<div class="pc-r1"><div>'+
         '<div class="pc-name">'+chip+' '+p.name+tierBadge+marginStr+'</div>'+
@@ -7068,7 +7111,8 @@ function renderPositions(ps){
       '</div></div>'+
       '<div class="mb-track"><div class="mb-fill" style="width:'+bw+'%;background:'+mbg+'"></div></div>'+
       '<div class="mb-labels"><span>Entry $'+p.entry.toFixed(4)+'</span><span>'+stop+'</span></div>'+
-      (p.pair?'<button class="close-btn" data-pair="'+p.pair+'" data-name="'+p.name+'" onclick="closePosition(this.dataset.pair,this.dataset.name)">✕ Close</button>':'')+
+      pillarRow+
+      (p.pair?'<button class="close-btn" data-pair="'+p.pair+'" data-name="'+p.name+'" onclick="closePosition(this.dataset.pair,this.dataset.name)">&#10005; Close</button>':'')+
       '</div>';
   }).join('');
 }
@@ -7911,14 +7955,17 @@ async function fetchMarket(){
 function renderGates(counters){
   const el=$('gate_bars');if(!el)return;
   const entries=Object.entries(counters).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
+  const total=entries.reduce((s,[,v])=>s+v,0);
+  const gt=$('gate_total');if(gt)gt.textContent=total?total+' signals blocked today':'';
   if(!entries.length){el.innerHTML='<div class="no-data">No blocks yet</div>';return;}
   const max=entries[0][1]||1;
   el.innerHTML=entries.map(([k,v])=>{
-    const pct=(v/max*100).toFixed(1);
+    const barPct=(v/max*100).toFixed(0);
+    const sharePct=total?Math.round(v/total*100):0;
     return '<div class="gate-row">'+
       '<div class="gate-lbl">'+k+'</div>'+
-      '<div class="gate-bar-wrap"><div class="gate-bar-fill" style="width:'+pct+'%"></div></div>'+
-      '<div class="gate-cnt">'+v+'</div></div>';
+      '<div class="gate-bar-wrap"><div class="gate-bar-fill" style="width:'+barPct+'%"></div></div>'+
+      '<div class="gate-cnt">'+v+' <span style="opacity:.45;font-size:.58rem">('+sharePct+'%)</span></div></div>';
   }).join('');
 }
 
@@ -7947,8 +7994,33 @@ function renderCalendar(days){
     if(!c)return '<div class="cal-day blank"></div>';
     const cls=c.pnl===null?'empty':c.pnl>0?'profit':'loss';
     const pnlStr=c.pnl!==null?(c.pnl>=0?'+$':'-$')+Math.abs(c.pnl).toFixed(2):'';
+    const short=c.pnl!==null?(c.pnl>=0?'+':'')+(c.pnl>0?'$'+Math.abs(c.pnl).toFixed(0):'-$'+Math.abs(c.pnl).toFixed(0)):'';
     const tip=c.key+(pnlStr?' · '+pnlStr:'');
-    return '<div class="cal-day '+cls+'" title="'+tip+'"><div class="cal-dn">'+c.day+'</div></div>';
+    return '<div class="cal-day '+cls+'" title="'+tip+'"><div class="cal-dn">'+c.day+'</div>'+
+      (short?'<div class="cal-pnl">'+short+'</div>':'')+
+      '</div>';
+  }).join('');
+}
+
+/* ── EXIT REASON BREAKDOWN ── */
+function renderExitReasons(trades){
+  const el=$('exit_reasons'),hdr=$('er_hdr');
+  if(!el)return;
+  if(!trades.length){if(hdr)hdr.style.display='none';el.innerHTML='';return;}
+  if(hdr)hdr.style.display='';
+  const counts={};
+  trades.forEach(t=>{const r=(t.reason||'exit').replace(/_/g,' ');counts[r]=(counts[r]||0)+1;});
+  const entries=Object.entries(counts).sort((a,b)=>b[1]-a[1]);
+  const max=entries[0][1]||1;
+  const total=trades.length;
+  el.innerHTML=entries.map(([r,n])=>{
+    const barPct=(n/max*100).toFixed(0);
+    const sharePct=Math.round(n/total*100);
+    const isStale=r==='stale exit';
+    return '<div class="er-row">'+
+      '<div class="er-lbl'+(isStale?' c-y':'')+'">'+(isStale?'⏱ ':'')+r+'</div>'+
+      '<div class="er-bar-wrap"><div class="er-bar-fill'+(isStale?' stale':'')+'" style="width:'+barPct+'%"></div></div>'+
+      '<div class="er-cnt">'+n+' <span style="opacity:.45;font-size:.58rem">('+sharePct+'%)</span></div></div>';
   }).join('');
 }
 
@@ -8755,6 +8827,7 @@ def _web_status():
             "margin":         round(p.get("margin", 0), 2),
             "margin_pct":     round(p.get("margin", 0) / max(trader.balance, 0.01) * 100, 1),
             "opened_at":      int(p.get("opened_at", 0) * 1000),
+            "pillars":         p.get("pillars", {}),
         })
 
     wins_streak  = trader.consecutive_wins
