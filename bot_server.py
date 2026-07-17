@@ -10509,7 +10509,7 @@ def _web_manifest():
 @_flask_app.route("/sw.js")
 def _web_sw():
     sw = r"""
-const CACHE='cryptobot-v4';
+const CACHE='cryptobot-v5';
 const STATIC=['/manifest.json','/icon/svg'];
 
 self.addEventListener('install',e=>e.waitUntil(
