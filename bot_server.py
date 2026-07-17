@@ -6041,6 +6041,16 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .er-cnt{font-family:var(--fn);font-size:.6rem;color:var(--tx);width:44px;flex-shrink:0;text-align:right}
 /* ── GATE TOTAL LABEL ── */
 .gate-total{padding:4px 16px 2px;font-size:.62rem;color:var(--mu);font-family:var(--fn)}
+/* ── LIVE DIAGNOSTICS PANEL ── */
+.diag-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid var(--bd2)}
+.diag-row:last-child{border-bottom:none}
+.diag-icon{width:20px;font-size:.9rem;line-height:1.4;flex-shrink:0;text-align:center}
+.diag-body{flex:1;min-width:0}
+.diag-title{font-size:.73rem;font-weight:700;line-height:1.3}
+.diag-sub{font-size:.6rem;color:var(--mu);margin-top:2px;line-height:1.4}
+.diag-ok{color:var(--g)}
+.diag-warn{color:var(--y)}
+.diag-err{color:var(--r)}
 /* ── CLOSE POSITION BTN ── */
 .close-btn{font-size:.56rem;font-weight:700;padding:4px 10px;border-radius:6px;
   border:1px solid rgba(255,51,82,.35);background:rgba(255,51,82,.08);
@@ -6815,6 +6825,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="set-row">
       <div><div class="set-lbl">Exchange</div><div class="set-sub" id="set_exch_sub">paper trading</div></div>
       <div class="set-info-val" id="set_exch_val">—</div>
+    </div>
+    <div class="set-section-lbl">Live Trading Diagnostics</div>
+    <div style="padding:4px 16px 14px" id="diag_panel">
+      <div class="no-data">Loading&#8230;</div>
     </div>
   </div>
 </div>
@@ -8209,6 +8223,51 @@ function updateLivePnl(){
 
 /* ── SETTINGS ── */
 let _setMaxPos=2;
+function renderDiagnostics(d){
+  const el=$('diag_panel');if(!el)return;
+  const rows=[];
+  // 1. API keys
+  if(d.live_mode){
+    rows.push({icon:'✅',cls:'diag-ok',title:'API keys loaded',sub:'Exchange: '+(d.exchange||'?').toUpperCase()+' — bot can place real orders'});
+  } else {
+    rows.push({icon:'❌',cls:'diag-err',title:'No API keys found',
+      sub:'Add KRAKEN_API_KEY + KRAKEN_API_SECRET (or BINANCE_API_KEY/BINANCE_API_SECRET) to Railway env vars, then redeploy'});
+  }
+  // 2. Paper mode override
+  if(d.paper_mode){
+    rows.push({icon:'⚠️',cls:'diag-warn',title:'Paper mode is ON',sub:'Toggle "Paper Mode" above to OFF, or send "🔴 go live" in Telegram'});
+  } else if(d.live_mode){
+    rows.push({icon:'✅',cls:'diag-ok',title:'Paper mode is OFF',sub:'Bot will place real orders when signals fire'});
+  }
+  // 3. Shorts on Kraken spot
+  if(d.live_mode && d.exchange==='kraken' && !d.kraken_margin){
+    rows.push({icon:'⚠️',cls:'diag-warn',title:'Kraken spot — SHORT trades disabled',
+      sub:'Set KRAKEN_MARGIN=1 in Railway env to enable short selling (and leverage). Without it only LONG trades execute'});
+  }
+  // 4. Paused
+  if(d.paused){
+    rows.push({icon:'⏸',cls:'diag-warn',title:'Bot is PAUSED',sub:'Press the play button (▶) in the header to resume'});
+  }
+  // 5. Loss streak cooldown
+  if(d.streak_cooldown>0){
+    const mins=Math.ceil(d.streak_cooldown/60);
+    rows.push({icon:'⏳',cls:'diag-warn',title:'30-min loss-streak cooldown active',
+      sub:mins+' min remaining — bot pauses new entries after 3 consecutive losses'});
+  } else if(d.loss_streak>=3){
+    rows.push({icon:'⚠️',cls:'diag-warn',title:d.loss_streak+' consecutive losses — conf gate raised',
+      sub:'Gate floor +'+Math.min(d.loss_streak*3,15)+'% — only very high-confidence signals will fire'});
+  }
+  // 6. All good
+  if(d.live_mode && !d.paper_mode && !d.paused && d.streak_cooldown===0){
+    rows.push({icon:'🟢',cls:'diag-ok',title:'Live trading active',sub:'Bot is scanning and will execute real orders on the next qualifying signal'});
+  }
+  el.innerHTML=rows.map(r=>'<div class="diag-row">'+
+    '<div class="diag-icon">'+r.icon+'</div>'+
+    '<div class="diag-body"><div class="diag-title '+r.cls+'">'+r.title+'</div>'+
+    '<div class="diag-sub">'+r.sub+'</div></div></div>'
+  ).join('');
+}
+
 async function openSettings(){
   try{
     const d=await(await fetch('/settings')).json();
@@ -8226,6 +8285,7 @@ async function openSettings(){
     if(ddEl)ddEl.textContent=_setDdLimit===0?'OFF':_setDdLimit+'%';
     const themeChk=$('set_theme');
     if(themeChk)themeChk.checked=(_theme==='light');
+    renderDiagnostics(d);
   }catch(e){console.warn('settings',e);}
   $('set_sheet').classList.add('open');
 }
@@ -9221,17 +9281,23 @@ def _web_settings():
         if "max_drawdown" in body:
             v = float(body["max_drawdown"])
             _rt_max_drawdown = max(0.0, min(50.0, v))
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    loss_streak = trader.consecutive_losses if trader else 0
+    streak_cool = trader._streak_cool_until if trader else 0
     return _Response(json.dumps({
-        "paper_mode":     _paper_mode,
-        "sim_enabled":    _sim_enabled,
-        "max_positions":  _rt_max_positions if _rt_max_positions > 0 else MAX_POSITIONS,
-        "max_drawdown":   _rt_max_drawdown,
-        "risk_pct":       f"{round(RISK_MIN*100,0):.0f}–{round(RISK_MAX*100,0):.0f}",
-        "live_mode":      LIVE_MODE,
-        "paper_target":   PAPER_TARGET,
-        "scan_universe":  len(SCAN_UNIVERSE),
-        "paused":         _paused,
-        "exchange":       LIVE_EXCHANGE if LIVE_MODE else "paper",
+        "paper_mode":       _paper_mode,
+        "sim_enabled":      _sim_enabled,
+        "max_positions":    _rt_max_positions if _rt_max_positions > 0 else MAX_POSITIONS,
+        "max_drawdown":     _rt_max_drawdown,
+        "risk_pct":         f"{round(RISK_MIN*100,0):.0f}–{round(RISK_MAX*100,0):.0f}",
+        "live_mode":        LIVE_MODE,
+        "paper_target":     PAPER_TARGET,
+        "scan_universe":    len(SCAN_UNIVERSE),
+        "paused":           _paused,
+        "exchange":         LIVE_EXCHANGE if LIVE_MODE else "paper",
+        "kraken_margin":    KRAKEN_MARGIN,
+        "loss_streak":      loss_streak,
+        "streak_cooldown":  max(0, round(streak_cool - time.time())),
     }), mimetype="application/json")
 
 @_flask_app.route("/control", methods=["POST"])
