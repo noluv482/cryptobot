@@ -762,6 +762,8 @@ funding_rates   = {}   # pair → last funding rate float (from Binance futures)
 trending_boost  = {}   # pair → bonus score from social/trending sources
 _paused         = False
 _paper_mode     = False   # when True: forces paper trading even if live keys are loaded
+_sim_enabled    = False   # when True: parallel $2000 sim trader runs alongside live/paper
+_sim_trader     = None    # PaperTrader(force_paper=True, start_balance=2000) created in main()
 _daily_limits   = False   # off by default — enable for real-money discipline
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
@@ -2021,18 +2023,20 @@ def get_next_rank(balance):
 
 # ── Paper trader ──────────────────────────────────────────────────────────────
 class PaperTrader:
-    def __init__(self, no_persist=False):
-        self._no_persist   = no_persist
-        self.balance       = PAPER_START
+    def __init__(self, no_persist=False, force_paper=False, start_balance=None):
+        self._no_persist    = no_persist or force_paper
+        self._force_paper   = force_paper
+        self._start_balance = start_balance if start_balance is not None else PAPER_START
+        self.balance       = self._start_balance
         self.positions     = {}   # pair → position dict (multi-coin)
         self.trades        = []
-        self.peak          = PAPER_START
+        self.peak          = self._start_balance
         self.coin_stats    = {}   # name → {"wins": n, "losses": n}
-        self.day_start_bal = PAPER_START
+        self.day_start_bal = self._start_balance
         self.day_trades    = 0
         self.day_date      = datetime.utcnow().strftime("%Y-%m-%d")
         self.current_rank  = RANKS[0]["name"]
-        self.session_start = PAPER_START
+        self.session_start = self._start_balance
         self._calib        = {}
         self._calib_ts     = 0.0
         # Feature fingerprint cache
@@ -2057,8 +2061,9 @@ class PaperTrader:
         self._kelly_sz  = 0.0
         self._kelly_ts  = 0.0
         self._live_orders  = {}   # pair → kraken txid (live mode only)
-        self._load()
-        if LIVE_MODE:
+        if not force_paper:
+            self._load()
+        if LIVE_MODE and not force_paper:
             if LIVE_EXCHANGE == "binance":
                 real_bal = _binance_get_usdt_balance()
                 exch_label = "Binance"
@@ -2084,6 +2089,10 @@ class PaperTrader:
         if len(self.positions) >= MAX_POSITIONS: return False
         used = sum(p["margin"] for p in self.positions.values())
         return (used / max(self.balance, 0.01)) < MAX_TOTAL_RISK
+
+    def _is_live(self):
+        """True only when this instance should place real orders."""
+        return not self._force_paper and is_live()
 
     def _apply_state(self, d):
         global _paper_mode
@@ -2576,7 +2585,7 @@ class PaperTrader:
             if sig == "BUY"  and self.can_open_new():
                 self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
             elif sig == "SELL" and self.can_open_new():
-                _spot_no_short = is_live() and LIVE_EXCHANGE == "kraken" and not KRAKEN_MARGIN
+                _spot_no_short = self._is_live() and LIVE_EXCHANGE == "kraken" and not KRAKEN_MARGIN
                 if _spot_no_short:
                     log("LIVE", f"SHORT skipped ({name}) — spot mode; set KRAKEN_MARGIN=1 to enable")
                 else:
@@ -2642,7 +2651,7 @@ class PaperTrader:
                         * session_mult
                         * gain_mult,
                         RISK_MAX)
-        if is_live():
+        if self._is_live():
             margin = round(self.balance * risk, 4)
             fill   = price
             if LIVE_EXCHANGE == "kraken_futures":
@@ -2782,11 +2791,12 @@ class PaperTrader:
         session_note = f" 🇺🇸 US×`{session_mult:.2f}`" if session_mult > 1.0 else \
                        f" 🌙 Asia×`{session_mult:.2f}`" if session_mult < 1.0 else ""
         gain_note    = f" 🔒 gain-protect×`{gain_mult:.2f}`" if gain_mult < 1.0 else ""
-        live_note    = f" 🔴 *LIVE ({LIVE_EXCHANGE.upper()})*" if is_live() else ""
+        live_note    = f" 🔴 *LIVE ({LIVE_EXCHANGE.upper()})*" if self._is_live() else ""
         _tier_emoji  = {"Cautious": "🔵", "Moderate": "🟡", "Confident": "🟠", "Max Bet": "🔴"}.get(contract_tier, "⚪")
-        _is_spot_live = is_live() and LIVE_EXCHANGE != "kraken_futures"
+        _is_spot_live = self._is_live() and LIVE_EXCHANGE != "kraken_futures"
         lev_str      = "1x spot" if _is_spot_live else f"*{leverage}× {contract_tier}* {_tier_emoji}"
-        tg(f"📂 *Trade OPENED — {name}*{live_note}\n"
+        _sim_pfx     = "📄 *[SIM]* " if self._force_paper else ""
+        tg(f"{_sim_pfx}📂 *Trade OPENED — {name}*{live_note}\n"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
            f"Confidence: `{conf_pct}%` | Contract: {lev_str}\n"
            f"Margin: `${margin:.2f}` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}{streak_note}{session_note}{gain_note}\n"
@@ -2808,7 +2818,7 @@ class PaperTrader:
         p = self.positions.get(pair)
         if not p: return
 
-        if is_live():
+        if self._is_live():
             contracts = p.get("contracts", 0.0)
             fill      = price
             try:
@@ -2864,27 +2874,28 @@ class PaperTrader:
                      "held_mins": held_mins, "reason": reason, "ts": time.time(),
                      "fkey": p.get("fkey", ""), "hour": datetime.utcnow().hour,
                      "pillars": p.get("pillars", {})}
-        db.log_feature(fkey, pair, pnl > 0)
-        db.log_pillars(p.get("pillars", {}), pnl > 0)
         self.trades.append(trade_rec)
-        db.save_trade({
-            "ts": trade_rec["ts"], "coin": trade_rec["coin"], "pair": pair,
-            "side": trade_rec["side"], "entry": trade_rec["entry"],
-            "exit_price": fill, "pnl": pnl, "held_mins": held_mins,
-            "reason": reason, "confidence": trade_rec["confidence"],
-            "nasdaq_mood": entry_nasdaq,
-            "news_sent": entry_news,
-            "balance_after": self.balance,
-        })
-        _push_sse("trade_close", {"name": name, "side": p["side"],
-                                   "pnl": pnl, "reason": reason,
-                                   "balance": self.balance, "win": pnl >= 0})
-        _send_web_push(
-            f"{'Trade Won ✓' if pnl >= 0 else 'Trade Lost ✗'}",
-            f"{name}: {'+$' if pnl >= 0 else '-$'}{abs(pnl):.2f} · {reason.replace('_', ' ')}"
-        )
-        # Max session drawdown: auto-pause if down MAX_SESSION_DD from peak
-        if self.peak > 0 and (self.peak - self.balance) / self.peak >= MAX_SESSION_DD:
+        if not self._force_paper:
+            db.log_feature(fkey, pair, pnl > 0)
+            db.log_pillars(p.get("pillars", {}), pnl > 0)
+            db.save_trade({
+                "ts": trade_rec["ts"], "coin": trade_rec["coin"], "pair": pair,
+                "side": trade_rec["side"], "entry": trade_rec["entry"],
+                "exit_price": fill, "pnl": pnl, "held_mins": held_mins,
+                "reason": reason, "confidence": trade_rec["confidence"],
+                "nasdaq_mood": entry_nasdaq,
+                "news_sent": entry_news,
+                "balance_after": self.balance,
+            })
+            _push_sse("trade_close", {"name": name, "side": p["side"],
+                                       "pnl": pnl, "reason": reason,
+                                       "balance": self.balance, "win": pnl >= 0})
+            _send_web_push(
+                f"{'Trade Won ✓' if pnl >= 0 else 'Trade Lost ✗'}",
+                f"{name}: {'+$' if pnl >= 0 else '-$'}{abs(pnl):.2f} · {reason.replace('_', ' ')}"
+            )
+        # Max session drawdown: auto-pause live trading if down MAX_SESSION_DD from peak
+        if not self._force_paper and self.peak > 0 and (self.peak - self.balance) / self.peak >= MAX_SESSION_DD:
             with _state_lock:
                 _paused = True
             dd_pct = (self.peak - self.balance) / self.peak * 100
@@ -2901,7 +2912,8 @@ class PaperTrader:
             if self.consecutive_losses >= 3:
                 self._streak_cool_until = time.time() + 1800
                 log("PAPER", f"Loss streak {self.consecutive_losses} → 30-min entry pause", "WARN")
-            _post_loss_analysis(p, pnl, reason, held_mins)
+            if not self._force_paper:
+                _post_loss_analysis(p, pnl, reason, held_mins)
         else:
             self._streak_cool_until = 0.0   # win resets the streak cooldown
         emoji = "✅" if pnl >= 0 else "❌"
@@ -2910,7 +2922,8 @@ class PaperTrader:
         news_icon   = "🟢" if entry_news  == "BULLISH" else "🔴" if entry_news  == "BEARISH" else "⚫"
         move_pct    = round((fill - p["entry"]) / p["entry"] * 100 * (1 if p["side"]=="LONG" else -1), 2)
         fkey_note   = f"\n📊 Signal: `{fkey}`" if fkey else ""
-        tg(f"{emoji} *Trade CLOSED — {name}*\n"
+        _sim_pfx    = "📄 *[SIM]* " if self._force_paper else ""
+        tg(f"{_sim_pfx}{emoji} *Trade CLOSED — {name}*\n"
            f"{'🟢 L' if p['side']=='LONG' else '🔴 S'} "
            f"`${p['entry']:.4f}` → `${fill:.4f}` ({move_pct:+.2f}%)\n"
            f"Reason: `{reason}` | Held: `{held_mins:.0f} min`\n"
@@ -2924,19 +2937,19 @@ class PaperTrader:
                          balance=self.balance,
                          win_rate=self.win_rate)
 
-        new_rank = get_rank(self.balance)
-        if new_rank["name"] != self.current_rank:
-            old = next((r for r in RANKS if r["name"] == self.current_rank), RANKS[0])
-            nxt = get_next_rank(self.balance)
-            tg(f"⬆️ *RANK UP!*\n{old['emoji']} {old['name']} → {new_rank['emoji']} *{new_rank['name']}*\n"
-               f"_{new_rank['unlock']}_\nNext: {nxt['emoji']} {nxt['name']} @ `${nxt['min']:,.0f}`")
-            self.current_rank = new_rank["name"]
-
-        threading.Thread(target=_send_position_chart,
-                         args=(pair, p["entry"], p["side"],
-                               p.get("trail_stop")),
-                         kwargs={"exit_price": fill, "exit_pnl": pnl},
-                         daemon=True).start()
+        if not self._force_paper:
+            new_rank = get_rank(self.balance)
+            if new_rank["name"] != self.current_rank:
+                old = next((r for r in RANKS if r["name"] == self.current_rank), RANKS[0])
+                nxt = get_next_rank(self.balance)
+                tg(f"⬆️ *RANK UP!*\n{old['emoji']} {old['name']} → {new_rank['emoji']} *{new_rank['name']}*\n"
+                   f"_{new_rank['unlock']}_\nNext: {nxt['emoji']} {nxt['name']} @ `${nxt['min']:,.0f}`")
+                self.current_rank = new_rank["name"]
+            threading.Thread(target=_send_position_chart,
+                             args=(pair, p["entry"], p["side"],
+                                   p.get("trail_stop")),
+                             kwargs={"exit_price": fill, "exit_pnl": pnl},
+                             daemon=True).start()
         del self.positions[pair]
         self._save()
 
@@ -2960,6 +2973,16 @@ class PaperTrader:
         if self.win_rate < 40 and len(self.trades) >= 5:
             lessons.append(f"Win rate only {self.win_rate:.0f}%")
         lesson_txt = "\n".join(f"• {l}" for l in lessons) if lessons else "• Not enough data"
+        if self._force_paper:
+            tg(f"📄 *[SIM] Sim account reset* — balance hit `${self.balance:.2f}`\n"
+               f"Trades: `{len(self.trades)}` | 🔄 Resetting to `${self._start_balance:.0f}`...")
+            self.balance       = self._start_balance
+            self.positions     = {}
+            self.trades        = []
+            self.peak          = self._start_balance
+            self.current_rank  = RANKS[0]["name"]
+            self.session_start = self._start_balance
+            return
         tg(f"💀 *BOT ELIMINATED — Restarting*\n"
            f"Balance: `${self.balance:.2f}` | Trades: `{len(self.trades)}`\n"
            f"📚 *Lessons:*\n{lesson_txt}\n🔄 Restarting at `${PAPER_START:.0f}`...")
@@ -3754,6 +3777,16 @@ _TEXT_ACTION: dict = {
     "📋 menu":     "menu",
     "📄 paper":    "toggle_mode",
     "🔴 go live":  "toggle_mode",
+    # sim commands
+    "sim on":      "sim_on",
+    "sim off":     "sim_off",
+    "/sim on":     "sim_on",
+    "/sim off":    "sim_off",
+    "/sim":        "sim_status",
+    "live on":     "live_on",
+    "live off":    "live_off",
+    "/live on":    "live_on",
+    "/live off":   "live_off",
     # text commands
     "/start":      "menu",
     "/menu":       "menu",
@@ -4520,9 +4553,13 @@ def send_menu(trader=None):
     fg_icon = "😱" if fg_val < 25 else "😨" if fg_val < 45 else "😐" if fg_val < 55 else "😄" if fg_val < 75 else "🤑"
     n_pos  = len(trader.positions) if trader else 0
     pos_str = f" | 📂 `{n_pos}/{MAX_POSITIONS}` open" if n_pos else ""
+    sim_line = ""
+    if _sim_trader is not None:
+        sim_status = "ON ✅" if _sim_enabled else "OFF ⏸"
+        sim_line = f"\n📄 Sim: `${_sim_trader.balance:,.2f}` ({sim_status}) — type *sim on/off*"
     header = (
         f"🤖 *CryptoBot* | {status}\n"
-        f"💵 Balance: `{bal}` | 🎯 Goal: `${PAPER_TARGET:,.0f}`\n"
+        f"💵 Balance: `{bal}` | 🎯 Goal: `${PAPER_TARGET:,.0f}`{sim_line}\n"
         f"📈 Top: *{coin}*{pos_str} | {nasdaq_icon} NASDAQ: `{nasdaq}`\n"
         f"{fg_icon} Fear & Greed: `{fg_val}` — _{fear_greed['label']}_"
     )
@@ -4545,9 +4582,56 @@ def _handle_callback(query, trader):
         tg(f"Error: {e}", plain=True)
 
 def _dispatch_callback(data, query, trader):
-    global _paused, _current_coin, _daily_limits, _paper_mode
+    global _paused, _current_coin, _daily_limits, _paper_mode, _sim_enabled
 
     if data == "menu":
+        send_menu(trader)
+
+    elif data == "sim_on":
+        if _sim_trader is None:
+            tg("⚠️ Sim trader not initialized — restart the bot.", plain=True)
+            return
+        _sim_enabled = True
+        tg(f"📄 *Sim trading ON*\n"
+           f"Running `${_sim_trader._start_balance:,.0f}` virtual account in background.\n"
+           f"Sim balance: `${_sim_trader.balance:,.2f}` | Trades: `{len(_sim_trader.trades)}`\n"
+           f"Type *sim off* to disable.\n"
+           f"_Sim trades are labeled_ 📄 *[SIM]*", plain=False)
+
+    elif data == "sim_off":
+        _sim_enabled = False
+        sim_bal = f"${_sim_trader.balance:,.2f}" if _sim_trader else "—"
+        tg(f"📄 *Sim trading OFF*\nFinal sim balance: `{sim_bal}`\nType *sim on* to resume.")
+
+    elif data == "sim_status":
+        if _sim_trader is None:
+            tg("Sim trader not initialized.", plain=True)
+            return
+        wins = sum(1 for t in _sim_trader.trades if t["pnl"] >= 0)
+        losses = len(_sim_trader.trades) - wins
+        wr = round(wins / max(len(_sim_trader.trades), 1) * 100)
+        pnl = round(_sim_trader.balance - _sim_trader._start_balance, 2)
+        tg(f"📄 *Sim Status* — {'ON ✅' if _sim_enabled else 'OFF ⏸'}\n"
+           f"Balance: `${_sim_trader.balance:,.2f}` (started `${_sim_trader._start_balance:,.0f}`)\n"
+           f"PnL: `{'+'if pnl>=0 else ''}{pnl:.2f}$` | WR: `{wr}%`\n"
+           f"Trades: `{len(_sim_trader.trades)}` (W: `{wins}` L: `{losses}`)\n"
+           f"Open positions: `{len(_sim_trader.positions)}`\n"
+           f"Type *sim on* / *sim off* to toggle.")
+
+    elif data == "live_on":
+        if not LIVE_MODE:
+            tg("⚠️ No live API keys loaded — can't enable live trading.", plain=True)
+            return
+        _paper_mode = False
+        tg("🔴 *Live trading ON* — real orders will be placed.")
+        send_menu(trader)
+
+    elif data == "live_off":
+        if not LIVE_MODE:
+            tg("Already in paper mode — no live keys loaded.", plain=True)
+            return
+        _paper_mode = True
+        tg("📄 *Live trading OFF* — switched to paper mode.")
         send_menu(trader)
 
     elif data == "toggle_mode":
@@ -5106,6 +5190,22 @@ def trading_loop(trader):
                 except Exception as e:
                     log("TRADE", f"manage {pair}: {e}", "ERR")
 
+            # ── Manage sim trader positions ────────────────────────────────
+            if _sim_enabled and _sim_trader is not None:
+                for pair in list(_sim_trader.positions.keys()):
+                    sp = _sim_trader.positions.get(pair)
+                    if not sp: continue
+                    try:
+                        price_s = get_price(pair)
+                        try:
+                            closes_s, highs_s, lows_s, _, _ = get_klines(pair)
+                            atr_s = calc_atr(highs_s, lows_s, closes_s)
+                        except Exception:
+                            atr_s = None
+                        _sim_trader.on_signal("HOLD", price_s, 0, 0, sp["name"], 0.0, pair, atr=atr_s)
+                    except Exception as e:
+                        log("TRADE", f"sim manage {pair}: {e}", "ERR")
+
             # ── Scan top-ranked coins for new entry signals ────────────────
             for coin_score in ranked_list[:8]:
                 pair = coin_score["pair"]
@@ -5322,6 +5422,9 @@ def trading_loop(trader):
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*{_pat_note}")
                         trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
                                          atr=atr, fkey=fkey, pillars=pillars)
+                        if _sim_enabled and _sim_trader is not None:
+                            _sim_trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
+                                                  atr=atr, fkey=fkey, pillars=pillars)
 
                     last_sigs[pair] = sig
 
@@ -7891,10 +7994,15 @@ def main():
 
     # Plain-text ping — always shows exchange so we know which keys loaded
     _exch_label = LIVE_EXCHANGE if LIVE_MODE else "paper"
-    ok = tg(f"CryptoBot booting... v2.6 | {_exch_label} | chat_id={TG_CHAT_ID}", plain=True)
+    ok = tg(f"CryptoBot booting... v2.7 | {_exch_label} | chat_id={TG_CHAT_ID}", plain=True)
     log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
 
     trader = PaperTrader()
+
+    # Create the parallel sim trader ($2000 virtual account, always paper)
+    global _sim_trader
+    _sim_trader = PaperTrader(force_paper=True, start_balance=2000.0)
+    log("BOOT", "Sim trader initialized — $2000 virtual account ready (type 'sim on' to start)")
 
     # If paper account burned to zero, auto-reset so trading can continue
     if not LIVE_MODE and trader.balance < 1.0:
