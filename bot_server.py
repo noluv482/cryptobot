@@ -3742,8 +3742,9 @@ def _switcher_loop(trader):
 # message branch of _poll_loop — so buttons work even when callback_query
 # delivery is broken.
 def _build_reply_kb():
-    """Build the Telegram reply keyboard — mode button changes based on current state."""
+    """Build the Telegram reply keyboard — mode/sim buttons reflect current state."""
     mode_btn = {"text": "📄 Paper"} if (LIVE_MODE and not _paper_mode) else {"text": "🔴 Go Live"}
+    sim_btn  = {"text": "⏸ Sim Off"} if _sim_enabled else {"text": "▶ Sim On"}
     return {
         "keyboard": [
             [{"text": "💰 Balance"},  {"text": "📊 Rankings"}],
@@ -3751,7 +3752,7 @@ def _build_reply_kb():
             [{"text": "🧠 Intel"},    {"text": "🏆 Ranks"},  {"text": "🎓 Learn"}],
             [{"text": "🔄 Switch"},   {"text": "⏸ Pause"},  {"text": "▶ Resume"}],
             [{"text": "🔍 Why"},      {"text": "📈 Chart"}, {"text": "📡 Live"}, {"text": "📋 Menu"}],
-            [{"text": "🔬 Backtest"}, mode_btn],
+            [{"text": "🔬 Backtest"}, mode_btn, sim_btn],
         ],
         "resize_keyboard": True,
     }
@@ -3777,9 +3778,11 @@ _TEXT_ACTION: dict = {
     "📋 menu":     "menu",
     "📄 paper":    "toggle_mode",
     "🔴 go live":  "toggle_mode",
-    # sim commands
+    # sim commands (text + keyboard buttons)
     "sim on":      "sim_on",
     "sim off":     "sim_off",
+    "▶ sim on":    "sim_on",
+    "⏸ sim off":   "sim_off",
     "/sim on":     "sim_on",
     "/sim off":    "sim_off",
     "/sim":        "sim_status",
