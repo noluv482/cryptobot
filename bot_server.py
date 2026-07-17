@@ -2062,6 +2062,9 @@ class PaperTrader:
             if LIVE_EXCHANGE == "binance":
                 real_bal = _binance_get_usdt_balance()
                 exch_label = "Binance"
+            elif LIVE_EXCHANGE == "kraken_futures":
+                real_bal = _kf_get_balance()
+                exch_label = "Kraken Futures"
             else:
                 real_bal = _kraken_get_usd_balance()
                 exch_label = "Kraken"
@@ -7862,7 +7865,7 @@ def main():
     except Exception as e:
         log("BOOT", f"deleteWebhook error: {e}", "ERR")
 
-    # Validate Kraken live keys before anything else touches the exchange
+    # Validate live exchange keys before anything else touches the exchange
     if LIVE_MODE:
         if LIVE_EXCHANGE == "binance":
             log("BOOT", "Validating Binance API keys...")
@@ -7871,35 +7874,25 @@ def main():
                 tg("🚨 *Binance API key validation FAILED*\nCheck `BINANCE_API_KEY` and `BINANCE_API_SECRET` env vars.\n_Exiting._", plain=True)
                 sys.exit(1)
             log("BOOT", _c(_C.GREEN + _C.BOLD, "Binance API keys valid — LIVE MODE active"))
+        elif LIVE_EXCHANGE == "kraken_futures":
+            log("BOOT", "Validating Kraken Futures API keys...")
+            if not _kf_validate_keys():
+                log("BOOT", "KRAKEN FUTURES KEY VALIDATION FAILED — check KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET", "ERR")
+                tg("🚨 *Kraken Futures key validation FAILED*\nCheck `KRAKEN_FUTURES_API_KEY` and `KRAKEN_FUTURES_API_SECRET` env vars.\n_Exiting._", plain=True)
+                sys.exit(1)
+            log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken Futures API keys valid — LIVE MODE active"))
         else:
-            log("BOOT", "Validating Kraken API keys...")
+            log("BOOT", "Validating Kraken spot API keys...")
             if not _kraken_validate_keys():
                 log("BOOT", "KRAKEN API KEY VALIDATION FAILED — check KRAKEN_API_KEY / KRAKEN_API_SECRET", "ERR")
                 tg("🚨 *Kraken API key validation FAILED*\nCheck `KRAKEN_API_KEY` and `KRAKEN_API_SECRET` env vars.\n_Exiting._", plain=True)
                 sys.exit(1)
-            log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken API keys valid — LIVE MODE active"))
+            log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken spot API keys valid — LIVE MODE active"))
 
-    # Plain-text ping — always shows mode so we know if API keys are loaded
-    _mode_str = "LIVE" if LIVE_MODE else "PAPER (no API keys)"
-    ok = tg(f"CryptoBot booting... v2.4 | mode={_mode_str} | chat_id={TG_CHAT_ID}", plain=True)
+    # Plain-text ping — always shows exchange so we know which keys loaded
+    _exch_label = LIVE_EXCHANGE if LIVE_MODE else "paper"
+    ok = tg(f"CryptoBot booting... v2.5 | {_exch_label} | chat_id={TG_CHAT_ID}", plain=True)
     log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
-
-    if LIVE_MODE:
-        _exch_disp = "Binance" if LIVE_EXCHANGE == "binance" else "Kraken"
-        # Pre-boot diagnostic: show raw Kraken API response BEFORE PaperTrader init
-        try:
-            _raw_bal = _kraken_private("Balance")
-            _bal_keys = ", ".join(f"{k}={v}" for k, v in _raw_bal.items()) or "empty"
-        except Exception as _be:
-            _bal_keys = f"error: {_be}"
-        try:
-            _raw_tb = _kraken_private("TradeBalance", {"asset": "ZUSD"})
-            _tb_keys = ", ".join(f"{k}={v}" for k, v in _raw_tb.items()) or "empty"
-        except Exception as _tbe:
-            _tb_keys = f"error: {_tbe}"
-        tg(f"🔍 *Kraken balance diagnostic*\n"
-           f"Balance API: `{_bal_keys}`\n"
-           f"TradeBalance API: `{_tb_keys}`", plain=True)
 
     trader = PaperTrader()
 
@@ -7914,8 +7907,12 @@ def main():
         tg("♻️ Paper balance reset to $100 (previous run hit $0)", plain=True)
 
     if LIVE_MODE:
-        _exch_disp = "Binance" if LIVE_EXCHANGE == "binance" else "Kraken"
-        _fee_disp  = "0.10%" if LIVE_EXCHANGE == "binance" else "0.26%"
+        _exch_disp = ("Binance"         if LIVE_EXCHANGE == "binance" else
+                      "Kraken Futures"  if LIVE_EXCHANGE == "kraken_futures" else
+                      "Kraken")
+        _fee_disp  = ("0.10%"  if LIVE_EXCHANGE == "binance" else
+                      "0.05%"  if LIVE_EXCHANGE == "kraken_futures" else
+                      "0.26%")
         tg(f"🔴 *LIVE TRADING MODE — real money on {_exch_disp}*\n"
            f"Balance: `${trader.balance:.2f}` USD\n"
            f"Exchange fee: `{_fee_disp}` per trade\n"
