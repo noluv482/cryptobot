@@ -6898,8 +6898,12 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       <div class="set-info-val" id="set_exch_val">—</div>
     </div>
     <div class="set-section-lbl">Live Trading Diagnostics</div>
-    <div style="padding:4px 16px 14px" id="diag_panel">
-      <div class="no-data">Loading&#8230;</div>
+    <div style="padding:4px 16px 8px">
+      <button class="bt-run-btn" id="livecheck_btn" onclick="runLiveCheck()" style="width:100%;margin:0">&#128269; Run Live Check</button>
+      <div style="font-size:.58rem;color:var(--mu);margin-top:5px;padding:0 2px">Also sends a report to Telegram</div>
+    </div>
+    <div style="padding:0 16px 14px" id="diag_panel">
+      <div class="no-data">Click Run Live Check above</div>
     </div>
   </div>
 </div>
@@ -8339,6 +8343,22 @@ function renderDiagnostics(d){
   ).join('');
 }
 
+async function runLiveCheck(){
+  const btn=$('livecheck_btn');
+  const el=$('diag_panel');
+  if(btn){btn.disabled=true;btn.textContent='Checking…';}
+  if(el)el.innerHTML='<div class="no-data">Running check…</div>';
+  try{
+    const d=await(await fetch('/livecheck_web')).json();
+    renderDiagnostics(d);
+    if(btn){btn.disabled=false;btn.textContent='✅ Done — check Telegram too';}
+    setTimeout(()=>{if(btn){btn.disabled=false;btn.textContent='🔍 Run Live Check';}},4000);
+  }catch(e){
+    if(el)el.innerHTML='<div class="no-data">Error — try again</div>';
+    if(btn){btn.disabled=false;btn.textContent='🔍 Run Live Check';}
+  }
+}
+
 async function openSettings(){
   try{
     const d=await(await fetch('/settings')).json();
@@ -9339,6 +9359,32 @@ def _web_calib_scatter():
                "avg_pnl": round(b["pnl"] / max(b["total"], 1), 2)}
               for b in buckets if b["total"] > 0]
     return _Response(json.dumps({"buckets": result}), mimetype="application/json")
+
+@_flask_app.route("/livecheck_web")
+def _web_livecheck():
+    """Return live-mode diagnostics as JSON and fire the Telegram livecheck."""
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    with _state_lock:
+        paused_now = _paused
+    loss_streak  = trader.consecutive_losses if trader else 0
+    streak_cool  = trader._streak_cool_until  if trader else 0
+    bal          = trader.balance             if trader else 0
+    payload = {
+        "live_mode":       LIVE_MODE,
+        "paper_mode":      _paper_mode,
+        "paused":          paused_now,
+        "exchange":        LIVE_EXCHANGE if LIVE_MODE else "paper",
+        "kraken_margin":   KRAKEN_MARGIN,
+        "loss_streak":     loss_streak,
+        "streak_cooldown": max(0, round(streak_cool - time.time())),
+        "balance":         round(bal, 2),
+    }
+    # Also fire the Telegram diagnostic in the background so it arrives in chat
+    def _fire():
+        if trader:
+            _dispatch_callback("livecheck", {}, trader)
+    threading.Thread(target=_fire, daemon=True).start()
+    return _Response(json.dumps(payload), mimetype="application/json")
 
 @_flask_app.route("/settings", methods=["GET", "POST"])
 def _web_settings():
