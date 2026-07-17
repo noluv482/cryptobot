@@ -931,6 +931,8 @@ _GATE_LOG_INTERVAL = 1800          # log top blockers every 30 min
 # device_id is a UUID generated in the browser's localStorage.
 # {"<uuid>": {"label": "iPhone/iPad", "added_ts": 1234567890}}
 _trusted_devices: dict = {}
+_pending_devices: dict = {}   # {dev_id: {"label","ip","ts","status":"pending"|"allowed"|"blocked"}}
+_PENDING_EXPIRY   = 600       # seconds before an unanswered approval request expires
 
 def _load_trusted_devices():
     global _trusted_devices
@@ -5633,21 +5635,24 @@ def _dispatch_callback(data, query, trader):
             lines.append(f"⚫ {len(neutral)} coins neutral")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
-    elif data.startswith("trust_dev:"):
-        # trust_dev:<uuid>:<label>
-        parts   = data.split(":", 2)
-        dev_id  = parts[1] if len(parts) > 1 else ""
-        label   = parts[2] if len(parts) > 2 else "My device"
-        if not dev_id:
-            tg("⚠️ Could not identify device — no ID received.", plain=True)
-            return
+    elif data.startswith("allow_dev:"):
+        dev_id = data[len("allow_dev:"):]
+        pending = _pending_devices.get(dev_id, {})
+        label   = pending.get("label", "Unknown device")
+        ip      = pending.get("ip", "?")
+        _pending_devices[dev_id] = {**pending, "status": "allowed"}
         _trusted_devices[dev_id] = {"label": label, "added_ts": time.time()}
         _save_trusted_devices()
-        log("AUTH", f"Device trusted via Telegram — {dev_id[:8]}…  '{label}'")
-        tg(f"🛡️ *Device trusted*\nLabel: `{label}`\nFuture logins from this device will show ✅")
+        log("AUTH", f"Device allowed via Telegram — {dev_id[:8]}…  '{label}'  {ip}")
+        tg(f"✅ *Access granted*\n`{label}` @ `{ip}` is now trusted.\n_They can enter their PIN to get in._")
 
-    elif data == "auth_ignore":
-        tg("🚫 Login alert dismissed. Change your PIN if you didn't log in.", plain=True)
+    elif data.startswith("block_dev:"):
+        dev_id = data[len("block_dev:"):]
+        pending = _pending_devices.get(dev_id, {})
+        label   = pending.get("label", "Unknown device")
+        _pending_devices[dev_id] = {**pending, "status": "blocked"}
+        log("AUTH", f"Device blocked via Telegram — {dev_id[:8]}…  '{label}'", "WARN")
+        tg(f"🚫 *Access blocked*\n`{label}` has been denied access to the dashboard.")
 
 def _weekly_summary(trader):
     cutoff = time.time() - 7 * 86400
@@ -9801,34 +9806,60 @@ async function _submitPin(){
       _pinUnlocked=true;
       sessionStorage.setItem('cb_auth','1');
       const lock=$('pin_lock');if(lock)lock.classList.add('gone');
-      if(!r.trusted){
-        // Not a recognised device — offer to trust it
-        const dl=r.device_label||'this device';
-        showToast(`New device detected (${dl})`,
-          `<button onclick="_trustThisDevice('${dl.replace(/'/g,"\\'")}');this.closest('.toast-wrap')?.remove()" `+
-          `style="margin-top:8px;padding:6px 14px;border-radius:8px;border:none;`+
-          `background:var(--b);color:#fff;font-size:.75rem;cursor:pointer">Trust this device</button>`,
-          12000);
-      }
+    }else if(r.pending){
+      _showPinWaiting(device_id,r.device_label||'your device');
+    }else if(r.blocked){
+      const e=$('pin_err');if(e)e.textContent='🚫 Access denied by owner.';
+      _pinBuf=[];_renderPinDots();
     }else{
       $('pin_err').textContent='Incorrect PIN — try again';
-      _pinBuf=[];
-      _renderPinDots();
+      _pinBuf=[];_renderPinDots();
       setTimeout(()=>{if($('pin_err'))$('pin_err').textContent='';},2000);
     }
-  }catch(e){
-    _pinBuf=[];_renderPinDots();
-  }
+  }catch(e){_pinBuf=[];_renderPinDots();}
 }
-async function _trustThisDevice(label){
-  const device_id=_getDeviceId();
-  const pin=prompt('Re-enter your PIN to trust this device:');
-  if(!pin)return;
-  const r=await(await fetch('/trust-device',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({device_id,label,pin})})).json();
-  if(r.ok) showToast('✅ Device trusted — future logins will show as yours','',3500);
-  else showToast('❌ Wrong PIN — device not trusted','',3000);
+function _showPinWaiting(device_id,label){
+  const t=$('pin_title'),s=$('pin_sub'),pad=document.querySelector('.pin-pad'),dots=$('pin_dots'),e=$('pin_err');
+  if(t)t.textContent='Waiting for approval…';
+  if(s)s.textContent='Check Telegram — the owner must allow this device';
+  if(pad)pad.style.display='none';
+  if(dots)dots.style.display='none';
+  if(e){e.textContent='⏳ Tap Allow in Telegram to continue';e.style.color='var(--b)';}
+  _pollAuthStatus(device_id);
+}
+function _resetPinScreen(){
+  const t=$('pin_title'),s=$('pin_sub'),pad=document.querySelector('.pin-pad'),dots=$('pin_dots'),e=$('pin_err');
+  if(t)t.textContent='Enter PIN to unlock';
+  if(s)s.textContent='Your dashboard is PIN protected';
+  if(pad)pad.style.display='';
+  if(dots)dots.style.display='';
+  if(e){e.textContent='';e.style.color='';}
+  _pinBuf=[];_renderPinDots();
+}
+let _authPollTimer=null;
+function _pollAuthStatus(device_id){
+  clearTimeout(_authPollTimer);
+  const start=Date.now();
+  function poll(){
+    if(Date.now()-start>300000){
+      const e=$('pin_err');if(e){e.textContent='Approval timed out — re-enter PIN to try again';e.style.color='var(--r)';}
+      _resetPinScreen();return;
+    }
+    fetch('/auth/status?device_id='+encodeURIComponent(device_id))
+      .then(r=>r.json()).then(r=>{
+        if(r.status==='allowed'){
+          _pinUnlocked=true;sessionStorage.setItem('cb_auth','1');
+          const lock=$('pin_lock');if(lock)lock.classList.add('gone');
+        }else if(r.status==='blocked'){
+          const e=$('pin_err');if(e){e.textContent='🚫 Access denied by owner.';e.style.color='var(--r)';}
+          _resetPinScreen();
+        }else if(r.status==='expired'){
+          const e=$('pin_err');if(e){e.textContent='Approval expired — re-enter PIN to try again';e.style.color='var(--r)';}
+          _resetPinScreen();
+        }else{_authPollTimer=setTimeout(poll,2000);}
+      }).catch(()=>{_authPollTimer=setTimeout(poll,3000);});
+  }
+  _authPollTimer=setTimeout(poll,2000);
 }
 function _requirePin(fn){
   if(!_pinUnlocked){showToast('&#128274; Unlock with PIN first','',2500);return;}
@@ -10728,50 +10759,67 @@ def _web_auth():
     if not DASHBOARD_PIN:
         return _Response('{"ok":true,"trusted":true}', mimetype="application/json")
     ok = body.get("pin", "") == DASHBOARD_PIN
-    if ok:
-        raw_ip  = (_flask_request.headers.get("X-Forwarded-For", "")
-                   or _flask_request.remote_addr or "unknown")
-        ip      = raw_ip.split(",")[0].strip()
-        ua      = _flask_request.headers.get("User-Agent", "")
-        if "iPhone" in ua or "iPad" in ua:
-            device_label = "iPhone/iPad"
-        elif "Android" in ua:
-            device_label = "Android"
-        elif "Windows" in ua:
-            device_label = "Windows"
-        elif "Macintosh" in ua or "Mac OS" in ua:
-            device_label = "Mac"
-        elif "Linux" in ua:
-            device_label = "Linux"
-        else:
-            device_label = "Unknown device"
-        ts_str   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        dev_id   = body.get("device_id", "")
-        is_mine  = bool(dev_id and dev_id in _trusted_devices)
-        if is_mine:
-            label = _trusted_devices[dev_id].get("label", device_label)
-            log("AUTH", f"Your device logged in — {ip}  {label}")
-            tg(f"✅ *Your device logged in*\n"
-               f"Device: `{label}`\n"
-               f"IP: `{ip}` | `{ts_str}`")
-        else:
-            log("AUTH", f"NEW device login — {ip}  {device_label}", "WARN")
-            msg = (f"⚠️ *New device login*\n"
-                   f"IP: `{ip}`\n"
-                   f"Device: `{device_label}`\n"
-                   f"Time: `{ts_str}`\n"
-                   f"_Tap below to trust it, or ignore if this wasn't you._")
-            if dev_id:
-                tg_buttons(msg, [[
-                    {"text": f"✅ Trust {device_label}", "callback_data": f"trust_dev:{dev_id}:{device_label[:20]}"},
-                    {"text": "🚫 Ignore", "callback_data": "auth_ignore"},
-                ]])
-            else:
-                tg(msg + "\n_⚠️ Could not identify device — change your PIN if suspicious._")
-        return _Response(json.dumps({"ok": True, "trusted": is_mine,
-                                     "device_label": device_label}),
-                         mimetype="application/json")
-    return _Response(json.dumps({"ok": False}), mimetype="application/json")
+    if not ok:
+        return _Response(json.dumps({"ok": False}), mimetype="application/json")
+
+    raw_ip = (_flask_request.headers.get("X-Forwarded-For", "")
+              or _flask_request.remote_addr or "unknown")
+    ip     = raw_ip.split(",")[0].strip()
+    ua     = _flask_request.headers.get("User-Agent", "")
+    if "iPhone" in ua or "iPad" in ua:   device_label = "iPhone/iPad"
+    elif "Android" in ua:                device_label = "Android"
+    elif "Windows" in ua:                device_label = "Windows"
+    elif "Macintosh" in ua or "Mac OS" in ua: device_label = "Mac"
+    elif "Linux" in ua:                  device_label = "Linux"
+    else:                                device_label = "Unknown device"
+    ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    dev_id = body.get("device_id", "")
+
+    # Already trusted device — grant access immediately
+    if dev_id and dev_id in _trusted_devices:
+        label = _trusted_devices[dev_id].get("label", device_label)
+        log("AUTH", f"Your device logged in — {ip}  {label}")
+        tg(f"✅ *Your device logged in*\nDevice: `{label}`\nIP: `{ip}` | `{ts_str}`")
+        return _Response(json.dumps({"ok": True, "trusted": True,
+                                     "device_label": label}), mimetype="application/json")
+
+    # Device has a pending approval decision
+    pending = _pending_devices.get(dev_id, {})
+    if pending:
+        status = pending.get("status", "pending")
+        if status == "allowed":
+            # Owner approved via Telegram — grant access and remember device
+            _pending_devices.pop(dev_id, None)
+            _trusted_devices[dev_id] = {"label": device_label, "added_ts": time.time()}
+            _save_trusted_devices()
+            log("AUTH", f"Pending device approved — {ip}  {device_label}")
+            tg(f"✅ *Device trusted*\nDevice: `{device_label}`\nIP: `{ip}`")
+            return _Response(json.dumps({"ok": True, "trusted": True,
+                                         "device_label": device_label}), mimetype="application/json")
+        if status == "blocked":
+            log("AUTH", f"Blocked device attempted login — {ip}  {device_label}", "WARN")
+            return _Response(json.dumps({"ok": False, "blocked": True}), mimetype="application/json")
+        # Still pending — tell the browser to keep polling
+        return _Response(json.dumps({"ok": False, "pending": True,
+                                     "device_label": device_label}), mimetype="application/json")
+
+    # Unknown device — require Telegram approval before granting access
+    if dev_id:
+        _pending_devices[dev_id] = {"label": device_label, "ip": ip,
+                                    "ts": time.time(), "status": "pending"}
+    log("AUTH", f"New device awaiting approval — {ip}  {device_label}", "WARN")
+    msg = (f"🔐 *New device wants access*\n"
+           f"IP: `{ip}`\nDevice: `{device_label}`\nTime: `{ts_str}`\n"
+           f"_Allow it to log in?_")
+    if dev_id:
+        tg_buttons(msg, [[
+            {"text": f"✅ Allow {device_label}", "callback_data": f"allow_dev:{dev_id}"},
+            {"text": "🚫 Block",                 "callback_data": f"block_dev:{dev_id}"},
+        ]])
+    else:
+        tg(msg + "\n_⚠️ Could not identify device — access denied._")
+    return _Response(json.dumps({"ok": False, "pending": bool(dev_id),
+                                 "device_label": device_label}), mimetype="application/json")
 
 @_flask_app.route("/trust-device", methods=["POST"])
 def _web_trust_device():
@@ -10792,6 +10840,21 @@ def _web_trust_device():
     log("AUTH", f"Device trusted — {dev_id[:8]}…  '{label}'  {ip}")
     tg(f"🛡️ *Device trusted*\nLabel: `{label}`\nIP: `{ip}`")
     return _Response('{"ok":true}', mimetype="application/json")
+
+@_flask_app.route("/auth/status")
+def _web_auth_status():
+    dev_id = _flask_request.args.get("device_id", "")
+    if not dev_id:
+        return _Response('{"status":"unknown"}', mimetype="application/json")
+    if dev_id in _trusted_devices:
+        return _Response('{"status":"allowed"}', mimetype="application/json")
+    pending = _pending_devices.get(dev_id)
+    if not pending:
+        return _Response('{"status":"unknown"}', mimetype="application/json")
+    if time.time() - pending.get("ts", 0) > _PENDING_EXPIRY:
+        _pending_devices.pop(dev_id, None)
+        return _Response('{"status":"expired"}', mimetype="application/json")
+    return _Response(json.dumps({"status": pending["status"]}), mimetype="application/json")
 
 @_flask_app.route("/market")
 def _web_market():
