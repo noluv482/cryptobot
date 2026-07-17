@@ -230,9 +230,10 @@ def _print_trade_box(action, name, side, price, **kw):
 def _clean_env(val):
     return val.strip().strip('"').strip("'").strip()
 
-TG_TOKEN   = _clean_env(os.environ.get("TG_TOKEN",   ""))
-TG_CHAT_ID = _clean_env(os.environ.get("TG_CHAT_ID", ""))
-TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+TG_TOKEN        = _clean_env(os.environ.get("TG_TOKEN",        ""))
+TG_CHAT_ID      = _clean_env(os.environ.get("TG_CHAT_ID",      ""))
+TG_URL          = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+DISCORD_WEBHOOK = _clean_env(os.environ.get("DISCORD_WEBHOOK", ""))
 BASE_URL         = "https://api.kraken.com/0/public"
 BINANCE_BASE_URL = "https://api.binance.com"
 
@@ -319,7 +320,9 @@ LEVERAGE_MAX   = 3             # 3x max — was 5x, high leverage amplifies stop
 RISK_MIN       = 0.04          # 4% margin at low confidence
 RISK_MAX       = 0.12          # 12% max — was 20%, limits per-trade blowup size
 MAX_TRADE_GAIN   = 0.12        # full-close at 12% (was 8%) — let winners run longer
-PARTIAL_TAKE_PCT = 0.08        # take 50% profit at 8% (was 5%) — more room before harvest
+PARTIAL_TAKE_PCT = 0.08        # 1st partial take at 8% move (1/3 of position)
+PARTIAL_TAKE_2X  = 0.16        # 2nd partial take at 16% move (another 1/3)
+PYRAMID_PCT      = 0.05        # pyramid add-on trigger: +5% in-trade move
 TRAIL_PCT        = 0.04        # 4% fallback trail on 15-min chart (was 3%)
 ATR_PERIOD       = 14
 ATR_MULTIPLIER   = 2.0         # 2× ATR trail (was 1.5) — gives trade room to breathe
@@ -916,7 +919,8 @@ _gate_counters = {
     "btc_dom": 0, "btc_momentum": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
     "pullback": 0, "momentum": 0, "rr_ratio": 0, "vwap": 0, "spike": 0, "daily_gain": 0,
     "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
-    "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0,
+    "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0, "15m_trend": 0,
+    "orderbook_wall": 0,
 }
 _gate_counter_lock = threading.Lock()
 
@@ -932,6 +936,13 @@ def tg(msg, plain=False):
     _tg_log.append({"ts": time.time(), "msg": clean[:280]})
     if len(_tg_log) > 15:
         _tg_log = _tg_log[-15:]
+    # Discord mirror — strip Telegram markdown, convert *bold* to **bold**
+    if DISCORD_WEBHOOK:
+        try:
+            discord_text = msg.replace("*", "**").replace("`", "`")
+            requests.post(DISCORD_WEBHOOK, json={"content": discord_text[:2000]}, timeout=5)
+        except Exception:
+            pass
     if not TG_TOKEN or not TG_CHAT_ID:
         return False
     try:
@@ -2224,6 +2235,50 @@ def _spread_pct(pair):
         _spread_cache.setdefault(pair, 0.0)
     return _spread_cache.get(pair, 0.0)
 
+# ── Order book wall detector ──────────────────────────────────────────────────
+_ob_cache    = {}   # pair → {"bid_wall": float, "ask_wall": float}
+_ob_cache_ts = {}
+
+def _orderbook_wall(pair, price, target, stop, sig):
+    """Return True if a large volume wall sits between price and the trade target.
+    Uses top 20 order book levels; cached 60 s. Wall = level with ≥15× median volume."""
+    now = time.time()
+    if now - _ob_cache_ts.get(pair, 0) < 60:
+        ob = _ob_cache.get(pair, {})
+    else:
+        try:
+            r = requests.get(f"{BASE_URL}/Depth", params={"pair": pair, "count": 20}, timeout=5)
+            raw = list(r.json().get("result", {}).values())
+            if raw:
+                bids = [(float(p), float(v)) for p, v, _ in raw[0].get("bids", [])]
+                asks = [(float(p), float(v)) for p, v, _ in raw[0].get("asks", [])]
+                def _wall_price(levels, is_ask):
+                    if not levels: return None
+                    vols = [v for _, v in levels]
+                    median_v = sorted(vols)[len(vols)//2]
+                    threshold = max(median_v * 15, 1e-9)
+                    for px, vol in levels:
+                        if vol >= threshold:
+                            return px
+                    return None
+                ob = {"ask_wall": _wall_price(asks, True), "bid_wall": _wall_price(bids, False)}
+            else:
+                ob = {}
+            _ob_cache[pair]    = ob
+            _ob_cache_ts[pair] = now
+        except Exception:
+            _ob_cache.setdefault(pair, {})
+            ob = _ob_cache.get(pair, {})
+    if sig == "BUY":
+        wall = ob.get("ask_wall")
+        if wall and target and price < wall < target:
+            return True  # wall blocks the path to target
+    elif sig == "SELL":
+        wall = ob.get("bid_wall")
+        if wall and target and target < wall < price:
+            return True
+    return False
+
 # ── Paper trader ──────────────────────────────────────────────────────────────
 class PaperTrader:
     def __init__(self, no_persist=False, force_paper=False, start_balance=None):
@@ -2270,6 +2325,13 @@ class PaperTrader:
         self._kelly_pair_ts = {}   # pair → float (timestamp)
         # Pairs eligible for half-size re-entry after a trailing-stop/signal-flip loss
         self._reentry_pairs = set()
+        # Per-pair daily PnL — auto-disable pair when it loses >5% of balance in one day
+        self._pair_day_pnl  = {}   # pair → float (resets daily)
+        self._pair_day_date = {}   # pair → "YYYY-MM-DD" (for daily reset detection)
+        # A/B confidence threshold test (A = current, B = +0.05); auto-adopts after 50 trades each
+        self._ab_stats      = {"A": {"wins": 0, "n": 0}, "B": {"wins": 0, "n": 0}}
+        self._ab_group      = {}   # pair → "A" | "B" (assignment per pair per trade)
+        self._ab_resolved   = False
         self._live_orders  = {}   # pair → kraken txid (live mode only)
         if not force_paper:
             self._load()
@@ -2583,22 +2645,53 @@ class PaperTrader:
             return 0.60
         return 0.0
 
-    def _partial_close(self, price, name, pair):
-        """Close 50% of position at current price and let the rest ride."""
+    def _partial_close(self, price, name, pair, stage=1):
+        """Scale out in thirds: close 1/3 at 1st target, 1/3 at 2nd, let last 1/3 trail."""
         p = self.positions.get(pair)
-        if not p or p.get("partial_taken"): return
+        if not p: return
+        if stage == 1 and p.get("partial_1_taken"): return
+        if stage == 2 and p.get("partial_2_taken"): return
         move = (price - p["entry"]) / p["entry"]
         if p["side"] == "SHORT": move = -move
-        pnl = round(move * (p["margin"] / 2) * p.get("leverage", LEVERAGE_MIN), 4)
-        self.balance = round(self.balance + pnl, 4)
-        p["contracts"]     = round(p["contracts"] / 2, 6)
-        p["margin"]        = round(p["margin"] / 2, 4)
-        p["partial_taken"] = True
+        frac = 1 / 3
+        pnl = round(move * (p["margin"] * frac) * p.get("leverage", LEVERAGE_MIN), 4)
+        self.balance      = round(self.balance + pnl, 4)
+        p["contracts"]    = round(p["contracts"] * (1 - frac), 6)
+        p["margin"]       = round(p["margin"]    * (1 - frac), 4)
+        if stage == 1:
+            p["partial_1_taken"] = True
+            label = "⅓"
+        else:
+            p["partial_2_taken"] = True
+            p["partial_taken"]   = True   # final partial — no more stages
+            label = "⅔"
         self.peak = max(self.peak, self.balance)
         self._save()
-        tg(f"🎯 *Partial Take-Profit — {name}*\n"
-           f"Closed 50% @ `${price:.4f}` | PnL: `+{pnl:.2f}$`\n"
-           f"Remaining half still running | Balance: `${self.balance:.2f}`")
+        tg(f"🎯 *{label} Partial TP — {name}*\n"
+           f"Closed {label} @ `${price:.4f}` | PnL: `+{pnl:.2f}$`\n"
+           f"Remaining {('⅔' if stage==1 else '⅓')} still running | Balance: `${self.balance:.2f}`")
+
+    def _pyramid_add(self, price, name, pair):
+        """Add 50% of current margin to a winning position at +5% move."""
+        p = self.positions.get(pair)
+        if not p or p.get("pyramided"): return
+        add_margin = round(p["margin"] * 0.5, 4)
+        if add_margin < 1.0 or add_margin > self.balance * 0.06: return
+        lev = p.get("leverage", LEVERAGE_MIN)
+        add_contracts = round(add_margin * lev / max(price, 1e-9), 8)
+        total_contracts = p["contracts"] + add_contracts
+        avg_entry = round(
+            (p["entry"] * p["contracts"] + price * add_contracts) / max(total_contracts, 1e-9), 6
+        )
+        p["contracts"] = round(total_contracts, 6)
+        p["margin"]    = round(p["margin"] + add_margin, 4)
+        p["entry"]     = avg_entry
+        p["pyramided"] = True
+        self.balance   = round(self.balance - add_margin, 4)
+        self._save()
+        tg(f"📈 *Pyramid Add — {name}*\n"
+           f"Added `${add_margin:.2f}` @ `${price:.4f}` | Avg entry: `${avg_entry:.4f}`\n"
+           f"Total margin: `${p['margin']:.2f}` | Balance: `${self.balance:.2f}`")
 
     @property
     def wins(self):
@@ -2729,9 +2822,27 @@ class PaperTrader:
             if side == "SHORT": move = -move
             mins_open = (time.time() - p.get("opened_at", time.time())) / 60
 
-            # Partial take-profit: book 50% at PARTIAL_TAKE_PCT, let rest ride
-            if not p.get("partial_taken") and move >= PARTIAL_TAKE_PCT:
-                self._partial_close(price, name, pair)
+            # Scale out in thirds: 1/3 at PARTIAL_TAKE_PCT, 1/3 at 2×, let last 1/3 trail
+            if not p.get("partial_1_taken") and move >= PARTIAL_TAKE_PCT:
+                self._partial_close(price, name, pair, stage=1)
+            elif p.get("partial_1_taken") and not p.get("partial_2_taken") and move >= PARTIAL_TAKE_2X:
+                self._partial_close(price, name, pair, stage=2)
+
+            # Pyramiding: add 50% of current size at +5% in-trade move (once per trade)
+            if not p.get("pyramided") and move >= PYRAMID_PCT:
+                self._pyramid_add(price, name, pair)
+
+            # BTC correlation-triggered exit: close alt longs if BTC drops ≥3% in 30 min
+            if pair != "XBTUSD" and side == "LONG" and not p.get("corr_exit_done"):
+                _now_m2 = time.time()
+                _hist_corr = [_pr for _ts, _pr in _btc_price_hist if _ts >= _now_m2 - 1800]
+                if len(_hist_corr) >= 3:
+                    _btc_drop = (_hist_corr[-1] - _hist_corr[0]) / max(_hist_corr[0], 1e-9)
+                    if _btc_drop <= -0.03:
+                        log("PAPER", f"{name} BTC-correlation exit — BTC down {_btc_drop*100:.1f}%")
+                        p["corr_exit_done"] = True
+                        self._close(price, name, "btc_correlation", pair)
+                        closed_this_tick = True
 
             # Update trailing stop using stored ATR distance (or fixed % fallback)
             atr_dist = p.get("atr_dist", price * TRAIL_PCT)
@@ -2822,6 +2933,13 @@ class PaperTrader:
                            self._min_conf_threshold(pair),
                            self._dynamic_conf_gate(),
                            self._hourly_conf_gate())
+            # A/B confidence test: B group uses +0.05 threshold; auto-adopt winner at 50 trades each
+            if not self._ab_resolved and sig in ("BUY", "SELL"):
+                import random as _rnd
+                if pair not in self._ab_group:
+                    self._ab_group[pair] = "A" if _rnd.random() < 0.5 else "B"
+                if self._ab_group[pair] == "B":
+                    confidence = min(1.0, round(confidence + 0.05, 2))
             if sig in ("BUY", "SELL") and confidence < min_conf:
                 with _gate_counter_lock: _gate_counters["min_conf"] += 1
                 return
@@ -3170,6 +3288,36 @@ class PaperTrader:
                f"Balance dropped `{dd_pct:.1f}%` from peak `${self.peak:.2f}`\n"
                f"Current: `${self.balance:.2f}` | Tap ▶ Resume to continue")
 
+        # Per-pair daily PnL — auto-disable pair for the day when it loses > 5% of balance
+        now_date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        if self._pair_day_date.get(pair) != now_date_str:
+            self._pair_day_pnl[pair]  = 0.0
+            self._pair_day_date[pair] = now_date_str
+        self._pair_day_pnl[pair] = round(self._pair_day_pnl.get(pair, 0.0) + pnl, 4)
+        if self._pair_day_pnl[pair] < -(self.balance * 0.05):
+            _disabled_pairs.add(pair)
+            tg(f"⚠️ *{name} auto-disabled for the day* — pair lost `${abs(self._pair_day_pnl[pair]):.2f}` today (>5% of balance)")
+            log("PAPER", f"{name} per-pair DD limit hit — disabled for today", "WARN")
+
+        # A/B test result tracking — compare win rates; auto-adopt winner at 50 trades each
+        if not self._ab_resolved:
+            grp = self._ab_group.pop(pair, None)
+            if grp:
+                self._ab_stats[grp]["n"] += 1
+                if pnl > 0:
+                    self._ab_stats[grp]["wins"] += 1
+                a_n = self._ab_stats["A"]["n"]
+                b_n = self._ab_stats["B"]["n"]
+                if a_n >= 50 and b_n >= 50:
+                    a_wr = self._ab_stats["A"]["wins"] / max(a_n, 1)
+                    b_wr = self._ab_stats["B"]["wins"] / max(b_n, 1)
+                    winner = "B" if b_wr > a_wr + 0.05 else "A"
+                    self._ab_resolved = True
+                    tg(f"🧪 *A/B Test Complete* — winner: `{winner}`\n"
+                       f"A WR: `{a_wr*100:.1f}%` ({a_n} trades) | B WR: `{b_wr*100:.1f}%` ({b_n} trades)\n"
+                       f"{'B (+0.05 confidence) adopted' if winner=='B' else 'A (baseline) retained'}")
+                    log("PAPER", f"A/B resolved → {winner} (A {a_wr*100:.1f}% vs B {b_wr*100:.1f}%)")
+
         # Cooldown: block re-entry on this pair after a loss
         if pnl < 0:
             if reason in ("trailing stop", "signal flip"):
@@ -3328,6 +3476,8 @@ class SignalEngine:
         self._pillar_w_ts     = 0.0
         self._hour_win_rates  = {}    # hour (int) → {"n": n, "wr": wr}
         self._hour_w_ts       = 0.0
+        self._dow_win_rates   = {}    # weekday int (0=Mon) → {"n": int, "wr": float}
+        self._dow_w_ts        = 0.0
 
     def reset(self):
         self.above_ticks = 0
@@ -3588,6 +3738,27 @@ class SignalEngine:
                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
                 sig = "HOLD"
 
+        # 15m confirmation — short-term EMA must also agree with signal direction
+        if sig in ("BUY", "SELL"):
+            _htf15 = _htf_trend(current_pair, interval=15, limit=50)
+            if _htf15 == "BEAR" and sig == "BUY":
+                with _gate_counter_lock: _gate_counters["15m_trend"] += 1
+                sig = "HOLD"
+            elif _htf15 == "BULL" and sig == "SELL":
+                with _gate_counter_lock: _gate_counters["15m_trend"] += 1
+                sig = "HOLD"
+
+        # Order book wall gate — large volume wall between price and target
+        if sig in ("BUY", "SELL"):
+            try:
+                _tgt = plan.get("exit", 0)
+                _stp = plan.get("stop", 0)
+                if _orderbook_wall(current_pair, price, _tgt, _stp, sig):
+                    with _gate_counter_lock: _gate_counters["orderbook_wall"] += 1
+                    sig = "HOLD"
+            except Exception:
+                pass
+
         # MACD divergence gate — divergence signals momentum exhaustion
         if macd_div == "BEARISH_DIV" and sig == "BUY":
             with _gate_counter_lock: _gate_counters["macd_div"] += 1
@@ -3749,6 +3920,35 @@ class SignalEngine:
                 confidence = min(round(confidence + 0.05, 2), 1.0)
             elif hour_data["wr"] <= 35:
                 confidence = max(round(confidence - 0.10, 2), 0.0)
+
+        # Day-of-week seasonality: tilt confidence based on historical weekday win rate
+        if sig in ("BUY", "SELL"):
+            now_dow = datetime.utcnow()
+            cur_dow = now_dow.weekday()   # 0=Mon … 6=Sun
+            now_ts_dow = time.time()
+            if now_ts_dow - self._dow_w_ts > 3600:
+                _tref = _web_trader_ref[0] if _web_trader_ref else None
+                if _tref and len(_tref.trades) >= 10:
+                    _dow_agg: dict = {}
+                    for _t in list(_tref.trades[-150:]):
+                        _ts = _t.get("ts", 0)
+                        if not _ts: continue
+                        _d = datetime.utcfromtimestamp(_ts).weekday()
+                        _dow_agg.setdefault(_d, {"wins": 0, "n": 0})
+                        _dow_agg[_d]["n"] += 1
+                        if _t["pnl"] > 0:
+                            _dow_agg[_d]["wins"] += 1
+                    self._dow_win_rates = {
+                        _d: {"wr": v["wins"] / v["n"] * 100, "n": v["n"]}
+                        for _d, v in _dow_agg.items() if v["n"] >= 4
+                    }
+                self._dow_w_ts = now_ts_dow
+            dow_stats = self._dow_win_rates.get(cur_dow)
+            if dow_stats:
+                if dow_stats["wr"] < 35:
+                    confidence = max(0.0, round(confidence - 0.10, 2))
+                elif dow_stats["wr"] > 65:
+                    confidence = min(1.0, round(confidence + 0.05, 2))
 
         # Market breadth: how many scanned coins are trending in the signal direction?
         # Strong agreement = macro move (boost); isolated signal = noise (penalty)
@@ -9763,6 +9963,22 @@ def _next_quiz_question():
             "correct_count": _quiz_state.get("correct", 0),
             "asked": _quiz_state.get("asked", 0)}
 
+def _compute_pair_ev(trader, pair):
+    """Expected value per signal for the given pair: EV = WR*avg_win - (1-WR)*avg_loss."""
+    if not trader or not pair:
+        return None
+    trades = [t for t in trader.trades if t.get("pair") == pair]
+    if len(trades) < 5:
+        return None
+    wins   = [t["pnl"] for t in trades if t["pnl"] > 0]
+    losses = [abs(t["pnl"]) for t in trades if t["pnl"] < 0]
+    wr     = len(wins) / len(trades)
+    avg_w  = sum(wins)   / len(wins)   if wins   else 0.0
+    avg_l  = sum(losses) / len(losses) if losses else 0.0
+    ev     = round(wr * avg_w - (1.0 - wr) * avg_l, 2)
+    return {"ev": ev, "wr": round(wr * 100, 1), "n": len(trades),
+            "avg_win": round(avg_w, 2), "avg_loss": round(avg_l, 2)}
+
 def _calc_balance_projection(trader):
     """Return 7-day daily rate and days-to-next-milestone for the balance projection card."""
     if not trader or not trader.trades:
@@ -9949,6 +10165,9 @@ def _web_status():
         "xp_info":               _compute_xp_and_level(trader),
         "profitable_day_streak": _profitable_day_streak(trader),
         "daily_challenge":       _get_daily_challenge(trader),
+        "pair_ev":               _compute_pair_ev(trader, _current_coin.get("pair", "")),
+        "ab_stats":              {**trader._ab_stats, "resolved": trader._ab_resolved},
+        "pair_day_pnl":          {pr: round(v, 2) for pr, v in trader._pair_day_pnl.items()},
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 

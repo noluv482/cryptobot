@@ -78,13 +78,16 @@ def load_csv(path):
     return out
 
 
-def run(candles, pair, name):
+def run(candles, pair, name, verbose=True):
+    """Run a single backtest pass. Returns summary dict."""
     n = len(candles)
     warmup = bs.CANDLE_LIMIT
     if n <= warmup + 5:
-        print(f"Not enough candles ({n}); need > {warmup + 5}. "
-              f"Use a smaller --interval or a CSV with more history.")
-        return None
+        if verbose:
+            print(f"Not enough candles ({n}); need > {warmup + 5}. "
+                  f"Use a smaller --interval or a CSV with more history.")
+        return {"return_pct": 0, "trades": 0, "win_rate": 0,
+                "profit_factor": 0, "max_dd": 0, "blew_up": False}
 
     trader = bs.PaperTrader(no_persist=True)   # fresh, never touches DB/file
     trader._eliminate = lambda: None           # disable respawn; we break instead
@@ -133,10 +136,10 @@ def run(candles, pair, name):
         if trader.balance >= bs.PAPER_TARGET:
             break
 
-    return summarize(trader, equity, blew_up, candles, name)
+    return summarize(trader, equity, blew_up, candles, name, verbose=verbose)
 
 
-def summarize(trader, equity, blew_up, candles, name):
+def summarize(trader, equity, blew_up, candles, name, verbose=True):
     trades = trader.trades
     start  = bs.PAPER_START
     end    = trader.balance
@@ -163,62 +166,134 @@ def summarize(trader, equity, blew_up, candles, name):
     span_days = (candles[-1]["t"] - candles[0]["t"]) / 86400 if len(candles) > 1 else 0
 
     line = "─" * 52
-    print(f"\n{line}")
-    print(f"  BACKTEST — {name}   ({span_days:.1f} days, {len(candles)} candles)")
-    print(line)
-    print(f"  Start balance      ${start:,.2f}")
-    print(f"  End balance        ${end:,.2f}")
-    print(f"  Total return       {(end/start - 1)*100:+.2f}%")
-    print(f"  Trades             {len(trades)}")
-    print(f"  Win rate           {wr:.1f}%   ({len(wins)}W / {len(losses)}L)")
-    print(f"  Profit factor      {pf:.2f}")
-    print(f"  Avg win / loss     ${avg_w:.2f} / ${avg_l:.2f}")
-    print(f"  Expectancy/trade   ${expectancy:+.3f}")
-    print(f"  Max drawdown       {max_dd*100:.1f}%")
-    if trades:
-        print(f"  Best / worst       ${max(pnls):+.2f} / ${min(pnls):+.2f}")
-    if blew_up:
-        print(f"  ⚠️  ACCOUNT HIT FLOOR (${bs.PAPER_FLOOR:.0f}) — strategy blew up.")
-    print(line)
+    if verbose:
+        print(f"\n{line}")
+        print(f"  BACKTEST — {name}   ({span_days:.1f} days, {len(candles)} candles)")
+        print(line)
+        print(f"  Start balance      ${start:,.2f}")
+        print(f"  End balance        ${end:,.2f}")
+        print(f"  Total return       {(end/start - 1)*100:+.2f}%")
+        print(f"  Trades             {len(trades)}")
+        print(f"  Win rate           {wr:.1f}%   ({len(wins)}W / {len(losses)}L)")
+        print(f"  Profit factor      {pf:.2f}")
+        print(f"  Avg win / loss     ${avg_w:.2f} / ${avg_l:.2f}")
+        print(f"  Expectancy/trade   ${expectancy:+.3f}")
+        print(f"  Max drawdown       {max_dd*100:.1f}%")
+        if trades:
+            print(f"  Best / worst       ${max(pnls):+.2f} / ${min(pnls):+.2f}")
+        if blew_up:
+            print(f"  ⚠️  ACCOUNT HIT FLOOR (${bs.PAPER_FLOOR:.0f}) — strategy blew up.")
+        print(line)
 
-    # write an equity curve for your dashboard / further analysis
-    out_csv = f"equity_{name}.csv"
-    try:
-        with open(out_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["step", "balance"])
-            for idx, e in enumerate(equity):
-                w.writerow([idx, round(e, 4)])
-        print(f"  Equity curve → {out_csv}")
-    except Exception as e:
-        print(f"  (could not write equity curve: {e})")
+        # write an equity curve for your dashboard / further analysis
+        out_csv = f"equity_{name}.csv"
+        try:
+            with open(out_csv, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["step", "balance"])
+                for idx, e in enumerate(equity):
+                    w.writerow([idx, round(e, 4)])
+            print(f"  Equity curve → {out_csv}")
+        except Exception as e:
+            print(f"  (could not write equity curve: {e})")
 
     return {"return_pct": (end/start - 1)*100, "trades": len(trades),
             "win_rate": wr, "profit_factor": pf, "max_dd": max_dd*100,
             "blew_up": blew_up}
 
 
+def walk_forward(candles, pair, interval_mins, window_days=30, step_days=15):
+    """Run walk-forward analysis: slide a 30-day window across the full dataset in 15-day steps.
+    Reports edge stability — does the strategy stay profitable across different time periods?"""
+    secs_per_candle = interval_mins * 60
+    window_candles  = int(window_days  * 86400 / secs_per_candle)
+    step_candles    = int(step_days   * 86400 / secs_per_candle)
+    min_candles     = 50   # need at least this many to run a window
+
+    if len(candles) < window_candles + step_candles:
+        print(f"Not enough candles for walk-forward (need ≥ {window_candles + step_candles}, got {len(candles)})")
+        return
+
+    line = "─" * 64
+    print(f"\n{line}")
+    print(f"  WALK-FORWARD — {pair}  window={window_days}d  step={step_days}d")
+    print(line)
+    print(f"  {'Window':26s}  {'Return':>8s}  {'WR':>6s}  {'Trades':>7s}  {'PF':>5s}  {'MaxDD':>7s}")
+    print(line)
+
+    results = []
+    idx = 0
+    while idx + window_candles <= len(candles):
+        window = candles[idx: idx + window_candles]
+        if len(window) < min_candles:
+            idx += step_candles
+            continue
+        from datetime import datetime as _dt
+        t0 = _dt.utcfromtimestamp(window[0]["t"]).strftime("%Y-%m-%d")
+        t1 = _dt.utcfromtimestamp(window[-1]["t"]).strftime("%Y-%m-%d")
+        label = f"{t0} → {t1}"
+        res = run(window, pair, label, verbose=False)
+        sign = "+" if res["return_pct"] >= 0 else ""
+        flag = " ✗" if res["blew_up"] else (" ✓" if res["return_pct"] >= 0 else "")
+        print(f"  {label:26s}  {sign}{res['return_pct']:>6.1f}%  {res['win_rate']:>5.1f}%"
+              f"  {res['trades']:>7d}  {res['profit_factor']:>5.2f}  {res['max_dd']:>6.1f}%{flag}")
+        results.append(res)
+        idx += step_candles
+
+    if not results:
+        print("  No windows completed.")
+        return
+
+    profitable = sum(1 for r in results if r["return_pct"] > 0 and not r["blew_up"])
+    avg_ret   = sum(r["return_pct"] for r in results) / len(results)
+    avg_wr    = sum(r["win_rate"]   for r in results) / len(results)
+    avg_dd    = sum(r["max_dd"]     for r in results) / len(results)
+    print(line)
+    print(f"  Windows: {len(results)}  Profitable: {profitable}/{len(results)}"
+          f"  Avg return: {avg_ret:+.1f}%  Avg WR: {avg_wr:.1f}%  Avg MaxDD: {avg_dd:.1f}%")
+    if profitable / max(len(results), 1) < 0.5:
+        print("  ⚠️  Edge is NOT stable — fewer than 50% of windows profitable.")
+    elif profitable / max(len(results), 1) < 0.7:
+        print("  ⚠️  Edge is MARGINAL — review gate settings before going live.")
+    else:
+        print("  ✓  Edge appears stable across time periods.")
+    print(line)
+
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Backtest CryptoBot's live strategy.")
-    ap.add_argument("--pair", default="XBTUSD", help="Kraken pair, e.g. XBTUSD, ETHUSD")
+    ap = argparse.ArgumentParser(description="CryptoBot backtester")
+    ap.add_argument("--pair",     default="XBTUSD")
     ap.add_argument("--interval", type=int, default=60,
-                    help="Candle minutes: 1,5,15,30,60,240,1440 (default 60)")
-    ap.add_argument("--csv", help="Load candles from CSV instead of Kraken")
+                    help="Candle interval in minutes (Kraken fetch only)")
+    ap.add_argument("--csv",      default="",  help="Path to candle CSV")
+    ap.add_argument("--walk-forward", action="store_true",
+                    help="Run walk-forward analysis across sliding windows")
+    ap.add_argument("--wf-window", type=int, default=30,
+                    help="Walk-forward window size in days (default 30)")
+    ap.add_argument("--wf-step",   type=int, default=15,
+                    help="Walk-forward step size in days (default 15)")
     args = ap.parse_args()
 
-    name = args.pair
     if args.csv:
-        if not os.path.exists(args.csv):
-            print(f"CSV not found: {args.csv}")
-            sys.exit(1)
-        print(f"Loading candles from {args.csv} ...")
         candles = load_csv(args.csv)
+        interval = args.interval
+        name = os.path.splitext(os.path.basename(args.csv))[0]
     else:
-        print(f"Fetching {args.pair} @ {args.interval}m from Kraken ...")
+        print(f"Fetching Kraken OHLC: {args.pair} interval={args.interval}m …")
         candles = fetch_kraken(args.pair, args.interval)
+        interval = args.interval
+        name = f"{args.pair}_{args.interval}m"
 
-    print(f"Loaded {len(candles)} candles.")
-    run(candles, args.pair, name)
+    if not candles:
+        print("No candles loaded. Exiting.")
+        sys.exit(1)
+
+    if args.walk_forward:
+        walk_forward(candles, args.pair, interval,
+                     window_days=args.wf_window, step_days=args.wf_step)
+
+    run(candles, args.pair, name, verbose=True)
 
 
 if __name__ == "__main__":
