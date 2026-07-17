@@ -5810,7 +5810,6 @@ def _dispatch_callback(data, query, trader):
             tg(f"⏭ *Trade skipped* — {pv['name']}")
 
     elif data == "toggle_preview":
-        global _trade_preview_mode
         _trade_preview_mode = not _trade_preview_mode
         state = "ON ✅" if _trade_preview_mode else "OFF"
         tg(f"🔔 *Trade Preview Mode {state}*\n"
