@@ -7879,8 +7879,9 @@ def main():
                 sys.exit(1)
             log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken API keys valid — LIVE MODE active"))
 
-    # Plain-text ping — proves connectivity before any markdown
-    ok = tg(f"CryptoBot booting... v2.3 (chat_id={TG_CHAT_ID})", plain=True)
+    # Plain-text ping — always shows mode so we know if API keys are loaded
+    _mode_str = "LIVE" if LIVE_MODE else "PAPER (no API keys)"
+    ok = tg(f"CryptoBot booting... v2.4 | mode={_mode_str} | chat_id={TG_CHAT_ID}", plain=True)
     log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
 
     if LIVE_MODE:
@@ -7901,6 +7902,16 @@ def main():
            f"TradeBalance API: `{_tb_keys}`", plain=True)
 
     trader = PaperTrader()
+
+    # If paper account burned to zero, auto-reset so trading can continue
+    if not LIVE_MODE and trader.balance < 1.0:
+        log("BOOT", "Paper balance at $0 — resetting to $100 for fresh start", "WRN")
+        trader.balance = 100.0
+        trader.peak = 100.0
+        trader.day_start_bal = 100.0
+        trader.session_start = 100.0
+        trader._save()
+        tg("♻️ Paper balance reset to $100 (previous run hit $0)", plain=True)
 
     if LIVE_MODE:
         _exch_disp = "Binance" if LIVE_EXCHANGE == "binance" else "Kraken"
