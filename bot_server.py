@@ -2435,6 +2435,22 @@ class PaperTrader:
                 self.positions = {}
         else:
             self.positions = pos_data
+        # Persist daily counters and streak state across restarts
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        saved_date = d.get("day_date", "")
+        if saved_date == today:
+            self.day_date           = today
+            self.day_start_bal      = d.get("day_start_bal", self.balance)
+            self.day_trades         = d.get("day_trades", 0)
+            self._streak_reset_len  = d.get("streak_reset_len", 0)
+            self._streak_cool_until = d.get("streak_cool_until", 0.0)
+        else:
+            # New day — fresh counters and reset the streak
+            self.day_date           = today
+            self.day_start_bal      = self.balance
+            self.day_trades         = 0
+            self._streak_reset_len  = len(self.trades)
+            self._streak_cool_until = 0.0
 
     def _load(self):
         if self._no_persist:
@@ -2467,7 +2483,12 @@ class PaperTrader:
         return {"balance": self.balance, "peak": self.peak,
                 "trades": self.trades[-1000:], "positions": self.positions,
                 "current_rank": self.current_rank,
-                "paper_mode": _paper_mode}
+                "paper_mode": _paper_mode,
+                "day_date":           self.day_date,
+                "day_start_bal":      self.day_start_bal,
+                "day_trades":         self.day_trades,
+                "streak_reset_len":   self._streak_reset_len,
+                "streak_cool_until":  self._streak_cool_until}
 
     def _save_file(self):
         try:
@@ -2559,9 +2580,13 @@ class PaperTrader:
     def _reset_day_if_needed(self):
         today = datetime.utcnow().strftime("%Y-%m-%d")
         if today != self.day_date:
-            self.day_date      = today
-            self.day_start_bal = self.balance
-            self.day_trades    = 0
+            self.day_date           = today
+            self.day_start_bal      = self.balance
+            self.day_trades         = 0
+            self._streak_reset_len  = len(self.trades)  # fresh loss streak each day
+            self._streak_cool_until = 0.0               # no cooldown carries into new day
+            self._save()
+            log("PAPER", f"New day — daily counters + loss streak reset")
 
     def _risk_multiplier(self):
         """Shrink position size after losing streaks to survive choppy markets."""
@@ -5127,22 +5152,50 @@ def _cmd_learn(trader):
         msg = msg[:3800].rsplit("\n", 1)[0] + "\n_...truncated_"
     tg_buttons(msg, [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
-def _cmd_why():
+def _cmd_why(trader=None):
     """Handler for /why — show which gates are currently blocking + today's counts."""
     with _gate_counter_lock:
         counts = dict(_gate_counters)
     total_blocked = sum(counts.values())
     lines = [
-        "*🔍 Gate Telemetry — Today*",
+        "*🔍 Why Isn't It Trading?*",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Total signals intercepted: `{total_blocked}`",
-        "",
     ]
+
+    # ── Active blocks (hard stops before even looking at signals) ─────────────
+    blocks = []
+    if trader:
+        now = time.time()
+        streak = trader.consecutive_losses
+        cool   = trader._streak_cool_until
+        if cool > now:
+            mins_left = int((cool - now) / 60) + 1
+            blocks.append(f"⏸ *Loss streak cooldown* — `{mins_left}m` left (streak: `{streak}` losses)")
+        elif streak >= 3:
+            blocks.append(f"⚠️ *Loss streak `{streak}`* — size at `{int(trader._risk_multiplier()*100)}%`, confidence floor raised `+{min(streak*3,15)}%`")
+        day_pnl_pct = (trader.balance - trader.day_start_bal) / max(trader.day_start_bal, 0.01)
+        if day_pnl_pct <= -DAILY_LOSS_LIMIT:
+            blocks.append(f"🛑 *Daily loss limit hit* — down `{day_pnl_pct*100:.1f}%` today (limit: `{DAILY_LOSS_LIMIT*100:.0f}%`)")
+        if trader.day_trades >= MAX_TRADES_DAY:
+            blocks.append(f"🛑 *Daily trade limit* — `{trader.day_trades}/{MAX_TRADES_DAY}` trades used today")
+        disabled = list(_disabled_pairs)
+        if disabled:
+            blocks.append(f"🚫 *Pairs auto-disabled today:* `{', '.join(disabled)}`")
+        if _paused:
+            blocks.append("⏸ *Bot is paused*")
+    if blocks:
+        lines.append("*🚨 Active blocks:*")
+        lines.extend(blocks)
+        lines.append("")
+
+    # ── Gate counters ──────────────────────────────────────────────────────────
+    lines.append(f"*📊 Gate hits today:* `{total_blocked}` signals intercepted")
     gate_labels = {
         "volume":       "📉 Volume too low",
         "choppy":       "〰️ Choppy regime (softened)",
         "4h_trend":     "📊 4-hour trend filter",
         "1h_trend":     "📊 1-hour trend filter",
+        "15m_trend":    "📊 15-min trend (softened)",
         "pullback":     "⏳ Waiting for pullback",
         "momentum":     "🚀 Counter-momentum entry",
         "nasdaq":       "🏦 Bearish NASDAQ",
@@ -5156,6 +5209,7 @@ def _cmd_why():
         "macd":         "📈 MACD fighting signal",
         "adx":          "📉 Weak trend (ADX < 20)",
         "efficiency":   "〰️ Random walk (Kaufman ER)",
+        "daily_gain":   "🎯 Daily gain ceiling hit",
         "min_conf":     "🔒 Below confidence floor",
     }
     rows = [(gate_labels.get(k, k), v) for k, v in sorted(counts.items(), key=lambda x: -x[1]) if v > 0]
@@ -5164,12 +5218,12 @@ def _cmd_why():
             bar = "█" * min(n, 10) + "░" * max(0, 10 - n)
             lines.append(f"`{bar}` {n:>3}  {label}")
     else:
-        lines.append("No gates have fired today yet.")
+        lines.append("  No gates have fired yet today.")
     lines += [
         "",
         "━━━━━━━━━━━━━━━━━━━━",
-        "_Counts reset at midnight UTC_",
-        "_Choppy is softened — lowers confidence, not blocked_",
+        "_Gate counts + loss streak reset at midnight UTC_",
+        "_15m/choppy are softened (lower confidence, not blocked)_",
     ]
     tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
@@ -5608,7 +5662,7 @@ def _dispatch_callback(data, query, trader):
         _cmd_learn(trader)
 
     elif data == "why":
-        _cmd_why()
+        _cmd_why(trader)
 
     elif data == "chart":
         _cmd_chart(trader)
