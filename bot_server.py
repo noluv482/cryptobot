@@ -768,6 +768,8 @@ _daily_limits   = False   # off by default — enable for real-money discipline
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
 _seen_headlines = set()
+_news_log: list = []   # rolling list of recent news for the web dashboard (max 40)
+_NEWS_LOG_MAX   = 40
 _state_lock     = threading.Lock()   # guards _paused and _current_coin
 # Long/Short ratio from Binance Futures (liquidation pressure proxy)
 lsr_data        = {}   # pair → {"lsr": float, "bias": "LONG_HEAVY"|"SHORT_HEAVY"|"NEUTRAL"}
@@ -3460,6 +3462,13 @@ def _news_loop():
                                     emoji = "🟢" if sent=="BULLISH" else "🔴"
                                     tg(f"{emoji} *{sent} NEWS — {coin_name}*\n📰 {title[:120]}\n"
                                        f"Impact: {'🔥 HIGH' if score>=3 else '⚡ MEDIUM' if score==2 else '📌 LOW'}")
+                                    _news_log.append({
+                                        "ts": time.time(), "coin": coin_name, "pair": pair,
+                                        "sentiment": sent, "headline": title[:120],
+                                        "score": score,
+                                    })
+                                    if len(_news_log) > _NEWS_LOG_MAX:
+                                        _news_log.pop(0)
                 except Exception:
                     pass
             for pair in COIN_KEYWORDS:
@@ -5871,6 +5880,39 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .hm-bell{font-size:.7rem;cursor:pointer;opacity:.5;float:right;padding:1px 3px;
   transition:opacity .15s}
 .hm-bell:hover,.hm-bell:active{opacity:1}
+/* ── SIM CARD ── */
+.sim-card{margin:0 16px 16px;background:var(--s0);border:1px solid var(--bd);
+  border-radius:12px;padding:14px 16px}
+.sim-top{display:flex;align-items:center;gap:12px;margin-bottom:11px}
+.sim-bal-lbl{font-size:.5rem;letter-spacing:.09em;text-transform:uppercase;color:var(--mu);margin-bottom:2px}
+.sim-bal{font-family:var(--fn);font-size:1.25rem;font-weight:700;font-variant-numeric:tabular-nums;flex:1}
+.sim-toggle{padding:7px 18px;border-radius:9px;border:none;font-size:.72rem;font-weight:700;
+  cursor:pointer;transition:background .2s,color .2s;background:var(--bd2);color:var(--mu)}
+.sim-toggle.on{background:var(--g);color:#fff}
+.sim-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;text-align:center}
+.sim-stat-lbl{font-size:.48rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mu);margin-bottom:2px}
+.sim-stat-val{font-family:var(--fn);font-size:.78rem;font-weight:700;font-variant-numeric:tabular-nums}
+.sim-pos-hdr{font-size:.5rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mu);
+  margin:10px 0 5px}
+.sim-pos-row{display:flex;justify-content:space-between;align-items:center;
+  padding:4px 0;border-bottom:1px solid var(--bd);font-size:.72rem}
+.sim-off-msg{text-align:center;padding:8px 0;font-size:.75rem;color:var(--mu)}
+/* ── NEWS FEED ── */
+.news-item{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--bd);align-items:flex-start}
+.news-item:last-child{border-bottom:none}
+.news-ico{flex-shrink:0;width:26px;height:26px;border-radius:6px;display:flex;
+  align-items:center;justify-content:center;font-size:.7rem;font-weight:700}
+.news-ico.bull{background:rgba(0,204,116,.15);color:var(--g)}
+.news-ico.bear{background:rgba(255,51,82,.12);color:var(--r)}
+.news-ico.neu{background:var(--bd2);color:var(--mu)}
+.news-body{flex:1;min-width:0}
+.news-coin{font-size:.72rem;font-weight:700;line-height:1.2;margin-bottom:2px}
+.news-hl{font-size:.65rem;color:var(--tx);opacity:.85;line-height:1.4;word-break:break-word}
+.news-meta{font-size:.52rem;color:var(--mu);margin-top:3px;display:flex;gap:8px}
+.news-impact{font-weight:700}
+.news-impact.hi{color:var(--r)}
+.news-impact.md{color:var(--y)}
+.news-impact.lo{color:var(--mu)}
 </style>
 </head>
 <body>
@@ -6012,6 +6054,38 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="mc-lbl">Avg Funding</div>
         <div class="mc-val c-mu" id="mc_fund_val">—</div>
         <div class="mc-sub">funding rate</div>
+      </div>
+    </div>
+
+    <div class="sh"><span>Sim Trader</span><span id="sim_sh_lbl" style="font-size:.55rem;color:var(--mu);font-weight:400">parallel $2,000 account</span></div>
+    <div class="sim-card" id="sim_card">
+      <div class="sim-top">
+        <div style="flex:1">
+          <div class="sim-bal-lbl">Sim Balance</div>
+          <div class="sim-bal" id="sim_bal">$2,000.00</div>
+        </div>
+        <button class="sim-toggle" id="sim_toggle_btn" onclick="toggleSim()">OFF</button>
+      </div>
+      <div class="sim-off-msg" id="sim_off_msg">Sim is OFF — tap to enable</div>
+      <div id="sim_stats_wrap" style="display:none">
+        <div class="sim-grid">
+          <div>
+            <div class="sim-stat-lbl">P&amp;L</div>
+            <div class="sim-stat-val" id="sim_pnl">—</div>
+          </div>
+          <div>
+            <div class="sim-stat-lbl">Trades</div>
+            <div class="sim-stat-val" id="sim_trades">—</div>
+          </div>
+          <div>
+            <div class="sim-stat-lbl">Win Rate</div>
+            <div class="sim-stat-val" id="sim_wr">—</div>
+          </div>
+        </div>
+        <div id="sim_pos_wrap" style="display:none">
+          <div class="sim-pos-hdr">Open Positions</div>
+          <div id="sim_pos_list"></div>
+        </div>
       </div>
     </div>
 
@@ -6168,6 +6242,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="hm-grid" id="hm_grid">
       <div class="no-data" style="grid-column:1/-1">Loading&#8230;</div>
     </div>
+    <div class="sh"><span>Crypto News</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">sentiment scan</span></div>
+    <div id="news_feed" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 16px;padding:0 14px">
+      <div class="no-data" style="padding:16px 0">Loading&#8230;</div>
+    </div>
   </div>
 
 </div><!-- /pages -->
@@ -6237,7 +6315,7 @@ function goTab(t){
   $('tab-'+t).classList.add('active');
   if(t==='chart'){drawCandles();}
   if(t==='home'){drawEquity();}
-  if(t==='market'){fetchMarket();}
+  if(t==='market'){fetchMarket();fetchNews();}
 }
 
 /* ── SWIPE ── */
@@ -6265,7 +6343,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchNews();}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -6994,6 +7072,7 @@ function initSSE(){
     const pb=$('pause_btn');
     pb.innerHTML=_paused?'&#9654;':'&#9208;';
     pb.className='icon-btn'+(_paused?' paused':'');
+    if(d.sim_enabled!==undefined){_simEnabled=d.sim_enabled;fetchSim();}
   });
   es.onerror=()=>{
     const d=$('conn_dot');if(d)d.className='conn-dot';
@@ -7157,8 +7236,8 @@ function renderCalendar(days){
 /* ── TICK ── */
 function tick(){
   if(--_tick<=0){
-    fetchStatus();fetchCandles();fetchHistory();
-    if(_tab==='market'){fetchMarket();}
+    fetchStatus();fetchCandles();fetchHistory();fetchSim();
+    if(_tab==='market'){fetchMarket();fetchNews();}
     if(_tab==='stats'){fetchHourly();}
     _tick=30;
   }
@@ -7305,9 +7384,87 @@ function updateNotifBtn(){
   b.title=_pushActive?'Push notifications on (background)':on?'In-tab notifications on':'Enable notifications';
 }
 
+/* ── SIM TRADER ── */
+let _simEnabled=false;
+async function fetchSim(){
+  try{
+    const d=await(await fetch('/sim')).json();
+    if(!d.ready)return;
+    renderSim(d);
+  }catch(e){console.warn('sim',e);}
+}
+function renderSim(d){
+  _simEnabled=!!d.enabled;
+  const btn=$('sim_toggle_btn'),off=$('sim_off_msg'),wrap=$('sim_stats_wrap');
+  if(btn){btn.textContent=_simEnabled?'ON':'OFF';btn.className='sim-toggle'+(_simEnabled?' on':'');}
+  if($('sim_bal'))$('sim_bal').textContent='$'+fmt(d.balance||0);
+  if(off)off.style.display=_simEnabled?'none':'';
+  if(wrap)wrap.style.display=_simEnabled?'':'none';
+  if(!_simEnabled)return;
+  const pnl=d.pnl||0;
+  const pnlEl=$('sim_pnl');
+  if(pnlEl){pnlEl.textContent=(pnl>=0?'+$':'-$')+fmt(Math.abs(pnl));pnlEl.style.color=pnl>0?'var(--g)':pnl<0?'var(--r)':'var(--mu)';}
+  if($('sim_trades'))$('sim_trades').textContent=(d.trades||0).toString();
+  if($('sim_wr'))$('sim_wr').textContent=(d.win_rate||0).toFixed(0)+'%';
+  const openPos=d.positions||[];
+  const posWrap=$('sim_pos_wrap');
+  if(posWrap)posWrap.style.display=openPos.length?'':'none';
+  if($('sim_pos_list')){
+    $('sim_pos_list').innerHTML=openPos.map(p=>{
+      const u=p.upnl||0;
+      return '<div class="sim-pos-row">'+
+        '<span>'+p.side+' '+p.name+'</span>'+
+        '<span style="color:'+(u>=0?'var(--g)':'var(--r)')+'font-variant-numeric:tabular-nums">'+(u>=0?'+$':'-$')+fmt(Math.abs(u))+'</span>'+
+      '</div>';
+    }).join('');
+  }
+}
+async function toggleSim(){
+  try{
+    const d=await(await fetch('/control',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'toggle_sim'})})).json();
+    const nowOn=d.sim_enabled;
+    fetchSim();
+    showToast(nowOn?'Sim On ▶':'Sim Off ⏸',
+      nowOn?'$2,000 sim trader running':'Sim trader paused',
+      nowOn?'open':'loss',2500);
+  }catch(e){console.warn('toggleSim',e);}
+}
+
+/* ── NEWS FEED ── */
+async function fetchNews(){
+  try{
+    const d=await(await fetch('/news')).json();
+    renderNews(d.items||[]);
+  }catch(e){console.warn('news',e);}
+}
+function renderNews(items){
+  const el=$('news_feed');if(!el)return;
+  if(!items.length){el.innerHTML='<div class="no-data" style="padding:16px 0">No news yet</div>';return;}
+  el.innerHTML=items.map(n=>{
+    const bull=n.sentiment==='bullish',bear=n.sentiment==='bearish';
+    const ico=bull?'▲':bear?'▼':'—';
+    const icoCls=bull?'bull':bear?'bear':'neu';
+    const impCls=n.impact==='HIGH'?'hi':n.impact==='MEDIUM'?'md':'lo';
+    return '<div class="news-item">'+
+      '<div class="news-ico '+icoCls+'">'+ico+'</div>'+
+      '<div class="news-body">'+
+        '<div class="news-coin">'+n.coin+'</div>'+
+        '<div class="news-hl">'+n.headline+'</div>'+
+        '<div class="news-meta">'+
+          '<span>'+n.ago+'</span>'+
+          '<span class="news-impact '+impCls+'">'+n.impact+'</span>'+
+        '</div>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+}
+
 /* ── INIT ── */
 initCandleHover();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
+fetchSim();fetchNews();
 fetchPrices();setInterval(fetchPrices,30000);
 initSSE();initWebPush();
 setInterval(tick,1000);
@@ -7507,6 +7664,16 @@ def _web_status():
         "margin_deployed":  margin_deployed,
         "max_margin":       max_margin,
         "risk_pct":         risk_pct,
+        "sim": {
+            "enabled":   _sim_enabled,
+            "ready":     _sim_trader is not None,
+            "balance":   round(_sim_trader.balance, 2) if _sim_trader else 0,
+            "start_bal": _sim_trader._start_balance if _sim_trader else 2000,
+            "pnl":       round(_sim_trader.balance - _sim_trader._start_balance, 2) if _sim_trader else 0,
+            "trades":    len(_sim_trader.trades) if _sim_trader else 0,
+            "positions": len(_sim_trader.positions) if _sim_trader else 0,
+        },
+        "news_sentiment": {p: news_sentiment[p]["sentiment"] for p in news_sentiment},
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
@@ -7610,9 +7777,62 @@ def _web_history():
     return _Response(json.dumps(pts), mimetype="application/json",
                      headers={"Cache-Control": "no-store"})
 
+@_flask_app.route("/news")
+def _web_news():
+    items = []
+    for n in reversed(_news_log[-30:]):
+        items.append({
+            "ts":        int(n["ts"]),
+            "ago":       _secs_ago(n["ts"]),
+            "coin":      n["coin"],
+            "pair":      n["pair"],
+            "sentiment": n["sentiment"],
+            "headline":  n["headline"],
+            "impact":    "HIGH" if n["score"] >= 3 else "MEDIUM" if n["score"] == 2 else "LOW",
+        })
+    current = {p: news_sentiment[p]["sentiment"] for p in news_sentiment if news_sentiment[p]["sentiment"] != "NEUTRAL"}
+    return _Response(json.dumps({"items": items, "current": current}), mimetype="application/json")
+
+def _secs_ago(ts):
+    s = int(time.time() - ts)
+    if s < 60:   return f"{s}s ago"
+    if s < 3600: return f"{s//60}m ago"
+    return f"{s//3600}h ago"
+
+@_flask_app.route("/sim")
+def _web_sim():
+    if _sim_trader is None:
+        return _Response(json.dumps({"ready": False}), mimetype="application/json")
+    wins = sum(1 for t in _sim_trader.trades if t["pnl"] >= 0)
+    n    = len(_sim_trader.trades)
+    pnl  = round(_sim_trader.balance - _sim_trader._start_balance, 2)
+    open_pos = []
+    for pr, p in dict(_sim_trader.positions).items():
+        try:
+            cur = get_price(pr)
+            upnl = round(_sim_trader.unrealized_pnl(cur, pr), 2)
+        except Exception:
+            upnl = 0.0
+        open_pos.append({"pair": pr, "name": p["name"], "side": p["side"],
+                         "entry": p["entry"], "upnl": upnl,
+                         "held_mins": int((time.time() - p.get("opened_at", time.time())) / 60)})
+    return _Response(json.dumps({
+        "ready":      True,
+        "enabled":    _sim_enabled,
+        "balance":    round(_sim_trader.balance, 2),
+        "start_bal":  _sim_trader._start_balance,
+        "pnl":        pnl,
+        "pnl_pct":    round(pnl / _sim_trader._start_balance * 100, 2),
+        "trades":     n,
+        "wins":       wins,
+        "losses":     n - wins,
+        "win_rate":   round(wins / max(n, 1) * 100, 1),
+        "positions":  open_pos,
+    }), mimetype="application/json")
+
 @_flask_app.route("/control", methods=["POST"])
 def _web_control():
-    global _paused, _paper_mode
+    global _paused, _paper_mode, _sim_enabled
     try:
         body = _flask_request.get_json(silent=True) or {}
         action = body.get("action", "toggle")
@@ -7629,13 +7849,21 @@ def _web_control():
             _paper_mode = False
         elif action == "toggle_mode":
             _paper_mode = not _paper_mode
+        elif action == "sim_on":
+            _sim_enabled = True
+        elif action == "sim_off":
+            _sim_enabled = False
+        elif action == "toggle_sim":
+            _sim_enabled = not _sim_enabled
         else:
             _paused = not _paused
         now_paused  = _paused
         now_paper   = _paper_mode
-    _push_sse("control", {"paused": now_paused, "paper_mode": now_paper})
+        now_sim     = _sim_enabled
+    _push_sse("control", {"paused": now_paused, "paper_mode": now_paper, "sim_enabled": now_sim})
     return _Response(json.dumps({"paused": now_paused, "paper_mode": now_paper,
-                                  "mode": "PAPER" if now_paper else "LIVE"}),
+                                  "mode": "PAPER" if now_paper else "LIVE",
+                                  "sim_enabled": now_sim}),
                      mimetype="application/json")
 
 @_flask_app.route("/market")
