@@ -770,6 +770,10 @@ _last_update_id = 0
 _seen_headlines = set()
 _news_log: list = []   # rolling list of recent news for the web dashboard (max 40)
 _NEWS_LOG_MAX   = 40
+_btc_benchmark_start: float = 0.0   # BTC price at bot startup (equity benchmark)
+_backtest_state: dict = {"running": False, "result": None, "pair": None, "started_at": 0.0}
+_rt_max_positions: int = 0           # 0 = use MAX_POSITIONS constant
+_rt_risk_pct: float   = 0.0          # 0.0 = use RISK_PCT constant
 _state_lock     = threading.Lock()   # guards _paused and _current_coin
 # Long/Short ratio from Binance Futures (liquidation pressure proxy)
 lsr_data        = {}   # pair → {"lsr": float, "bias": "LONG_HEAVY"|"SHORT_HEAVY"|"NEUTRAL"}
@@ -2088,7 +2092,8 @@ class PaperTrader:
         return next(iter(self.positions.values()), None)
 
     def can_open_new(self):
-        if len(self.positions) >= MAX_POSITIONS: return False
+        limit = _rt_max_positions if _rt_max_positions > 0 else MAX_POSITIONS
+        if len(self.positions) >= limit: return False
         used = sum(p["margin"] for p in self.positions.values())
         return (used / max(self.balance, 0.01)) < MAX_TOTAL_RISK
 
@@ -5913,6 +5918,67 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .news-impact.hi{color:var(--r)}
 .news-impact.md{color:var(--y)}
 .news-impact.lo{color:var(--mu)}
+/* ── SETTINGS SHEET ── */
+.set-sheet{position:fixed;inset:0;z-index:400;display:none}
+.set-sheet.open{display:block}
+.set-overlay{position:absolute;inset:0;background:rgba(0,0,0,.55)}
+.set-panel{position:absolute;bottom:0;left:0;right:0;background:var(--s0);
+  border-radius:20px 20px 0 0;padding:20px 20px calc(20px + var(--sb));
+  border-top:1px solid var(--bd2);max-height:85vh;overflow-y:auto}
+.set-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.set-title{font-weight:700;font-size:.95rem}
+.set-close{background:none;border:none;color:var(--mu);font-size:1.1rem;cursor:pointer;padding:4px}
+.set-section-lbl{font-size:.5rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--mu);padding:10px 0 3px;font-weight:700}
+.set-row{display:flex;align-items:center;justify-content:space-between;
+  padding:12px 0;border-bottom:1px solid var(--bd)}
+.set-row:last-child{border-bottom:none}
+.set-lbl{font-size:.82rem;font-weight:600;line-height:1.3}
+.set-sub{font-size:.6rem;color:var(--mu);margin-top:1px}
+.set-toggle-wrap{position:relative;width:44px;height:24px;flex-shrink:0;cursor:pointer}
+.set-toggle-wrap input{opacity:0;width:0;height:0;position:absolute}
+.set-slider{position:absolute;cursor:pointer;inset:0;background:var(--bd2);
+  border-radius:12px;transition:.25s}
+.set-slider::before{content:'';position:absolute;width:18px;height:18px;
+  left:3px;top:3px;background:#fff;border-radius:50%;transition:.25s;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.set-toggle-wrap input:checked+.set-slider{background:var(--g)}
+.set-toggle-wrap input:checked+.set-slider::before{transform:translateX(20px)}
+.set-ctrl{display:flex;align-items:center;gap:6px}
+.set-step-btn{width:28px;height:28px;border-radius:8px;border:1px solid var(--bd2);
+  background:var(--bg);color:var(--tx);font-size:1.1rem;cursor:pointer;line-height:1;
+  display:flex;align-items:center;justify-content:center}
+.set-step-btn:active{opacity:.6}
+.set-num{font-family:var(--fn);font-size:.9rem;font-weight:700;min-width:22px;text-align:center}
+.set-info-val{font-family:var(--fn);font-size:.82rem;font-weight:700;color:var(--mu)}
+/* ── INSTALL BUTTON ── */
+#install_btn{display:none;padding:5px 10px;border-radius:8px;font-size:.65rem;font-weight:700;
+  cursor:pointer;border:1px solid rgba(74,143,255,.4);background:rgba(74,143,255,.12);color:var(--b)}
+#install_btn.show{display:block}
+/* ── DRAWDOWN CHART ── */
+.dd-wrap{margin:0 16px 16px}
+/* ── BACKTEST SECTION ── */
+.bt-form{margin:0 16px 16px;background:var(--s0);border:1px solid var(--bd);
+  border-radius:12px;padding:14px 16px}
+.bt-sel{width:100%;background:var(--bg);border:1px solid var(--bd2);border-radius:9px;
+  padding:9px 12px;color:var(--tx);font-size:.82rem;font-family:var(--fn);
+  outline:none;margin-bottom:10px;appearance:none;-webkit-appearance:none}
+.bt-sel:focus{border-color:var(--b)}
+.bt-run-btn{width:100%;padding:11px;border-radius:10px;background:var(--b);border:none;
+  color:#fff;font-size:.82rem;font-weight:700;cursor:pointer;transition:opacity .15s}
+.bt-run-btn:active,.bt-run-btn:disabled{opacity:.55;cursor:default}
+.bt-result{margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)}
+.bt-stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px}
+.bt-stat{text-align:center;background:var(--bg);border-radius:8px;padding:8px 4px}
+.bt-stat-lbl{font-size:.46rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mu);margin-bottom:2px}
+.bt-stat-val{font-family:var(--fn);font-size:.82rem;font-weight:700;font-variant-numeric:tabular-nums}
+.bt-trade-row{display:flex;justify-content:space-between;align-items:center;
+  font-size:.7rem;padding:5px 0;border-bottom:1px solid var(--bd);font-family:var(--fn)}
+.bt-trade-row:last-child{border-bottom:none}
+/* ── EXPORT BUTTON ── */
+.export-btn{font-size:.6rem;padding:3px 10px;border-radius:6px;border:1px solid var(--bd2);
+  background:var(--bg);color:var(--mu);cursor:pointer;text-decoration:none;
+  display:inline-block;font-family:var(--fn)}
+.export-btn:active{opacity:.7}
 </style>
 </head>
 <body>
@@ -5929,6 +5995,8 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div id="hdr_tick" style="font-size:.44rem;color:var(--mu);font-family:var(--fn);line-height:1;margin-top:1px">↻ 30s</div>
   </div>
   <div class="hdr-actions">
+    <button id="install_btn" onclick="installApp()" title="Add to home screen">+ App</button>
+    <button class="icon-btn" id="settings_btn" onclick="openSettings()" title="Settings">&#9881;</button>
     <button class="icon-btn" id="pause_btn" onclick="togglePause()" title="Pause bot">&#9208;</button>
     <button class="icon-btn" id="notif_btn" onclick="requestNotifs()" title="Notifications">&#128276;</button>
   </div>
@@ -6155,7 +6223,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   <!-- STATS -->
   <div class="page" id="pg-stats">
     <div class="ptr" id="ptr-stats">&#8635; Refreshing…</div>
-    <div class="sh"><span>Performance</span></div>
+    <div class="sh"><span>Performance</span><a class="export-btn" id="export_btn" href="/export/trades.csv" download>&#8681; Export CSV</a></div>
     <div class="stat-grid">
       <div class="scard">
         <div class="scard-lbl">Win Rate</div>
@@ -6208,6 +6276,8 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       </div>
       <div style="font-size:.57rem;color:var(--mu);margin-top:5px;font-family:var(--fn)" id="s_learn_status"></div>
     </div>
+    <div class="sh"><span>Drawdown</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">% below peak</span></div>
+    <div class="dd-wrap"><canvas id="dd_cv" style="display:block;width:100%" height="70"></canvas></div>
     <div class="sh"><span>Pattern Scan</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">updates every 15 min</span></div>
     <div id="pattern_scan_list" style="padding:0 12px 16px">
       <div class="no-data">Scanning…</div>
@@ -6228,6 +6298,20 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     </div>
     <div class="sh"><span>Gate Filters</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">blocked trades</span></div>
     <div id="gate_bars" style="padding-bottom:12px"><div class="no-data">No blocks yet</div></div>
+    <div class="sh"><span>Backtest</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">60h replay · live signal engine</span></div>
+    <div class="bt-form">
+      <select class="bt-sel" id="bt_pair"></select>
+      <button class="bt-run-btn" id="bt_run_btn" onclick="runBacktest()">&#9654; Run Backtest</button>
+      <div id="bt_result" style="display:none" class="bt-result">
+        <div class="bt-stats-row">
+          <div class="bt-stat"><div class="bt-stat-lbl">Trades</div><div class="bt-stat-val" id="bt_n">—</div></div>
+          <div class="bt-stat"><div class="bt-stat-lbl">Win Rate</div><div class="bt-stat-val" id="bt_wr">—</div></div>
+          <div class="bt-stat"><div class="bt-stat-lbl">Total P&amp;L</div><div class="bt-stat-val" id="bt_total">—</div></div>
+          <div class="bt-stat"><div class="bt-stat-lbl">Avg P&amp;L</div><div class="bt-stat-val" id="bt_avg">—</div></div>
+        </div>
+        <div id="bt_trades_list"></div>
+      </div>
+    </div>
   </div>
 
   <!-- MARKET -->
@@ -6249,6 +6333,51 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   </div>
 
 </div><!-- /pages -->
+
+<!-- Settings sheet -->
+<div class="set-sheet" id="set_sheet">
+  <div class="set-overlay" onclick="closeSettings()"></div>
+  <div class="set-panel">
+    <div class="set-hdr">
+      <div class="set-title">&#9881; Settings</div>
+      <button class="set-close" onclick="closeSettings()">&#10005;</button>
+    </div>
+    <div class="set-section-lbl">Trading</div>
+    <div class="set-row">
+      <div><div class="set-lbl">Paper Mode</div><div class="set-sub">No real orders placed</div></div>
+      <label class="set-toggle-wrap"><input type="checkbox" id="set_paper" onchange="saveSetting('paper')"><span class="set-slider"></span></label>
+    </div>
+    <div class="set-row">
+      <div><div class="set-lbl">Sim Trader ($2,000)</div><div class="set-sub">Parallel virtual account</div></div>
+      <label class="set-toggle-wrap"><input type="checkbox" id="set_sim" onchange="saveSetting('sim')"><span class="set-slider"></span></label>
+    </div>
+    <div class="set-row">
+      <div><div class="set-lbl">Max Positions</div><div class="set-sub">Simultaneous open trades</div></div>
+      <div class="set-ctrl">
+        <button class="set-step-btn" onclick="stepMaxPos(-1)">&#8722;</button>
+        <div class="set-num" id="set_max_pos_val">2</div>
+        <button class="set-step-btn" onclick="stepMaxPos(1)">+</button>
+      </div>
+    </div>
+    <div class="set-section-lbl">Info</div>
+    <div class="set-row">
+      <div><div class="set-lbl">Risk Per Trade</div><div class="set-sub">% of balance as margin</div></div>
+      <div class="set-info-val" id="set_risk_val">—</div>
+    </div>
+    <div class="set-row">
+      <div><div class="set-lbl">Balance Target</div><div class="set-sub">Your trading goal</div></div>
+      <div class="set-info-val" id="set_target_val">—</div>
+    </div>
+    <div class="set-row">
+      <div><div class="set-lbl">Coins Monitored</div><div class="set-sub">Scan universe size</div></div>
+      <div class="set-info-val" id="set_scan_val">26</div>
+    </div>
+    <div class="set-row">
+      <div><div class="set-lbl">Exchange</div><div class="set-sub" id="set_exch_sub">paper trading</div></div>
+      <div class="set-info-val" id="set_exch_val">—</div>
+    </div>
+  </div>
+</div>
 
 <nav class="tabbar">
   <button class="tab active" id="tab-home" onclick="goTab('home')">
@@ -6316,6 +6445,7 @@ function goTab(t){
   if(t==='chart'){drawCandles();}
   if(t==='home'){drawEquity();}
   if(t==='market'){fetchMarket();fetchNews();}
+  if(t==='stats'){drawDownChart();}
 }
 
 /* ── SWIPE ── */
@@ -6460,7 +6590,9 @@ async function fetchStatus(){
 }
 
 /* ── POSITIONS ── */
+let _openPositions=[];
 function renderPositions(ps){
+  _openPositions=ps;
   const el=$('pos_list');
   if(!ps.length){
     el.innerHTML='<div class="pos-empty"><div class="pos-empty-ico">&#128219;</div><div class="pos-empty-txt">No open positions<br><small style="opacity:.5">Bot is watching markets</small></div></div>';
@@ -6485,8 +6617,8 @@ function renderPositions(ps){
         '<div class="pc-name">'+chip+' '+p.name+tierBadge+'</div>'+
         '<div class="pc-meta">Entry $'+p.entry.toFixed(4)+' · '+p.confidence+'% conf · '+(p.held_mins||0)+'m</div>'+
       '</div><div class="pc-right">'+
-        '<div class="pc-pnl '+pc(p.unrealized_pnl)+'">'+msign(p.unrealized_pnl)+'</div>'+
-        '<div class="pc-move '+mc+'">' +(p.move_pct>=0?'+':'')+p.move_pct.toFixed(2)+'%</div>'+
+        '<div class="pc-pnl '+pc(p.unrealized_pnl)+'" id="pnl_'+p.pair+'">'+msign(p.unrealized_pnl)+'</div>'+
+        '<div class="pc-move '+mc+'" id="mv_'+p.pair+'">' +(p.move_pct>=0?'+':'')+p.move_pct.toFixed(2)+'%</div>'+
       '</div></div>'+
       '<div class="mb-track"><div class="mb-fill" style="width:'+bw+'%;background:'+mbg+'"></div></div>'+
       '<div class="mb-labels"><span>Entry $'+p.entry.toFixed(4)+'</span><span>'+stop+'</span></div>'+
@@ -6714,10 +6846,15 @@ function renderPattern(d){
 }
 
 /* ── HISTORY / EQUITY CURVE ── */
+let _eqBtcReturnPct=0,_eqStartBal=0;
 async function fetchHistory(){
   try{
-    const pts=await(await fetch('/history')).json();
-    if(pts&&pts.length){_eqData=pts;if(_tab==='home')drawEquity();}
+    const d=await(await fetch('/history')).json();
+    // support both old array format and new object format
+    const pts=Array.isArray(d)?d:(d.pts||[]);
+    _eqBtcReturnPct=d.btc_return_pct||0;
+    _eqStartBal=d.start_bal||0;
+    if(pts&&pts.length){_eqData=pts;if(_tab==='home')drawEquity();drawDownChart();}
   }catch(e){console.warn('history',e);}
 }
 function drawEquity(){
@@ -6741,6 +6878,32 @@ function drawEquity(){
     ctx.fillStyle='#4d6f94';ctx.font='9px monospace';ctx.textAlign='right';
     ctx.fillText('$'+Math.round(lo+(hi-lo)*f).toLocaleString(),P.l-3,y+3);
   });
+  // BTC benchmark: straight line from start_bal to start_bal*(1+btcReturn)
+  const btcEnd=_eqStartBal>0&&pts.length>1?_eqStartBal*(1+_eqBtcReturnPct/100):null;
+  // re-scale to include benchmark if it extends outside current range
+  if(btcEnd!==null){lo=Math.min(lo,_eqStartBal,btcEnd);hi=Math.max(hi,_eqStartBal,btcEnd);}
+  if(hi===lo){hi+=1;lo-=1;}
+  // redraw gridlines with updated scale
+  ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle='#162540';ctx.lineWidth=.7;
+  [0,.5,1].forEach(f=>{
+    const y=yS(lo+(hi-lo)*f);
+    ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();
+    ctx.fillStyle='#4d6f94';ctx.font='9px monospace';ctx.textAlign='right';
+    ctx.fillText('$'+Math.round(lo+(hi-lo)*f).toLocaleString(),P.l-3,y+3);
+  });
+  // benchmark line (BTC hold)
+  if(btcEnd!==null&&pts.length>1){
+    ctx.beginPath();
+    ctx.moveTo(xS(0),yS(_eqStartBal));
+    ctx.lineTo(xS(pts.length-1),yS(btcEnd));
+    ctx.strokeStyle=_eqBtcReturnPct>=0?'rgba(255,165,0,.55)':'rgba(255,100,0,.45)';
+    ctx.lineWidth=1.2;ctx.setLineDash([4,4]);ctx.stroke();ctx.setLineDash([]);
+    // label
+    ctx.fillStyle='rgba(255,165,0,.7)';ctx.font='8px monospace';ctx.textAlign='left';
+    ctx.fillText('BTC '+(_eqBtcReturnPct>=0?'+':'')+_eqBtcReturnPct.toFixed(1)+'%',
+      xS(pts.length-1)-28,yS(btcEnd)-4);
+  }
   const trend=pts[pts.length-1].balance>=pts[0].balance;
   const lc=trend?'#4a8fff':'#ff3352';
   const grad=ctx.createLinearGradient(0,P.t,0,P.t+ch);
@@ -6755,6 +6918,54 @@ function drawEquity(){
   ctx.strokeStyle=lc;ctx.lineWidth=1.5;ctx.lineJoin='round';ctx.stroke();
   const lx=xS(pts.length-1),ly=yS(pts[pts.length-1].balance);
   ctx.beginPath();ctx.arc(lx,ly,3.5,0,Math.PI*2);ctx.fillStyle=lc;ctx.fill();
+}
+
+/* ── DRAWDOWN CHART ── */
+function drawDownChart(){
+  const cv=$('dd_cv');if(!cv)return;
+  const pts=_eqData;if(!pts||pts.length<2)return;
+  const W=cv.parentElement.clientWidth||320;
+  const H=70,PR=devicePixelRatio||1;
+  cv.width=W*PR;cv.height=H*PR;cv.style.width=W+'px';cv.style.height=H+'px';
+  const ctx=cv.getContext('2d');ctx.scale(PR,PR);
+  const P={t:6,r:10,b:18,l:46};
+  const cw=W-P.l-P.r,ch=H-P.t-P.b;
+  // compute running drawdown
+  let peak=pts[0].balance;
+  const dds=pts.map(p=>{if(p.balance>peak)peak=p.balance;return peak>0?((p.balance-peak)/peak*100):0;});
+  const minDD=Math.min(...dds,-0.01);
+  const xS=i=>P.l+(i/(pts.length-1||1))*cw;
+  const yS=v=>P.t+(v/minDD)*ch; // v is negative; deeper = higher y
+  // grid
+  ctx.strokeStyle='#162540';ctx.lineWidth=.7;
+  [0,.5,1].forEach(f=>{
+    const pct=minDD*f;
+    const y=P.t+f*ch;
+    ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();
+    ctx.fillStyle='#4d6f94';ctx.font='9px monospace';ctx.textAlign='right';
+    ctx.fillText(pct.toFixed(1)+'%',P.l-3,y+3);
+  });
+  // zero line label
+  ctx.fillStyle='#4d6f94';ctx.font='9px monospace';ctx.textAlign='right';
+  ctx.fillText('0%',P.l-3,P.t+3);
+  // area
+  ctx.beginPath();
+  ctx.moveTo(xS(0),P.t);
+  dds.forEach((d,i)=>ctx.lineTo(xS(i),yS(d)));
+  ctx.lineTo(xS(pts.length-1),P.t);
+  ctx.closePath();
+  const grad=ctx.createLinearGradient(0,P.t,0,P.t+ch);
+  grad.addColorStop(0,'rgba(255,51,82,.28)');grad.addColorStop(1,'rgba(255,51,82,.04)');
+  ctx.fillStyle=grad;ctx.fill();
+  // line
+  ctx.beginPath();
+  dds.forEach((d,i)=>i===0?ctx.moveTo(xS(0),P.t):ctx.lineTo(xS(i),yS(d)));
+  ctx.strokeStyle='#ff3352';ctx.lineWidth=1.2;ctx.lineJoin='round';ctx.stroke();
+  // max drawdown marker
+  const minIdx=dds.indexOf(minDD);
+  ctx.beginPath();ctx.arc(xS(minIdx),yS(minDD),3,0,Math.PI*2);ctx.fillStyle='#ff3352';ctx.fill();
+  ctx.fillStyle='#ff3352';ctx.font='9px monospace';ctx.textAlign='center';
+  ctx.fillText(minDD.toFixed(1)+'%',xS(minIdx),yS(minDD)-5);
 }
 
 /* ── CANDLES ── */
@@ -7074,6 +7285,10 @@ function initSSE(){
     pb.className='icon-btn'+(_paused?' paused':'');
     if(d.sim_enabled!==undefined){_simEnabled=d.sim_enabled;fetchSim();}
   });
+  es.addEventListener('backtest_done',e=>{
+    const d=JSON.parse(e.data);
+    renderBacktestResult(d);
+  });
   es.onerror=()=>{
     const d=$('conn_dot');if(d)d.className='conn-dot';
     clearTimeout(_sseTimer);
@@ -7238,7 +7453,7 @@ function tick(){
   if(--_tick<=0){
     fetchStatus();fetchCandles();fetchHistory();fetchSim();
     if(_tab==='market'){fetchMarket();fetchNews();}
-    if(_tab==='stats'){fetchHourly();}
+    if(_tab==='stats'){fetchHourly();drawDownChart();}
     _tick=30;
   }
   const td=$('hdr_tick');if(td)td.textContent='↻ '+_tick+'s';
@@ -7384,6 +7599,170 @@ function updateNotifBtn(){
   b.title=_pushActive?'Push notifications on (background)':on?'In-tab notifications on':'Enable notifications';
 }
 
+/* ── LIVE P&L TICKER ── */
+function updateLivePnl(){
+  if(!_openPositions.length)return;
+  _openPositions.forEach(p=>{
+    const cur=_coinPrices[p.pair];
+    if(!cur)return;
+    const isL=p.side==='LONG';
+    const move=((cur-p.entry)/p.entry*100*(isL?1:-1));
+    // Re-derive upnl from current price: (cur - entry) / entry * leverage * notional
+    // We don't have notional client-side, so use last_upnl / last_move_pct as the "per %" scalar
+    const lastMove=p.move_pct||0;
+    const lastUpnl=p.unrealized_pnl||0;
+    let upnl;
+    if(Math.abs(lastMove)>0.001){
+      const perPct=lastUpnl/lastMove;
+      upnl=move*perPct;
+    } else {
+      upnl=lastUpnl; // no baseline yet, keep last known
+    }
+    const pnlEl=$('pnl_'+p.pair),mvEl=$('mv_'+p.pair);
+    if(pnlEl){
+      pnlEl.textContent=msign(upnl);
+      pnlEl.className='pc-pnl '+pc(upnl);
+    }
+    if(mvEl){
+      mvEl.textContent=(move>=0?'+':'')+move.toFixed(2)+'%';
+      mvEl.className='pc-move '+(move>=0?'c-g':'c-r');
+    }
+  });
+}
+
+/* ── SETTINGS ── */
+let _setMaxPos=2;
+async function openSettings(){
+  try{
+    const d=await(await fetch('/settings')).json();
+    _setMaxPos=d.max_positions||2;
+    $('set_paper').checked=!!d.paper_mode;
+    $('set_sim').checked=!!d.sim_enabled;
+    $('set_max_pos_val').textContent=_setMaxPos;
+    $('set_risk_val').textContent=(d.risk_pct||0).toFixed(1)+'%';
+    $('set_target_val').textContent='$'+(d.paper_target||0).toLocaleString();
+    $('set_scan_val').textContent=(d.scan_universe||26).toString();
+    $('set_exch_val').textContent=d.live_mode?(d.exchange||'live').toUpperCase():'Paper';
+    $('set_exch_sub').textContent=d.live_mode?'live trading':'paper / simulation';
+  }catch(e){console.warn('settings',e);}
+  $('set_sheet').classList.add('open');
+}
+function closeSettings(){$('set_sheet').classList.remove('open');}
+async function saveSetting(key){
+  try{
+    if(key==='paper'){
+      const live=!$('set_paper').checked;
+      await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({action:live?'live':'paper'})});
+    } else if(key==='sim'){
+      const on=$('set_sim').checked;
+      await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({action:on?'sim_on':'sim_off'})});
+      fetchSim();
+    }
+  }catch(e){console.warn('saveSetting',e);}
+}
+async function stepMaxPos(delta){
+  _setMaxPos=Math.max(1,Math.min(10,_setMaxPos+delta));
+  $('set_max_pos_val').textContent=_setMaxPos;
+  try{
+    await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({max_positions:_setMaxPos})});
+  }catch(e){console.warn('stepMaxPos',e);}
+}
+
+/* ── BACKTEST ── */
+(function(){
+  const sel=$('bt_pair');if(!sel)return;
+  _SCAN_PAIRS.forEach(c=>{
+    const o=document.createElement('option');
+    o.value=c.pair;o.textContent=c.sym+'/USD';
+    sel.appendChild(o);
+  });
+})();
+let _btRunning=false;
+async function runBacktest(){
+  if(_btRunning)return;
+  const pair=($('bt_pair')||{}).value||'XBTUSD';
+  const btn=$('bt_run_btn');
+  _btRunning=true;
+  if(btn){btn.disabled=true;btn.textContent='Running…';}
+  $('bt_result').style.display='none';
+  try{
+    await fetch('/backtest_run',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pair})});
+    showToast('Backtest Started','Results in ~30–60 seconds','open',3000);
+    // poll every 5s (SSE backtest_done will also fire)
+    const poll=setInterval(async()=>{
+      try{
+        const d=await(await fetch('/backtest_result')).json();
+        if(!d.running&&d.result){clearInterval(poll);renderBacktestResult(d.result);}
+      }catch(e){}
+    },5000);
+  }catch(e){
+    console.warn('backtest',e);
+    _btRunning=false;
+    if(btn){btn.disabled=false;btn.textContent='▶ Run Backtest';}
+  }
+}
+function renderBacktestResult(r){
+  _btRunning=false;
+  const btn=$('bt_run_btn');
+  if(btn){btn.disabled=false;btn.textContent='▶ Run Backtest';}
+  if(!r||r.error){
+    showToast('Backtest Failed',r&&r.error?r.error:'Unknown error','loss',4000);
+    return;
+  }
+  $('bt_n').textContent=r.trades||0;
+  $('bt_wr').textContent=(r.win_rate||0).toFixed(0)+'%';
+  const tot=(r.total_pnl_pct||0);
+  const avg=(r.avg_pnl_pct||0);
+  const totEl=$('bt_total');
+  if(totEl){totEl.textContent=(tot>=0?'+':'')+tot.toFixed(2)+'%';totEl.style.color=tot>=0?'var(--g)':'var(--r)';}
+  const avgEl=$('bt_avg');
+  if(avgEl){avgEl.textContent=(avg>=0?'+':'')+avg.toFixed(2)+'%';avgEl.style.color=avg>=0?'var(--g)':'var(--r)';}
+  const list=$('bt_trades_list');
+  const trades=r.recent_trades||[];
+  if(list&&trades.length){
+    list.innerHTML='<div style="font-size:.5rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mu);margin-bottom:4px">Last '+trades.length+' trades</div>'+
+    trades.map(t=>{
+      const w=t.pnl_pct>=0;
+      return '<div class="bt-trade-row">'+
+        '<span style="color:'+(t.side==='BUY'?'var(--g)':'var(--r)')+'">'+t.side+'</span>'+
+        '<span style="color:var(--mu)">'+t.reason+'</span>'+
+        '<span style="color:var(--mu)">'+(t.bars||0)+' bars</span>'+
+        '<span style="color:'+(w?'var(--g)':'var(--r)')+'">'+
+          (t.pnl_pct>=0?'+':'')+t.pnl_pct.toFixed(2)+'%</span>'+
+        '</div>';
+    }).join('');
+  }
+  $('bt_result').style.display='';
+  showToast('Backtest Done',r.trades+' trades · '+r.win_rate+'% WR · avg '+(avg>=0?'+':'')+avg.toFixed(2)+'%',
+    r.win_rate>=50?'win':'loss',4000);
+}
+
+/* ── PWA INSTALL ── */
+let _installPrompt=null;
+window.addEventListener('beforeinstallprompt',e=>{
+  e.preventDefault();
+  _installPrompt=e;
+  const btn=$('install_btn');
+  if(btn)btn.classList.add('show');
+});
+window.addEventListener('appinstalled',()=>{
+  _installPrompt=null;
+  const btn=$('install_btn');
+  if(btn)btn.classList.remove('show');
+  showToast('App Installed ✓','CryptoBot added to home screen','win',3000);
+});
+async function installApp(){
+  if(!_installPrompt)return;
+  _installPrompt.prompt();
+  const {outcome}=await _installPrompt.userChoice;
+  if(outcome==='accepted')_installPrompt=null;
+}
+
 /* ── SIM TRADER ── */
 let _simEnabled=false;
 async function fetchSim(){
@@ -7465,10 +7844,11 @@ function renderNews(items){
 initCandleHover();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
 fetchSim();fetchNews();
-fetchPrices();setInterval(fetchPrices,30000);
+fetchPrices();setInterval(fetchPrices,8000);
 initSSE();initWebPush();
 setInterval(tick,1000);
-window.addEventListener('resize',()=>{drawEquity();drawCandles();});
+setInterval(updateLivePnl,5000);
+window.addEventListener('resize',()=>{drawEquity();drawCandles();drawDownChart();});
 if('Notification' in window&&Notification.permission==='granted'){_notif=true;updateNotifBtn();}
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script>
@@ -7763,19 +8143,27 @@ def _web_prices():
 @_flask_app.route("/history")
 def _web_history():
     trader = _web_trader_ref[0] if _web_trader_ref else None
+    empty = {"pts": [], "btc_return_pct": 0.0, "start_bal": 0}
     if not trader:
-        return _Response("[]", mimetype="application/json")
+        return _Response(json.dumps(empty), mimetype="application/json")
     trades = list(trader.trades)
     if not trades:
-        return _Response("[]", mimetype="application/json")
+        return _Response(json.dumps(empty), mimetype="application/json")
     base = round(trader.balance - sum(t["pnl"] for t in trades), 2)
     bal = base
     pts = []
     for t in trades:
         bal = round(bal + t["pnl"], 2)
         pts.append({"ts": int(t["ts"] * 1000), "balance": bal})
-    return _Response(json.dumps(pts), mimetype="application/json",
-                     headers={"Cache-Control": "no-store"})
+    btc_return_pct = 0.0
+    try:
+        if _btc_benchmark_start > 0:
+            cur_btc = get_price("XBTUSD")
+            btc_return_pct = round((cur_btc - _btc_benchmark_start) / _btc_benchmark_start * 100, 2)
+    except Exception:
+        pass
+    return _Response(json.dumps({"pts": pts, "btc_return_pct": btc_return_pct, "start_bal": base}),
+                     mimetype="application/json", headers={"Cache-Control": "no-store"})
 
 @_flask_app.route("/news")
 def _web_news():
@@ -7828,6 +8216,99 @@ def _web_sim():
         "losses":     n - wins,
         "win_rate":   round(wins / max(n, 1) * 100, 1),
         "positions":  open_pos,
+    }), mimetype="application/json")
+
+@_flask_app.route("/export/trades.csv")
+def _web_export_csv():
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    if not trader:
+        return _Response("", status=404)
+    rows = ["Date,Pair,Coin,Side,Entry,Exit,PnL,PnL%,Duration(min),Reason,Confidence"]
+    for t in list(trader.trades):
+        ts = ""
+        try:
+            ts = datetime.fromtimestamp(float(t.get("closed_at", t.get("ts", 0)))).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        entry = t.get("entry", 0) or 0
+        exit_p = t.get("exit", 0) or 0
+        pnl = t.get("pnl", 0) or 0
+        pnl_pct = round((exit_p - entry) / entry * 100, 2) if entry else 0
+        rows.append(",".join([
+            ts, t.get("pair", ""), t.get("coin", ""), t.get("side", ""),
+            str(round(entry, 6)), str(round(exit_p, 6)),
+            str(round(pnl, 2)), str(pnl_pct),
+            str(round(t.get("held_mins", 0))),
+            t.get("reason", ""), str(round(t.get("confidence", 0), 2)),
+        ]))
+    return _Response("\n".join(rows), mimetype="text/csv",
+                     headers={"Content-Disposition": "attachment; filename=cryptobot_trades.csv",
+                               "Cache-Control": "no-store"})
+
+@_flask_app.route("/backtest_run", methods=["POST"])
+def _web_backtest_run():
+    global _backtest_state
+    if _backtest_state["running"]:
+        return _Response(json.dumps({"error": "already_running", "pair": _backtest_state["pair"]}),
+                         mimetype="application/json")
+    body = _flask_request.get_json(silent=True) or {}
+    pair = body.get("pair", "XBTUSD")
+    if not any(c["pair"] == pair for c in SCAN_UNIVERSE):
+        pair = "XBTUSD"
+    _backtest_state = {"running": True, "result": None, "pair": pair, "started_at": time.time()}
+    def _run():
+        global _backtest_state
+        try:
+            trades = _backtest_coin(pair)
+            n = len(trades)
+            wins = sum(1 for t in trades if t.get("pnl_pct", 0) > 0)
+            pnl_pcts = [t.get("pnl_pct", 0) for t in trades]
+            total_pct = round(sum(pnl_pcts) * 100, 2)
+            _backtest_state["result"] = {
+                "pair": pair, "trades": n, "wins": wins, "losses": n - wins,
+                "win_rate": round(wins / max(n, 1) * 100, 1),
+                "total_pnl_pct": total_pct,
+                "avg_pnl_pct": round(total_pct / max(n, 1), 2),
+                "recent_trades": [{"pnl_pct": round(t.get("pnl_pct",0)*100,2),
+                                    "reason": t.get("reason",""), "bars": t.get("bars",0),
+                                    "side": t.get("side","")} for t in trades[-15:]],
+                "duration_secs": round(time.time() - _backtest_state["started_at"], 1),
+            }
+        except Exception as e:
+            _backtest_state["result"] = {"error": str(e), "pair": pair}
+        finally:
+            _backtest_state["running"] = False
+            _push_sse("backtest_done", _backtest_state.get("result") or {})
+    threading.Thread(target=_run, daemon=True).start()
+    return _Response(json.dumps({"started": True, "pair": pair}), mimetype="application/json")
+
+@_flask_app.route("/backtest_result")
+def _web_backtest_result():
+    return _Response(json.dumps({
+        "running": _backtest_state["running"],
+        "result":  _backtest_state.get("result"),
+        "pair":    _backtest_state.get("pair"),
+    }), mimetype="application/json")
+
+@_flask_app.route("/settings", methods=["GET", "POST"])
+def _web_settings():
+    global _rt_max_positions, _paper_mode
+    if _flask_request.method == "POST":
+        body = _flask_request.get_json(silent=True) or {}
+        if "max_positions" in body:
+            v = int(body["max_positions"])
+            if 1 <= v <= 10:
+                _rt_max_positions = v
+    return _Response(json.dumps({
+        "paper_mode":     _paper_mode,
+        "sim_enabled":    _sim_enabled,
+        "max_positions":  _rt_max_positions if _rt_max_positions > 0 else MAX_POSITIONS,
+        "risk_pct":       round((_rt_risk_pct if _rt_risk_pct > 0 else RISK_PCT) * 100, 1),
+        "live_mode":      LIVE_MODE,
+        "paper_target":   PAPER_TARGET,
+        "scan_universe":  len(SCAN_UNIVERSE),
+        "paused":         _paused,
+        "exchange":       LIVE_EXCHANGE if LIVE_MODE else "paper",
     }), mimetype="application/json")
 
 @_flask_app.route("/control", methods=["POST"])
@@ -8239,9 +8720,14 @@ def main():
     trader = PaperTrader()
 
     # Create the parallel sim trader ($2000 virtual account, always paper)
-    global _sim_trader
+    global _sim_trader, _btc_benchmark_start
     _sim_trader = PaperTrader(force_paper=True, start_balance=2000.0)
     log("BOOT", "Sim trader initialized — $2000 virtual account ready (type 'sim on' to start)")
+    try:
+        _btc_benchmark_start = get_price("XBTUSD")
+        log("BOOT", f"BTC benchmark start: ${_btc_benchmark_start:,.2f}")
+    except Exception:
+        pass
 
     # If paper account burned to zero, auto-reset so trading can continue
     if not LIVE_MODE and trader.balance < 1.0:
