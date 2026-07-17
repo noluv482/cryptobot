@@ -785,6 +785,10 @@ open_interest_data = {}  # pair → {"oi": float, "prev_oi": float, "trend": "RI
 _econ_events    = []   # list of {"title": str, "date": str, "impact": str}
 # User-set price alerts  {pair: [{"target": float, "above": bool, "label": str}]}
 _price_alerts   = {}
+# Pairs manually disabled from the dashboard (won't receive signals)
+_disabled_pairs: set = set()
+# Rolling log of the last 15 Telegram messages sent by the bot
+_tg_log: list = []
 # Web Push (VAPID) — optional; gracefully skipped when keys not set
 VAPID_PUBLIC_KEY   = os.environ.get("VAPID_PUBLIC_KEY",   "")
 VAPID_PRIVATE_KEY  = os.environ.get("VAPID_PRIVATE_KEY",  "")
@@ -833,6 +837,12 @@ def is_live():
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 def tg(msg, plain=False):
+    global _tg_log
+    # Keep a rolling log of the last 15 messages for the dashboard panel
+    clean = msg.replace("*", "").replace("`", "").replace("_", " ")
+    _tg_log.append({"ts": time.time(), "msg": clean[:280]})
+    if len(_tg_log) > 15:
+        _tg_log = _tg_log[-15:]
     if not TG_TOKEN or not TG_CHAT_ID:
         return False
     try:
@@ -2587,6 +2597,7 @@ class PaperTrader:
             paused = _paused
         if paused or self.balance < PAPER_FLOOR: return
         if not self._is_live() and self.balance >= PAPER_TARGET: return
+        if pair in _disabled_pairs: return
         self._reset_day_if_needed()
         if _daily_limits:
             if self.day_trades >= MAX_TRADES_DAY: return
@@ -6149,6 +6160,33 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .er-cnt{font-family:var(--fn);font-size:.6rem;color:var(--tx);width:44px;flex-shrink:0;text-align:right}
 /* ── GATE TOTAL LABEL ── */
 .gate-total{padding:4px 16px 2px;font-size:.62rem;color:var(--mu);font-family:var(--fn)}
+/* ── WEEKLY CALENDAR TOTAL ── */
+.cal-week-total{grid-column:1/-1;display:flex;align-items:center;justify-content:flex-end;
+  padding:2px 6px 4px;font-size:.58rem;font-family:var(--fn);font-weight:700;color:var(--mu)}
+.cal-week-total.wk-up{color:rgba(0,204,116,.85)}
+.cal-week-total.wk-dn{color:rgba(255,51,82,.85)}
+/* ── BALANCE PROJECTION ── */
+.proj-row{padding:6px 16px 10px;display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+.proj-rate{font-family:var(--fn);font-size:.85rem;font-weight:700}
+.proj-rate.up{color:var(--g)}.proj-rate.dn{color:var(--r)}
+.proj-eta{font-size:.62rem;color:var(--mu)}
+/* ── BOT MESSAGES PANEL ── */
+.bmsg-row{padding:9px 0;border-bottom:1px solid var(--bd2);display:flex;gap:10px;align-items:flex-start}
+.bmsg-row:last-child{border-bottom:none}
+.bmsg-time{font-size:.55rem;color:var(--mu);font-family:var(--fn);flex-shrink:0;padding-top:2px;min-width:38px}
+.bmsg-text{font-size:.62rem;color:var(--tx);line-height:1.45;word-break:break-word}
+/* ── COIN CONTROL TOGGLES ── */
+.coin-ctrl-row{display:flex;align-items:center;gap:10px;padding:6px 16px;border-bottom:1px solid var(--bd2)}
+.coin-ctrl-row:last-child{border-bottom:none}
+.coin-ctrl-name{font-size:.72rem;font-weight:600;flex:1;color:var(--tx)}
+.coin-ctrl-pair{font-size:.56rem;color:var(--mu)}
+.cc-toggle{position:relative;width:36px;height:20px;flex-shrink:0}
+.cc-toggle input{opacity:0;width:0;height:0}
+.cc-slider{position:absolute;inset:0;background:var(--bd2);border-radius:20px;cursor:pointer;transition:.2s}
+.cc-slider:before{content:'';position:absolute;height:14px;width:14px;left:3px;bottom:3px;
+  background:#fff;border-radius:50%;transition:.2s}
+.cc-toggle input:checked+.cc-slider{background:var(--g)}
+.cc-toggle input:checked+.cc-slider:before{transform:translateX(16px)}
 /* ── BEST SETUPS CARDS ── */
 .setup-card{background:var(--c2);border:1px solid var(--bd2);border-radius:11px;padding:11px 13px;margin-bottom:9px}
 .setup-card:last-child{margin-bottom:0}
@@ -6593,6 +6631,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="qcard-sub" id="best_sub"></div>
       </div>
     </div>
+    <div class="proj-row" id="proj_row" style="display:none">
+      <span class="proj-rate" id="proj_rate"></span>
+      <span class="proj-eta" id="proj_eta"></span>
+    </div>
 
     <div class="sh"><span>Daily Goal</span></div>
     <div class="goal-wrap">
@@ -6756,6 +6798,8 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="trade-box" id="trades_box"><div class="no-data">No trades yet</div></div>
     <div class="sh" id="er_hdr" style="display:none"><span>Exit Reasons</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">last 20 trades</span></div>
     <div id="exit_reasons" style="padding-bottom:14px"></div>
+    <div class="sh"><span>&#128241; Bot Messages</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">last 15 alerts</span></div>
+    <div id="bot_msgs" style="padding:0 16px 14px"><div class="no-data">No messages yet</div></div>
   </div>
 
   <!-- STATS -->
@@ -6887,6 +6931,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="sh"><span>Market Heatmap</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">26 coins · 15-min signals</span></div>
     <div class="hm-grid" id="hm_grid">
       <div class="no-data" style="grid-column:1/-1">Loading&#8230;</div>
+    </div>
+    <div class="sh"><span>&#128275; Coin Controls</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">toggle coins on/off</span></div>
+    <div id="coin_ctrl_list" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;overflow:hidden">
+      <div class="no-data">Loading&#8230;</div>
     </div>
     <div class="sh"><span>Crypto News</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">sentiment scan</span></div>
     <div id="news_feed" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 16px;padding:0 14px">
@@ -7057,7 +7105,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchNews();fetchBestSetups();}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchNews();fetchBestSetups();fetchBotMsgs();}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -7178,6 +7226,7 @@ async function fetchStatus(){
     if(d.market_conditions)renderConditions(d.market_conditions);
     if(d.gate_counters)renderGates(d.gate_counters);
     renderRiskGauge(d);
+    renderProjection(d.balance_projection||null);
     _updateLiveStats(d);
     const _curDd=d.peak>0?Math.round((d.peak-d.balance)/d.peak*100):0;
     const _ddAlertEl=$('dd_alert');
@@ -8075,23 +8124,26 @@ async function fetchMarket(){
     const el=$('hm_grid');if(!el)return;
     _hmCoins=d.coins||[];
     if(!_hmCoins.length){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No data yet</div>';return;}
+    const _disSet=new Set((d.disabled_pairs||[]));
     el.innerHTML=_hmCoins.map(c=>{
       const sig=c.signal||'NONE';
       const bull=sig==='BULL',bear=sig==='BEAR';
-      const cls=bull?'bull':bear?'bear':'';
-      const sigCol=bull?'var(--g)':bear?'var(--r)':'var(--mu)';
-      const sigTxt=bull?'▲ BULL':bear?'▼ BEAR':'— NONE';
+      const dis=_disSet.has(c.pair);
+      const cls=(dis?'':'')+(bull?'bull':bear?'bear':'');
+      const sigCol=dis?'var(--mu)':bull?'var(--g)':bear?'var(--r)':'var(--mu)';
+      const sigTxt=dis?'— OFF':bull?'▲ BULL':bear?'▼ BEAR':'— NONE';
       const str=c.strength>0?Math.round(c.strength*100)+'%':'';
-      return '<div class="hm-cell '+cls+'">'+
+      return '<div class="hm-cell '+cls+'" style="'+(dis?'opacity:.45':'')+'">'+
         '<div style="display:flex;align-items:flex-start;justify-content:space-between">'+
           '<div class="hm-name">'+c.name+'</div>'+
           '<span class="hm-bell" data-pair="'+c.pair+'" data-name="'+c.name+'" onclick="openAlertSheet(this.dataset.pair,this.dataset.name)">&#128276;</span>'+
         '</div>'+
         '<div class="hm-sig" style="color:'+sigCol+'">'+sigTxt+'</div>'+
-        (str?'<div class="hm-str">'+str+' conf'+(c.pattern?' · '+c.pattern:'')+'</div>':'')
+        (str&&!dis?'<div class="hm-str">'+str+' conf'+(c.pattern?' · '+c.pattern:'')+'</div>':'')
         +'</div>';
     }).join('');
     fetchAlerts();
+    fetchCoinControls(d.disabled_pairs||[]);
   }catch(e){console.warn('market',e);}
 }
 
@@ -8111,6 +8163,115 @@ function renderGates(counters){
       '<div class="gate-bar-wrap"><div class="gate-bar-fill" style="width:'+barPct+'%"></div></div>'+
       '<div class="gate-cnt">'+v+' <span style="opacity:.45;font-size:.58rem">('+sharePct+'%)</span></div></div>';
   }).join('');
+}
+
+/* ── BALANCE PROJECTION ── */
+function renderProjection(proj){
+  const row=$('proj_row'),rEl=$('proj_rate'),eEl=$('proj_eta');
+  if(!row||!proj||proj.daily_rate==null){if(row)row.style.display='none';return;}
+  const rate=proj.daily_rate;
+  const up=rate>0;
+  rEl.textContent=(up?'+':'')+('$'+Math.abs(rate).toFixed(2))+'/day (7-day avg)';
+  rEl.className='proj-rate '+(up?'up':'dn');
+  if(proj.days_to_milestone&&proj.milestone){
+    eEl.textContent='→ $'+proj.milestone+' in ~'+proj.days_to_milestone+' days at this pace';
+  }else{
+    eEl.textContent=rate<0?'Trending down — review your strategy':'';
+  }
+  row.style.display='flex';
+}
+
+/* ── BOT MESSAGES ── */
+async function fetchBotMsgs(){
+  try{
+    const d=await(await fetch('/tglog')).json();
+    const el=$('bot_msgs');if(!el)return;
+    if(!d.messages||!d.messages.length){
+      el.innerHTML='<div class="no-data">No messages yet</div>';return;
+    }
+    el.innerHTML=d.messages.map(m=>{
+      const dt=new Date(m.ts*1000);
+      const t=dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+      const day=dt.toLocaleDateString([],{month:'short',day:'numeric'});
+      const isToday=new Date().toDateString()===dt.toDateString();
+      return '<div class="bmsg-row">'+
+        '<div class="bmsg-time">'+(isToday?t:day)+'</div>'+
+        '<div class="bmsg-text">'+m.msg.replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</div>'+
+      '</div>';
+    }).join('');
+  }catch(e){console.warn('tglog',e);}
+}
+
+/* ── COIN CONTROLS ── */
+let _coinCtrlPairs=[];
+async function fetchCoinControls(disabledPairs){
+  const el=$('coin_ctrl_list');if(!el)return;
+  // Build from SCAN_UNIVERSE known to the market heatmap
+  const known=window._hmCoins||[];
+  if(!known.length){el.innerHTML='<div class="no-data">Load market heatmap first</div>';return;}
+  _coinCtrlPairs=known;
+  const dis=new Set(disabledPairs||[]);
+  el.innerHTML=known.map(c=>{
+    const en=!dis.has(c.pair);
+    const id='cc_'+c.pair.replace(/[^a-z0-9]/gi,'_');
+    return '<div class="coin-ctrl-row">'+
+      '<div class="coin-ctrl-name">'+c.name+'<span class="coin-ctrl-pair"> · '+c.pair+'</span></div>'+
+      '<label class="cc-toggle">'+
+        '<input type="checkbox" id="'+id+'" '+(en?'checked':'')+
+          ' onchange="toggleCoin(\''+c.pair+'\',this.checked)">'+
+        '<span class="cc-slider"></span>'+
+      '</label>'+
+    '</div>';
+  }).join('');
+}
+async function toggleCoin(pair,enabled){
+  try{
+    await fetch('/togglepair',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pair,enabled})});
+  }catch(e){console.warn('togglepair',e);}
+}
+
+/* ── WEEKLY CALENDAR TOTAL ── */
+function renderCalendarWithWeeks(days){
+  const el=$('cal_grid');if(!el)return;
+  if(!days.length){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No trades yet</div>';return;}
+  const map={};days.forEach(d=>{map[d.date]=d.pnl;});
+  const today=new Date();
+  const cells=[];
+  for(let i=29;i>=0;i--){
+    const dt=new Date(today);dt.setDate(today.getDate()-i);
+    const key=dt.toISOString().slice(0,10);
+    cells.push({key,day:dt.getDate(),pnl:map.hasOwnProperty(key)?map[key]:null});
+  }
+  const firstDow=new Date(cells[0].key+'T00:00:00Z').getUTCDay();
+  const blanks=Array(firstDow).fill(null);
+  const allCells=[...blanks,...cells];
+  // Chunk into rows of 7, add week total after each row
+  let html='';
+  for(let r=0;r<allCells.length;r+=7){
+    const row=allCells.slice(r,r+7);
+    html+=row.map(c=>{
+      if(!c)return '<div class="cal-day blank"></div>';
+      const cls=c.pnl===null?'empty':c.pnl>0?'profit':'loss';
+      const pnlStr=c.pnl!==null?(c.pnl>=0?'+$':'-$')+Math.abs(c.pnl).toFixed(2):'';
+      const short=c.pnl!==null?(c.pnl>=0?'+':'')+(c.pnl>0?'$'+Math.abs(c.pnl).toFixed(0):'-$'+Math.abs(c.pnl).toFixed(0)):'';
+      return '<div class="cal-day '+cls+'" title="'+c.key+(pnlStr?' · '+pnlStr:'')+'">'+
+        '<div class="cal-dn">'+c.day+'</div>'+
+        (short?'<div class="cal-pnl">'+short+'</div>':'')+
+      '</div>';
+    }).join('');
+    // Week total row (only for rows that have at least one real cell)
+    const realCells=row.filter(c=>c&&c.pnl!==null);
+    if(realCells.length){
+      const wSum=realCells.reduce((s,c)=>s+(c.pnl||0),0);
+      const wCls=wSum>0?'wk-up':wSum<0?'wk-dn':'';
+      const wStr=(wSum>=0?'+$':'-$')+Math.abs(wSum).toFixed(2);
+      html+='<div class="cal-week-total '+wCls+'">week: '+wStr+'</div>';
+    }else{
+      html+='<div class="cal-week-total"></div>';
+    }
+  }
+  el.innerHTML=html;
 }
 
 /* ── BEST SETUPS ── */
@@ -8154,7 +8315,7 @@ async function fetchBestSetups(){
 async function fetchDailyPnl(){
   try{
     const d=await(await fetch('/daily_pnl')).json();
-    renderCalendar(d.days||[]);
+    renderCalendarWithWeeks(d.days||[]);
   }catch(e){console.warn('daily_pnl',e);}
 }
 function renderCalendar(days){
@@ -8984,7 +9145,7 @@ applyTheme(_theme);
 _initSoundBtn();
 _initKeyboard();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
-fetchSim();fetchNews();fetchBestSetups();
+fetchSim();fetchNews();fetchBestSetups();fetchBotMsgs();
 fetchPrices();setInterval(fetchPrices,8000);
 initSSE();initWebPush();
 setInterval(tick,1000);
@@ -9050,6 +9211,24 @@ def _web_chart_png():
         return _Response("Chart unavailable.", status=503, mimetype="text/plain")
     return _Response(buf.read(), mimetype="image/png",
                      headers={"Cache-Control": "no-store, no-cache"})
+
+def _calc_balance_projection(trader):
+    """Return 7-day daily rate and days-to-next-milestone for the balance projection card."""
+    if not trader or not trader.trades:
+        return None
+    seven_ago = time.time() - 7 * 86400
+    recent = [t["pnl"] for t in trader.trades if t.get("ts", 0) > seven_ago]
+    if not recent:
+        return None
+    daily_rate = sum(recent) / 7.0
+    if daily_rate <= 0:
+        return {"daily_rate": round(daily_rate, 2), "days_to_milestone": None, "milestone": None}
+    # Next milestone: next $100 or $500 boundary above current balance
+    bal = trader.balance
+    step = 500 if bal >= 1000 else 100
+    milestone = (int(bal / step) + 1) * step
+    days = round((milestone - bal) / daily_rate, 1)
+    return {"daily_rate": round(daily_rate, 2), "days_to_milestone": days, "milestone": milestone}
 
 @_flask_app.route("/status")
 def _web_status():
@@ -9214,6 +9393,8 @@ def _web_status():
             "positions": len(_sim_trader.positions) if _sim_trader else 0,
         },
         "news_sentiment": {p: news_sentiment[p]["sentiment"] for p in news_sentiment},
+        "disabled_pairs": list(_disabled_pairs),
+        "balance_projection": _calc_balance_projection(trader),
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
@@ -9514,6 +9695,30 @@ def _web_resetstreak():
        f"_Confidence gate and cooldown lifted — full sizing resumes._")
     return _Response('{"ok":true}', mimetype="application/json")
 
+@_flask_app.route("/togglepair", methods=["POST"])
+def _web_togglepair():
+    """Enable or disable a specific pair from receiving signals."""
+    global _disabled_pairs
+    body = _flask_request.get_json(silent=True) or {}
+    pair = body.get("pair", "").strip().upper()
+    enabled = body.get("enabled", True)
+    if not pair:
+        return _Response('{"ok":false}', mimetype="application/json")
+    if enabled:
+        _disabled_pairs.discard(pair)
+        log("LIVE", f"Pair {pair} re-enabled via dashboard")
+    else:
+        _disabled_pairs.add(pair)
+        log("LIVE", f"Pair {pair} disabled via dashboard")
+    return _Response(json.dumps({"ok": True, "disabled": list(_disabled_pairs)}),
+                     mimetype="application/json")
+
+@_flask_app.route("/tglog")
+def _web_tglog():
+    """Return the last 15 Telegram messages the bot sent."""
+    return _Response(json.dumps({"messages": list(reversed(_tg_log))}),
+                     mimetype="application/json")
+
 @_flask_app.route("/bestsetups")
 def _web_bestsetups():
     """Return guard-mode winning setups saved in memory."""
@@ -9612,7 +9817,8 @@ def _web_market():
             "pattern": pat.get("name", ""),
             "candle": pat.get("candle_name", ""),
         })
-    return _Response(json.dumps({"coins": coins}), mimetype="application/json")
+    return _Response(json.dumps({"coins": coins, "disabled_pairs": list(_disabled_pairs)}),
+                     mimetype="application/json")
 
 @_flask_app.route("/close/<pair>", methods=["POST"])
 def _web_close_position(pair):
