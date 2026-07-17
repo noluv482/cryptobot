@@ -2159,6 +2159,7 @@ class PaperTrader:
         # Loss streak global entry cooldown (30-min pause after ≥3 consecutive losses)
         self._streak_cool_until = 0.0
         self._streak_reset_len  = 0    # manual reset: only count trades after this index
+        self._saved_setups      = []   # guard-mode winning setups (capped at 50)
         # Volatility-adaptive sizing: EMA of ATR per pair to detect elevated volatility
         self._base_atr  = {}   # pair → long-run EMA of ATR
         # Kelly Criterion cache (refreshed every 5 min when ≥20 trades available)
@@ -2895,7 +2896,9 @@ class PaperTrader:
                                 "atr_dist": atr_dist, "fkey": fkey,
                                 "entry_nasdaq": market_mood["nasdaq"],
                                 "entry_news": news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"),
-                                "pillars": pillars or {}}
+                                "pillars": pillars or {},
+                                "guard_mode": self.consecutive_losses >= 3,
+                                "streak_at_entry": self.consecutive_losses}
         self._save()
         _push_sse("trade_open", {"name": name, "side": side,
                                   "entry": fill, "pair": pair,
@@ -3034,6 +3037,39 @@ class PaperTrader:
                 _post_loss_analysis(p, pnl, reason, held_mins)
         else:
             self._streak_cool_until = 0.0   # win resets the streak cooldown
+            if p.get("guard_mode") and pnl > 0:
+                streak_n = p.get("streak_at_entry", 0)
+                setup = {
+                    "ts":         time.time(),
+                    "pair":       pair,
+                    "name":       name,
+                    "side":       p["side"],
+                    "entry":      p["entry"],
+                    "exit":       fill,
+                    "pnl":        round(pnl, 2),
+                    "held_mins":  round(held_mins, 1),
+                    "confidence": round(p.get("confidence", 0) * 100),
+                    "pillars":    p.get("pillars", {}),
+                    "reason":     reason,
+                    "streak_at_entry": streak_n,
+                    "nasdaq":     entry_nasdaq,
+                    "news":       entry_news,
+                }
+                self._saved_setups.append(setup)
+                if len(self._saved_setups) > 50:
+                    self._saved_setups.pop(0)
+                _pm = "📄 [SIM] " if self._force_paper else ""
+                pillar_lines = "\n".join(
+                    f"  {'✅' if v else '❌'} `{k.replace('_',' ').title()}`"
+                    for k, v in setup["pillars"].items()
+                ) if setup["pillars"] else "  _no pillar data_"
+                tg(f"{_pm}⭐ *Guard-Mode WIN — Setup Saved!*\n"
+                   f"{'🟢 LONG' if p['side']=='LONG' else '🔴 SHORT'} {name}\n"
+                   f"Entry: `${p['entry']:.4f}` → Exit: `${fill:.4f}`\n"
+                   f"PnL: `+${pnl:.2f}` | Held: `{held_mins:.0f} min` | Conf: `{setup['confidence']}%`\n"
+                   f"Streak at entry: `{streak_n} losses` (gate was +{min(streak_n*3,15)}%)\n"
+                   f"*Pillars active:*\n{pillar_lines}\n"
+                   f"_This setup is saved in your dashboard Best Setups section._")
         emoji = "✅" if pnl >= 0 else "❌"
         # Trade journal — rich close message
         nasdaq_icon = "📈" if entry_nasdaq == "BULLISH" else "📉" if entry_nasdaq == "BEARISH" else "➖"
@@ -6113,6 +6149,21 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .er-cnt{font-family:var(--fn);font-size:.6rem;color:var(--tx);width:44px;flex-shrink:0;text-align:right}
 /* ── GATE TOTAL LABEL ── */
 .gate-total{padding:4px 16px 2px;font-size:.62rem;color:var(--mu);font-family:var(--fn)}
+/* ── BEST SETUPS CARDS ── */
+.setup-card{background:var(--c2);border:1px solid var(--bd2);border-radius:11px;padding:11px 13px;margin-bottom:9px}
+.setup-card:last-child{margin-bottom:0}
+.setup-top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.setup-pair{font-size:.78rem;font-weight:700;color:var(--tx);flex:1}
+.setup-side{font-size:.58rem;font-weight:700;padding:2px 7px;border-radius:20px;text-transform:uppercase}
+.setup-side.long{background:rgba(0,204,116,.18);color:var(--g)}
+.setup-side.short{background:rgba(255,51,82,.18);color:var(--r)}
+.setup-pnl{font-size:.8rem;font-weight:700;font-family:var(--fn);color:var(--g)}
+.setup-meta{font-size:.58rem;color:var(--mu);margin-bottom:7px;line-height:1.6}
+.setup-pillars{display:flex;flex-wrap:wrap;gap:4px}
+.sp-chip{font-size:.52rem;padding:2px 6px;border-radius:10px;font-weight:600}
+.sp-chip.on{background:rgba(0,204,116,.15);color:var(--g)}
+.sp-chip.off{background:var(--bd2);color:var(--mu)}
+.setup-streak{font-size:.56rem;color:var(--y);font-weight:600;margin-top:5px}
 /* ── LIVE DIAGNOSTICS PANEL ── */
 .diag-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid var(--bd2)}
 .diag-row:last-child{border-bottom:none}
@@ -6791,6 +6842,8 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="sh"><span>Gate Filters</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">blocked signals today</span></div>
     <div class="gate-total" id="gate_total"></div>
     <div id="gate_bars" style="padding-bottom:12px"><div class="no-data">No blocks yet</div></div>
+    <div class="sh"><span>&#11088; Best Setups</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">guard-mode wins to study</span></div>
+    <div id="best_setups" style="padding:0 16px 14px"><div class="no-data">No guard-mode wins yet — these appear when the bot wins a trade while the loss-streak gate is raised</div></div>
     <div class="sh"><span>Backtest</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">60h replay · live signal engine</span></div>
     <div class="bt-form">
       <select class="bt-sel" id="bt_pair"></select>
@@ -7004,7 +7057,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchNews();}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchNews();fetchBestSetups();}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -8060,6 +8113,43 @@ function renderGates(counters){
   }).join('');
 }
 
+/* ── BEST SETUPS ── */
+async function fetchBestSetups(){
+  try{
+    const d=await(await fetch('/bestsetups')).json();
+    const el=$('best_setups');if(!el)return;
+    if(!d.setups||!d.setups.length){
+      el.innerHTML='<div class="no-data">No guard-mode wins yet — these appear when the bot wins a trade while the loss-streak gate is raised</div>';
+      return;
+    }
+    const PILLAR_LABELS={'rsi_zone':'RSI Zone','news_align':'News','nasdaq_align':'NASDAQ',
+      'tick_strength':'Tick','macd_align':'MACD','high_volume':'Volume','candle_pattern':'Candle',
+      'vwap_align':'VWAP','obv_trend':'OBV','chart_struct':'Structure','stoch_rsi':'Stoch RSI'};
+    el.innerHTML=d.setups.map(s=>{
+      const dt=new Date(s.ts*1000);
+      const dtStr=dt.toLocaleDateString('en-US',{month:'short',day:'numeric'})+' '+dt.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+      const pillarsHtml=Object.entries(s.pillars||{}).map(([k,v])=>
+        '<span class="sp-chip '+(v?'on':'off')+'">'+(PILLAR_LABELS[k]||k)+'</span>'
+      ).join('');
+      const pnlStr='+$'+s.pnl.toFixed(2);
+      const move=((s.exit-s.entry)/s.entry*(s.side==='LONG'?1:-1)*100).toFixed(2);
+      return '<div class="setup-card">'+
+        '<div class="setup-top">'+
+          '<div class="setup-pair">'+s.name+'</div>'+
+          '<span class="setup-side '+(s.side==='LONG'?'long':'short')+'">'+s.side+'</span>'+
+          '<div class="setup-pnl">'+pnlStr+'</div>'+
+        '</div>'+
+        '<div class="setup-meta">'+
+          dtStr+' · Conf: '+s.confidence+'% · Held: '+s.held_mins+' min · '+move+'% move'+
+          (s.reason?' · Exit: '+s.reason.replace(/_/g,' '):'')+
+        '</div>'+
+        (pillarsHtml?'<div class="setup-pillars">'+pillarsHtml+'</div>':'')+
+        '<div class="setup-streak">⚠️ Entered with '+s.streak_at_entry+' losses on streak (gate was +'+(Math.min(s.streak_at_entry*3,15))+'%)</div>'+
+      '</div>';
+    }).join('');
+  }catch(e){console.warn('bestsetups',e);}
+}
+
 /* ── DAILY P&L CALENDAR ── */
 async function fetchDailyPnl(){
   try{
@@ -8894,7 +8984,7 @@ applyTheme(_theme);
 _initSoundBtn();
 _initKeyboard();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
-fetchSim();fetchNews();
+fetchSim();fetchNews();fetchBestSetups();
 fetchPrices();setInterval(fetchPrices,8000);
 initSSE();initWebPush();
 setInterval(tick,1000);
@@ -9423,6 +9513,13 @@ def _web_resetstreak():
        f"Previous streak: `{old_streak}` losses cleared via dashboard\n"
        f"_Confidence gate and cooldown lifted — full sizing resumes._")
     return _Response('{"ok":true}', mimetype="application/json")
+
+@_flask_app.route("/bestsetups")
+def _web_bestsetups():
+    """Return guard-mode winning setups saved in memory."""
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    setups = list(reversed(trader._saved_setups)) if trader else []
+    return _Response(json.dumps({"setups": setups}), mimetype="application/json")
 
 @_flask_app.route("/settings", methods=["GET", "POST"])
 def _web_settings():
