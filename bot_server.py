@@ -260,6 +260,7 @@ LIVE_EXCHANGE     = ("binance"         if (USE_BINANCE and BINANCE_API_KEY) else
 BINANCE_FEE       = 0.001   # 0.10% per trade (vs Kraken's 0.26%)
 KRAKEN_MARGIN     = os.environ.get("KRAKEN_MARGIN", "0") in ("1", "true", "yes")
 KRAKEN_LEVERAGE   = max(2, min(5, int(os.environ.get("KRAKEN_LEVERAGE", "2"))))
+DASHBOARD_PIN     = _clean_env(os.environ.get("DASHBOARD_PIN", ""))
 
 # Binance kline interval strings
 _BINANCE_IV = {1:"1m",3:"3m",5:"5m",15:"15m",30:"30m",60:"1h",120:"2h",240:"4h",1440:"1d"}
@@ -5781,6 +5782,56 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 /* color helpers */
 .c-g{color:var(--g)}.c-r{color:var(--r)}.c-b{color:var(--b)}.c-y{color:var(--y)}.c-tx{color:var(--tx)}.c-mu{color:var(--mu)}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+/* ── MOBILE-FIRST RESPONSIVE GRIDS ── */
+.lpg{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;padding:0 16px 16px}
+@media(min-width:500px){.lpg{grid-template-columns:repeat(4,1fr);gap:8px}}
+@media(max-width:480px){
+  .bt-stats-row{grid-template-columns:repeat(2,1fr)!important}
+  .sim-grid{grid-template-columns:1fr 1fr!important}
+  .hr-grid{grid-template-columns:repeat(4,1fr)!important;gap:3px}
+  .qcard-val{font-size:1.08rem}
+  .hdr-actions{gap:4px}
+  .icon-btn,#theme_btn,#sound_btn{width:34px;height:34px;font-size:.9rem}
+  .pc{padding:12px}
+  .hero-int{font-size:2.2rem}
+}
+/* ── UNREALIZED PNL BANNER ── */
+.upnl-banner{margin:0 16px 12px;border-radius:12px;padding:14px 16px;
+  display:flex;align-items:center;gap:14px;
+  background:rgba(0,204,116,.08);border:1px solid rgba(0,204,116,.2);transition:background .3s,border-color .3s}
+.upnl-banner.neg{background:rgba(255,51,82,.07);border-color:rgba(255,51,82,.2)}
+.upnl-banner.hidden{display:none}
+.upnl-ico{font-size:1.6rem;flex-shrink:0;line-height:1}
+.upnl-body{flex:1;min-width:0}
+.upnl-lbl{font-size:.52rem;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:3px}
+.upnl-val{font-family:var(--fn);font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}
+.upnl-cnt{font-size:.6rem;color:var(--mu);margin-top:3px}
+/* ── DAILY GOAL ── */
+.goal-wrap{margin:0 16px 16px;background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:14px 15px}
+/* ── SCAN STRIP ── */
+.scan-strip{display:flex;align-items:center;gap:8px;padding:4px 16px 8px;font-size:.62rem;color:var(--mu)}
+.scan-dot{width:6px;height:6px;border-radius:50%;background:var(--g);animation:blink 1.8s ease-in-out infinite;flex-shrink:0}
+.scan-dot.idle{background:var(--mu);animation:none}
+/* ── PIN LOCK SCREEN ── */
+.pin-lock{position:fixed;inset:0;z-index:9999;background:var(--bg);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 20px}
+.pin-lock.gone{display:none}
+.pin-logo{font-family:var(--fn);font-size:.75rem;font-weight:700;letter-spacing:.22em;
+  text-transform:uppercase;color:var(--b);margin-bottom:36px}
+.pin-title{font-size:.9rem;font-weight:700;margin-bottom:5px}
+.pin-sub{font-size:.65rem;color:var(--mu);margin-bottom:30px;text-align:center}
+.pin-dots{display:flex;gap:14px;margin-bottom:30px}
+.pin-dot{width:16px;height:16px;border-radius:50%;border:2px solid var(--bd2);transition:background .12s,border-color .12s}
+.pin-dot.filled{background:var(--b);border-color:var(--b)}
+.pin-pad{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;width:252px}
+.pin-key{height:68px;border-radius:16px;border:1px solid var(--bd2);
+  background:var(--s0);color:var(--tx);font-size:1.5rem;font-weight:600;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;
+  touch-action:manipulation;transition:background .1s;user-select:none;-webkit-user-select:none}
+.pin-key:active{background:var(--s1)}
+.pin-key.del{font-size:.9rem;color:var(--mu)}
+.pin-key.empty{opacity:0;pointer-events:none}
+.pin-err{font-size:.65rem;color:var(--r);margin-top:16px;min-height:1.4em;text-align:center}
 /* ── MARKET CONDITIONS ── */
 .mc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:0 16px 10px}
 .mc-tile{background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:12px 13px}
@@ -6068,6 +6119,34 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 </head>
 <body>
 
+<!-- PIN LOCK -->
+<div class="pin-lock gone" id="pin_lock" role="dialog" aria-label="Enter PIN">
+  <div class="pin-logo">CRYPTOBOT</div>
+  <div class="pin-title">Enter PIN to unlock</div>
+  <div class="pin-sub">Your dashboard is PIN protected</div>
+  <div class="pin-dots" id="pin_dots">
+    <div class="pin-dot" id="pd0"></div>
+    <div class="pin-dot" id="pd1"></div>
+    <div class="pin-dot" id="pd2"></div>
+    <div class="pin-dot" id="pd3"></div>
+  </div>
+  <div class="pin-pad">
+    <button class="pin-key" onclick="pinKey(1)">1</button>
+    <button class="pin-key" onclick="pinKey(2)">2</button>
+    <button class="pin-key" onclick="pinKey(3)">3</button>
+    <button class="pin-key" onclick="pinKey(4)">4</button>
+    <button class="pin-key" onclick="pinKey(5)">5</button>
+    <button class="pin-key" onclick="pinKey(6)">6</button>
+    <button class="pin-key" onclick="pinKey(7)">7</button>
+    <button class="pin-key" onclick="pinKey(8)">8</button>
+    <button class="pin-key" onclick="pinKey(9)">9</button>
+    <button class="pin-key empty" aria-hidden="true"></button>
+    <button class="pin-key" onclick="pinKey(0)">0</button>
+    <button class="pin-key del" onclick="pinDel()">&#9003;</button>
+  </div>
+  <div class="pin-err" id="pin_err"></div>
+</div>
+
 <header class="hdr">
   <div class="hdr-logo">CB<span id="conn_dot" class="conn-dot"></span></div>
   <div id="mode_badge" class="badge badge-paper" onclick="toggleMode()" title="Tap to switch Paper / Live" style="cursor:pointer">
@@ -6116,12 +6195,18 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       </div>
     </div>
 
+    <div class="scan-strip">
+      <div class="scan-dot" id="scan_dot"></div>
+      <span id="scan_msg">Scanning markets…</span>
+      <span style="margin-left:auto;font-family:var(--fn);font-size:.55rem;opacity:.7" id="scan_time"></span>
+    </div>
+
     <div id="sharpe_row" class="sharpe-row" style="display:none">
       <span class="sharpe-badge" id="sharpe_badge">— Sharpe</span>
     </div>
 
     <div class="sh"><span>Live Prices</span></div>
-    <div id="live_prices_grid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:0 16px 16px">
+    <div id="live_prices_grid" class="lpg">
       <div class="no-data" style="grid-column:1/-1;padding:10px 0">Loading prices…</div>
     </div>
 
@@ -6182,6 +6267,36 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="qcard-lbl">Avg Win / Loss</div>
         <div class="qcard-val" id="avgwl_val" style="font-size:.88rem">—</div>
         <div class="qcard-sub" id="avgwl_sub"></div>
+      </div>
+    </div>
+    <div class="qrow" style="padding-top:0">
+      <div class="qcard ac-m">
+        <div class="qcard-lbl">Avg Hold Time</div>
+        <div class="qcard-val c-b" id="hold_val">—</div>
+        <div class="qcard-sub" id="hold_sub">per trade</div>
+      </div>
+      <div class="qcard ac-m">
+        <div class="qcard-lbl">Best Trade</div>
+        <div class="qcard-val c-g" id="best_val">—</div>
+        <div class="qcard-sub" id="best_sub"></div>
+      </div>
+    </div>
+
+    <div class="sh"><span>Daily Goal</span></div>
+    <div class="goal-wrap">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:8px">
+        <div style="font-family:var(--fn);font-size:1.35rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1" id="goal_today">$0.00</div>
+        <div style="display:flex;align-items:center;gap:6px">
+          <button class="set-step-btn" onclick="stepGoal(-1)" title="Lower goal">&#8722;</button>
+          <span style="font-size:.62rem;color:var(--mu);font-family:var(--fn)" id="goal_target_lbl">$10 goal</span>
+          <button class="set-step-btn" onclick="stepGoal(1)" title="Raise goal">+</button>
+        </div>
+      </div>
+      <div style="height:8px;background:var(--bd2);border-radius:4px;overflow:hidden">
+        <div id="goal_bar" style="height:100%;border-radius:4px;background:var(--g);transition:width .8s ease;width:0%"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:5px;font-size:.57rem;color:var(--mu);font-family:var(--fn)">
+        <span>$0</span><span id="goal_pct_lbl">0%</span><span id="goal_max_lbl">$10</span>
       </div>
     </div>
 
@@ -6313,6 +6428,14 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="sh"><span>Open Positions</span></div>
     <div class="dd-alert" id="dd_alert">&#128683; Drawdown limit reached — new trades paused</div>
     <div class="corr-warn" id="corr_warn">&#9888; Correlated exposure</div>
+    <div class="upnl-banner hidden" id="upnl_banner">
+      <div class="upnl-ico" id="upnl_ico">&#128200;</div>
+      <div class="upnl-body">
+        <div class="upnl-lbl">Total Open P&amp;L</div>
+        <div class="upnl-val" id="upnl_total">+$0.00</div>
+        <div class="upnl-cnt" id="upnl_count">0 positions</div>
+      </div>
+    </div>
     <div id="pos_list"></div>
     <div class="sh"><span>Recent Trades</span></div>
     <div class="trade-box" id="trades_box"><div class="no-data">No trades yet</div></div>
@@ -6639,6 +6762,7 @@ async function fetchStatus(){
     $('mode_txt').textContent=(d.mode||'PAPER')+(live&&d.exchange?' · '+d.exchange.toUpperCase():'');
     setBal(d.balance,pc(d.day_pnl));
     const dp=d.day_pnl||0;
+    _updateGoalTracker(dp);
     const pill=$('hero_pill');
     pill.textContent=(dp>=0?'+':'')+msign(dp)+' today';
     pill.className='hero-pill '+(dp>0?'pill-up':dp<0?'pill-dn':'pill-fl');
@@ -6690,6 +6814,14 @@ async function fetchStatus(){
     if($('s_avg_loss')){$('s_avg_loss').textContent=al!=null?'$'+al.toFixed(2):'—';$('s_avg_loss_sub').textContent=aw&&al?'ratio '+(aw/Math.max(al,0.01)).toFixed(2)+'×':'';}
 
     const recent=(d.recent_trades||[]).slice(0,10);
+    // Avg hold time + best trade
+    const heldArr=recent.filter(t=>t.held_mins!=null);
+    const avgHold=heldArr.length?heldArr.reduce((s,t)=>s+t.held_mins,0)/heldArr.length:null;
+    if($('hold_val'))$('hold_val').textContent=avgHold!=null?Math.round(avgHold)+'m':'—';
+    if($('hold_sub'))$('hold_sub').textContent=avgHold!=null?'over '+heldArr.length+' trades':'no trades yet';
+    const bestT=recent.reduce((b,t)=>(t.pnl>(b?b.pnl:Number.NEGATIVE_INFINITY))?t:b,null);
+    if($('best_val')){$('best_val').textContent=bestT?msign(bestT.pnl):'—';$('best_val').className='qcard-val '+(bestT&&bestT.pnl>0?'c-g':bestT&&bestT.pnl<0?'c-r':'c-mu');}
+    if($('best_sub'))$('best_sub').textContent=bestT?bestT.coin||'':'';
     $('sparks').innerHTML=recent.map(t=>'<div class="spark '+(t.pnl>0?'spark-w':'spark-l')+'" title="'+(t.pnl>0?'+':'')+t.pnl.toFixed(2)+'"></div>').join('');
     const coin=d.coin||'—',pair=d.pair||coin;
     $('coin_val').textContent=coin;
@@ -6732,6 +6864,19 @@ function renderPositions(ps){
   _openPositions=ps;
   _posTimerData={};
   const el=$('pos_list');
+  // Total unrealized PNL banner
+  const banner=$('upnl_banner');
+  if(banner){
+    if(!ps.length){
+      banner.className='upnl-banner hidden';
+    }else{
+      const totalU=ps.reduce((s,p)=>s+(p.unrealized_pnl||0),0);
+      banner.className='upnl-banner'+(totalU<0?' neg':'');
+      const uv=$('upnl_total');if(uv){uv.textContent=msign(totalU);uv.className='upnl-val '+(totalU>0?'c-g':totalU<0?'c-r':'c-mu');}
+      const ui=$('upnl_ico');if(ui)ui.textContent=totalU>=0?'📈':'📉';
+      const uc=$('upnl_count');if(uc)uc.textContent=ps.length+' position'+(ps.length!==1?'s':'')+' open';
+    }
+  }
   if(!ps.length){
     el.innerHTML='<div class="pos-empty"><div class="pos-empty-ico">&#128270;</div>'+
       '<div class="pos-empty-txt">No open positions<br>'+
@@ -6804,6 +6949,17 @@ function renderTrades(recent){
 
 /* ── ACTIVITY FEED ── */
 function renderActivity(log){
+  // Update scan strip from latest activity
+  const _sd=$('scan_dot'),_sm=$('scan_msg'),_st=$('scan_time');
+  if(log&&log.length){
+    const last=log[0];
+    if(_sm)_sm.textContent=(last.coin||'...')+' — '+(last.eval_sig==='HOLD'?'watching':last.eval_sig+' signal');
+    if(_sd)_sd.className='scan-dot';
+    if(_st){const ago=Math.round((Date.now()-new Date(last.ts).getTime())/1000);_st.textContent=ago<60?ago+'s ago':Math.round(ago/60)+'m ago';}
+  }else{
+    if(_sm)_sm.textContent='Scanning markets…';
+    if(_sd)_sd.className='scan-dot idle';
+  }
   const el=$('activity_feed');
   if(!el)return;
   if(!log||!log.length){el.innerHTML='<div class="no-data" style="padding:16px 0">Waiting for first scan…</div>';return;}
@@ -7506,6 +7662,7 @@ function updateNotifBtn(){
 
 /* ── PAUSE / RESUME ── */
 async function togglePause(){
+  if(!_pinUnlocked){showToast('🔒 Unlock with PIN first','',2500);return;}
   try{
     const d=await(await fetch('/control',{method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -7557,6 +7714,7 @@ function renderConditions(mc){
 
 /* ── CLOSE POSITION ── */
 async function closePosition(pair,name){
+  if(!_pinUnlocked){showToast('🔒 Unlock with PIN first','',2500);return;}
   if(!confirm('Close '+name+' position? This will place a market close order.'))return;
   try{
     const r=await fetch('/close/'+encodeURIComponent(pair),{method:'POST'});
@@ -8255,7 +8413,80 @@ function _renderBtvsLive(r){
   setCC('btvl_avg_live',(lvAvg>=0?'+':'')+lvAvg.toFixed(2)+'%',col(lvAvg,0));
 }
 
+/* ── PIN LOCK ── */
+let _pinUnlocked=false;
+let _pinBuf=[];
+async function _initPin(){
+  try{
+    const r=await(await fetch('/auth')).json();
+    if(!r.pin_required){_pinUnlocked=true;return;}
+    if(sessionStorage.getItem('cb_auth')==='1'){_pinUnlocked=true;return;}
+    const lock=$('pin_lock');if(lock)lock.classList.remove('gone');
+  }catch(e){_pinUnlocked=true;}
+}
+function pinKey(n){
+  if(_pinBuf.length>=4)return;
+  _pinBuf.push(n);
+  _renderPinDots();
+  if(_pinBuf.length===4)_submitPin();
+}
+function pinDel(){
+  _pinBuf.pop();
+  $('pin_err').textContent='';
+  _renderPinDots();
+}
+function _renderPinDots(){
+  for(let i=0;i<4;i++){
+    const d=$('pd'+i);
+    if(d)d.className='pin-dot'+(_pinBuf.length>i?' filled':'');
+  }
+}
+async function _submitPin(){
+  const pin=_pinBuf.join('');
+  try{
+    const r=await(await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})})).json();
+    if(r.ok){
+      _pinUnlocked=true;
+      sessionStorage.setItem('cb_auth','1');
+      const lock=$('pin_lock');if(lock)lock.classList.add('gone');
+    }else{
+      $('pin_err').textContent='Incorrect PIN — try again';
+      _pinBuf=[];
+      _renderPinDots();
+      setTimeout(()=>{if($('pin_err'))$('pin_err').textContent='';},2000);
+    }
+  }catch(e){
+    _pinBuf=[];_renderPinDots();
+  }
+}
+function _requirePin(fn){
+  if(!_pinUnlocked){showToast('&#128274; Unlock with PIN first','',2500);return;}
+  fn();
+}
+
+/* ── DAILY GOAL ── */
+let _dailyGoal=parseFloat(localStorage.getItem('cb_goal')||'10');
+let _lastDayPnl=0;
+function stepGoal(d){
+  _dailyGoal=Math.max(1,Math.round(_dailyGoal+d));
+  localStorage.setItem('cb_goal',_dailyGoal);
+  _updateGoalTracker(_lastDayPnl);
+}
+function _updateGoalTracker(dp){
+  _lastDayPnl=dp;
+  const bar=$('goal_bar');if(!bar)return;
+  const pct=_dailyGoal>0?Math.min(100,Math.max(0,dp/_dailyGoal*100)):0;
+  const today=$('goal_today'),tgtLbl=$('goal_target_lbl'),pctEl=$('goal_pct_lbl'),maxEl=$('goal_max_lbl');
+  if(today){today.textContent=(dp>=0?'+':'')+msign(dp);today.className=(dp>0?'c-g':dp<0?'c-r':'c-mu');}
+  bar.style.width=pct+'%';
+  bar.style.background=dp<0?'var(--r)':pct>=100?'var(--b)':'var(--g)';
+  if(tgtLbl)tgtLbl.textContent='$'+_dailyGoal+' goal';
+  if(pctEl)pctEl.textContent=Math.abs(pct).toFixed(0)+'%';
+  if(maxEl)maxEl.textContent='$'+_dailyGoal;
+}
+
 /* ── INIT ── */
+_initPin();
 initCandleHover();
 applyTheme(_theme);
 _initSoundBtn();
@@ -8809,6 +9040,17 @@ def _web_control():
                                   "mode": "PAPER" if now_paper else "LIVE",
                                   "sim_enabled": now_sim}),
                      mimetype="application/json")
+
+@_flask_app.route("/auth", methods=["GET", "POST"])
+def _web_auth():
+    if _flask_request.method == "GET":
+        return _Response(json.dumps({"pin_required": bool(DASHBOARD_PIN)}),
+                         mimetype="application/json")
+    body = _flask_request.get_json(silent=True) or {}
+    if not DASHBOARD_PIN:
+        return _Response('{"ok":true}', mimetype="application/json")
+    ok = body.get("pin", "") == DASHBOARD_PIN
+    return _Response(json.dumps({"ok": ok}), mimetype="application/json")
 
 @_flask_app.route("/market")
 def _web_market():
