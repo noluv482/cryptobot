@@ -923,6 +923,26 @@ _gate_counters = {
     "orderbook_wall": 0,
 }
 _gate_counter_lock = threading.Lock()
+_gate_log_ts: float = 0.0          # last time we printed the gate summary
+_GATE_LOG_INTERVAL = 1800          # log top blockers every 30 min
+
+
+def _log_gate_summary():
+    """Print the top gate blockers to stdout so Railway logs show why the bot is quiet."""
+    global _gate_log_ts
+    now = time.time()
+    if now - _gate_log_ts < _GATE_LOG_INTERVAL:
+        return
+    _gate_log_ts = now
+    with _gate_counter_lock:
+        snap = dict(_gate_counters)
+    active = sorted(((v, k) for k, v in snap.items() if v > 0), reverse=True)
+    if not active:
+        log("GATES", "No gates fired yet this session")
+        return
+    top = "  ".join(f"{k}={v}" for v, k in active[:8])
+    log("GATES", f"Top blockers → {top}")
+
 
 def is_live():
     """True when real orders should be placed — keys present AND paper override is off."""
@@ -3738,15 +3758,15 @@ class SignalEngine:
                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
                 sig = "HOLD"
 
-        # 15m confirmation — short-term EMA must also agree with signal direction
+        # 15m confirmation — soft gate: counter-trend 15m penalises confidence but
+        # doesn't hard-block. 15m EMA(14) is too noisy to veto valid 1h/4h signals.
+        _15m_against = False
         if sig in ("BUY", "SELL"):
             _htf15 = _htf_trend(current_pair, interval=15, limit=50)
             if _htf15 == "BEAR" and sig == "BUY":
-                with _gate_counter_lock: _gate_counters["15m_trend"] += 1
-                sig = "HOLD"
+                _15m_against = True
             elif _htf15 == "BULL" and sig == "SELL":
-                with _gate_counter_lock: _gate_counters["15m_trend"] += 1
-                sig = "HOLD"
+                _15m_against = True
 
         # Order book wall gate — large volume wall between price and target
         if sig in ("BUY", "SELL"):
@@ -3873,6 +3893,11 @@ class SignalEngine:
         if choppy:
             with _gate_counter_lock: _gate_counters["choppy"] += 1
             confidence = max(0.0, round(confidence - 0.15, 2))
+
+        # 15m soft gate — counter-trend 15m trims confidence without hard-blocking
+        if _15m_against and sig in ("BUY", "SELL"):
+            with _gate_counter_lock: _gate_counters["15m_trend"] += 1
+            confidence = max(0.0, round(confidence - 0.08, 2))
 
         # Bonus: Long/Short Ratio squeeze potential (contrarian liquidation boost)
         lsr = lsr_data.get(current_pair, {})
@@ -6108,6 +6133,7 @@ def trading_loop(trader):
 
         except Exception as e:
             log("TRADE", str(e), "ERR")
+        _log_gate_summary()
         time.sleep(REFRESH_SEC)
 
 # ── Web Dashboard ─────────────────────────────────────────────────────────────
