@@ -7891,7 +7891,7 @@ def main():
 
     # Plain-text ping — always shows exchange so we know which keys loaded
     _exch_label = LIVE_EXCHANGE if LIVE_MODE else "paper"
-    ok = tg(f"CryptoBot booting... v2.5 | {_exch_label} | chat_id={TG_CHAT_ID}", plain=True)
+    ok = tg(f"CryptoBot booting... v2.6 | {_exch_label} | chat_id={TG_CHAT_ID}", plain=True)
     log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
 
     trader = PaperTrader()
