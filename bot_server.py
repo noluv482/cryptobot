@@ -823,6 +823,7 @@ _gate_counters = {
     "btc_dom": 0, "btc_momentum": 0, "news": 0, "macd": 0, "1h_trend": 0, "4h_trend": 0,
     "pullback": 0, "momentum": 0, "rr_ratio": 0, "vwap": 0, "spike": 0, "daily_gain": 0,
     "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
+    "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0,
 }
 _gate_counter_lock = threading.Lock()
 
@@ -2029,6 +2030,100 @@ def get_next_rank(balance):
         if balance < r["min"]: return r
     return RANKS[-1]
 
+# ── Stochastic RSI ────────────────────────────────────────────────────────────
+def _simple_rsi(prices, period=14):
+    """RSI approximation using the last `period` price deltas."""
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = [prices[i] - prices[i-1] for i in range(max(1, len(prices) - period), len(prices))]
+    ag = sum(max(0.0, d) for d in deltas) / period
+    al = sum(max(0.0, -d) for d in deltas) / period
+    if al == 0:
+        return 100.0 if ag > 0 else 50.0
+    return round(100.0 - 100.0 / (1.0 + ag / al), 1)
+
+def calc_stoch_rsi(closes, period=14, smooth=3):
+    """Stochastic of RSI values. k < 20 = oversold, k > 80 = overbought."""
+    if len(closes) < period * 2 + smooth:
+        return 50.0, 50.0
+    try:
+        rsi_vals = [_simple_rsi(closes[:i], period) for i in range(period + 1, len(closes) + 1)]
+        if len(rsi_vals) < period + smooth:
+            return 50.0, 50.0
+        k_vals = []
+        for j in range(smooth):
+            pos = len(rsi_vals) - smooth + j
+            win = rsi_vals[pos - period + 1:pos + 1]   # window includes current bar
+            lo_w, hi_w = min(win), max(win)
+            k_vals.append(100.0 * (rsi_vals[pos] - lo_w) / (hi_w - lo_w) if hi_w > lo_w else 50.0)
+        k = round(sum(k_vals) / smooth, 1)
+        return k, k
+    except Exception:
+        return 50.0, 50.0
+
+# ── MACD divergence detector ──────────────────────────────────────────────────
+def detect_macd_divergence(closes, highs, lows, lookback=12):
+    """Bearish: price higher high but MACD lower high. Bullish: vice versa."""
+    if len(closes) < 40 + lookback:
+        return "NONE"
+    try:
+        hist_series = []
+        for i in range(-lookback, 0):
+            sub = closes[:len(closes) + i + 1]
+            _, _, h = calc_macd(sub)
+            hist_series.append(h)
+        half = lookback // 2
+        if (max(highs[-half:]) > max(highs[-lookback:-half]) and
+                max(hist_series[half:]) < max(hist_series[:half])):
+            return "BEARISH_DIV"
+        if (min(lows[-half:]) < min(lows[-lookback:-half]) and
+                min(hist_series[half:]) > min(hist_series[:half])):
+            return "BULLISH_DIV"
+    except Exception:
+        pass
+    return "NONE"
+
+# ── Higher timeframe trend filter ─────────────────────────────────────────────
+_htf_cache    = {}
+_htf_cache_ts = {}
+
+def _htf_trend(pair, interval=60, limit=50):
+    """1-hour EMA trend. 'BULL', 'BEAR', or 'NEUTRAL'. Cached 5 min."""
+    now = time.time()
+    if now - _htf_cache_ts.get(pair, 0) < 300:
+        return _htf_cache.get(pair, "NEUTRAL")
+    try:
+        cls, _, _, _, _ = get_klines(pair, interval=interval, limit=limit)
+        if len(cls) >= EMA_PERIOD + 5:
+            _htf_cache[pair] = "BULL" if cls[-1] > calc_ema(cls) else "BEAR"
+        else:
+            _htf_cache.setdefault(pair, "NEUTRAL")
+        _htf_cache_ts[pair] = now
+    except Exception:
+        _htf_cache.setdefault(pair, "NEUTRAL")
+    return _htf_cache.get(pair, "NEUTRAL")
+
+# ── Bid-ask spread filter ─────────────────────────────────────────────────────
+_spread_cache    = {}
+_spread_cache_ts = {}
+
+def _spread_pct(pair):
+    """Current bid-ask spread as a fraction of bid price. Cached 30 s."""
+    now = time.time()
+    if now - _spread_cache_ts.get(pair, 0) < 30:
+        return _spread_cache.get(pair, 0.0)
+    try:
+        r = requests.get(f"{BASE_URL}/Ticker", params={"pair": pair}, timeout=5)
+        result = list(r.json().get("result", {}).values())
+        if result:
+            bid = float(result[0]["b"][0])
+            ask = float(result[0]["a"][0])
+            _spread_cache[pair] = (ask - bid) / max(bid, 1e-9)
+        _spread_cache_ts[pair] = now
+    except Exception:
+        _spread_cache.setdefault(pair, 0.0)
+    return _spread_cache.get(pair, 0.0)
+
 # ── Paper trader ──────────────────────────────────────────────────────────────
 class PaperTrader:
     def __init__(self, no_persist=False, force_paper=False, start_balance=None):
@@ -2257,19 +2352,21 @@ class PaperTrader:
 
     def _dynamic_conf_gate(self):
         """Raise confidence gate when recent performance is poor.
-        Looks at the last 10 trades; needs ≥5 to activate."""
+        Steps up floor per consecutive loss so a long losing streak is progressively harder."""
         recent = self.trades[-10:]
-        if len(recent) < 5:
-            return 0.0
-        wr = sum(1 for t in recent if t["pnl"] > 0) / len(recent)
         losses = self.consecutive_losses
+        # Per-loss floor: each consecutive loss raises gate ~0.03, capped at 0.15
+        loss_floor = min(losses * 0.03, 0.15) if losses >= 2 else 0.0
+        if len(recent) < 5:
+            return loss_floor
+        wr = sum(1 for t in recent if t["pnl"] > 0) / len(recent)
         if wr < 0.30:
-            return 0.65   # <30% WR → only very high-confidence entries
+            return max(loss_floor, 0.65)   # <30% WR → only very high-confidence entries
         if wr < 0.40:
-            return 0.55   # <40% WR → raise bar meaningfully
+            return max(loss_floor, 0.55)   # <40% WR → raise bar meaningfully
         if wr < 0.50 and losses >= 3:
-            return 0.50   # bad stretch + active streak → moderate caution
-        return 0.0
+            return max(loss_floor, 0.50)   # bad stretch + active streak → moderate caution
+        return loss_floor
 
     def _hourly_conf_gate(self):
         """Raise confidence floor during hours of the day that historically lose.
@@ -2571,6 +2668,8 @@ class PaperTrader:
                 self._close(price, name, "trailing stop", pair); closed_this_tick = True
             elif mins_open >= MAX_TRADE_MINS:
                 self._close(price, name, "time limit",   pair); closed_this_tick = True
+            elif mins_open >= 45 and abs(move) * p["entry"] < atr_dist:
+                self._close(price, name, "stale exit",   pair); closed_this_tick = True
             elif side == "LONG"  and price >= p.get("target", float("inf")):
                 self._close(price, name, "take profit",  pair); closed_this_tick = True
             elif side == "SHORT" and price <= p.get("target", 0):
@@ -3071,6 +3170,19 @@ class SignalEngine:
         candle_pat = detect_candle_pattern(opens, closes, highs, lows)
         # Classical chart pattern (10th confidence pillar)
         chart_pat  = detect_chart_pattern(closes, highs, lows)
+
+        # Stochastic RSI (11th pillar — entry timing confirmation)
+        stoch_k, _stoch_d = calc_stoch_rsi(closes)
+
+        # MACD divergence over last 12 bars
+        try:
+            macd_div = detect_macd_divergence(closes, highs, lows)
+        except Exception:
+            macd_div = "NONE"
+
+        # Volume breakout: current bar has the highest volume of the last 10 bars
+        vol_breakout = len(volumes) >= 10 and volumes[-1] == max(volumes[-10:])
+
         price_range = max(highs) - min(lows) or 1
         tolerance   = price_range * 0.005
         levels = []
@@ -3253,6 +3365,42 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["econ"] += 1
             sig = "HOLD"
 
+        # Spread gate — wide bid-ask spread signals low liquidity
+        if sig in ("BUY", "SELL"):
+            try:
+                _sp = _spread_pct(current_pair)
+                if _sp > 0.003:
+                    with _gate_counter_lock: _gate_counters["spread"] += 1
+                    sig = "HOLD"
+            except Exception:
+                pass
+
+        # HTF trend gate — only trade with the 1-hour EMA trend
+        if sig in ("BUY", "SELL"):
+            _htf = _htf_trend(current_pair)
+            if _htf == "BEAR" and sig == "BUY":
+                with _gate_counter_lock: _gate_counters["htf"] += 1
+                sig = "HOLD"
+            elif _htf == "BULL" and sig == "SELL":
+                with _gate_counter_lock: _gate_counters["htf"] += 1
+                sig = "HOLD"
+
+        # MACD divergence gate — divergence signals momentum exhaustion
+        if macd_div == "BEARISH_DIV" and sig == "BUY":
+            with _gate_counter_lock: _gate_counters["macd_div"] += 1
+            sig = "HOLD"
+        if macd_div == "BULLISH_DIV" and sig == "SELL":
+            with _gate_counter_lock: _gate_counters["macd_div"] += 1
+            sig = "HOLD"
+
+        # Stochastic RSI gate — block entries at extreme opposing readings
+        if sig == "BUY"  and stoch_k > 85:
+            with _gate_counter_lock: _gate_counters["stoch_rsi"] += 1
+            sig = "HOLD"
+        if sig == "SELL" and stoch_k < 15:
+            with _gate_counter_lock: _gate_counters["stoch_rsi"] += 1
+            sig = "HOLD"
+
         # ── Refresh adaptive pillar weights (DB preferred, in-memory fallback) ──
         now_ts = time.time()
         if now_ts - self._pillar_w_ts > 600:
@@ -3286,7 +3434,7 @@ class SignalEngine:
         tick_pts   = (min(ticks / 5.0, 1.0) if ticks > 0
                       else (min(n_score / 5.0, 1.0) if sig in ("BUY","SELL") and n_score >= 3 else 0.0))
         macd_pts   = 1.0 if (sig == "BUY" and macd_bull) or (sig == "SELL" and macd_bear) else 0.0
-        vol_pts    = 1.0 if high_volume else 0.5
+        vol_pts    = (1.0 if vol_breakout else 0.85 if high_volume else 0.5)
         _cp_sig    = candle_pat["signal"]
         candle_pts = (1.0 if (sig == "BUY"  and _cp_sig == "BULL") or
                              (sig == "SELL" and _cp_sig == "BEAR")
@@ -3317,6 +3465,11 @@ class SignalEngine:
         else:
             chart_pts = 0.5                     # no pattern = neutral
 
+        # Stochastic RSI pillar (11th): oversold/overbought confirms entry timing
+        stoch_pts = (1.0 if (sig == "BUY"  and stoch_k < 30) or (sig == "SELL" and stoch_k > 70)
+                     else 0.0 if (sig == "BUY" and stoch_k > 70) or (sig == "SELL" and stoch_k < 30)
+                     else 0.5)
+
         pts = (rsi_pts    * pw.get("rsi_zone",       1.0) +
                news_pts   * pw.get("news_align",     1.0) +
                nasdaq_pts * pw.get("nasdaq_align",   1.0) +
@@ -3326,7 +3479,8 @@ class SignalEngine:
                candle_pts * pw.get("candle_pattern", 1.0) +
                vwap_pts   * pw.get("vwap_align",     1.0) +
                obv_pts    * pw.get("obv_trend",      1.0) +
-               chart_pts  * pw.get("chart_struct",   1.0))
+               chart_pts  * pw.get("chart_struct",   1.0) +
+               stoch_pts  * pw.get("stoch_rsi",      1.0))
         max_pts = (1.0 * pw.get("rsi_zone",       1.0) +
                    1.0 * pw.get("news_align",     1.0) +
                    1.0 * pw.get("nasdaq_align",   1.0) +
@@ -3336,7 +3490,8 @@ class SignalEngine:
                    1.0 * pw.get("candle_pattern", 1.0) +
                    1.0 * pw.get("vwap_align",     1.0) +
                    1.0 * pw.get("obv_trend",      1.0) +
-                   1.0 * pw.get("chart_struct",   1.0))
+                   1.0 * pw.get("chart_struct",   1.0) +
+                   1.0 * pw.get("stoch_rsi",      1.0))
         confidence = round(pts / max(max_pts, 0.1), 2) if sig in ("BUY", "SELL") else 0.0
 
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
@@ -3423,6 +3578,7 @@ class SignalEngine:
             "vwap_align":    vwap_pts >= 1.0,
             "obv_trend":     obv_pts >= 1.0,
             "chart_struct":  chart_pts >= 0.7,
+            "stoch_rsi":     stoch_pts >= 1.0,
         }
         if chart_pat["name"]:
             plan["chart_name"]     = chart_pat["name"]
