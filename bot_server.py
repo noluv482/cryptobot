@@ -5212,8 +5212,15 @@ def trading_loop(trader):
             # ── Scan top-ranked coins for new entry signals ────────────────
             for coin_score in ranked_list[:8]:
                 pair = coin_score["pair"]
-                if pair in trader.positions: continue   # already in this coin
-                if not trader.can_open_new(): break     # position slots full
+                _sim_on    = _sim_enabled and _sim_trader is not None
+                _main_open = pair not in trader.positions and trader.can_open_new()
+                _sim_open  = (_sim_on and pair not in _sim_trader.positions
+                              and _sim_trader.can_open_new())
+                if not _main_open and not _sim_open:
+                    # Both blocked — break if both also at full capacity
+                    if not trader.can_open_new() and (not _sim_on or not _sim_trader.can_open_new()):
+                        break
+                    continue
 
                 coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
                 if not coin: continue
@@ -5423,9 +5430,10 @@ def trading_loop(trader):
                            f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
                            f"R:R: `{_rr_str}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*{_pat_note}")
-                        trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
-                                         atr=atr, fkey=fkey, pillars=pillars)
-                        if _sim_enabled and _sim_trader is not None:
+                        if _main_open:
+                            trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
+                                             atr=atr, fkey=fkey, pillars=pillars)
+                        if _sim_open:
                             _sim_trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
                                                   atr=atr, fkey=fkey, pillars=pillars)
 
