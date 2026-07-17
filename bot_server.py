@@ -6918,7 +6918,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       <button class="iv-btn" data-iv="240" onclick="setCdInterval(240)">4h</button>
     </div>
     <div class="chart-wrap">
-      <canvas id="cd_cv" style="display:block;width:100%" height="320"></canvas>
+      <canvas id="cd_cv" style="display:block;width:100%" height="376"></canvas>
       <div class="cv-tip" id="cv_tip"></div>
     </div>
   </div>
@@ -7948,10 +7948,21 @@ function selectCoin(pair,sym){
   _cdPair=pair;
   _cdOpenPos=(_openPairs.has(pair)?[]:[]); // will update on next status
   _cdTrades=[];
-  renderCoinStrip();
   const name=sym?sym+'/USD':pair;
   $('ci_name').textContent=name;
+  if(_tab!=='chart')goTab('chart');
+  renderCoinStrip();
+  _showChartLoading(name);
   fetchCandles();
+}
+function _showChartLoading(name){
+  const cv=$('cd_cv');if(!cv)return;
+  const W=cv.parentElement.clientWidth||320,H=320,PR=devicePixelRatio||1;
+  cv.width=W*PR;cv.height=H*PR;cv.style.width=W+'px';cv.style.height=H+'px';
+  const ctx=cv.getContext('2d');ctx.scale(PR,PR);
+  ctx.fillStyle='rgba(10,18,32,0.5)';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#4d6f94';ctx.font='bold 14px sans-serif';ctx.textAlign='center';
+  ctx.fillText('Loading '+name+'…',W/2,H/2);
 }
 function _ema(data,period){
   const closes=data.map(c=>c.c);
@@ -7970,15 +7981,33 @@ function setCdInterval(iv){
   document.querySelectorAll('.iv-btn').forEach(b=>{b.classList.toggle('active',+b.dataset.iv===iv);});
   fetchCandles();
 }
+function _calcRSI(data,period=14){
+  if(data.length<period+1)return data.map(()=>null);
+  const gains=[],losses=[];
+  for(let i=1;i<data.length;i++){
+    const d=data[i].c-data[i-1].c;
+    gains.push(Math.max(0,d));losses.push(Math.max(0,-d));
+  }
+  const rsi=new Array(data.length).fill(null);
+  let ag=gains.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  let al=losses.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  rsi[period]=al===0?100:100-100/(1+ag/al);
+  for(let i=period;i<gains.length;i++){
+    ag=(ag*(period-1)+gains[i])/period;
+    al=(al*(period-1)+losses[i])/period;
+    rsi[i+1]=al===0?100:100-100/(1+ag/al);
+  }
+  return rsi;
+}
 function drawCandles(){
   const cv=$('cd_cv');
   const W=cv.parentElement.clientWidth||320;
-  const H=320,PR=devicePixelRatio||1;
+  const RSI_H=50,H=320+RSI_H+6,PR=devicePixelRatio||1;
   cv.width=W*PR;cv.height=H*PR;cv.style.width=W+'px';cv.style.height=H+'px';
   const ctx=cv.getContext('2d');ctx.scale(PR,PR);
   const data=_cdData;if(!data.length)return;
   const P={t:10,r:10,b:22,l:56};
-  const VH=40,cw=W-P.l-P.r,ch=H-P.t-P.b-VH-6;
+  const VH=40,cw=W-P.l-P.r,ch=320-P.t-P.b-VH-6;
   const n=data.length;
   const slotW=cw/n,barW=Math.max(2,Math.floor(slotW*.72));
   const prices=data.flatMap(c=>[c.h,c.l]);
@@ -8087,22 +8116,64 @@ function drawCandles(){
       ctx.strokeStyle='rgba(255,255,255,.35)';ctx.lineWidth=1;ctx.stroke();
     }
   });
-  // Time axis
+  // Time axis  (anchored to candle section, not full canvas height)
+  const CHART_B=320-P.b;
   ctx.fillStyle='#4d6f94';ctx.font='8px monospace';ctx.textAlign='center';
   const stride=Math.max(1,Math.ceil(n/7));
   data.forEach((c,i)=>{
     if(i%stride===0){
       const dd=new Date(c.t*1000);
-      ctx.fillText(dd.getHours().toString().padStart(2,'0')+':'+dd.getMinutes().toString().padStart(2,'0'),xC(i),H-P.b+10);
+      ctx.fillText(dd.getHours().toString().padStart(2,'0')+':'+dd.getMinutes().toString().padStart(2,'0'),xC(i),CHART_B+10);
     }
   });
-  // Crosshair
+  // Crosshair (limited to candle section)
   if(_cdHover>=0){
     const x=xC(_cdHover);
     ctx.save();ctx.strokeStyle='rgba(200,218,240,.2)';ctx.lineWidth=1;
     ctx.setLineDash([3,3]);
-    ctx.beginPath();ctx.moveTo(x,P.t);ctx.lineTo(x,H-P.b);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(x,P.t);ctx.lineTo(x,CHART_B);ctx.stroke();
     ctx.restore();
+  }
+  // ── RSI Panel ──
+  const rsiArr=_calcRSI(data);
+  const RP={t:320+8,h:RSI_H-10};
+  // divider
+  ctx.strokeStyle='rgba(22,37,64,.8)';ctx.lineWidth=.5;
+  ctx.beginPath();ctx.moveTo(P.l,320+3);ctx.lineTo(W-P.r,320+3);ctx.stroke();
+  // RSI label
+  ctx.fillStyle='#4d6f94';ctx.font='7.5px monospace';ctx.textAlign='left';
+  ctx.fillText('RSI 14',P.l,RP.t+RP.h+6);
+  // overbought/oversold lines
+  [30,50,70].forEach(lvl=>{
+    const y=RP.t+(1-(lvl-0)/(100-0))*RP.h;
+    ctx.strokeStyle=lvl===50?'rgba(77,111,148,.5)':'rgba(77,111,148,.3)';
+    ctx.lineWidth=.5;
+    ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();
+    ctx.fillStyle='#4d6f94';ctx.font='7px monospace';ctx.textAlign='right';
+    ctx.fillText(lvl,P.l-2,y+2.5);
+  });
+  // RSI line
+  ctx.save();ctx.lineJoin='round';ctx.lineWidth=1.2;
+  ctx.beginPath();
+  let rsiStarted=false;
+  rsiArr.forEach((v,i)=>{
+    if(v===null)return;
+    const x=xC(i),y=RP.t+(1-v/100)*RP.h;
+    if(!rsiStarted){ctx.moveTo(x,y);rsiStarted=true;}else ctx.lineTo(x,y);
+  });
+  // Color RSI line by current value
+  const lastRsi=rsiArr.filter(v=>v!==null).slice(-1)[0]||50;
+  ctx.strokeStyle=lastRsi>=70?'#ff3352':lastRsi<=30?'#00cc74':'#58a6ff';
+  ctx.stroke();ctx.restore();
+  // Current RSI value badge
+  if(lastRsi!==null){
+    const lastIdx=rsiArr.reduce((li,v,i)=>v!==null?i:li,-1);
+    if(lastIdx>=0){
+      const bx=xC(lastIdx)+5,by=RP.t+(1-lastRsi/100)*RP.h;
+      const col=lastRsi>=70?'#ff3352':lastRsi<=30?'#00cc74':'#58a6ff';
+      ctx.fillStyle=col;ctx.font='bold 8px monospace';ctx.textAlign='left';
+      ctx.fillText(Math.round(lastRsi),bx,by+3);
+    }
   }
 }
 function initCandleHover(){
@@ -8118,12 +8189,14 @@ function initCandleHover(){
     const ts=new Date(c.t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
     const f6=v=>v>=100?v.toFixed(2):v.toPrecision(6);
     const e20=_ema20[i],e50=_ema50[i];
+    const _rsiTip=_calcRSI(_cdData)[i];const _rsiTipCol=_rsiTip!==null&&_rsiTip>=70?'var(--r)':_rsiTip!==null&&_rsiTip<=30?'var(--g)':'#58a6ff';
     tip.innerHTML='<b>'+ts+'</b>&nbsp; O&nbsp;'+f6(c.o)+
       '&nbsp; H&nbsp;<span style="color:var(--g)">'+f6(c.h)+'</span>'+
       '&nbsp; L&nbsp;<span style="color:var(--r)">'+f6(c.l)+'</span>'+
       '&nbsp; C&nbsp;<span style="color:'+(bull?'var(--g)':'var(--r)')+'">'+f6(c.c)+'</span>'+
       (e20!==null?'<br><span style="color:#58a6ff">EMA20 '+f6(e20)+'</span>':'')+
-      (e50!==null?'&nbsp;<span style="color:#f0883e">EMA50 '+f6(e50)+'</span>':'');
+      (e50!==null?'&nbsp;<span style="color:#f0883e">EMA50 '+f6(e50)+'</span>':'')+
+      (_rsiTip!==null?'&nbsp;<span style="color:'+_rsiTipCol+'">RSI '+Math.round(_rsiTip)+'</span>':'');
     tip.style.display='block';
   };
   cv.addEventListener('mousemove',e=>show(idx(e.clientX)));
