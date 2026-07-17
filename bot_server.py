@@ -2584,7 +2584,7 @@ class PaperTrader:
         with _state_lock:
             paused = _paused
         if paused or self.balance < PAPER_FLOOR: return
-        if self.balance >= PAPER_TARGET: return
+        if not self._is_live() and self.balance >= PAPER_TARGET: return
         self._reset_day_if_needed()
         if _daily_limits:
             if self.day_trades >= MAX_TRADES_DAY: return
@@ -2820,7 +2820,12 @@ class PaperTrader:
                     contracts  = round(margin * (leverage if KRAKEN_MARGIN else 1) / fill, 8)
                     min_vol    = _KRAKEN_MIN_VOL.get(pair, 0.0)
                     if contracts < min_vol:
-                        log("LIVE", f"Skipping {name} — size {contracts:.8f} < min {min_vol} (balance too small)")
+                        need_usd = round(min_vol * fill / (leverage if KRAKEN_MARGIN else 1), 2)
+                        log("LIVE", f"Skipping {name} — size {contracts:.8f} < min {min_vol} (need ~${need_usd} balance)")
+                        tg(f"⚠️ *Order too small — {name}*\n"
+                           f"Kraken minimum: `{min_vol}` units (≈`${need_usd}`)\n"
+                           f"Your balance: `${self.balance:.2f}` · margin: `${margin:.2f}`\n"
+                           f"_Deposit more or switch to Binance/Kraken Futures for small accounts._")
                         return
                     txid = _kraken_place_order(pair, order_side, contracts, leverage=lev_arg)
                     self._live_orders[pair] = txid
@@ -3986,6 +3991,8 @@ _TEXT_ACTION: dict = {
     "/close":      "force_close",
     "/status":     "balance",
     "/alerts":     "alert_list",
+    "/livecheck":  "livecheck",
+    "livecheck":   "livecheck",
 }
 
 def _parse_alert_command(txt):
@@ -4881,6 +4888,70 @@ def _dispatch_callback(data, query, trader):
             f"⬆️ Next Rank: {next_rnk['emoji']} {next_rnk['name']} @ `${next_rnk['min']:,.0f}`",
             buttons
         )
+
+    elif data == "livecheck":
+        lines = ["🔍 *Live Trading Diagnostics*", "━━━━━━━━━━━━━━━━━━━━"]
+        # 1. API keys
+        if LIVE_MODE:
+            lines.append(f"✅ API keys loaded — exchange: `{LIVE_EXCHANGE.upper()}`")
+        else:
+            lines.append("❌ *No API keys* — bot is paper trading")
+            lines.append("  Add `KRAKEN_API_KEY` + `KRAKEN_API_SECRET` to Railway")
+            lines.append("  then redeploy ← *most common cause*")
+        # 2. Paper mode
+        if _paper_mode:
+            lines.append("⚠️ *Paper mode is ON* — send `🔴 go live` to disable")
+        elif LIVE_MODE:
+            lines.append("✅ Paper mode OFF — real orders will fire")
+        # 3. Paused
+        with _state_lock:
+            _p = _paused
+        if _p:
+            lines.append("⏸ *Bot is PAUSED* — tap ▶ in dashboard or send `/resume`")
+        else:
+            lines.append("✅ Bot is running")
+        # 4. Streak cooldown
+        cool = getattr(trader, "_streak_cool_until", 0)
+        if cool > time.time():
+            mins = int((cool - time.time()) / 60) + 1
+            lines.append(f"⏳ Loss-streak cooldown: *{mins} min remaining* — no new entries until then")
+        # 5. Balance + min volume check
+        bal = trader.balance
+        lines.append(f"💵 Bot balance: `${bal:.2f}`")
+        if LIVE_MODE and LIVE_EXCHANGE == "kraken" and not KRAKEN_MARGIN:
+            # Check if any coin passes minimum volume at current balance
+            min_usd = min(
+                _KRAKEN_MIN_VOL.get(c["pair"], 0) * 50000  # rough price estimate
+                / (RISK_MIN * bal) if bal > 0 else 9999
+                for c in SCAN_UNIVERSE
+            )
+            need = round(RISK_MIN * bal, 2)
+            # Find cheapest pair requirement
+            cheapest = min(
+                (_KRAKEN_MIN_VOL.get(c["pair"], 0) / RISK_MIN, c["pair"])
+                for c in SCAN_UNIVERSE
+            )
+            lines.append(f"  Margin per trade: `${need:.2f}` ({int(RISK_MIN*100)}% of balance)")
+            if bal < 200:
+                lines.append("  ⚠️ *Balance may be too small* for Kraken spot min order sizes")
+                lines.append(f"  Try `EXCHANGE=binance` or deposit more USD")
+        # 6. Kraken spot shorts
+        if LIVE_MODE and LIVE_EXCHANGE == "kraken" and not KRAKEN_MARGIN:
+            lines.append("⚠️ Kraken spot: only LONG trades fire (add `KRAKEN_MARGIN=1` for shorts)")
+        # 7. Active hours
+        from datetime import datetime as _dt
+        h = _dt.utcnow().hour
+        if not (ACTIVE_HOURS_UTC[0] <= h < ACTIVE_HOURS_UTC[1]):
+            lines.append(f"🌙 Outside trading hours (UTC {h:02d}:xx) — resumes at {ACTIVE_HOURS_UTC[0]:02d}:00 UTC")
+        else:
+            lines.append(f"✅ Inside active trading window (UTC {h:02d}:xx)")
+        # 8. Overall verdict
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        if LIVE_MODE and not _paper_mode and not _p and not (cool > time.time()):
+            lines.append("🟢 *Everything looks good — bot is live and scanning*")
+        else:
+            lines.append("🔴 *One or more issues above need fixing*")
+        tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "rankings":
         scores = rank_coins()[:5]
