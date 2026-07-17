@@ -956,10 +956,12 @@ def tg(msg, plain=False):
     _tg_log.append({"ts": time.time(), "msg": clean[:280]})
     if len(_tg_log) > 15:
         _tg_log = _tg_log[-15:]
-    # Discord mirror — strip Telegram markdown, convert *bold* to **bold**
+    # Discord mirror — convert Telegram *bold* to Discord **bold**
+    # Use regex so we only replace standalone * not already-doubled **
     if DISCORD_WEBHOOK:
         try:
-            discord_text = msg.replace("*", "**").replace("`", "`")
+            import re as _re
+            discord_text = _re.sub(r'(?<!\*)\*(?!\*)', '**', msg)
             requests.post(DISCORD_WEBHOOK, json={"content": discord_text[:2000]}, timeout=5)
         except Exception:
             pass
@@ -2352,6 +2354,7 @@ class PaperTrader:
         self._ab_stats      = {"A": {"wins": 0, "n": 0}, "B": {"wins": 0, "n": 0}}
         self._ab_group      = {}   # pair → "A" | "B" (assignment per pair per trade)
         self._ab_resolved   = False
+        self._ab_winner     = "A"  # set to "B" when B wins; drives permanent policy after resolution
         self._live_orders  = {}   # pair → kraken txid (live mode only)
         if not force_paper:
             self._load()
@@ -2673,7 +2676,8 @@ class PaperTrader:
         if stage == 2 and p.get("partial_2_taken"): return
         move = (price - p["entry"]) / p["entry"]
         if p["side"] == "SHORT": move = -move
-        frac = 1 / 3
+        # Stage 1 closes 1/3 of original; stage 2 closes half of the remaining 2/3 (= 1/3 original)
+        frac = 1/3 if stage == 1 else 0.5
         pnl = round(move * (p["margin"] * frac) * p.get("leverage", LEVERAGE_MIN), 4)
         self.balance      = round(self.balance + pnl, 4)
         p["contracts"]    = round(p["contracts"] * (1 - frac), 6)
@@ -2683,12 +2687,11 @@ class PaperTrader:
             label = "⅓"
         else:
             p["partial_2_taken"] = True
-            p["partial_taken"]   = True   # final partial — no more stages
             label = "⅔"
         self.peak = max(self.peak, self.balance)
         self._save()
         tg(f"🎯 *{label} Partial TP — {name}*\n"
-           f"Closed {label} @ `${price:.4f}` | PnL: `+{pnl:.2f}$`\n"
+           f"Closed {label} @ `${price:.4f}` | PnL: `{pnl:+.2f}$`\n"
            f"Remaining {('⅔' if stage==1 else '⅓')} still running | Balance: `${self.balance:.2f}`")
 
     def _pyramid_add(self, price, name, pair):
@@ -2842,6 +2845,11 @@ class PaperTrader:
             if side == "SHORT": move = -move
             mins_open = (time.time() - p.get("opened_at", time.time())) / 60
 
+            # Back-compat: positions saved before two-stage partials only have partial_taken
+            if p.get("partial_taken") and not p.get("partial_1_taken"):
+                p["partial_1_taken"] = True
+                p["partial_2_taken"] = True
+
             # Scale out in thirds: 1/3 at PARTIAL_TAKE_PCT, 1/3 at 2×, let last 1/3 trail
             if not p.get("partial_1_taken") and move >= PARTIAL_TAKE_PCT:
                 self._partial_close(price, name, pair, stage=1)
@@ -2863,6 +2871,9 @@ class PaperTrader:
                         p["corr_exit_done"] = True
                         self._close(price, name, "btc_correlation", pair)
                         closed_this_tick = True
+
+            if closed_this_tick:
+                return   # position gone — skip trailing / lock-in blocks below
 
             # Update trailing stop using stored ATR distance (or fixed % fallback)
             atr_dist = p.get("atr_dist", price * TRAIL_PCT)
@@ -2954,11 +2965,15 @@ class PaperTrader:
                            self._dynamic_conf_gate(),
                            self._hourly_conf_gate())
             # A/B confidence test: B group uses +0.05 threshold; auto-adopt winner at 50 trades each
-            if not self._ab_resolved and sig in ("BUY", "SELL"):
-                import random as _rnd
-                if pair not in self._ab_group:
-                    self._ab_group[pair] = "A" if _rnd.random() < 0.5 else "B"
-                if self._ab_group[pair] == "B":
+            if sig in ("BUY", "SELL"):
+                if not self._ab_resolved:
+                    import random as _rnd
+                    if pair not in self._ab_group:
+                        self._ab_group[pair] = "A" if _rnd.random() < 0.5 else "B"
+                    if self._ab_group[pair] == "B":
+                        confidence = min(1.0, round(confidence + 0.05, 2))
+                elif self._ab_winner == "B":
+                    # Test concluded; permanently apply winning policy
                     confidence = min(1.0, round(confidence + 0.05, 2))
             if sig in ("BUY", "SELL") and confidence < min_conf:
                 with _gate_counter_lock: _gate_counters["min_conf"] += 1
@@ -3333,6 +3348,7 @@ class PaperTrader:
                     b_wr = self._ab_stats["B"]["wins"] / max(b_n, 1)
                     winner = "B" if b_wr > a_wr + 0.05 else "A"
                     self._ab_resolved = True
+                    self._ab_winner   = winner
                     tg(f"🧪 *A/B Test Complete* — winner: `{winner}`\n"
                        f"A WR: `{a_wr*100:.1f}%` ({a_n} trades) | B WR: `{b_wr*100:.1f}%` ({b_n} trades)\n"
                        f"{'B (+0.05 confidence) adopted' if winner=='B' else 'A (baseline) retained'}")
@@ -3967,7 +3983,7 @@ class SignalEngine:
                         _d: {"wr": v["wins"] / v["n"] * 100, "n": v["n"]}
                         for _d, v in _dow_agg.items() if v["n"] >= 4
                     }
-                self._dow_w_ts = now_ts_dow
+                    self._dow_w_ts = now_ts_dow  # only advance when we had ≥10 trades to learn from
             dow_stats = self._dow_win_rates.get(cur_dow)
             if dow_stats:
                 if dow_stats["wr"] < 35:
@@ -5655,6 +5671,12 @@ def _daily_summary_loop(trader):
                    f"━━━━━━━━━━━━━━━━━━━━\n"
                    f"Balance: `${trader.balance:.2f}` | {rank['emoji']} {rank['name']}\n"
                    f"Trading: *{_current_coin['name']}*")
+            # Clear pairs that were auto-disabled by the per-pair daily loss cap —
+            # the new day means a fresh allowance; manual disables (via UI) stay.
+            for _dd_pair, _dd_date in list(trader._pair_day_date.items()):
+                if _dd_date != datetime.utcnow().strftime("%Y-%m-%d"):
+                    _disabled_pairs.discard(_dd_pair)
+
             # Gate telemetry daily report + counter reset
             with _gate_counter_lock:
                 gate_snap = dict(_gate_counters)

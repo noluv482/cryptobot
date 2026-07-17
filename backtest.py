@@ -208,7 +208,7 @@ def walk_forward(candles, pair, interval_mins, window_days=30, step_days=15):
     secs_per_candle = interval_mins * 60
     window_candles  = int(window_days  * 86400 / secs_per_candle)
     step_candles    = int(step_days   * 86400 / secs_per_candle)
-    min_candles     = 50   # need at least this many to run a window
+    min_candles     = bs.CANDLE_LIMIT + 6   # must exceed run()'s warmup guard (CANDLE_LIMIT+5)
 
     if len(candles) < window_candles + step_candles:
         print(f"Not enough candles for walk-forward (need ≥ {window_candles + step_candles}, got {len(candles)})")
@@ -276,6 +276,9 @@ def main():
     args = ap.parse_args()
 
     if args.csv:
+        if not os.path.exists(args.csv):
+            print(f"CSV not found: {args.csv}")
+            sys.exit(1)
         candles = load_csv(args.csv)
         interval = args.interval
         name = os.path.splitext(os.path.basename(args.csv))[0]
@@ -292,6 +295,7 @@ def main():
     if args.walk_forward:
         walk_forward(candles, args.pair, interval,
                      window_days=args.wf_window, step_days=args.wf_step)
+        return   # walk-forward already ran a full-dataset summary internally
 
     run(candles, args.pair, name, verbose=True)
 
