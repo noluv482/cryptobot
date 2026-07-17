@@ -350,7 +350,8 @@ ADX_MIN           = 18         # allow mildly trending markets (Wilder's neutral
 ER_PERIOD         = 10
 ER_MIN            = 0.15       # realistic efficiency floor (most real moves sit 0.10–0.25)
 
-SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
+SAVE_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
+TRUSTED_DEV_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trusted_devices.json")
 
 SCAN_UNIVERSE = [
     {"name": "SOL/USD",   "pair": "SOLUSD",   "alert_buffer": 0.10},
@@ -925,6 +926,28 @@ _gate_counters = {
 _gate_counter_lock = threading.Lock()
 _gate_log_ts: float = 0.0          # last time we printed the gate summary
 _GATE_LOG_INTERVAL = 1800          # log top blockers every 30 min
+
+# ── Trusted device registry ───────────────────────────────────────────────────
+# device_id is a UUID generated in the browser's localStorage.
+# {"<uuid>": {"label": "iPhone/iPad", "added_ts": 1234567890}}
+_trusted_devices: dict = {}
+
+def _load_trusted_devices():
+    global _trusted_devices
+    try:
+        with open(TRUSTED_DEV_FILE) as f:
+            _trusted_devices = json.load(f)
+    except FileNotFoundError:
+        _trusted_devices = {}
+    except Exception as e:
+        log("AUTH", f"Could not load trusted devices: {e}", "ERR")
+
+def _save_trusted_devices():
+    try:
+        with open(TRUSTED_DEV_FILE, "w") as f:
+            json.dump(_trusted_devices, f, indent=2)
+    except Exception as e:
+        log("AUTH", f"Could not save trusted devices: {e}", "ERR")
 
 
 def _log_gate_summary():
@@ -9742,14 +9765,35 @@ function _renderPinDots(){
     if(d)d.className='pin-dot'+(_pinBuf.length>i?' filled':'');
   }
 }
+function _getDeviceId(){
+  let id=localStorage.getItem('cb_device_id');
+  if(!id){
+    id='xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{
+      const r=Math.random()*16|0;return(c==='x'?r:(r&0x3|0x8)).toString(16);
+    });
+    localStorage.setItem('cb_device_id',id);
+  }
+  return id;
+}
 async function _submitPin(){
   const pin=_pinBuf.join('');
+  const device_id=_getDeviceId();
   try{
-    const r=await(await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})})).json();
+    const r=await(await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pin,device_id})})).json();
     if(r.ok){
       _pinUnlocked=true;
       sessionStorage.setItem('cb_auth','1');
       const lock=$('pin_lock');if(lock)lock.classList.add('gone');
+      if(!r.trusted){
+        // Not a recognised device — offer to trust it
+        const dl=r.device_label||'this device';
+        showToast(`New device detected (${dl})`,
+          `<button onclick="_trustThisDevice('${dl.replace(/'/g,"\\'")}');this.closest('.toast-wrap')?.remove()" `+
+          `style="margin-top:8px;padding:6px 14px;border-radius:8px;border:none;`+
+          `background:var(--b);color:#fff;font-size:.75rem;cursor:pointer">Trust this device</button>`,
+          12000);
+      }
     }else{
       $('pin_err').textContent='Incorrect PIN — try again';
       _pinBuf=[];
@@ -9759,6 +9803,16 @@ async function _submitPin(){
   }catch(e){
     _pinBuf=[];_renderPinDots();
   }
+}
+async function _trustThisDevice(label){
+  const device_id=_getDeviceId();
+  const pin=prompt('Re-enter your PIN to trust this device:');
+  if(!pin)return;
+  const r=await(await fetch('/trust-device',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({device_id,label,pin})})).json();
+  if(r.ok) showToast('✅ Device trusted — future logins will show as yours','',3500);
+  else showToast('❌ Wrong PIN — device not trusted','',3000);
 }
 function _requirePin(fn){
   if(!_pinUnlocked){showToast('&#128274; Unlock with PIN first','',2500);return;}
@@ -10656,34 +10710,65 @@ def _web_auth():
                          mimetype="application/json")
     body = _flask_request.get_json(silent=True) or {}
     if not DASHBOARD_PIN:
-        return _Response('{"ok":true}', mimetype="application/json")
+        return _Response('{"ok":true,"trusted":true}', mimetype="application/json")
     ok = body.get("pin", "") == DASHBOARD_PIN
     if ok:
-        # Prefer X-Forwarded-For (set by Railway / reverse proxy) over direct addr
         raw_ip  = (_flask_request.headers.get("X-Forwarded-For", "")
                    or _flask_request.remote_addr or "unknown")
         ip      = raw_ip.split(",")[0].strip()
         ua      = _flask_request.headers.get("User-Agent", "")
-        # Derive a human-readable device hint from the UA string
         if "iPhone" in ua or "iPad" in ua:
-            device = "iPhone/iPad"
+            device_label = "iPhone/iPad"
         elif "Android" in ua:
-            device = "Android"
+            device_label = "Android"
         elif "Windows" in ua:
-            device = "Windows"
+            device_label = "Windows"
         elif "Macintosh" in ua or "Mac OS" in ua:
-            device = "Mac"
+            device_label = "Mac"
         elif "Linux" in ua:
-            device = "Linux"
+            device_label = "Linux"
         else:
-            device = "Unknown device"
-        ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        log("AUTH", f"Dashboard unlocked — {ip}  {device}")
-        tg(f"🔓 *Dashboard login*\n"
-           f"IP: `{ip}`\n"
-           f"Device: `{device}`\n"
-           f"Time: `{ts_str}`")
-    return _Response(json.dumps({"ok": ok}), mimetype="application/json")
+            device_label = "Unknown device"
+        ts_str   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        dev_id   = body.get("device_id", "")
+        is_mine  = bool(dev_id and dev_id in _trusted_devices)
+        if is_mine:
+            label = _trusted_devices[dev_id].get("label", device_label)
+            log("AUTH", f"Your device logged in — {ip}  {label}")
+            tg(f"✅ *Your device logged in*\n"
+               f"Device: `{label}`\n"
+               f"IP: `{ip}` | `{ts_str}`")
+        else:
+            log("AUTH", f"NEW device login — {ip}  {device_label}", "WARN")
+            tg(f"⚠️ *New device login*\n"
+               f"IP: `{ip}`\n"
+               f"Device: `{device_label}`\n"
+               f"Time: `{ts_str}`\n"
+               f"_If this wasn't you, change your PIN immediately._")
+        return _Response(json.dumps({"ok": True, "trusted": is_mine,
+                                     "device_label": device_label}),
+                         mimetype="application/json")
+    return _Response(json.dumps({"ok": False}), mimetype="application/json")
+
+@_flask_app.route("/trust-device", methods=["POST"])
+def _web_trust_device():
+    """Mark a device_id as trusted (owner's device). Requires correct PIN."""
+    body    = _flask_request.get_json(silent=True) or {}
+    dev_id  = body.get("device_id", "").strip()
+    label   = body.get("label", "My device")[:40]
+    pin     = body.get("pin", "")
+    if not dev_id:
+        return _Response('{"ok":false,"error":"missing device_id"}', mimetype="application/json")
+    if DASHBOARD_PIN and pin != DASHBOARD_PIN:
+        return _Response('{"ok":false,"error":"wrong pin"}', mimetype="application/json")
+    _trusted_devices[dev_id] = {"label": label, "added_ts": time.time()}
+    _save_trusted_devices()
+    raw_ip = (_flask_request.headers.get("X-Forwarded-For", "")
+              or _flask_request.remote_addr or "unknown")
+    ip = raw_ip.split(",")[0].strip()
+    log("AUTH", f"Device trusted — {dev_id[:8]}…  '{label}'  {ip}")
+    tg(f"🛡️ *Device trusted*\nLabel: `{label}`\nIP: `{ip}`")
+    return _Response('{"ok":true}', mimetype="application/json")
 
 @_flask_app.route("/market")
 def _web_market():
@@ -11055,6 +11140,9 @@ def main():
     _exch_label = LIVE_EXCHANGE if LIVE_MODE else "paper"
     ok = tg(f"CryptoBot booting... v2.7 | {_exch_label} | chat_id={TG_CHAT_ID}", plain=True)
     log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
+
+    _load_trusted_devices()
+    log("BOOT", f"Trusted devices loaded: {len(_trusted_devices)}")
 
     trader = PaperTrader()
 
