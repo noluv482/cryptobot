@@ -8427,7 +8427,7 @@ async function loadQuiz(){
       '<div class="quiz-q">'+d.question+'</div>'+
       '<div class="quiz-opts" id="quiz_opts">'+
         d.options.map((o,i)=>
-          '<button class="quiz-opt" onclick="answerQuiz(this,\''+o.replace(/'/g,'&#39;')+'\')" data-opt="'+i+'">'+o+'</button>'
+          '<button class="quiz-opt" onclick="answerQuiz(this)" data-opt="'+i+'" data-answer="'+o.replace(/&/g,'&amp;').replace(/"/g,'&quot;')+'">'+o+'</button>'
         ).join('')+
       '</div>'+
       '<div id="quiz_explain" style="display:none"></div>'+
@@ -8437,9 +8437,10 @@ async function loadQuiz(){
       '</div>';
   }catch(e){if(box)box.innerHTML='<div class="no-data">Could not load question</div>';}
 }
-async function answerQuiz(btn,answer){
+async function answerQuiz(btn){
   if(_quizAnswered)return;
   _quizAnswered=true;
+  const answer=btn.dataset.answer||'';
   try{
     const r=await fetch('/quiz/answer',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({answer})});
@@ -8485,7 +8486,7 @@ async function fetchCoinControls(disabledPairs){
       '<div class="coin-ctrl-name">'+c.name+'<span class="coin-ctrl-pair"> · '+c.pair+'</span></div>'+
       '<label class="cc-toggle">'+
         '<input type="checkbox" id="'+id+'" '+(en?'checked':'')+
-          ' onchange="toggleCoin(\''+c.pair+'\',this.checked)">'+
+          ' data-pair="'+c.pair+'" onchange="toggleCoin(this.dataset.pair,this.checked)">'+
         '<span class="cc-slider"></span>'+
       '</label>'+
     '</div>';
