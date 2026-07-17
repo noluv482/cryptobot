@@ -5633,6 +5633,22 @@ def _dispatch_callback(data, query, trader):
             lines.append(f"⚫ {len(neutral)} coins neutral")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
+    elif data.startswith("trust_dev:"):
+        # trust_dev:<uuid>:<label>
+        parts   = data.split(":", 2)
+        dev_id  = parts[1] if len(parts) > 1 else ""
+        label   = parts[2] if len(parts) > 2 else "My device"
+        if not dev_id:
+            tg("⚠️ Could not identify device — no ID received.", plain=True)
+            return
+        _trusted_devices[dev_id] = {"label": label, "added_ts": time.time()}
+        _save_trusted_devices()
+        log("AUTH", f"Device trusted via Telegram — {dev_id[:8]}…  '{label}'")
+        tg(f"🛡️ *Device trusted*\nLabel: `{label}`\nFuture logins from this device will show ✅")
+
+    elif data == "auth_ignore":
+        tg("🚫 Login alert dismissed. Change your PIN if you didn't log in.", plain=True)
+
 def _weekly_summary(trader):
     cutoff = time.time() - 7 * 86400
     week   = [t for t in trader.trades if t.get("ts", 0) >= cutoff]
@@ -10740,11 +10756,18 @@ def _web_auth():
                f"IP: `{ip}` | `{ts_str}`")
         else:
             log("AUTH", f"NEW device login — {ip}  {device_label}", "WARN")
-            tg(f"⚠️ *New device login*\n"
-               f"IP: `{ip}`\n"
-               f"Device: `{device_label}`\n"
-               f"Time: `{ts_str}`\n"
-               f"_If this wasn't you, change your PIN immediately._")
+            msg = (f"⚠️ *New device login*\n"
+                   f"IP: `{ip}`\n"
+                   f"Device: `{device_label}`\n"
+                   f"Time: `{ts_str}`\n"
+                   f"_Tap below to trust it, or ignore if this wasn't you._")
+            if dev_id:
+                tg_buttons(msg, [[
+                    {"text": f"✅ Trust {device_label}", "callback_data": f"trust_dev:{dev_id}:{device_label[:20]}"},
+                    {"text": "🚫 Ignore", "callback_data": "auth_ignore"},
+                ]])
+            else:
+                tg(msg + "\n_⚠️ Could not identify device — change your PIN if suspicious._")
         return _Response(json.dumps({"ok": True, "trusted": is_mine,
                                      "device_label": device_label}),
                          mimetype="application/json")
