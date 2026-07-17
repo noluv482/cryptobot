@@ -10658,6 +10658,31 @@ def _web_auth():
     if not DASHBOARD_PIN:
         return _Response('{"ok":true}', mimetype="application/json")
     ok = body.get("pin", "") == DASHBOARD_PIN
+    if ok:
+        # Prefer X-Forwarded-For (set by Railway / reverse proxy) over direct addr
+        raw_ip  = (_flask_request.headers.get("X-Forwarded-For", "")
+                   or _flask_request.remote_addr or "unknown")
+        ip      = raw_ip.split(",")[0].strip()
+        ua      = _flask_request.headers.get("User-Agent", "")
+        # Derive a human-readable device hint from the UA string
+        if "iPhone" in ua or "iPad" in ua:
+            device = "iPhone/iPad"
+        elif "Android" in ua:
+            device = "Android"
+        elif "Windows" in ua:
+            device = "Windows"
+        elif "Macintosh" in ua or "Mac OS" in ua:
+            device = "Mac"
+        elif "Linux" in ua:
+            device = "Linux"
+        else:
+            device = "Unknown device"
+        ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        log("AUTH", f"Dashboard unlocked — {ip}  {device}")
+        tg(f"🔓 *Dashboard login*\n"
+           f"IP: `{ip}`\n"
+           f"Device: `{device}`\n"
+           f"Time: `{ts_str}`")
     return _Response(json.dumps({"ok": ok}), mimetype="application/json")
 
 @_flask_app.route("/market")
