@@ -2158,6 +2158,7 @@ class PaperTrader:
         self._wr_ts        = 0.0
         # Loss streak global entry cooldown (30-min pause after ≥3 consecutive losses)
         self._streak_cool_until = 0.0
+        self._streak_reset_len  = 0    # manual reset: only count trades after this index
         # Volatility-adaptive sizing: EMA of ATR per pair to detect elevated volatility
         self._base_atr  = {}   # pair → long-run EMA of ATR
         # Kelly Criterion cache (refreshed every 5 min when ≥20 trades available)
@@ -2293,7 +2294,7 @@ class PaperTrader:
     @property
     def consecutive_losses(self):
         count = 0
-        for t in reversed(self.trades):
+        for t in reversed(self.trades[self._streak_reset_len:]):
             if t["pnl"] <= 0: count += 1
             else: break
         return count
@@ -6898,10 +6899,11 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       <div class="set-info-val" id="set_exch_val">—</div>
     </div>
     <div class="set-section-lbl">Live Trading Diagnostics</div>
-    <div style="padding:4px 16px 8px">
-      <button class="bt-run-btn" id="livecheck_btn" onclick="runLiveCheck()" style="width:100%;margin:0">&#128269; Run Live Check</button>
-      <div style="font-size:.58rem;color:var(--mu);margin-top:5px;padding:0 2px">Also sends a report to Telegram</div>
+    <div style="padding:4px 16px 8px;display:flex;gap:8px">
+      <button class="bt-run-btn" id="livecheck_btn" onclick="runLiveCheck()" style="flex:1;margin:0">&#128269; Run Live Check</button>
+      <button class="bt-run-btn" id="resetstreak_btn" onclick="resetStreak()" style="flex:1;margin:0;background:rgba(255,152,0,.15);border-color:rgba(255,152,0,.4);color:var(--y)" title="Clear loss streak — lifts confidence gate and cooldown">&#128260; Reset Streak</button>
     </div>
+    <div style="font-size:.58rem;color:var(--mu);margin-top:2px;padding:0 18px 6px">Live Check also sends a report to Telegram &middot; Reset Streak clears the loss-streak gate</div>
     <div style="padding:0 16px 14px" id="diag_panel">
       <div class="no-data">Click Run Live Check above</div>
     </div>
@@ -8359,6 +8361,27 @@ async function runLiveCheck(){
   }
 }
 
+async function resetStreak(){
+  const btn=$('resetstreak_btn');
+  if(btn){btn.disabled=true;btn.textContent='Resetting…';}
+  try{
+    const r=await fetch('/resetstreak',{method:'POST'});
+    const d=await r.json();
+    if(d.ok){
+      if(btn){btn.textContent='✅ Streak cleared!';}
+      setTimeout(async()=>{
+        const s=await(await fetch('/livecheck_web')).json();
+        renderDiagnostics(s);
+        if(btn){btn.disabled=false;btn.textContent='🔄 Reset Streak';}
+      },1200);
+    }else{
+      if(btn){btn.disabled=false;btn.textContent='🔄 Reset Streak';}
+    }
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent='🔄 Reset Streak';}
+  }
+}
+
 async function openSettings(){
   try{
     const d=await(await fetch('/settings')).json();
@@ -9385,6 +9408,21 @@ def _web_livecheck():
             _dispatch_callback("livecheck", {}, trader)
     threading.Thread(target=_fire, daemon=True).start()
     return _Response(json.dumps(payload), mimetype="application/json")
+
+@_flask_app.route("/resetstreak", methods=["POST"])
+def _web_resetstreak():
+    """Manually reset the loss streak and cooldown from the dashboard."""
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    if not trader:
+        return _Response('{"ok":false,"error":"no trader"}', mimetype="application/json")
+    old_streak = trader.consecutive_losses
+    trader._streak_reset_len  = len(trader.trades)
+    trader._streak_cool_until = 0.0
+    log("LIVE", f"Loss streak manually reset (was {old_streak}) via dashboard", "WARN")
+    tg(f"⚠️ *Loss streak manually reset*\n"
+       f"Previous streak: `{old_streak}` losses cleared via dashboard\n"
+       f"_Confidence gate and cooldown lifted — full sizing resumes._")
+    return _Response('{"ok":true}', mimetype="application/json")
 
 @_flask_app.route("/settings", methods=["GET", "POST"])
 def _web_settings():
