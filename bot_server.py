@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import base64
 import urllib.parse
+import random
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import matplotlib
@@ -383,6 +384,91 @@ CORRELATED_GROUPS = [
     frozenset({"PEPEUSD", "BONKUSD", "WIFUSD", "FLOKIUSD", "XDGUSD"}),
     frozenset({"SOLUSD", "AVAXUSD", "APTUSD", "SUIUSD", "NEARUSD"}),
     frozenset({"XRPUSD", "ADAUSD", "ALGOUSD"}),
+]
+
+# ── Gamification ──────────────────────────────────────────────────────────────
+_LEVEL_THRESHOLDS = [(35,"Market Wizard"),(26,"Elite Trader"),(19,"Chart Master"),
+                     (13,"Signal Hunter"),(8,"Market Reader"),(4,"Junior Analyst"),(1,"Apprentice")]
+
+ACHIEVEMENTS_DEF = [
+    {"id":"first_trade",  "name":"First Trade",     "emoji":"🎯","desc":"Place your first trade"},
+    {"id":"first_live",   "name":"Going Live",      "emoji":"🔴","desc":"Execute a real money trade"},
+    {"id":"first_win",    "name":"First Blood",     "emoji":"✅","desc":"Win your first trade"},
+    {"id":"win_5",        "name":"On a Roll",       "emoji":"🎲","desc":"Win 5 trades total"},
+    {"id":"win_25",       "name":"Quarter Century", "emoji":"🏅","desc":"Win 25 trades total"},
+    {"id":"win_50",       "name":"Half Century",    "emoji":"💯","desc":"Win 50 trades total"},
+    {"id":"streak_3",     "name":"Hat Trick",       "emoji":"🔥","desc":"3 consecutive wins"},
+    {"id":"streak_5",     "name":"Unstoppable",     "emoji":"⚡","desc":"5 consecutive wins"},
+    {"id":"pnl_50",       "name":"First $50",       "emoji":"💵","desc":"Total profits cross $50"},
+    {"id":"pnl_100",      "name":"Triple Digits",   "emoji":"💶","desc":"Total profits cross $100"},
+    {"id":"pnl_500",      "name":"High Roller",     "emoji":"💎","desc":"Total profits cross $500"},
+    {"id":"day_3",        "name":"3-Day Run",       "emoji":"📅","desc":"3 profitable days in a row"},
+    {"id":"day_7",        "name":"Perfect Week",    "emoji":"📆","desc":"7 profitable days in a row"},
+    {"id":"conf_80",      "name":"Sure Thing",      "emoji":"🎯","desc":"Win a trade at 80%+ confidence"},
+    {"id":"hold_2h",      "name":"Patient Trader",  "emoji":"⏳","desc":"Win a trade held 2+ hours"},
+    {"id":"level_5",      "name":"Leveled Up",      "emoji":"⬆️","desc":"Reach Level 5"},
+    {"id":"level_10",     "name":"Veteran",         "emoji":"🏆","desc":"Reach Level 10"},
+    {"id":"quiz_5",       "name":"Quick Learner",   "emoji":"📚","desc":"Answer 5 quiz questions correctly"},
+    {"id":"quiz_10",      "name":"Chart Scholar",   "emoji":"🎓","desc":"Answer 10 quiz questions correctly"},
+]
+
+CHALLENGE_TYPES = [
+    {"type":"win_trades",  "target":2,  "desc":"Win 2 trades today",            "unit":"wins"},
+    {"type":"pnl_target",  "target":15, "desc":"Earn +$15 today",               "unit":"$"},
+    {"type":"high_conf",   "target":1,  "desc":"Win a 70%+ confidence trade",   "unit":"win"},
+    {"type":"hold_time",   "target":45, "desc":"Win a trade held 45+ minutes",  "unit":"min"},
+    {"type":"no_loss_day", "target":1,  "desc":"Close the day with zero losses","unit":"day"},
+]
+
+QUIZ_QUESTIONS = [
+    {"q":"RSI rises above 70. What does your bot flag this as?",
+     "a":"Overbought — possible pullback ahead",
+     "opts":["Overbought — possible pullback ahead","Oversold — time to buy","Strong buy signal","Ignore it"],
+     "xp":5,"explain":"RSI over 70 means the asset is overbought. The bot uses this as a caution filter for new longs."},
+    {"q":"Price closes above the VWAP. What does this mean for the day?",
+     "a":"Buyers have paid above average — bullish bias",
+     "opts":["Buyers have paid above average — bullish bias","Sellers dominate today","Price is overvalued","Low volume signal"],
+     "xp":5,"explain":"VWAP above = buyers controlled the day. The bot uses this as a bullish entry filter."},
+    {"q":"MACD line crosses above its signal line. What is this called?",
+     "a":"Bullish crossover",
+     "opts":["Bullish crossover","Death cross","Bearish divergence","Volume spike"],
+     "xp":5,"explain":"A MACD bullish crossover is one of the bot's core pillar checks. It confirms upside momentum."},
+    {"q":"A 'bull flag' pattern signals?",
+     "a":"Brief pullback after a strong rise — likely continues up",
+     "opts":["Brief pullback after a strong rise — likely continues up","Start of a downtrend","Price stuck sideways","Double top forming"],
+     "xp":5,"explain":"Bull flags form after a fast move up, with a tight consolidation before the next leg higher."},
+    {"q":"OBV is falling while price is rising. What is this?",
+     "a":"Bearish divergence — smart money is selling",
+     "opts":["Bearish divergence — smart money is selling","Bullish confirmation","Volume breakout","Normal market behavior"],
+     "xp":5,"explain":"OBV measures cumulative buy/sell volume. If it falls while price rises, big players are quietly exiting."},
+    {"q":"A hammer candle at the bottom of a downtrend suggests?",
+     "a":"Potential bullish reversal",
+     "opts":["Potential bullish reversal","Continuation lower","Indecision — no trade","Take profit signal"],
+     "xp":5,"explain":"A hammer has a long lower wick — buyers aggressively rejected lower prices. Often marks a reversal."},
+    {"q":"What does Stochastic RSI above 0.8 mean?",
+     "a":"Overbought — momentum may be peaking",
+     "opts":["Overbought — momentum may be peaking","Oversold — buy now","Trend is accelerating","Neutral reading"],
+     "xp":5,"explain":"StochRSI above 0.8 = RSI is at the top of its recent range. Momentum may be fading."},
+    {"q":"The bot detects a CHOPPY regime. What happens next?",
+     "a":"All signals become HOLD — no new trades",
+     "opts":["All signals become HOLD — no new trades","Bot trades more aggressively","Position size doubles","Stop losses tighten"],
+     "xp":5,"explain":"In choppy markets the bot switches all signals to HOLD. Better to wait for a real trend than lose money in noise."},
+    {"q":"After 3 consecutive losses, the bot raises the confidence gate by?",
+     "a":"+9% (3% per loss)",
+     "opts":["+9% (3% per loss)","+3% flat","+15% immediately","+1% per loss"],
+     "xp":5,"explain":"Each consecutive loss adds 3% to the minimum confidence floor. 3 losses = gate raised 9%, so only strong signals pass."},
+    {"q":"Profit factor of 1.5 means?",
+     "a":"You earn $1.50 for every $1.00 lost",
+     "opts":["You earn $1.50 for every $1.00 lost","You win 150% of trades","Your average win is $1.50","Losses exceed wins by 50%"],
+     "xp":5,"explain":"Profit factor = gross wins / gross losses. 1.5 means winners average 1.5x the size of losers — that's solid."},
+    {"q":"A trailing stop does what as price moves in your favor?",
+     "a":"Moves to lock in profits, never moves against you",
+     "opts":["Moves to lock in profits, never moves against you","Stays at your entry price","Moves to break even only","Exits at a fixed target"],
+     "xp":5,"explain":"Trailing stops follow price upward (for longs), locking in gains. They never move back down, which protects your profit."},
+    {"q":"Rising BTC dominance usually hurts which assets most?",
+     "a":"Altcoins — money rotates into BTC",
+     "opts":["Altcoins — money rotates into BTC","Bitcoin itself","Stablecoins","ETH only"],
+     "xp":5,"explain":"When BTC dominance rises, capital flows from altcoins into Bitcoin. The bot tracks this to filter risky alt signals."},
 ]
 
 # CoinGecko coin ID → Kraken pair (used by the trending scanner)
@@ -789,6 +875,9 @@ _price_alerts   = {}
 _disabled_pairs: set = set()
 # Rolling log of the last 15 Telegram messages sent by the bot
 _tg_log: list = []
+# Gamification: quiz state and achievement notification tracking
+_quiz_state: dict = {"idx": 0, "order": [], "current_correct": "", "correct": 0, "asked": 0}
+_notified_achievements: set = set()   # IDs we already sent a TG alert for
 # Web Push (VAPID) — optional; gracefully skipped when keys not set
 VAPID_PUBLIC_KEY   = os.environ.get("VAPID_PUBLIC_KEY",   "")
 VAPID_PRIVATE_KEY  = os.environ.get("VAPID_PRIVATE_KEY",  "")
@@ -2170,6 +2259,7 @@ class PaperTrader:
         self._streak_cool_until = 0.0
         self._streak_reset_len  = 0    # manual reset: only count trades after this index
         self._saved_setups      = []   # guard-mode winning setups (capped at 50)
+        self._quiz_xp           = 0    # XP earned from quiz correct answers
         # Volatility-adaptive sizing: EMA of ATR per pair to detect elevated volatility
         self._base_atr  = {}   # pair → long-run EMA of ATR
         # Kelly Criterion cache (refreshed every 5 min when ≥20 trades available)
@@ -3101,6 +3191,7 @@ class PaperTrader:
                          held_mins=held_mins,
                          balance=self.balance,
                          win_rate=self.win_rate)
+        threading.Thread(target=_check_notify_achievements, args=(self,), daemon=True).start()
 
         if not self._force_paper:
             new_rank = get_rank(self.balance)
@@ -6175,6 +6266,44 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .bmsg-row:last-child{border-bottom:none}
 .bmsg-time{font-size:.55rem;color:var(--mu);font-family:var(--fn);flex-shrink:0;padding-top:2px;min-width:38px}
 .bmsg-text{font-size:.62rem;color:var(--tx);line-height:1.45;word-break:break-word}
+/* ── XP BAR ── */
+.xp-bar-wrap{height:4px;background:var(--bd2);border-radius:2px;margin:4px 0 3px;overflow:hidden}
+.xp-bar-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--b),#a855f7);transition:width .6s}
+/* ── DAILY CHALLENGE ── */
+.chal-wrap{margin:0 16px 16px;background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:13px 15px}
+.chal-title{font-size:.78rem;font-weight:700;color:var(--tx);margin-bottom:4px}
+.chal-desc{font-size:.62rem;color:var(--mu);margin-bottom:10px}
+.chal-prog-wrap{height:8px;background:var(--bd2);border-radius:4px;overflow:hidden;margin-bottom:5px}
+.chal-prog-fill{height:100%;border-radius:4px;background:var(--b);transition:width .6s}
+.chal-prog-fill.done{background:var(--g)}
+.chal-bottom{display:flex;justify-content:space-between;font-size:.58rem;color:var(--mu);font-family:var(--fn)}
+.chal-badge{font-size:.62rem;font-weight:700;padding:2px 8px;border-radius:10px}
+.chal-badge.done{background:rgba(0,204,116,.15);color:var(--g)}
+.chal-badge.open{background:rgba(70,130,255,.12);color:var(--b)}
+/* ── TROPHY CASE ── */
+.trophy-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.trophy-card{background:var(--c2);border:1px solid var(--bd2);border-radius:10px;padding:9px 8px;text-align:center}
+.trophy-card.earned{border-color:rgba(245,161,28,.5);background:rgba(245,161,28,.06)}
+.trophy-emoji{font-size:1.4rem;line-height:1.2;margin-bottom:3px}
+.trophy-name{font-size:.52rem;font-weight:700;color:var(--tx);line-height:1.3}
+.trophy-desc{font-size:.46rem;color:var(--mu);margin-top:2px;line-height:1.3}
+.trophy-card:not(.earned) .trophy-emoji{filter:grayscale(1);opacity:.35}
+.trophy-card:not(.earned) .trophy-name{color:var(--mu)}
+/* ── QUIZ ── */
+.quiz-q{font-size:.78rem;font-weight:700;color:var(--tx);margin-bottom:10px;line-height:1.4}
+.quiz-opts{display:flex;flex-direction:column;gap:7px}
+.quiz-opt{padding:9px 12px;border-radius:9px;border:1px solid var(--bd2);background:var(--c2);
+  font-size:.68rem;color:var(--tx);cursor:pointer;text-align:left;transition:.15s;width:100%}
+.quiz-opt:active{transform:scale(.98)}
+.quiz-opt.correct{border-color:rgba(0,204,116,.6);background:rgba(0,204,116,.1);color:var(--g);font-weight:700}
+.quiz-opt.wrong{border-color:rgba(255,51,82,.5);background:rgba(255,51,82,.08);color:var(--r)}
+.quiz-opt.dim{opacity:.45}
+.quiz-explain{margin-top:10px;font-size:.62rem;color:var(--mu);line-height:1.5;padding:8px 10px;
+  background:var(--bd2);border-radius:8px}
+.quiz-footer{display:flex;align-items:center;justify-content:space-between;margin-top:10px}
+.quiz-score{font-size:.6rem;color:var(--mu);font-family:var(--fn)}
+.quiz-next{padding:8px 16px;border-radius:9px;background:var(--b);color:#fff;font-size:.68rem;font-weight:700;cursor:pointer}
+.quiz-xp-pop{font-size:.65rem;font-weight:700;color:#a855f7}
 /* ── COIN CONTROL TOGGLES ── */
 .coin-ctrl-row{display:flex;align-items:center;gap:10px;padding:6px 16px;border-bottom:1px solid var(--bd2)}
 .coin-ctrl-row:last-child{border-bottom:none}
@@ -6631,6 +6760,19 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="qcard-sub" id="best_sub"></div>
       </div>
     </div>
+    <div class="qrow" style="padding-top:0">
+      <div class="qcard ac-m" id="xp_card">
+        <div class="qcard-lbl">XP &amp; Level</div>
+        <div class="qcard-val" id="xp_level_val" style="font-size:.85rem">Lv 1</div>
+        <div class="xp-bar-wrap"><div class="xp-bar-fill" id="xp_bar" style="width:0%"></div></div>
+        <div class="qcard-sub" id="xp_sub">0 XP · 100 to next level</div>
+      </div>
+      <div class="qcard ac-m">
+        <div class="qcard-lbl">Day Streak</div>
+        <div class="qcard-val c-g" id="day_streak_val">—</div>
+        <div class="qcard-sub" id="day_streak_sub">profitable days in a row</div>
+      </div>
+    </div>
     <div class="proj-row" id="proj_row" style="display:none">
       <span class="proj-rate" id="proj_rate"></span>
       <span class="proj-eta" id="proj_eta"></span>
@@ -6652,6 +6794,11 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
       <div style="display:flex;justify-content:space-between;margin-top:5px;font-size:.57rem;color:var(--mu);font-family:var(--fn)">
         <span>$0</span><span id="goal_pct_lbl">0%</span><span id="goal_max_lbl">$10</span>
       </div>
+    </div>
+
+    <div class="sh"><span>&#127381; Daily Challenge</span></div>
+    <div class="chal-wrap" id="chal_wrap">
+      <div class="no-data">Loading&#8230;</div>
     </div>
 
     <div class="sh"><span>Risk Exposure</span></div>
@@ -6888,6 +7035,8 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div id="gate_bars" style="padding-bottom:12px"><div class="no-data">No blocks yet</div></div>
     <div class="sh"><span>&#11088; Best Setups</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">guard-mode wins to study</span></div>
     <div id="best_setups" style="padding:0 16px 14px"><div class="no-data">No guard-mode wins yet — these appear when the bot wins a trade while the loss-streak gate is raised</div></div>
+    <div class="sh"><span>&#127942; Trophy Case</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">achievements</span></div>
+    <div id="trophy_case" style="padding:0 16px 14px"><div class="no-data">Loading&#8230;</div></div>
     <div class="sh"><span>Backtest</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">60h replay · live signal engine</span></div>
     <div class="bt-form">
       <select class="bt-sel" id="bt_pair"></select>
@@ -6931,6 +7080,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="sh"><span>Market Heatmap</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">26 coins · 15-min signals</span></div>
     <div class="hm-grid" id="hm_grid">
       <div class="no-data" style="grid-column:1/-1">Loading&#8230;</div>
+    </div>
+    <div class="sh"><span>&#127873; Pattern Quiz</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">test your trading knowledge</span></div>
+    <div id="quiz_box" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;padding:14px 15px">
+      <div class="no-data">Loading&#8230;</div>
     </div>
     <div class="sh"><span>&#128275; Coin Controls</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">toggle coins on/off</span></div>
     <div id="coin_ctrl_list" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;overflow:hidden">
@@ -7076,7 +7229,7 @@ function goTab(t){
   $('tab-'+t).classList.add('active');
   if(t==='chart'){drawCandles();}
   if(t==='home'){drawEquity();}
-  if(t==='market'){fetchMarket();fetchNews();}
+  if(t==='market'){fetchMarket();fetchNews();loadQuiz();}
   if(t==='stats'){drawDownChart();fetchCalibration();}
 }
 
@@ -7225,6 +7378,8 @@ async function fetchStatus(){
     renderPattern(d);
     if(d.market_conditions)renderConditions(d.market_conditions);
     if(d.gate_counters)renderGates(d.gate_counters);
+    renderXpAndStreak(d);
+    renderChallenge(d.daily_challenge||null);
     renderRiskGauge(d);
     renderProjection(d.balance_projection||null);
     _updateLiveStats(d);
@@ -8202,6 +8357,118 @@ async function fetchBotMsgs(){
   }catch(e){console.warn('tglog',e);}
 }
 
+/* ── XP / LEVEL / DAY STREAK ── */
+function renderXpAndStreak(d){
+  const xi=d.xp_info;
+  if(xi){
+    const lvEl=$('xp_level_val');
+    if(lvEl)lvEl.textContent='Lv '+xi.level+' · '+xi.title;
+    const barEl=$('xp_bar');
+    if(barEl)barEl.style.width=(xi.xp_in_level)+'%';
+    const subEl=$('xp_sub');
+    if(subEl)subEl.textContent=xi.xp+' XP · '+xi.xp_to_next+' to next level';
+    const card=$('xp_card');
+    if(card)card.className='qcard '+(xi.level>=10?'ac-g':xi.level>=5?'ac-b':'ac-m');
+  }
+  const ds=d.profitable_day_streak||0;
+  const dsEl=$('day_streak_val');
+  const dsSub=$('day_streak_sub');
+  if(dsEl)dsEl.textContent=ds>0?'🔥 '+ds:'0';
+  if(dsSub)dsSub.textContent=ds>=3?'profitable days — keep it going!':ds>0?'profitable day streak':'no streak yet';
+}
+
+/* ── DAILY CHALLENGE ── */
+function renderChallenge(ch){
+  const el=$('chal_wrap');if(!el||!ch)return;
+  const pct=Math.min(100,ch.type==='pnl_target'
+    ? Math.round(Math.max(0,ch.progress)/ch.target*100)
+    : Math.round(Math.min(ch.progress,ch.target)/ch.target*100));
+  const done=ch.completed;
+  el.innerHTML=
+    '<div class="chal-title">'+(done?'✅ ':'')+(ch.desc||'')+'</div>'+
+    '<div class="chal-desc">Daily challenge · resets at midnight UTC</div>'+
+    '<div class="chal-prog-wrap"><div class="chal-prog-fill'+(done?' done':'')+'" style="width:'+pct+'%"></div></div>'+
+    '<div class="chal-bottom">'+
+      '<span>Progress: '+(ch.type==='pnl_target'?'$'+ch.progress:ch.progress)+' / '+(ch.type==='pnl_target'?'$':'')+ch.target+'</span>'+
+      '<span class="chal-badge '+(done?'done':'open')+'">'+(done?'Complete!':pct+'%')+'</span>'+
+    '</div>';
+}
+
+/* ── TROPHY CASE ── */
+async function fetchAchievements(){
+  try{
+    const d=await(await fetch('/achievements')).json();
+    const el=$('trophy_case');if(!el)return;
+    const all=d.achievements||[];
+    if(!all.length){el.innerHTML='<div class="no-data">No trades yet</div>';return;}
+    const earned=all.filter(a=>a.earned).length;
+    el.innerHTML='<div style="font-size:.6rem;color:var(--mu);margin-bottom:8px">'+earned+' / '+all.length+' unlocked</div>'+
+      '<div class="trophy-grid">'+
+      all.map(a=>
+        '<div class="trophy-card'+(a.earned?' earned':'')+'">'+
+          '<div class="trophy-emoji">'+a.emoji+'</div>'+
+          '<div class="trophy-name">'+a.name+'</div>'+
+          '<div class="trophy-desc">'+a.desc+'</div>'+
+        '</div>'
+      ).join('')+
+      '</div>';
+  }catch(e){console.warn('achievements',e);}
+}
+
+/* ── PATTERN QUIZ ── */
+let _quizAnswered=false;
+async function loadQuiz(){
+  const box=$('quiz_box');if(!box)return;
+  _quizAnswered=false;
+  box.innerHTML='<div class="no-data">Loading question&#8230;</div>';
+  try{
+    const d=await(await fetch('/quiz')).json();
+    box.innerHTML=
+      '<div class="quiz-q">'+d.question+'</div>'+
+      '<div class="quiz-opts" id="quiz_opts">'+
+        d.options.map((o,i)=>
+          '<button class="quiz-opt" onclick="answerQuiz(this,\''+o.replace(/'/g,'&#39;')+'\')" data-opt="'+i+'">'+o+'</button>'
+        ).join('')+
+      '</div>'+
+      '<div id="quiz_explain" style="display:none"></div>'+
+      '<div class="quiz-footer">'+
+        '<span class="quiz-score" id="quiz_score">Correct: '+d.correct_count+' / '+d.asked+'</span>'+
+        '<span class="quiz-xp-pop" id="quiz_xp_pop"></span>'+
+      '</div>';
+  }catch(e){if(box)box.innerHTML='<div class="no-data">Could not load question</div>';}
+}
+async function answerQuiz(btn,answer){
+  if(_quizAnswered)return;
+  _quizAnswered=true;
+  try{
+    const r=await fetch('/quiz/answer',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({answer})});
+    const d=await r.json();
+    const opts=document.querySelectorAll('.quiz-opt');
+    opts.forEach(o=>{
+      const oAns=o.textContent.trim();
+      if(oAns===d.correct_answer) o.classList.add('correct');
+      else if(o===btn&&!d.correct)  o.classList.add('wrong');
+      else                           o.classList.add('dim');
+      o.disabled=true;
+    });
+    const exp=$('quiz_explain');
+    if(exp){exp.className='quiz-explain';exp.textContent=d.explain;exp.style.display='block';}
+    const sc=$('quiz_score');
+    if(sc)sc.textContent='Correct: '+d.total_correct+' / '+(parseInt(sc.textContent.split('/')[1]||'0')+1);
+    const xpPop=$('quiz_xp_pop');
+    if(xpPop)xpPop.textContent=d.correct?'+'+d.xp_earned+' XP':'';
+    // Add Next button
+    const footer=document.querySelector('.quiz-footer');
+    if(footer){
+      const nb=document.createElement('button');
+      nb.className='quiz-next';nb.textContent='Next question';
+      nb.onclick=loadQuiz;
+      footer.appendChild(nb);
+    }
+  }catch(e){console.warn('quiz answer',e);}
+}
+
 /* ── COIN CONTROLS ── */
 let _coinCtrlPairs=[];
 async function fetchCoinControls(disabledPairs){
@@ -9145,7 +9412,7 @@ applyTheme(_theme);
 _initSoundBtn();
 _initKeyboard();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
-fetchSim();fetchNews();fetchBestSetups();fetchBotMsgs();
+fetchSim();fetchNews();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();
 fetchPrices();setInterval(fetchPrices,8000);
 initSSE();initWebPush();
 setInterval(tick,1000);
@@ -9211,6 +9478,157 @@ def _web_chart_png():
         return _Response("Chart unavailable.", status=503, mimetype="text/plain")
     return _Response(buf.read(), mimetype="image/png",
                      headers={"Cache-Control": "no-store, no-cache"})
+
+def _get_level_title(level):
+    for threshold, title in _LEVEL_THRESHOLDS:
+        if level >= threshold:
+            return title
+    return "Apprentice"
+
+def _compute_xp_and_level(trader):
+    """Compute total XP earned from all trades and derive level."""
+    xp = trader._quiz_xp if hasattr(trader, "_quiz_xp") else 0
+    wins = [t for t in trader.trades if t["pnl"] > 0]
+    for i, t in enumerate(trader.trades):
+        if t["pnl"] > 0:
+            conf = t.get("confidence", 0) or 0
+            base = 10
+            conf_bonus = int(min(conf, 1.0) * 10)
+            hold_bonus = min(5, int((t.get("held_mins", 0) or 0) / 30))
+            # Streak bonus: were the 2 prior trades also wins?
+            streak_bonus = 5 if i >= 2 and all(trader.trades[j]["pnl"] > 0 for j in (i-2, i-1)) else 0
+            xp += base + conf_bonus + hold_bonus + streak_bonus
+    level = xp // 100 + 1
+    xp_in_level = xp % 100
+    return {"xp": xp, "level": level, "xp_in_level": xp_in_level,
+            "xp_to_next": 100 - xp_in_level, "title": _get_level_title(level)}
+
+def _profitable_day_streak(trader):
+    """Count consecutive calendar days (UTC) ending with positive P&L."""
+    daily: dict = {}
+    for t in trader.trades:
+        day = datetime.utcfromtimestamp(t.get("ts", 0)).strftime("%Y-%m-%d")
+        daily[day] = daily.get(day, 0.0) + t["pnl"]
+    today = datetime.utcnow()
+    streak = 0
+    # Start from yesterday (today may still be open)
+    for i in range(1, 367):
+        day = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        if day not in daily:
+            break
+        if daily[day] > 0:
+            streak += 1
+        else:
+            break
+    # Include today if it already has positive P&L
+    today_key = today.strftime("%Y-%m-%d")
+    if daily.get(today_key, 0) > 0:
+        streak += 1
+    return streak
+
+def _get_achievements(trader):
+    """Return all achievement definitions with earned=True/False."""
+    trades = trader.trades
+    wins = [t for t in trades if t["pnl"] > 0]
+    total_profit = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+    # Find max consecutive win streak
+    max_streak = cur_streak = 0
+    for t in trades:
+        if t["pnl"] > 0:
+            cur_streak += 1; max_streak = max(max_streak, cur_streak)
+        else:
+            cur_streak = 0
+    day_streak = _profitable_day_streak(trader)
+    xp_info = _compute_xp_and_level(trader)
+    quiz_correct = _quiz_state.get("correct", 0)
+    has_live = any(not t.get("force_paper", True) for t in trades)
+
+    def earned_ts(cond, trades_ref, idx):
+        return trades_ref[idx]["ts"] if cond and idx < len(trades_ref) else None
+
+    results = []
+    for a in ACHIEVEMENTS_DEF:
+        aid = a["id"]
+        e, ts = False, None
+        if aid == "first_trade"  and trades:         e=True;  ts=trades[0]["ts"]
+        elif aid == "first_live" and has_live:        e=True
+        elif aid == "first_win"  and wins:            e=True;  ts=wins[0]["ts"]
+        elif aid == "win_5"      and len(wins)>=5:    e=True;  ts=wins[4]["ts"]
+        elif aid == "win_25"     and len(wins)>=25:   e=True;  ts=wins[24]["ts"]
+        elif aid == "win_50"     and len(wins)>=50:   e=True;  ts=wins[49]["ts"]
+        elif aid == "streak_3"   and max_streak>=3:   e=True
+        elif aid == "streak_5"   and max_streak>=5:   e=True
+        elif aid == "pnl_50"     and total_profit>=50:    e=True
+        elif aid == "pnl_100"    and total_profit>=100:   e=True
+        elif aid == "pnl_500"    and total_profit>=500:   e=True
+        elif aid == "day_3"      and day_streak>=3:   e=True
+        elif aid == "day_7"      and day_streak>=7:   e=True
+        elif aid == "conf_80"    and any(t["pnl"]>0 and (t.get("confidence",0) or 0)>=0.8 for t in trades): e=True
+        elif aid == "hold_2h"    and any(t["pnl"]>0 and (t.get("held_mins",0) or 0)>=120 for t in trades): e=True
+        elif aid == "level_5"    and xp_info["level"]>=5:   e=True
+        elif aid == "level_10"   and xp_info["level"]>=10:  e=True
+        elif aid == "quiz_5"     and quiz_correct>=5:   e=True
+        elif aid == "quiz_10"    and quiz_correct>=10:  e=True
+        results.append({**a, "earned": e, "earned_at": ts})
+    return results
+
+def _check_notify_achievements(trader):
+    """Send Telegram alerts for any newly earned achievements."""
+    global _notified_achievements
+    for a in _get_achievements(trader):
+        if a["earned"] and a["id"] not in _notified_achievements:
+            _notified_achievements.add(a["id"])
+            tg(f"🏆 *Achievement Unlocked!*\n"
+               f"{a['emoji']} *{a['name']}*\n"
+               f"_{a['desc']}_")
+
+def _get_daily_challenge(trader):
+    """Return today's challenge definition and current progress."""
+    day_num = datetime.utcnow().timetuple().tm_yday
+    ch = CHALLENGE_TYPES[day_num % len(CHALLENGE_TYPES)]
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_ts = today_start.timestamp()
+    today_trades = [t for t in trader.trades if t.get("ts", 0) >= today_ts]
+    today_wins = [t for t in today_trades if t["pnl"] > 0]
+
+    progress = 0
+    ct = ch["type"]
+    if ct == "win_trades":
+        progress = len(today_wins)
+    elif ct == "pnl_target":
+        progress = round(sum(t["pnl"] for t in today_trades), 2)
+    elif ct == "high_conf":
+        progress = 1 if any((t.get("confidence",0) or 0) >= 0.70 and t["pnl"] > 0
+                            for t in today_trades) else 0
+    elif ct == "hold_time":
+        progress = max((t.get("held_mins",0) or 0) for t in today_wins) if today_wins else 0
+    elif ct == "no_loss_day":
+        progress = 0 if any(t["pnl"] < 0 for t in today_trades) else (1 if today_trades else 0)
+
+    completed = (ct == "pnl_target" and progress >= ch["target"]) or \
+                (ct != "pnl_target" and progress >= ch["target"])
+    return {**ch, "progress": round(progress, 2), "completed": completed, "date": today_start.strftime("%Y-%m-%d")}
+
+def _next_quiz_question():
+    """Advance quiz to the next question, shuffling options."""
+    global _quiz_state
+    order = _quiz_state.get("order", [])
+    if not order:
+        order = list(range(len(QUIZ_QUESTIONS)))
+        random.shuffle(order)
+        _quiz_state["order"] = order
+        _quiz_state["idx"] = 0
+    idx = _quiz_state.get("idx", 0) % len(order)
+    q = QUIZ_QUESTIONS[order[idx]]
+    opts = q["opts"][:]
+    random.shuffle(opts)
+    _quiz_state["current_correct"] = q["a"]
+    _quiz_state["current_xp"] = q.get("xp", 5)
+    _quiz_state["current_explain"] = q["explain"]
+    _quiz_state["idx"] = idx + 1
+    return {"question": q["q"], "options": opts,
+            "correct_count": _quiz_state.get("correct", 0),
+            "asked": _quiz_state.get("asked", 0)}
 
 def _calc_balance_projection(trader):
     """Return 7-day daily rate and days-to-next-milestone for the balance projection card."""
@@ -9393,8 +9811,11 @@ def _web_status():
             "positions": len(_sim_trader.positions) if _sim_trader else 0,
         },
         "news_sentiment": {p: news_sentiment[p]["sentiment"] for p in news_sentiment},
-        "disabled_pairs": list(_disabled_pairs),
-        "balance_projection": _calc_balance_projection(trader),
+        "disabled_pairs":        list(_disabled_pairs),
+        "balance_projection":    _calc_balance_projection(trader),
+        "xp_info":               _compute_xp_and_level(trader),
+        "profitable_day_streak": _profitable_day_streak(trader),
+        "daily_challenge":       _get_daily_challenge(trader),
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
@@ -9694,6 +10115,41 @@ def _web_resetstreak():
        f"Previous streak: `{old_streak}` losses cleared via dashboard\n"
        f"_Confidence gate and cooldown lifted — full sizing resumes._")
     return _Response('{"ok":true}', mimetype="application/json")
+
+@_flask_app.route("/achievements")
+def _web_achievements():
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    if not trader:
+        return _Response(json.dumps({"achievements": []}), mimetype="application/json")
+    return _Response(json.dumps({"achievements": _get_achievements(trader)}),
+                     mimetype="application/json")
+
+@_flask_app.route("/quiz")
+def _web_quiz():
+    return _Response(json.dumps(_next_quiz_question()), mimetype="application/json")
+
+@_flask_app.route("/quiz/answer", methods=["POST"])
+def _web_quiz_answer():
+    global _quiz_state
+    body = _flask_request.get_json(silent=True) or {}
+    answer = body.get("answer", "")
+    correct = answer == _quiz_state.get("current_correct", "")
+    _quiz_state["asked"] = _quiz_state.get("asked", 0) + 1
+    xp_earned = 0
+    if correct:
+        _quiz_state["correct"] = _quiz_state.get("correct", 0) + 1
+        xp_earned = _quiz_state.get("current_xp", 5)
+        trader = _web_trader_ref[0] if _web_trader_ref else None
+        if trader:
+            trader._quiz_xp = getattr(trader, "_quiz_xp", 0) + xp_earned
+            threading.Thread(target=_check_notify_achievements, args=(trader,), daemon=True).start()
+    return _Response(json.dumps({
+        "correct": correct,
+        "correct_answer": _quiz_state.get("current_correct", ""),
+        "explain": _quiz_state.get("current_explain", ""),
+        "xp_earned": xp_earned,
+        "total_correct": _quiz_state.get("correct", 0),
+    }), mimetype="application/json")
 
 @_flask_app.route("/togglepair", methods=["POST"])
 def _web_togglepair():
