@@ -7639,7 +7639,7 @@ async function openSettings(){
     $('set_paper').checked=!!d.paper_mode;
     $('set_sim').checked=!!d.sim_enabled;
     $('set_max_pos_val').textContent=_setMaxPos;
-    $('set_risk_val').textContent=(d.risk_pct||0).toFixed(1)+'%';
+    $('set_risk_val').textContent=(d.risk_pct||'—')+'%';
     $('set_target_val').textContent='$'+(d.paper_target||0).toLocaleString();
     $('set_scan_val').textContent=(d.scan_universe||26).toString();
     $('set_exch_val').textContent=d.live_mode?(d.exchange||'live').toUpperCase():'Paper';
@@ -8303,7 +8303,7 @@ def _web_settings():
         "paper_mode":     _paper_mode,
         "sim_enabled":    _sim_enabled,
         "max_positions":  _rt_max_positions if _rt_max_positions > 0 else MAX_POSITIONS,
-        "risk_pct":       round((_rt_risk_pct if _rt_risk_pct > 0 else RISK_PCT) * 100, 1),
+        "risk_pct":       f"{round(RISK_MIN*100,0):.0f}–{round(RISK_MAX*100,0):.0f}",
         "live_mode":      LIVE_MODE,
         "paper_target":   PAPER_TARGET,
         "scan_universe":  len(SCAN_UNIVERSE),
