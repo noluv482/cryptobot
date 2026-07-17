@@ -2187,20 +2187,21 @@ _htf_cache    = {}
 _htf_cache_ts = {}
 
 def _htf_trend(pair, interval=60, limit=50):
-    """1-hour EMA trend. 'BULL', 'BEAR', or 'NEUTRAL'. Cached 5 min."""
+    """EMA trend for any timeframe. 'BULL', 'BEAR', or 'NEUTRAL'. Cached 5 min."""
     now = time.time()
-    if now - _htf_cache_ts.get(pair, 0) < 300:
-        return _htf_cache.get(pair, "NEUTRAL")
+    key = (pair, interval)
+    if now - _htf_cache_ts.get(key, 0) < 300:
+        return _htf_cache.get(key, "NEUTRAL")
     try:
         cls, _, _, _, _ = get_klines(pair, interval=interval, limit=limit)
         if len(cls) >= EMA_PERIOD + 5:
-            _htf_cache[pair] = "BULL" if cls[-1] > calc_ema(cls) else "BEAR"
+            _htf_cache[key] = "BULL" if cls[-1] > calc_ema(cls) else "BEAR"
         else:
-            _htf_cache.setdefault(pair, "NEUTRAL")
-        _htf_cache_ts[pair] = now
+            _htf_cache.setdefault(key, "NEUTRAL")
+        _htf_cache_ts[key] = now
     except Exception:
-        _htf_cache.setdefault(pair, "NEUTRAL")
-    return _htf_cache.get(pair, "NEUTRAL")
+        _htf_cache.setdefault(key, "NEUTRAL")
+    return _htf_cache.get(key, "NEUTRAL")
 
 # ── Bid-ask spread filter ─────────────────────────────────────────────────────
 _spread_cache    = {}
@@ -2263,8 +2264,12 @@ class PaperTrader:
         # Volatility-adaptive sizing: EMA of ATR per pair to detect elevated volatility
         self._base_atr  = {}   # pair → long-run EMA of ATR
         # Kelly Criterion cache (refreshed every 5 min when ≥20 trades available)
-        self._kelly_sz  = 0.0
-        self._kelly_ts  = 0.0
+        self._kelly_sz      = 0.0
+        self._kelly_ts      = 0.0
+        self._kelly_pair_sz = {}   # pair → float (per-pair half-Kelly)
+        self._kelly_pair_ts = {}   # pair → float (timestamp)
+        # Pairs eligible for half-size re-entry after a trailing-stop/signal-flip loss
+        self._reentry_pairs = set()
         self._live_orders  = {}   # pair → kraken txid (live mode only)
         if not force_paper:
             self._load()
@@ -2422,9 +2427,12 @@ class PaperTrader:
         return 1.0
 
     def _session_multiplier(self):
-        """Size by trading session: US hours have the most volume and follow-through;
-        Asian session is choppier with more false breakouts."""
-        h = datetime.utcnow().hour
+        """Size by trading session. Weekends have ~40% lower volume and more false
+        breakouts; US hours have best follow-through; Asian session is choppiest."""
+        now_utc = datetime.utcnow()
+        h = now_utc.hour
+        if now_utc.weekday() >= 5:   # Saturday=5, Sunday=6
+            return 0.65
         if 13 <= h < 20:   # US session (NY open → close)
             return 1.10
         if 0 <= h < 6:     # Asian session (low liquidity, choppy)
@@ -2648,10 +2656,30 @@ class PaperTrader:
         w_total = sum(math.exp(-(now - t["ts"]) / half_life) for t in self.trades)
         return (w_wins / w_total * 100) if w_total > 1e-9 else 0.0
 
-    def _kelly_size(self):
+    def _kelly_size(self, pair=None):
         """Half-Kelly optimal risk fraction from realized win/loss stats.
-        Requires ≥20 trades; returns 0 when insufficient data."""
+        If pair given and ≥20 pair trades exist, uses per-pair stats; else global.
+        Returns 0 when insufficient data."""
         now = time.time()
+        if pair:
+            if now - self._kelly_pair_ts.get(pair, 0) < 300:
+                return self._kelly_pair_sz.get(pair, 0.0)
+            pair_trades = [t for t in self.trades if t.get("pair") == pair]
+            if len(pair_trades) >= 20:
+                wins   = [t["pnl"] for t in pair_trades if t["pnl"] > 0]
+                losses = [abs(t["pnl"]) for t in pair_trades if t["pnl"] < 0]
+                if wins and losses:
+                    p_wr   = len(wins) / len(pair_trades)
+                    q_wr   = 1.0 - p_wr
+                    b      = (sum(wins) / len(wins)) / max(sum(losses) / len(losses), 1e-9)
+                    kelly  = (p_wr * b - q_wr) / max(b, 1e-9)
+                    result = max(0.0, min(kelly * 0.5, RISK_MAX))
+                else:
+                    result = 0.0
+                self._kelly_pair_sz[pair] = result
+                self._kelly_pair_ts[pair] = now
+                return result
+        # Global Kelly (used when no pair given or pair has <20 trades)
         if now - self._kelly_ts < 300:
             return self._kelly_sz
         self._kelly_ts = now
@@ -2807,13 +2835,24 @@ class PaperTrader:
                     self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
 
     def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None):
-        # Correlation filter: don't pile into the same direction on correlated coins
+        # Correlation filter: halve size when already in the same direction on a correlated coin
+        corr_mult = 1.0
         for grp in CORRELATED_GROUPS:
             if pair not in grp: continue
             for ep, ep_data in self.positions.items():
                 if ep in grp and ep != pair and ep_data["side"] == side:
-                    log("PAPER", f"Blocked {name} {side} — correlated with {ep_data['name']}")
-                    return
+                    corr_mult = 0.5
+                    log("PAPER", f"{name} {side} — correlated with {ep_data['name']}, size halved")
+                    break
+            if corr_mult < 1.0:
+                break
+
+        # Re-entry multiplier: half size for first re-entry after a trailing-stop loss
+        reentry_mult = 1.0
+        if pair in self._reentry_pairs:
+            reentry_mult = 0.5
+            self._reentry_pairs.discard(pair)
+            log("PAPER", f"{name} re-entry after stop-out — half size")
 
         # Win-rate-based stake multiplier (refreshed every 10 min from DB)
         now_ts = time.time()
@@ -2828,21 +2867,22 @@ class PaperTrader:
         if wr_data:
             wr = wr_data["wr"]
             if   wr >= 65: wr_mult = 1.20; log("PAPER", f"{pair} WR {wr:.0f}% → +20% stake")
-            elif wr <= 35: wr_mult = 0.60; log("PAPER", f"{pair} WR {wr:.0f}% → -40% stake")
+            elif wr <= 40: wr_mult = 0.60; log("PAPER", f"{pair} WR {wr:.0f}% → -40% stake")
             elif wr <= 45: wr_mult = 0.80; log("PAPER", f"{pair} WR {wr:.0f}% → -20% stake")
 
         # Kelly Criterion base risk when ≥20 trades available (half-Kelly)
         # Floor at 50% of the linear formula to prevent a jarring drop when Kelly
         # first activates on a marginal strategy (e.g., 55% WR → kelly ≈ 5%).
         linear = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
-        kelly  = self._kelly_size()
+        kelly  = self._kelly_size(pair=pair)
         if kelly > 0:
             kelly_base = kelly * (0.5 + 0.5 * confidence)
             base_risk  = max(kelly_base, linear * 0.5)
         else:
             base_risk = linear
 
-        # Volatility-adaptive multiplier: shrink size when current ATR is elevated
+        # Volatility-adaptive multiplier: skip when ATR spikes (news/liquidation event);
+        # taper down size for moderate elevation vs the long-run baseline.
         vol_mult = 1.0
         if atr is not None and atr > 0:
             prev_base = self._base_atr.get(pair)
@@ -2850,6 +2890,9 @@ class PaperTrader:
             self._base_atr[pair] = new_base
             if prev_base and prev_base > 1e-9:
                 vol_ratio = atr / new_base
+                if vol_ratio > 2.5:   # extreme ATR spike — skip, not just reduce
+                    log("PAPER", f"{name} ATR spike {vol_ratio:.1f}× baseline — entry skipped")
+                    return
                 vol_mult  = max(0.5, min(1.0, 1.0 / max(vol_ratio, 1.0)))
 
         streak_mult  = self._win_streak_multiplier(confidence)
@@ -2864,7 +2907,9 @@ class PaperTrader:
                         * vol_mult
                         * streak_mult
                         * session_mult
-                        * gain_mult,
+                        * gain_mult
+                        * corr_mult
+                        * reentry_mult,
                         RISK_MAX)
         if self._is_live():
             margin = round(self.balance * risk, 4)
@@ -3127,7 +3172,11 @@ class PaperTrader:
 
         # Cooldown: block re-entry on this pair after a loss
         if pnl < 0:
-            cooldown = 1800 if reason in ("trailing stop", "signal flip") else 900
+            if reason in ("trailing stop", "signal flip"):
+                cooldown = 900   # 15 min — allows half-size re-entry if signal still valid
+                self._reentry_pairs.add(pair)
+            else:
+                cooldown = 900
             self._cooldown[pair] = time.time() + cooldown
             log("PAPER", f"{name} cooldown {cooldown//60}m after {reason} loss")
             # Loss streak global cooldown: ≥3 in a row → 30-min pause on all new entries
@@ -3527,6 +3576,16 @@ class SignalEngine:
                 sig = "HOLD"
             elif _htf == "BULL" and sig == "SELL":
                 with _gate_counter_lock: _gate_counters["htf"] += 1
+                sig = "HOLD"
+
+        # 4H multi-timeframe confirmation — 4H EMA trend must align with signal
+        if sig in ("BUY", "SELL"):
+            _htf4 = _htf_trend(current_pair, interval=240, limit=50)
+            if _htf4 == "BEAR" and sig == "BUY":
+                with _gate_counter_lock: _gate_counters["4h_trend"] += 1
+                sig = "HOLD"
+            elif _htf4 == "BULL" and sig == "SELL":
+                with _gate_counter_lock: _gate_counters["4h_trend"] += 1
                 sig = "HOLD"
 
         # MACD divergence gate — divergence signals momentum exhaustion
