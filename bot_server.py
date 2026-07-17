@@ -921,8 +921,12 @@ _gate_counters = {
     "pullback": 0, "momentum": 0, "rr_ratio": 0, "vwap": 0, "spike": 0, "daily_gain": 0,
     "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
     "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0, "15m_trend": 0,
-    "orderbook_wall": 0,
+    "orderbook_wall": 0, "daily_trend": 0, "pair_profit_cap": 0,
 }
+
+# Trade preview / confirmation state
+_trade_previews: dict = {}   # pid → {side, name, pair, target, confidence, atr, fkey, stop, pillars, ts}
+_trade_preview_mode: bool = False
 _gate_counter_lock = threading.Lock()
 _gate_log_ts: float = 0.0          # last time we printed the gate summary
 _GATE_LOG_INTERVAL = 1800          # log top blockers every 30 min
@@ -2375,6 +2379,9 @@ class PaperTrader:
         # Per-pair daily PnL — auto-disable pair when it loses >5% of balance in one day
         self._pair_day_pnl  = {}   # pair → float (resets daily)
         self._pair_day_date = {}   # pair → "YYYY-MM-DD" (for daily reset detection)
+        # Weekly drawdown pause: pause entries when balance drops ≥8% from weekly peak; reset Monday
+        self._weekly_peak      = self._start_balance
+        self._weekly_dd_paused = False
         # A/B confidence threshold test (A = current, B = +0.05); auto-adopts after 50 trades each
         self._ab_stats      = {"A": {"wins": 0, "n": 0}, "B": {"wins": 0, "n": 0}}
         self._ab_group      = {}   # pair → "A" | "B" (assignment per pair per trade)
@@ -2412,6 +2419,16 @@ class PaperTrader:
             dd = (self.peak - self.balance) / self.peak * 100
             if dd >= _rt_max_drawdown:
                 return False
+        # Weekly drawdown pause: check and trigger if balance dropped ≥8% from weekly peak
+        if self._weekly_peak > 0 and not self._weekly_dd_paused:
+            if self.balance < self._weekly_peak * 0.92:
+                self._weekly_dd_paused = True
+                self._save()
+                tg(f"⛔ *Weekly drawdown pause*\n"
+                   f"Balance `${self.balance:.2f}` dropped 8%+ from weekly peak `${self._weekly_peak:.2f}`\n"
+                   f"New entries paused until Monday. Existing positions still managed.")
+        if self._weekly_dd_paused:
+            return False
         used = sum(p["margin"] for p in self.positions.values())
         return (used / max(self.balance, 0.01)) < MAX_TOTAL_RISK
 
@@ -2435,6 +2452,9 @@ class PaperTrader:
                 self.positions = {}
         else:
             self.positions = pos_data
+        # Restore weekly peak
+        self._weekly_peak      = d.get("weekly_peak", self.balance)
+        self._weekly_dd_paused = d.get("weekly_dd_paused", False)
         # Persist daily counters and streak state across restarts
         today = datetime.utcnow().strftime("%Y-%m-%d")
         saved_date = d.get("day_date", "")
@@ -2488,7 +2508,9 @@ class PaperTrader:
                 "day_start_bal":      self.day_start_bal,
                 "day_trades":         self.day_trades,
                 "streak_reset_len":   self._streak_reset_len,
-                "streak_cool_until":  self._streak_cool_until}
+                "streak_cool_until":  self._streak_cool_until,
+                "weekly_peak":        self._weekly_peak,
+                "weekly_dd_paused":   self._weekly_dd_paused}
 
     def _save_file(self):
         try:
@@ -2578,13 +2600,19 @@ class PaperTrader:
         return 1.0
 
     def _reset_day_if_needed(self):
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        now   = datetime.utcnow()
+        today = now.strftime("%Y-%m-%d")
         if today != self.day_date:
             self.day_date           = today
             self.day_start_bal      = self.balance
             self.day_trades         = 0
             self._streak_reset_len  = len(self.trades)  # fresh loss streak each day
             self._streak_cool_until = 0.0               # no cooldown carries into new day
+            # Monday: reset weekly peak and lift any weekly DD pause
+            if now.weekday() == 0:
+                self._weekly_peak      = self.balance
+                self._weekly_dd_paused = False
+                log("PAPER", "Monday — weekly drawdown pause cleared, weekly peak reset")
             self._save()
             log("PAPER", f"New day — daily counters + loss streak reset")
 
@@ -2900,11 +2928,18 @@ class PaperTrader:
                 p["partial_1_taken"] = True
                 p["partial_2_taken"] = True
 
-            # Scale out in thirds: 1/3 at PARTIAL_TAKE_PCT, 1/3 at 2×, let last 1/3 trail
-            if not p.get("partial_1_taken") and move >= PARTIAL_TAKE_PCT:
-                self._partial_close(price, name, pair, stage=1)
-            elif p.get("partial_1_taken") and not p.get("partial_2_taken") and move >= PARTIAL_TAKE_2X:
-                self._partial_close(price, name, pair, stage=2)
+            # Scale out in thirds: 1/3 at 1R (ATR-based), 1/3 at 2R; last 1/3 trails
+            # R-multiple levels stored at entry; fall back to fixed % for old positions
+            if not p.get("partial_1_taken"):
+                r1 = p.get("r1_price")
+                hit1 = (price >= r1 if side == "LONG" else price <= r1) if r1 else (move >= PARTIAL_TAKE_PCT)
+                if hit1:
+                    self._partial_close(price, name, pair, stage=1)
+            elif p.get("partial_1_taken") and not p.get("partial_2_taken"):
+                r2 = p.get("r2_price")
+                hit2 = (price >= r2 if side == "LONG" else price <= r2) if r2 else (move >= PARTIAL_TAKE_2X)
+                if hit2:
+                    self._partial_close(price, name, pair, stage=2)
 
             # Pyramiding: add 50% of current size at +5% in-trade move (once per trade)
             if not p.get("pyramided") and move >= PYRAMID_PCT:
@@ -3028,16 +3063,46 @@ class PaperTrader:
             if sig in ("BUY", "SELL") and confidence < min_conf:
                 with _gate_counter_lock: _gate_counters["min_conf"] += 1
                 return
-            if sig == "BUY"  and self.can_open_new():
-                self._open("LONG",  price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
+            if sig == "BUY" and self.can_open_new():
+                _open_side = "LONG"
             elif sig == "SELL" and self.can_open_new():
                 _spot_no_short = self._is_live() and LIVE_EXCHANGE == "kraken" and not KRAKEN_MARGIN
                 if _spot_no_short:
                     log("LIVE", f"SHORT skipped ({name}) — spot mode; set KRAKEN_MARGIN=1 to enable")
-                else:
-                    self._open("SHORT", price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
+                    return
+                _open_side = "SHORT"
+            else:
+                return
+            # Trade preview mode: queue for Telegram confirmation instead of immediate entry
+            if _trade_preview_mode and not self._is_live():
+                pid = str(abs(hash(f"{pair}{time.time()}")))[-6:]
+                _trade_previews[pid] = {
+                    "side": _open_side, "name": name, "pair": pair, "target": target,
+                    "confidence": confidence, "atr": atr, "fkey": fkey, "stop": stop,
+                    "pillars": pillars, "ts": time.time(),
+                }
+                tg_buttons(
+                    f"🔔 *Trade Signal — {name}*\n"
+                    f"{'🟢 BUY' if _open_side=='LONG' else '🔴 SELL'} | Conf: `{int(confidence*100)}%`\n"
+                    f"Entry: `${price:.4f}` | `{pair}`\n"
+                    f"⏱ Auto-executes in 60s if no action",
+                    [[{"text": "✅ Allow", "callback_data": f"allow_trade:{pid}"},
+                      {"text": "⏭ Skip",  "callback_data": f"skip_trade:{pid}"}]]
+                )
+                return
+            self._open(_open_side, price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
 
     def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None):
+        # Per-pair daily profit cap: skip new entry when pair already made ≥4% of balance today
+        now_date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        if self._pair_day_date.get(pair) != now_date_str:
+            self._pair_day_pnl[pair]  = 0.0
+            self._pair_day_date[pair] = now_date_str
+        if self._pair_day_pnl.get(pair, 0.0) >= self.balance * 0.04:
+            with _gate_counter_lock: _gate_counters["pair_profit_cap"] += 1
+            log("PAPER", f"{name} per-pair profit cap hit (${self._pair_day_pnl[pair]:.2f} today) — skipping")
+            return
+
         # Correlation filter: halve size when already in the same direction on a correlated coin
         corr_mult = 1.0
         for grp in CORRELATED_GROUPS:
@@ -3233,6 +3298,9 @@ class PaperTrader:
         if atr is None:
             stop_label = "fixed"
         trail_stop = round(fill - atr_dist if side == "LONG" else fill + atr_dist, 6)
+        # R-multiple partial take levels: 1R and 2R from entry based on ATR distance
+        r1_price = round(fill + atr_dist      if side == "LONG" else fill - atr_dist,      6)
+        r2_price = round(fill + atr_dist * 2  if side == "LONG" else fill - atr_dist * 2,  6)
         effective_target = float("inf") if (side == "LONG"  and self._trail_only(pair)) else \
                            0.0          if (side == "SHORT" and self._trail_only(pair)) else target
         self.positions[pair] = {"side": side, "entry": fill,
@@ -3243,6 +3311,7 @@ class PaperTrader:
                                 "pair": pair, "name": name,
                                 "trail_stop": trail_stop, "trail_peak": fill,
                                 "atr_dist": atr_dist, "fkey": fkey,
+                                "r1_price": r1_price, "r2_price": r2_price,
                                 "entry_nasdaq": market_mood["nasdaq"],
                                 "entry_news": news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"),
                                 "pillars": pillars or {},
@@ -3330,7 +3399,8 @@ class PaperTrader:
             pnl  = round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN) - fee, 4)
             self.balance = round(self.balance + pnl, 4)
 
-        self.peak    = max(self.peak, self.balance)
+        self.peak         = max(self.peak, self.balance)
+        self._weekly_peak = max(self._weekly_peak, self.balance)
         held_mins    = round((time.time() - p.get("opened_at", time.time())) / 60, 1)
         cs = self.coin_stats.setdefault(name, {"wins": 0, "losses": 0})
         if pnl >= 0: cs["wins"] += 1
@@ -3964,6 +4034,16 @@ class SignalEngine:
         if _15m_against and sig in ("BUY", "SELL"):
             with _gate_counter_lock: _gate_counters["15m_trend"] += 1
             confidence = max(0.0, round(confidence - 0.08, 2))
+
+        # Daily EMA soft gate — counter-trend daily trend trims confidence
+        if sig in ("BUY", "SELL"):
+            try:
+                _htf_daily = _htf_trend(current_pair, interval=1440, limit=30)
+                if (_htf_daily == "BEAR" and sig == "BUY") or (_htf_daily == "BULL" and sig == "SELL"):
+                    with _gate_counter_lock: _gate_counters["daily_trend"] += 1
+                    confidence = max(0.0, round(confidence - 0.05, 2))
+            except Exception:
+                pass
 
         # Bonus: Long/Short Ratio squeeze potential (contrarian liquidation boost)
         lsr = lsr_data.get(current_pair, {})
@@ -5708,6 +5788,34 @@ def _dispatch_callback(data, query, trader):
         log("AUTH", f"Device blocked via Telegram — {dev_id[:8]}…  '{label}'", "WARN")
         tg(f"🚫 *Access blocked*\n`{label}` has been denied access to the dashboard.")
 
+    elif data.startswith("allow_trade:"):
+        global _trade_preview_mode
+        pid = data[len("allow_trade:"):]
+        pv  = _trade_previews.pop(pid, None)
+        if pv:
+            try:
+                price = get_price(pv["pair"])
+                trader._open(pv["side"], price, pv["name"], pv["target"], pv["confidence"],
+                             pv["pair"], pv["atr"], fkey=pv.get("fkey",""),
+                             stop=pv.get("stop"), pillars=pv.get("pillars"))
+            except Exception as exc:
+                tg(f"❌ *Trade execution failed*\n`{exc}`")
+        else:
+            tg("⚠️ Trade preview expired or already handled.")
+
+    elif data.startswith("skip_trade:"):
+        pid = data[len("skip_trade:"):]
+        pv  = _trade_previews.pop(pid, None)
+        if pv:
+            tg(f"⏭ *Trade skipped* — {pv['name']}")
+
+    elif data == "toggle_preview":
+        global _trade_preview_mode
+        _trade_preview_mode = not _trade_preview_mode
+        state = "ON ✅" if _trade_preview_mode else "OFF"
+        tg(f"🔔 *Trade Preview Mode {state}*\n"
+           f"{'Bot will ask before opening trades' if _trade_preview_mode else 'Bot opens trades automatically'}")
+
 def _weekly_summary(trader):
     cutoff = time.time() - 7 * 86400
     week   = [t for t in trader.trades if t.get("ts", 0) >= cutoff]
@@ -5803,6 +5911,56 @@ def _daily_summary_loop(trader):
                 _weekly_summary(trader)
         except Exception as e:
             log("BOT", f"DailySummary error: {e}", "ERR")
+
+def _morning_brief_loop(trader):
+    while True:
+        now      = datetime.utcnow()
+        next_8am = now.replace(hour=8, minute=0, second=0, microsecond=0)
+        if now >= next_8am:
+            next_8am += timedelta(days=1)
+        time.sleep((next_8am - now).total_seconds())
+        try:
+            cutoff    = time.time() - 8 * 3600
+            overnight = [t for t in trader.trades if t.get("ts", 0) >= cutoff]
+            n_pos     = len(trader.positions)
+            rank      = get_rank(trader.balance)
+            if overnight:
+                wins      = [t for t in overnight if t["pnl"] > 0]
+                losses    = [t for t in overnight if t["pnl"] <= 0]
+                total_pnl = sum(t["pnl"] for t in overnight)
+                wr        = len(wins) / len(overnight) * 100
+                pnl_str   = f"{'+'if total_pnl>=0 else ''}{total_pnl:.2f}$"
+                trade_line = f"Overnight: `{len(overnight)}` trades | WR `{wr:.0f}%` | P&L `{pnl_str}`\n"
+            else:
+                trade_line = "No trades overnight\n"
+            pos_line = f"Open positions: `{n_pos}`\n" if n_pos else "No open positions\n"
+            dd_pct   = (trader._weekly_peak - trader.balance) / max(trader._weekly_peak, 1) * 100
+            tg(f"☀️ *Morning Brief*\n"
+               f"Balance: `${trader.balance:.2f}` {rank['emoji']} {rank['name']}\n"
+               f"{trade_line}"
+               f"{pos_line}"
+               f"Weekly DD: `{dd_pct:.1f}%` from peak `${trader._weekly_peak:.2f}`\n"
+               f"Bot is active 🤖")
+        except Exception as e:
+            log("BOT", f"MorningBrief error: {e}", "ERR")
+
+def _trade_preview_loop(trader):
+    while True:
+        time.sleep(5)
+        now = time.time()
+        for pid in list(_trade_previews.keys()):
+            pv = _trade_previews.get(pid)
+            if not pv:
+                continue
+            if now - pv["ts"] >= 60:
+                _trade_previews.pop(pid, None)
+                try:
+                    price = get_price(pv["pair"])
+                    trader._open(pv["side"], price, pv["name"], pv["target"], pv["confidence"],
+                                 pv["pair"], pv["atr"], fkey=pv.get("fkey", ""),
+                                 stop=pv.get("stop"), pillars=pv.get("pillars"))
+                except Exception as e:
+                    log("PREVIEW", f"Auto-execute error for {pv.get('name','?')}: {e}", "ERR")
 
 def _pnl_update_loop(trader):
     while True:
@@ -6793,6 +6951,17 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .hr-cell.loss{background:rgba(255,51,82,.18)}
 .hr-h{font-size:.58rem;font-weight:700;font-family:var(--fn);line-height:1}
 .hr-p{font-size:.48rem;font-family:var(--fn);margin-top:2px;font-variant-numeric:tabular-nums}
+/* ── DOW GRID ── */
+.dow-cell{border-radius:8px;padding:8px 4px;text-align:center;background:var(--s0);border:1px solid var(--bd)}
+.dow-cell.profit{background:rgba(0,204,116,.22);border-color:rgba(0,204,116,.3)}
+.dow-cell.loss{background:rgba(255,51,82,.18);border-color:rgba(255,51,82,.25)}
+.dow-lbl{font-size:.6rem;font-weight:700;color:var(--mu);margin-bottom:3px}
+.dow-wr{font-size:.7rem;font-weight:800;font-family:var(--fn)}
+.dow-n{font-size:.5rem;color:var(--mu);margin-top:2px}
+/* ── TRADE FILTER CHIPS ── */
+.tf-chip{padding:4px 11px;border-radius:20px;border:1px solid var(--bd2);background:var(--s0);
+  color:var(--mu);font-size:.68rem;font-weight:600;cursor:pointer;transition:all .15s}
+.tf-chip.active{background:rgba(74,143,255,.15);border-color:rgba(74,143,255,.4);color:var(--b)}
 /* ── PRICE ALERT SHEET ── */
 .alert-sheet{position:fixed;inset:0;z-index:300;display:none}
 .alert-sheet.open{display:block}
@@ -7333,6 +7502,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="ptr" id="ptr-pos">&#8635; Refreshing…</div>
     <div class="sh"><span>Open Positions</span></div>
     <div class="dd-alert" id="dd_alert">&#128683; Drawdown limit reached — new trades paused</div>
+    <div class="dd-alert" id="weekly_dd_alert" style="display:none;background:rgba(255,152,0,.12);border-color:rgba(255,152,0,.35);color:var(--y)">&#9203; Weekly drawdown pause — new entries blocked until Monday</div>
     <div class="corr-warn" id="corr_warn">&#9888; Correlated exposure</div>
     <div class="streak-warn" id="streak_warn">
       &#9888; <strong><span id="sw_count">0</span> consecutive losses</strong> &#8212; conf gate raised +<span id="sw_floor">0</span>% &middot; only take high-confidence setups
@@ -7345,8 +7515,25 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="upnl-cnt" id="upnl_count">0 positions</div>
       </div>
     </div>
+    <div id="heat_wrap" style="display:none;margin:0 16px 12px;background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:11px 14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px">
+        <span style="font-size:.72rem;font-weight:700;color:var(--tx);letter-spacing:.02em">Portfolio Heat</span>
+        <span style="font-size:.72rem;font-family:var(--fn);font-weight:700;color:var(--b)" id="heat_pct">0%</span>
+      </div>
+      <div style="height:7px;background:var(--bd2);border-radius:4px;overflow:hidden">
+        <div id="heat_fill" style="height:100%;border-radius:4px;transition:width .5s ease;background:linear-gradient(90deg,#22c55e,#f59e0b,#ef4444);width:0%"></div>
+      </div>
+      <div style="font-size:.6rem;color:var(--mu);margin-top:5px" id="heat_detail">0 positions · $0 at risk</div>
+    </div>
     <div id="pos_list"></div>
     <div class="sh"><span>Recent Trades</span></div>
+    <div id="trade_filter_row" style="display:flex;gap:6px;padding:0 16px 10px;flex-wrap:wrap">
+      <button class="tf-chip active" id="tf_all"   onclick="setTradeFilter('all')">All</button>
+      <button class="tf-chip"        id="tf_win"   onclick="setTradeFilter('win')">Wins</button>
+      <button class="tf-chip"        id="tf_loss"  onclick="setTradeFilter('loss')">Losses</button>
+      <button class="tf-chip"        id="tf_long"  onclick="setTradeFilter('long')">Long</button>
+      <button class="tf-chip"        id="tf_short" onclick="setTradeFilter('short')">Short</button>
+    </div>
     <div class="trade-box" id="trades_box"><div class="no-data">No trades yet</div></div>
     <div class="sh" id="er_hdr" style="display:none"><span>Exit Reasons</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">last 20 trades</span></div>
     <div id="exit_reasons" style="padding-bottom:14px"></div>
@@ -7433,6 +7620,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div class="cal-grid" id="cal_grid"><div class="no-data" style="grid-column:1/-1">No trades yet</div></div>
     <div class="sh"><span>Hour of Day</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">UTC · best trading hours</span></div>
     <div class="hr-grid" id="hr_grid">
+      <div class="no-data" style="grid-column:1/-1">No trades yet</div>
+    </div>
+    <div class="sh"><span>Day of Week</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">UTC · win rate by weekday</span></div>
+    <div id="dow_grid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px;padding:0 16px 14px">
       <div class="no-data" style="grid-column:1/-1">No trades yet</div>
     </div>
     <div class="sh"><span>Gate Filters</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">blocked signals today</span></div>
@@ -7534,6 +7725,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
         <div class="set-num" id="set_dd_val">OFF</div>
         <button class="set-step-btn" onclick="stepDdLimit(5)">+</button>
       </div>
+    </div>
+    <div class="set-row">
+      <div><div class="set-lbl">Trade Preview Mode</div><div class="set-sub">Confirm each trade via Telegram before opening</div></div>
+      <label class="set-toggle-wrap"><input type="checkbox" id="set_preview" onchange="saveSetting('preview')"><span class="set-slider"></span></label>
     </div>
     <div class="set-section-lbl">Appearance</div>
     <div class="set-row">
@@ -7775,6 +7970,7 @@ async function fetchStatus(){
     pb.className='icon-btn'+(_paused?' paused':'');
     pb.title=_paused?'Resume bot':'Pause bot';
     renderPositions(d.open_positions||[]);
+    updateHeatMeter(d.open_positions||[],d.balance||0);
     renderActivity(d.activity_log||[]);
     renderTrades(recent);
     renderExitReasons(d.recent_trades||[]);
@@ -7791,6 +7987,8 @@ async function fetchStatus(){
     const _curDd=d.peak>0?Math.round((d.peak-d.balance)/d.peak*100):0;
     const _ddAlertEl=$('dd_alert');
     if(_ddAlertEl)_ddAlertEl.style.display=(_setDdLimit>0&&_curDd>=_setDdLimit)?'':'none';
+    const _wddEl=$('weekly_dd_alert');
+    if(_wddEl)_wddEl.style.display=d.weekly_dd_paused?'':'none';
     _botPair=d.pair||'';
     _openPairs=new Set((d.open_positions||[]).map(p=>p.pair));
     if(!_cdPair)_cdPair=_botPair;
@@ -7872,6 +8070,9 @@ function renderPositions(ps){
 
 /* ── RECENT TRADES ── */
 function renderTrades(recent){
+  _allTrades=recent||[];
+  renderDOW(_allTrades);
+  if(_tradeFilter!=='all'){renderFilteredTrades();return;}
   const box=$('trades_box');
   if(!recent.length){box.innerHTML='<div class="no-data">No trades yet</div>';return;}
   const notes=_noteKeys();
@@ -9160,6 +9361,82 @@ function renderHourly(hours){
   }).join('');
 }
 
+/* ── DOW HEATMAP ── */
+function renderDOW(trades){
+  const el=$('dow_grid');if(!el)return;
+  const days=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  const buckets=days.map(()=>({wins:0,losses:0,pnl:0}));
+  (trades||[]).forEach(t=>{
+    const dow=new Date((t.ts||0)*1000).getUTCDay(); // 0=Sun
+    const idx=dow===0?6:dow-1; // Mon=0…Sun=6
+    const b=buckets[idx];
+    if(t.pnl>0)b.wins++;else b.losses++;
+    b.pnl+=t.pnl||0;
+  });
+  const hasData=buckets.some(b=>b.wins+b.losses>0);
+  if(!hasData){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No trades yet</div>';return;}
+  el.innerHTML=buckets.map((b,i)=>{
+    const tot=b.wins+b.losses;
+    const wr=tot?Math.round(b.wins/tot*100):null;
+    const cls=tot===0?'dow-cell':wr>=50?'dow-cell profit':'dow-cell loss';
+    const tip=days[i]+' — '+tot+' trades'+(wr!==null?', '+wr+'% WR':'');
+    return '<div class="'+cls+'" title="'+tip+'">'+
+      '<div class="dow-lbl">'+days[i]+'</div>'+
+      (wr!==null?'<div class="dow-wr" style="color:'+(wr>=50?'var(--g)':'var(--r)')+'">'+wr+'%</div>':
+                 '<div class="dow-wr" style="color:var(--mu)">—</div>')+
+      '<div class="dow-n">'+(tot||'')+'</div>'+
+    '</div>';
+  }).join('');
+}
+
+/* ── PORTFOLIO HEAT METER ── */
+function updateHeatMeter(positions,balance){
+  const wrap=$('heat_wrap');if(!wrap)return;
+  const totalMargin=positions.reduce((s,p)=>s+(p.margin||0),0);
+  const pct=balance>0?Math.min(totalMargin/balance*100,100):0;
+  const fill=$('heat_fill'),pctEl=$('heat_pct'),detail=$('heat_detail');
+  if(fill)fill.style.width=pct.toFixed(1)+'%';
+  if(pctEl)pctEl.textContent=pct.toFixed(1)+'%';
+  if(detail)detail.textContent=positions.length+' position'+(positions.length!==1?'s':'')+
+    ' · $'+totalMargin.toFixed(2)+' at risk';
+  wrap.style.display=positions.length>0?'':'none';
+}
+
+/* ── TRADE HISTORY FILTER ── */
+let _tradeFilter='all';
+let _allTrades=[];
+function setTradeFilter(f){
+  _tradeFilter=f;
+  ['all','win','loss','long','short'].forEach(x=>$('tf_'+x)&&$('tf_'+x).classList.toggle('active',x===f));
+  renderFilteredTrades();
+}
+function renderFilteredTrades(){
+  const box=$('trades_box');if(!box)return;
+  let trades=_allTrades;
+  if(_tradeFilter==='win')   trades=trades.filter(t=>t.pnl>0);
+  else if(_tradeFilter==='loss')  trades=trades.filter(t=>t.pnl<=0);
+  else if(_tradeFilter==='long')  trades=trades.filter(t=>t.side==='LONG');
+  else if(_tradeFilter==='short') trades=trades.filter(t=>t.side==='SHORT');
+  if(!trades.length){box.innerHTML='<div class="no-data">No trades match filter</div>';return;}
+  box.innerHTML=trades.slice().reverse().slice(0,30).map(t=>{
+    const dt=new Date((t.ts||0)*1000);
+    const dtStr=dt.toLocaleDateString('en-US',{month:'short',day:'numeric'})+
+      ' '+dt.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+    const pnlCls=t.pnl>0?'c-g':'c-r';
+    const sideCls=t.side==='LONG'?'c-g':'c-r';
+    return '<div class="trade-row">'+
+      '<div style="flex:1;min-width:0">'+
+        '<span class="'+sideCls+'" style="font-weight:700;font-size:.72rem">'+t.side+'</span>'+
+        ' <span style="font-weight:600;font-size:.78rem">'+t.coin+'</span>'+
+        '<div style="font-size:.6rem;color:var(--mu);margin-top:2px">'+dtStr+
+          ' · '+(t.held_mins||0).toFixed(0)+'min · '+(t.reason||'').replace(/_/g,' ')+'</div>'+
+      '</div>'+
+      '<div class="'+pnlCls+'" style="font-family:var(--fn);font-size:.82rem;font-weight:700;white-space:nowrap">'+
+        (t.pnl>=0?'+':'')+t.pnl.toFixed(2)+'$</div>'+
+    '</div>';
+  }).join('');
+}
+
 /* ── PRICE ALERTS ── */
 let _alertPair='',_alertAbove=true;
 async function fetchAlerts(){
@@ -9396,6 +9673,8 @@ async function openSettings(){
     if(ddEl)ddEl.textContent=_setDdLimit===0?'OFF':_setDdLimit+'%';
     const themeChk=$('set_theme');
     if(themeChk)themeChk.checked=(_theme==='light');
+    const prevChk=$('set_preview');
+    if(prevChk)prevChk.checked=!!d.trade_preview_mode;
     renderDiagnostics(d);
   }catch(e){console.warn('settings',e);}
   $('set_sheet').classList.add('open');
@@ -9412,6 +9691,11 @@ async function saveSetting(key){
       await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({action:on?'sim_on':'sim_off'})});
       fetchSim();
+    } else if(key==='preview'){
+      const on=$('set_preview').checked;
+      await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({trade_preview:on})});
+      showToast(on?'Preview ON 🔔':'Preview OFF','Trade preview mode '+(on?'enabled':'disabled'),'open',2500);
     }
   }catch(e){console.warn('saveSetting',e);}
 }
@@ -10371,6 +10655,9 @@ def _web_status():
         "pair_ev":               _compute_pair_ev(trader, _current_coin.get("pair", "")),
         "ab_stats":              {**trader._ab_stats, "resolved": trader._ab_resolved},
         "pair_day_pnl":          {pr: round(v, 2) for pr, v in trader._pair_day_pnl.items()},
+        "weekly_peak":           round(trader._weekly_peak, 2),
+        "weekly_dd_paused":      trader._weekly_dd_paused,
+        "trade_preview_mode":    _trade_preview_mode,
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
@@ -10739,7 +11026,7 @@ def _web_bestsetups():
 
 @_flask_app.route("/settings", methods=["GET", "POST"])
 def _web_settings():
-    global _rt_max_positions, _paper_mode, _rt_max_drawdown
+    global _rt_max_positions, _paper_mode, _rt_max_drawdown, _trade_preview_mode
     if _flask_request.method == "POST":
         body = _flask_request.get_json(silent=True) or {}
         if "max_positions" in body:
@@ -10749,23 +11036,26 @@ def _web_settings():
         if "max_drawdown" in body:
             v = float(body["max_drawdown"])
             _rt_max_drawdown = max(0.0, min(50.0, v))
+        if "trade_preview" in body:
+            _trade_preview_mode = bool(body["trade_preview"])
     trader = _web_trader_ref[0] if _web_trader_ref else None
     loss_streak = trader.consecutive_losses if trader else 0
     streak_cool = trader._streak_cool_until if trader else 0
     return _Response(json.dumps({
-        "paper_mode":       _paper_mode,
-        "sim_enabled":      _sim_enabled,
-        "max_positions":    _rt_max_positions if _rt_max_positions > 0 else MAX_POSITIONS,
-        "max_drawdown":     _rt_max_drawdown,
-        "risk_pct":         f"{round(RISK_MIN*100,0):.0f}–{round(RISK_MAX*100,0):.0f}",
-        "live_mode":        LIVE_MODE,
-        "paper_target":     PAPER_TARGET,
-        "scan_universe":    len(SCAN_UNIVERSE),
-        "paused":           _paused,
-        "exchange":         LIVE_EXCHANGE if LIVE_MODE else "paper",
-        "kraken_margin":    KRAKEN_MARGIN,
-        "loss_streak":      loss_streak,
-        "streak_cooldown":  max(0, round(streak_cool - time.time())),
+        "paper_mode":         _paper_mode,
+        "sim_enabled":        _sim_enabled,
+        "max_positions":      _rt_max_positions if _rt_max_positions > 0 else MAX_POSITIONS,
+        "max_drawdown":       _rt_max_drawdown,
+        "risk_pct":           f"{round(RISK_MIN*100,0):.0f}–{round(RISK_MAX*100,0):.0f}",
+        "live_mode":          LIVE_MODE,
+        "paper_target":       PAPER_TARGET,
+        "scan_universe":      len(SCAN_UNIVERSE),
+        "paused":             _paused,
+        "exchange":           LIVE_EXCHANGE if LIVE_MODE else "paper",
+        "kraken_margin":      KRAKEN_MARGIN,
+        "loss_streak":        loss_streak,
+        "streak_cooldown":    max(0, round(streak_cool - time.time())),
+        "trade_preview_mode": _trade_preview_mode,
     }), mimetype="application/json")
 
 @_flask_app.route("/control", methods=["POST"])
@@ -11334,6 +11624,8 @@ def main():
         ("Open interest",     _oi_loop,             ()),
         ("Econ calendar",     _econ_calendar_loop,  ()),
         ("Price alerts",      _alert_loop,          (trader,)),
+        ("Morning brief",     _morning_brief_loop,  (trader,)),
+        ("Trade preview",     _trade_preview_loop,  (trader,)),
         ("Web dashboard",     _start_web_server,    (trader,)),
     ]
     for name, fn, args in threads:
