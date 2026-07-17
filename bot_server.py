@@ -6006,6 +6006,11 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .corr-warn.show{display:flex}
 /* ── SHARPE BADGE ── */
 .sharpe-row{padding:0 16px 10px}
+.px-tile{background:var(--s0);border:1px solid var(--bd);border-radius:10px;padding:10px 10px 8px;display:flex;flex-direction:column;gap:3px;cursor:pointer;transition:border-color .15s}
+.px-tile:hover{border-color:var(--b)}
+.px-tile-sym{font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--mu)}
+.px-tile-price{font-size:.88rem;font-weight:700;color:var(--tx);font-variant-numeric:tabular-nums;line-height:1}
+.px-tile-pct{font-size:.65rem;font-weight:600;font-variant-numeric:tabular-nums}
 .sharpe-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;
   border-radius:99px;font-family:var(--fn);font-size:.68rem;font-weight:700;
   font-variant-numeric:tabular-nums;border:1px solid rgba(74,143,255,.25);
@@ -6114,6 +6119,12 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
     <div id="sharpe_row" class="sharpe-row" style="display:none">
       <span class="sharpe-badge" id="sharpe_badge">— Sharpe</span>
     </div>
+
+    <div class="sh"><span>Live Prices</span></div>
+    <div id="live_prices_grid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:0 16px 16px">
+      <div class="no-data" style="grid-column:1/-1;padding:10px 0">Loading prices…</div>
+    </div>
+
     <div class="sh"><span>Rank Progress</span></div>
     <div style="margin:0 16px 16px;background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:15px 16px" id="rank_card">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
@@ -6710,6 +6721,7 @@ async function fetchStatus(){
     _cdTrades=(d.recent_trades||[]).filter(t=>t.pair===_cdPair);
     _cdPatSig=d.chart_pattern_signal||'NONE';
     renderCoinStrip();
+    renderLivePrices();
     if(_tab==='chart')drawCandles();
   }catch(e){console.warn('status',e);}
 }
@@ -6782,7 +6794,8 @@ function renderTrades(recent){
         '<div style="display:flex;align-items:center;gap:5px">'+
           '<div class="tr-time">'+ts+'</div>'+
           '<button class="tnote-btn'+(hasNote?' has-note':'')+'" '+
-            'onclick="openNote(\''+key+'\',\''+noteLabel+'\')" '+
+            'data-key="'+key+'" data-label="'+noteLabel+'" '+
+            'onclick="openNote(this.dataset.key,this.dataset.label)" '+
             'title="'+(hasNote?'Edit note':'Add note')+'">'+(hasNote?'📝':'📄')+'</button>'+
         '</div>'+
       '</div></div>';
@@ -7144,6 +7157,7 @@ async function fetchPrices(){
     const d=await(await fetch('/prices')).json();
     _coinPrices=d;
     renderCoinStrip();
+    renderLivePrices();
   }catch(e){console.warn('prices',e);}
 }
 function _fmtPrice(p){
@@ -7194,6 +7208,38 @@ function renderCoinStrip(){
     }
   }
 }
+/* ── LIVE PRICES GRID ── */
+const _PRICE_PAIRS=[
+  {pair:'XBTUSD',sym:'BTC'},{pair:'ETHUSD',sym:'ETH'},
+  {pair:'SOLUSD',sym:'SOL'},{pair:'XRPUSD',sym:'XRP'},
+  {pair:'XDGUSD',sym:'DOGE'},{pair:'ADAUSD',sym:'ADA'},
+  {pair:'AVAXUSD',sym:'AVAX'},{pair:'LINKUSD',sym:'LINK'},
+];
+function renderLivePrices(){
+  const grid=$('live_prices_grid');if(!grid)return;
+  const hasPrices=Object.keys(_coinPrices).length>0;
+  if(!hasPrices){
+    grid.innerHTML='<div class="no-data" style="grid-column:1/-1;padding:10px 0">Fetching live prices…</div>';
+    return;
+  }
+  grid.innerHTML=_PRICE_PAIRS.map(({pair,sym})=>{
+    const d=_coinPrices[pair]||{};
+    const price=d.price;
+    const pct=d.pct||0;
+    const col=_COIN_COLORS[pair]||'#888';
+    const inPos=_openPairs.has(pair);
+    const pctCls=pct>0?'c-g':pct<0?'c-r':'c-mu';
+    const pctStr=price?(pct>=0?'+':'')+pct.toFixed(2)+'%':'—';
+    const priceStr=price?_fmtPrice(price):'—';
+    const border=inPos?'border-color:var(--b);box-shadow:0 0 0 2px rgba(70,130,255,.15)':'';
+    return '<div class="px-tile" style="'+border+'" data-pair="'+pair+'" data-sym="'+sym+'" onclick="selectCoin(this.dataset.pair,this.dataset.sym)" title="'+sym+'/USD">'+
+      '<div class="px-tile-sym">'+sym+(inPos?' ●':'')+' <span style="color:'+col+';font-size:.45rem">■</span></div>'+
+      '<div class="px-tile-price">'+priceStr+'</div>'+
+      '<div class="px-tile-pct '+pctCls+'">'+pctStr+'</div>'+
+    '</div>';
+  }).join('');
+}
+
 function selectCoin(pair,sym){
   _cdPair=pair;
   _cdOpenPos=(_openPairs.has(pair)?[]:[]); // will update on next status
