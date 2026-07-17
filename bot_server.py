@@ -943,7 +943,7 @@ def _kraken_get_usd_balance():
     try:
         result = _kraken_private("Balance")
         log("LIVE", f"Balance keys from Kraken: {list(result.keys())}")
-        # Try known USD key names first, then any key containing USD
+        log("LIVE", f"Balance full result: {result}")
         for key in ("ZUSD", "USD", "USD.M", "USD.HOLD"):
             if key in result and float(result[key]) > 0:
                 return float(result[key])
@@ -956,7 +956,18 @@ def _kraken_get_usd_balance():
                         return v
                 except (ValueError, TypeError):
                     pass
-        log("LIVE", f"No USD balance found. Full result: {result}", "WARN")
+        # Fallback: TradeBalance returns equity for margin accounts
+        log("LIVE", f"No USD in Balance — trying TradeBalance fallback", "WARN")
+        tb = _kraken_private("TradeBalance", {"asset": "ZUSD"})
+        log("LIVE", f"TradeBalance result: {tb}")
+        for tbkey in ("tb", "eb", "mf"):
+            if tbkey in tb:
+                v = float(tb[tbkey])
+                if v > 0:
+                    log("LIVE", f"USD balance from TradeBalance[{tbkey}]: ${v:.2f}")
+                    return v
+        log("LIVE", f"No USD balance found anywhere. Balance={result} TradeBalance={tb}", "WARN")
+        tg(f"⚠️ Kraken balance is $0 — check Railway logs for raw keys")
         return 0.0
     except Exception as e:
         log("LIVE", f"balance fetch error: {e}", "ERR")
@@ -7869,23 +7880,33 @@ def main():
             log("BOOT", _c(_C.GREEN + _C.BOLD, "Kraken API keys valid — LIVE MODE active"))
 
     # Plain-text ping — proves connectivity before any markdown
-    ok = tg(f"CryptoBot booting... v2.2 (chat_id={TG_CHAT_ID})", plain=True)
+    ok = tg(f"CryptoBot booting... v2.3 (chat_id={TG_CHAT_ID})", plain=True)
     log("BOOT", f"Telegram ping: {_c(_C.GREEN, 'OK') if ok else _c(_C.RED, 'FAILED')}")
+
+    if LIVE_MODE:
+        _exch_disp = "Binance" if LIVE_EXCHANGE == "binance" else "Kraken"
+        # Pre-boot diagnostic: show raw Kraken API response BEFORE PaperTrader init
+        try:
+            _raw_bal = _kraken_private("Balance")
+            _bal_keys = ", ".join(f"{k}={v}" for k, v in _raw_bal.items()) or "empty"
+        except Exception as _be:
+            _bal_keys = f"error: {_be}"
+        try:
+            _raw_tb = _kraken_private("TradeBalance", {"asset": "ZUSD"})
+            _tb_keys = ", ".join(f"{k}={v}" for k, v in _raw_tb.items()) or "empty"
+        except Exception as _tbe:
+            _tb_keys = f"error: {_tbe}"
+        tg(f"🔍 *Kraken balance diagnostic*\n"
+           f"Balance API: `{_bal_keys}`\n"
+           f"TradeBalance API: `{_tb_keys}`", plain=True)
 
     trader = PaperTrader()
 
     if LIVE_MODE:
         _exch_disp = "Binance" if LIVE_EXCHANGE == "binance" else "Kraken"
         _fee_disp  = "0.10%" if LIVE_EXCHANGE == "binance" else "0.26%"
-        # Diagnostic: show raw balance keys so we can debug $0 issues
-        try:
-            _raw_bal = _kraken_private("Balance")
-            _bal_keys = ", ".join(f"{k}={v}" for k, v in _raw_bal.items()) or "empty"
-        except Exception as _be:
-            _bal_keys = f"error: {_be}"
         tg(f"🔴 *LIVE TRADING MODE — real money on {_exch_disp}*\n"
            f"Balance: `${trader.balance:.2f}` USD\n"
-           f"Raw Kraken balance: `{_bal_keys}`\n"
            f"Exchange fee: `{_fee_disp}` per trade\n"
            f"⚠️ _This bot will place real orders. Ensure balance is intentional._")
 
