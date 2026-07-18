@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *.pyo
 paper_state.json
+trusted_devices.json
