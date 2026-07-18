@@ -2397,6 +2397,7 @@ class PaperTrader:
         self._ab_resolved   = False
         self._ab_winner     = "A"  # set to "B" when B wins; drives permanent policy after resolution
         self._live_orders  = {}   # pair → kraken txid (live mode only)
+        self._min_size_warn_ts = {}  # pair → last time "order too small" tg() was sent
         if not force_paper:
             self._load()
         if LIVE_MODE and not force_paper:
@@ -3267,10 +3268,13 @@ class PaperTrader:
                     if contracts < min_vol:
                         need_usd = round(min_vol * fill / (leverage if KRAKEN_MARGIN else 1), 2)
                         log("LIVE", f"Skipping {name} — size {contracts:.8f} < min {min_vol} (need ~${need_usd} balance)")
-                        tg(f"⚠️ *Order too small — {name}*\n"
-                           f"Kraken minimum: `{min_vol}` units (≈`${need_usd}`)\n"
-                           f"Your balance: `${self.balance:.2f}` · margin: `${margin:.2f}`\n"
-                           f"_Deposit more or switch to Binance/Kraken Futures for small accounts._")
+                        _warn_cooldown = 3600  # 1-hour cooldown per pair to avoid spam
+                        if time.time() - self._min_size_warn_ts.get(pair, 0) > _warn_cooldown:
+                            self._min_size_warn_ts[pair] = time.time()
+                            tg(f"⚠️ *Order too small — {name}*\n"
+                               f"Kraken minimum: `{min_vol}` units (≈`${need_usd}`)\n"
+                               f"Your balance: `${self.balance:.2f}` · margin: `${margin:.2f}`\n"
+                               f"_Deposit more or switch to Binance/Kraken Futures for small accounts._")
                         return
                     # Slippage floor: aggressive limit order — fills at market speed but
                     # Kraken will reject fills worse than this price.
