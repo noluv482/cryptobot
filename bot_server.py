@@ -309,8 +309,8 @@ EMA_PERIOD    = 14
 RSI_PERIOD    = 14
 CANDLE_LIMIT  = 80             # more history for 15-min chart
 INTERVAL      = 15             # 15-min candles: far less noise than 5-min
-REFRESH_SEC   = 60             # poll every 60s on 15-min chart
-CONFIRM_TICKS = 2              # 2 × 15-min bars = 30-min confirmation before signal
+REFRESH_SEC   = 30             # poll every 30s on 15-min chart (was 60)
+CONFIRM_TICKS = 1              # fire on first valid signal scan (was 2)
 
 PAPER_START    = 100.0
 PAPER_TARGET   = 50000.0
@@ -336,15 +336,15 @@ FUNDING_THRESHOLD = 0.0005
 MAX_POSITIONS     = 2          # max 2 simultaneous positions (was 3) — focus on quality
 MAX_TOTAL_RISK    = 0.25       # total margin ≤ 25% (was 40%) — reduce correlated exposure
 BREAKEVEN_PCT     = 0.020      # lock breakeven at +2% (was 1.2%) — 15-min moves are bigger
-MIN_RR_RATIO      = 2.0        # require 2:1 R:R minimum (was 1.5) — only asymmetric trades
+MIN_RR_RATIO      = 1.5        # require 1.5:1 R:R minimum — still asymmetric, more opportunities
 DAILY_GAIN_SOFT   = 0.03
 DAILY_GAIN_HARD   = 0.06
 LIVE_CHART_MINS   = 10
 MAX_SESSION_DD    = 0.12
-VOLUME_FILTER_MULT= 1.2
+VOLUME_FILTER_MULT= 1.0        # require at least average volume (was 1.2)
 EXTREME_FUNDING   = 0.001
 ECON_BLACKOUT_MINS= 15
-MIN_CONFIDENCE    = 0.55       # 55% confidence floor — balanced signal quality vs. frequency
+MIN_CONFIDENCE    = 0.52       # 52% confidence floor (was 0.55) — more opportunities without sacrificing quality
 ADX_PERIOD        = 14
 ADX_MIN           = 18         # allow mildly trending markets (Wilder's neutral zone starts ~20)
 ER_PERIOD         = 10
@@ -4570,6 +4570,10 @@ _TEXT_ACTION: dict = {
     "/alerts":     "alert_list",
     "/livecheck":  "livecheck",
     "livecheck":   "livecheck",
+    "/scan":       "scan",
+    "scan":        "scan",
+    "/signals":    "scan",
+    "signals":     "scan",
 }
 
 def _parse_alert_command(txt):
@@ -5558,6 +5562,55 @@ def _dispatch_callback(data, query, trader):
         else:
             lines.append("🔴 *One or more issues above need fixing*")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data == "scan":
+        def _do_scan():
+            tg("🔍 *Scanning all coins for live signals...*", plain=True)
+            found = []
+            blocked = []
+            try:
+                scores = rank_coins()
+            except Exception as e:
+                tg(f"❌ Scan error: {e}", plain=True)
+                return
+            for s in scores[:12]:
+                pair = s["pair"]
+                try:
+                    closes, highs, lows, volumes, opens = get_klines(pair)
+                    price = get_price(pair)
+                    ab = next((c["alert_buffer"] for c in SCAN_UNIVERSE if c["pair"] == pair), 0.02)
+                    eng = SignalEngine()
+                    sig, plan, ema, rsi, conf = eng.evaluate(
+                        closes, highs, lows, volumes, price, ab, pair=pair, opens=opens)
+                    if sig in ("BUY", "SELL"):
+                        rr_r    = abs(plan.get("exit",  price) - price)
+                        rr_risk = abs(price - plan.get("stop", price))
+                        rr      = round(rr_r / rr_risk, 1) if rr_risk > 0 else 0
+                        arrow   = "🟢 BUY" if sig == "BUY" else "🔴 SELL"
+                        conf_ok = "✅" if conf >= MIN_CONFIDENCE else "⚠️"
+                        rr_ok   = "✅" if rr >= MIN_RR_RATIO else "⚠️"
+                        found.append(
+                            f"{arrow} *{s['name']}*  {conf_ok} Conf `{int(conf*100)}%`  "
+                            f"{rr_ok} R:R `{rr}:1`  RSI `{rsi}`"
+                        )
+                    else:
+                        blocked.append(f"  ⬜ {s['name']} — HOLD (RSI `{rsi}`, conf `{int(conf*100)}%`)")
+                except Exception:
+                    pass
+            lines = ["📡 *Signal Scan Results*", "━━━━━━━━━━━━━━━━━━━━"]
+            if found:
+                lines.append(f"*Active Signals ({len(found)}):*")
+                lines.extend(found)
+            else:
+                lines.append("😴 *No entry signals right now*")
+                lines.append("_Market conditions don't meet criteria — bot will enter when they do._")
+            if blocked:
+                lines.append("\n*Top coins holding:*")
+                lines.extend(blocked[:5])
+            mode_str = "🔴 LIVE" if (LIVE_MODE and not _paper_mode) else "📄 PAPER"
+            lines.append(f"\n_{mode_str} | Min conf {int(MIN_CONFIDENCE*100)}% | Min R:R {MIN_RR_RATIO}:1_")
+            tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+        threading.Thread(target=_do_scan, daemon=True).start()
 
     elif data == "rankings":
         scores = rank_coins()[:5]
@@ -12070,6 +12123,12 @@ def main():
            f"Balance: `${trader.balance:.2f}` USD\n"
            f"Exchange fee: `{_fee_disp}` per trade\n"
            f"⚠️ _This bot will place real orders. Ensure balance is intentional._")
+        # Warn loudly if state restored with paper mode ON — user may not know
+        if _paper_mode:
+            tg("⚠️ *WARNING: Bot is in PAPER MODE*\n"
+               "Live keys are loaded but paper mode was saved ON from a previous session.\n"
+               "Real orders will NOT be placed until you switch to live.\n"
+               "➡️ Send `live on` or tap *🔴 Go Live* in the dashboard to start real trading.")
 
     # Start background threads
     threads = [
