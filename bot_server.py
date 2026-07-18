@@ -2455,6 +2455,12 @@ class PaperTrader:
         # Restore weekly peak
         self._weekly_peak      = d.get("weekly_peak", self.balance)
         self._weekly_dd_paused = d.get("weekly_dd_paused", False)
+        # Restore per-pair daily P&L (only if same day)
+        saved_pair_date = d.get("pair_day_date", {})
+        saved_pair_pnl  = d.get("pair_day_pnl",  {})
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        self._pair_day_pnl  = {p: v for p, v in saved_pair_pnl.items() if saved_pair_date.get(p) == today_str}
+        self._pair_day_date = {p: d_ for p, d_ in saved_pair_date.items() if d_ == today_str}
         # Persist daily counters and streak state across restarts
         today = datetime.utcnow().strftime("%Y-%m-%d")
         saved_date = d.get("day_date", "")
@@ -2510,7 +2516,9 @@ class PaperTrader:
                 "streak_reset_len":   self._streak_reset_len,
                 "streak_cool_until":  self._streak_cool_until,
                 "weekly_peak":        self._weekly_peak,
-                "weekly_dd_paused":   self._weekly_dd_paused}
+                "weekly_dd_paused":   self._weekly_dd_paused,
+                "pair_day_pnl":       dict(self._pair_day_pnl),
+                "pair_day_date":      dict(self._pair_day_date)}
 
     def _save_file(self):
         try:
@@ -10200,7 +10208,7 @@ function _renderCalibChart(buckets){
 }
 
 /* ── TRADE NOTES ── */
-let _noteCurrentKey='',_noteCurrentLabel='';
+let _noteCurrentKey='',_noteCurrentLabel='',_noteTags=[];
 function _noteKeys(){
   try{return JSON.parse(localStorage.getItem('cb_notes')||'{}');}catch(e){return {};}
 }
@@ -10634,7 +10642,6 @@ function _renderJournalCalendar(){
 }
 
 /* ── TAG SYSTEM ── */
-let _noteTags=[];
 function toggleTag(el){
   el.classList.toggle('sel');
   const tag=el.dataset.tag;
@@ -10944,12 +10951,14 @@ def _web_status():
             "unrealized_pnl": upnl,
             "move_pct":       move_pct,
             "trail_stop":     round(p.get("trail_stop", 0), 4),
+            "r1_price":       p.get("r1_price"),
+            "r2_price":       p.get("r2_price"),
             "confidence":     round(p.get("confidence", 0) * 100),
             "held_mins":      int(held),
             "margin":         round(p.get("margin", 0), 2),
             "margin_pct":     round(p.get("margin", 0) / max(trader.balance, 0.01) * 100, 1),
             "opened_at":      int(p.get("opened_at", 0) * 1000),
-            "pillars":         p.get("pillars", {}),
+            "pillars":        p.get("pillars", {}),
         })
 
     wins_streak  = trader.consecutive_wins
@@ -10969,6 +10978,8 @@ def _web_status():
             "entry_ts":    int(t.get("opened_at", 0) * 1000),
             "entry_price": round(t.get("entry", 0), 6),
             "exit_price":  round(t.get("exit", 0), 6),
+            "confidence":  round(t.get("confidence", 0), 3),
+            "pillars":     t.get("pillars", []),
         })
 
     coin_stats: dict = {}
