@@ -328,7 +328,9 @@ ATR_PERIOD       = 14
 ATR_MULTIPLIER   = 2.0         # 2× ATR trail (was 1.5) — gives trade room to breathe
 MAX_TRADE_MINS   = 120         # 2-hour time limit (was 30 min) — trends need time
 KRAKEN_FEE       = 0.0026
-SLIPPAGE         = 0.001
+SLIPPAGE                = 0.001
+ORDER_TTL_SECS          = 45      # max seconds from signal to order placement; older signals are dropped
+LIVE_SLIPPAGE_TOLERANCE = 0.003   # 0.3% worst acceptable fill vs signal price on live orders
 MAX_TRADES_DAY   = 10
 DAILY_LOSS_LIMIT = 0.10
 ACTIVE_HOURS_UTC  = (5, 23)
@@ -922,6 +924,7 @@ _gate_counters = {
     "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
     "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0, "15m_trend": 0,
     "orderbook_wall": 0, "daily_trend": 0, "pair_profit_cap": 0,
+    "ttl_expired": 0,
 }
 
 # Trade preview / confirmation state
@@ -1146,23 +1149,28 @@ def _kraken_get_usd_balance():
         tg(f"⚠️ Kraken balance error: `{e}`")
         return 0.0
 
-def _kraken_place_order(pair, side, volume, validate=False, leverage=None):
+def _kraken_place_order(pair, side, volume, validate=False, leverage=None, price_limit=None):
     """
-    Place a Kraken spot or margin market order.
+    Place a Kraken spot or margin order.
     side: 'buy' or 'sell'
     volume: base-currency units (e.g. BTC amount, not USD)
     leverage: integer ≥2 for margin order; None for spot
+    price_limit: when set, places an aggressive limit order instead of a market order.
+      The limit sits LIVE_SLIPPAGE_TOLERANCE away from the signal price so it fills
+      like a market order but is guaranteed not to fill worse than the limit.
     Returns txid string or raises on failure.
     """
     min_vol = _KRAKEN_MIN_VOL.get(pair, 0.0)
     if volume < min_vol:
         raise ValueError(f"Order volume {volume:.8f} below Kraken minimum {min_vol} for {pair}")
     params = {
-        "pair":       pair,
-        "type":       side,
-        "ordertype":  "market",
-        "volume":     f"{volume:.8f}",
+        "pair":      pair,
+        "type":      side,
+        "ordertype": "limit" if price_limit else "market",
+        "volume":    f"{volume:.8f}",
     }
+    if price_limit:
+        params["price"] = f"{price_limit:.4f}"
     if leverage and leverage >= 2:
         params["leverage"] = str(leverage)
     if validate:
@@ -1170,8 +1178,9 @@ def _kraken_place_order(pair, side, volume, validate=False, leverage=None):
     result = _kraken_private("AddOrder", params)
     txids  = result.get("txid", [])
     txid   = txids[0] if txids else "unknown"
-    lev_str = f" {leverage}×margin" if leverage else " spot"
-    log("LIVE", f"Order placed: {side.upper()}{lev_str} {volume:.6f} {pair}  txid={txid}")
+    lev_str  = f" {leverage}×margin" if leverage else " spot"
+    lim_str  = f" limit≤${price_limit:.4f}" if price_limit else " market"
+    log("LIVE", f"Order placed: {side.upper()}{lev_str}{lim_str} {volume:.6f} {pair}  txid={txid}")
     return txid
 
 def _kraken_cancel_order(txid):
@@ -2912,7 +2921,7 @@ class PaperTrader:
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN), 4)
 
-    def on_signal(self, sig, price, stop, target, name, confidence, pair, atr=None, fkey="", pillars=None):
+    def on_signal(self, sig, price, stop, target, name, confidence, pair, atr=None, fkey="", pillars=None, signal_ts=None):
         with _state_lock:
             paused = _paused
         if paused or self.balance < PAPER_FLOOR: return
@@ -3098,9 +3107,21 @@ class PaperTrader:
                       {"text": "⏭ Skip",  "callback_data": f"skip_trade:{pid}"}]]
                 )
                 return
-            self._open(_open_side, price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars)
+            self._open(_open_side, price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars, signal_ts=signal_ts)
 
-    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None):
+    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None, signal_ts=None):
+        # Order TTL: if the signal is older than ORDER_TTL_SECS don't place the order.
+        # Gates and API calls between evaluate() and here can add several seconds of lag;
+        # acting on a stale signal risks entering at a price the market has already moved past.
+        if self._is_live() and signal_ts is not None:
+            _age = time.time() - signal_ts
+            if _age > ORDER_TTL_SECS:
+                log("LIVE", f"Signal for {name} expired ({_age:.0f}s > TTL {ORDER_TTL_SECS}s) — order skipped")
+                tg(f"⏱️ *Signal expired — {name}*\n"
+                   f"Signal was `{_age:.0f}s` old (max `{ORDER_TTL_SECS}s`) — order not placed.")
+                with _gate_counter_lock: _gate_counters["ttl_expired"] += 1
+                return
+
         # Per-pair daily profit cap: skip new entry when pair already made ≥4% of balance today
         now_date_str = datetime.utcnow().strftime("%Y-%m-%d")
         if self._pair_day_date.get(pair) != now_date_str:
@@ -3251,7 +3272,14 @@ class PaperTrader:
                            f"Your balance: `${self.balance:.2f}` · margin: `${margin:.2f}`\n"
                            f"_Deposit more or switch to Binance/Kraken Futures for small accounts._")
                         return
-                    txid = _kraken_place_order(pair, order_side, contracts, leverage=lev_arg)
+                    # Slippage floor: aggressive limit order — fills at market speed but
+                    # Kraken will reject fills worse than this price.
+                    # BUY: ceiling = signal price + tolerance (don't pay more than this)
+                    # SELL: floor  = signal price - tolerance (don't accept less than this)
+                    _slip_limit = round(fill * (1 + LIVE_SLIPPAGE_TOLERANCE), 4) if order_side == "buy" \
+                                  else round(fill * (1 - LIVE_SLIPPAGE_TOLERANCE), 4)
+                    txid = _kraken_place_order(pair, order_side, contracts, leverage=lev_arg,
+                                               price_limit=_slip_limit)
                     self._live_orders[pair] = txid
                     real_usd = _kraken_get_usd_balance()
                 except Exception as exc:
@@ -6242,6 +6270,7 @@ def trading_loop(trader):
                         closes, highs, lows, volumes, price, coin["alert_buffer"],
                         pair=pair, opens=opens)
                     sig_from_eval = sig   # capture before gate filters may change it
+                    _signal_ts = time.time()  # stamp immediately after evaluate()
                     try: atr = calc_atr(highs, lows, closes)
                     except Exception: atr = None
 
@@ -6449,10 +6478,10 @@ def trading_loop(trader):
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*{_pat_note}")
                         if _main_open:
                             trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
-                                             atr=atr, fkey=fkey, pillars=pillars)
+                                             atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
                         if _sim_open:
                             _sim_trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
-                                                  atr=atr, fkey=fkey, pillars=pillars)
+                                                  atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
 
                     last_sigs[pair] = sig
 
