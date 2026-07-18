@@ -11625,42 +11625,15 @@ def _web_auth():
         return _Response(json.dumps({"ok": True, "trusted": True,
                                      "device_label": label}), mimetype="application/json")
 
-    # Device has a pending approval decision
-    pending = _pending_devices.get(dev_id, {})
-    if pending:
-        status = pending.get("status", "pending")
-        if status == "allowed":
-            # Owner approved via Telegram — grant access and remember device
-            _pending_devices.pop(dev_id, None)
-            _trusted_devices[dev_id] = {"label": device_label, "added_ts": time.time()}
-            _save_trusted_devices()
-            log("AUTH", f"Pending device approved — {ip}  {device_label}")
-            tg(f"✅ *Device trusted*\nDevice: `{device_label}`\nIP: `{ip}`")
-            return _Response(json.dumps({"ok": True, "trusted": True,
-                                         "device_label": device_label}), mimetype="application/json")
-        if status == "blocked":
-            log("AUTH", f"Blocked device attempted login — {ip}  {device_label}", "WARN")
-            return _Response(json.dumps({"ok": False, "blocked": True}), mimetype="application/json")
-        # Still pending — tell the browser to keep polling
-        return _Response(json.dumps({"ok": False, "pending": True,
-                                     "device_label": device_label}), mimetype="application/json")
-
-    # Unknown device — require Telegram approval before granting access
+    # Correct PIN = owner. Auto-trust the device so they're in immediately.
+    # Previously this required a Telegram approval tap which blocked dashboard access.
     if dev_id:
-        _pending_devices[dev_id] = {"label": device_label, "ip": ip,
-                                    "ts": time.time(), "status": "pending"}
-    log("AUTH", f"New device awaiting approval — {ip}  {device_label}", "WARN")
-    msg = (f"🔐 *New device wants access*\n"
-           f"IP: `{ip}`\nDevice: `{device_label}`\nTime: `{ts_str}`\n"
-           f"_Allow it to log in?_")
-    if dev_id:
-        tg_buttons(msg, [[
-            {"text": f"✅ Allow {device_label}", "callback_data": f"allow_dev:{dev_id}"},
-            {"text": "🚫 Block",                 "callback_data": f"block_dev:{dev_id}"},
-        ]])
-    else:
-        tg(msg + "\n_⚠️ Could not identify device — access denied._")
-    return _Response(json.dumps({"ok": False, "pending": bool(dev_id),
+        _pending_devices.pop(dev_id, None)
+        _trusted_devices[dev_id] = {"label": device_label, "added_ts": time.time()}
+        _save_trusted_devices()
+    log("AUTH", f"New device granted access via PIN — {ip}  {device_label}")
+    tg(f"🔐 *Dashboard unlocked*\nDevice: `{device_label}`\nIP: `{ip}` | `{ts_str}`")
+    return _Response(json.dumps({"ok": True, "trusted": True,
                                  "device_label": device_label}), mimetype="application/json")
 
 @_flask_app.route("/trust-device", methods=["POST"])
