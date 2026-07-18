@@ -346,9 +346,9 @@ EXTREME_FUNDING   = 0.001
 ECON_BLACKOUT_MINS= 15
 MIN_CONFIDENCE    = 0.52       # 52% confidence floor (was 0.55) — more opportunities without sacrificing quality
 ADX_PERIOD        = 14
-ADX_MIN           = 18         # allow mildly trending markets (Wilder's neutral zone starts ~20)
+ADX_MIN           = 14         # allow mildly trending markets (was 18, most coins sit 14-18)
 ER_PERIOD         = 10
-ER_MIN            = 0.15       # realistic efficiency floor (most real moves sit 0.10–0.25)
+ER_MIN            = 0.08       # efficiency floor (was 0.15 — most real moves sit 0.08–0.25)
 
 SAVE_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 TRUSTED_DEV_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trusted_devices.json")
@@ -3763,11 +3763,9 @@ class SignalEngine:
                         "exit":  nearest_s if nearest_s else price * 0.980,
                         "stop":  nearest_r if nearest_r else price * 1.020}
 
-        # NASDAQ gate
+        # NASDAQ gate — soft: bearish NASDAQ reduces confidence but doesn't hard-block.
+        # Crypto often moves independently of equities, especially BTC itself.
         nasdaq_mood = market_mood["nasdaq"]
-        if nasdaq_mood == "BEARISH" and sig == "BUY":
-            with _gate_counter_lock: _gate_counters["nasdaq"] += 1
-            sig = "HOLD"
 
         # Fear & Greed gate
         fg_val = fear_greed["value"]
@@ -3778,10 +3776,8 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["fear_greed"] += 1
             sig = "HOLD"
 
-        # Bitcoin dominance gate — rising BTC dominance → altcoins bleed
-        if btc_dominance["rising"] and sig == "BUY" and current_pair != "XBTUSD":
-            with _gate_counter_lock: _gate_counters["btc_dom"] += 1
-            sig = "HOLD"
+        # Bitcoin dominance gate — soft: rising dominance reduces alt confidence but doesn't block.
+        # Hard-blocking caused days of no trades when dominance trended for extended periods.
 
         # BTC price momentum gate — if BTC drops ≥2% in the last 30 min, pause altcoin longs
         if sig == "BUY" and current_pair != "XBTUSD":
@@ -3821,8 +3817,11 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["active_hours"] += 1
             sig = "HOLD"
 
-        # Volume gate — low-volume moves fail too often to act on
-        if sig in ("BUY", "SELL") and not high_volume:
+        # Volume gate — very low volume is a hard block; average volume is allowed.
+        # vol_pts pillar already penalises confidence for below-average volume.
+        # Only hard-block when volume is extremely thin (< 40% of average).
+        _very_low_vol = (volumes[-1] < (sum(volumes) / len(volumes)) * 0.40) if volumes else False
+        if sig in ("BUY", "SELL") and _very_low_vol:
             with _gate_counter_lock: _gate_counters["volume"] += 1
             sig = "HOLD"
 
@@ -3839,22 +3838,12 @@ class SignalEngine:
         except Exception:
             vwap = None
         above_vwap = price > vwap if vwap else True
-        if sig == "BUY"  and vwap and not above_vwap:
-            with _gate_counter_lock: _gate_counters["vwap"] += 1
-            sig = "HOLD"
-        if sig == "SELL" and vwap and above_vwap:
-            with _gate_counter_lock: _gate_counters["vwap"] += 1
-            sig = "HOLD"
+        # VWAP hard block removed — already penalised via vwap_pts pillar in confidence.
+        # Hard-blocking created long droughts because rolling 15m VWAP sits above price
+        # for extended periods during any pullback.
 
-        # Bollinger Band squeeze — bands are narrowest in 20 candles = breakout forming
-        # but direction is unknown; wait until price picks a side and bands expand
-        if sig in ("BUY", "SELL"):
-            try:
-                if calc_bb_squeeze(closes):
-                    with _gate_counter_lock: _gate_counters["bb_squeeze"] += 1
-                    sig = "HOLD"
-            except Exception:
-                pass
+        # BB squeeze gate removed — a squeeze is a pre-breakout condition, not a reason
+        # to avoid entry. Blocking at squeezes caused missing the best momentum entries.
 
         # ADX gate — Wilder: only enter when a real trend exists (ADX > ADX_MIN)
         # ADX measures trend *strength* without regard to direction
@@ -3882,25 +3871,21 @@ class SignalEngine:
             except Exception:
                 pass
 
-        # HTF trend gate — only trade with the 1-hour EMA trend
+        # HTF 1H trend — soft gate: counter-trend penalises confidence instead of hard-blocking.
+        # Hard-blocking 1H meant coins on any pullback could never get a BUY entry.
         if sig in ("BUY", "SELL"):
             _htf = _htf_trend(current_pair)
-            if _htf == "BEAR" and sig == "BUY":
+            if (_htf == "BEAR" and sig == "BUY") or (_htf == "BULL" and sig == "SELL"):
                 with _gate_counter_lock: _gate_counters["htf"] += 1
-                sig = "HOLD"
-            elif _htf == "BULL" and sig == "SELL":
-                with _gate_counter_lock: _gate_counters["htf"] += 1
-                sig = "HOLD"
+                # Penalty handled below in confidence calculation
 
-        # 4H multi-timeframe confirmation — 4H EMA trend must align with signal
+        # 4H trend gate — hard block removed; trading loop already applies ±0.07/0.10
+        # confidence adjustment for 4H alignment. Double-penalising caused droughts.
+        # Telemetry counter preserved for dashboard visibility.
         if sig in ("BUY", "SELL"):
             _htf4 = _htf_trend(current_pair, interval=240, limit=50)
-            if _htf4 == "BEAR" and sig == "BUY":
+            if (_htf4 == "BEAR" and sig == "BUY") or (_htf4 == "BULL" and sig == "SELL"):
                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
-                sig = "HOLD"
-            elif _htf4 == "BULL" and sig == "SELL":
-                with _gate_counter_lock: _gate_counters["4h_trend"] += 1
-                sig = "HOLD"
 
         # 15m confirmation — soft gate: counter-trend 15m penalises confidence but
         # doesn't hard-block. 15m EMA(14) is too noisy to veto valid 1h/4h signals.
@@ -3931,11 +3916,12 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["macd_div"] += 1
             sig = "HOLD"
 
-        # Stochastic RSI gate — block entries at extreme opposing readings
-        if sig == "BUY"  and stoch_k > 85:
+        # Stochastic RSI gate — only block at extreme readings (92/8 instead of 85/15).
+        # Trending coins hold stoch > 85 for many candles; 92 catches only true exhaustion.
+        if sig == "BUY"  and stoch_k > 92:
             with _gate_counter_lock: _gate_counters["stoch_rsi"] += 1
             sig = "HOLD"
-        if sig == "SELL" and stoch_k < 15:
+        if sig == "SELL" and stoch_k < 8:
             with _gate_counter_lock: _gate_counters["stoch_rsi"] += 1
             sig = "HOLD"
 
@@ -4042,6 +4028,20 @@ class SignalEngine:
         if _15m_against and sig in ("BUY", "SELL"):
             with _gate_counter_lock: _gate_counters["15m_trend"] += 1
             confidence = max(0.0, round(confidence - 0.08, 2))
+
+        # NASDAQ soft gate — bearish NASDAQ trims confidence (was a hard block)
+        if sig in ("BUY", "SELL") and nasdaq_mood == "BEARISH" and sig == "BUY":
+            confidence = max(0.0, round(confidence - 0.08, 2))
+
+        # BTC dominance soft gate — rising dominance trims altcoin confidence (was a hard block)
+        if sig == "BUY" and current_pair != "XBTUSD" and btc_dominance.get("rising"):
+            confidence = max(0.0, round(confidence - 0.06, 2))
+
+        # 1H HTF soft gate — counter-trend 1H trims confidence (was a hard block)
+        if sig in ("BUY", "SELL"):
+            _htf_1h_check = _htf_trend(current_pair)
+            if (_htf_1h_check == "BEAR" and sig == "BUY") or (_htf_1h_check == "BULL" and sig == "SELL"):
+                confidence = max(0.0, round(confidence - 0.09, 2))
 
         # Daily EMA soft gate — counter-trend daily trend trims confidence
         if sig in ("BUY", "SELL"):
@@ -6388,9 +6388,18 @@ def trading_loop(trader):
                         fkey     = plan.get("fkey",    "")
                         pillars  = plan.get("pillars", {})
 
-                        # R:R gate: skip entry when reward doesn't justify the risk
+                        # R:R gate: if S/R levels give bad R:R, fall back to ATR-based
+                        # targets before deciding to skip. S/R can place nearby resistance
+                        # that makes every trade appear unfavourable.
                         _rr_reward = (target - price) if sig == "BUY" else (price - target)
                         _rr_risk   = (price - stop)   if sig == "BUY" else (stop - price)
+                        if atr and atr > 0 and (_rr_risk <= 0 or _rr_reward / max(_rr_risk, 1e-12) < MIN_RR_RATIO):
+                            _atr_stop   = (price - atr * ATR_MULTIPLIER) if sig == "BUY" else (price + atr * ATR_MULTIPLIER)
+                            _atr_target = (price + atr * ATR_MULTIPLIER * 2.2) if sig == "BUY" else (price - atr * ATR_MULTIPLIER * 2.2)
+                            stop   = round(_atr_stop, 8)
+                            target = round(_atr_target, 8)
+                            _rr_reward = (target - price) if sig == "BUY" else (price - target)
+                            _rr_risk   = (price - stop)   if sig == "BUY" else (stop - price)
                         if _rr_risk <= 0 or _rr_reward / _rr_risk < MIN_RR_RATIO:
                             with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
                             last_sigs[pair] = sig
