@@ -7331,6 +7331,213 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 /* ── DRAWDOWN WATERFALL ── */
 .wfall-wrap{margin:0 16px 16px;background:var(--s0);border:1px solid var(--bd);
   border-radius:12px;padding:14px 16px}
+
+/* ════════════════════════════════════════════════
+   MODERN REDESIGN OVERRIDES — 2025
+   ════════════════════════════════════════════════ */
+
+/* ── Deeper, richer palette ── */
+:root{
+  --bg:#030912;
+  --s0:rgba(10,20,40,0.85);
+  --s1:rgba(15,28,55,0.9);
+  --bd:rgba(255,255,255,0.07);
+  --bd2:rgba(255,255,255,0.04);
+  --bd3:rgba(255,255,255,0.09);
+  --tx:#ddeeff;
+  --mu:#4a7aaa;
+  --g:#00e676;
+  --r:#ff3366;
+  --b:#2979ff;
+  --y:#ffb300;
+  --glass:rgba(255,255,255,0.03);
+  --glow-g:rgba(0,230,118,0.18);
+  --glow-r:rgba(255,51,102,0.15);
+  --glow-b:rgba(41,121,255,0.18);
+}
+
+/* ── Base ── */
+body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.07) 0%,var(--bg) 60%)}
+
+/* ── Frosted header ── */
+.hdr{
+  background:rgba(3,9,18,0.75);
+  backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+  border-bottom:1px solid var(--bd);
+}
+
+/* ── Frosted tab bar ── */
+.tabbar{
+  background:rgba(3,9,18,0.80);
+  backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+  border-top:1px solid var(--bd);
+}
+.tab.active{color:var(--b)}
+.tab.active .tab-ico{filter:drop-shadow(0 0 6px rgba(41,121,255,0.6))}
+
+/* ── Hero balance — gradient text ── */
+.hero{
+  background:linear-gradient(160deg,rgba(15,28,55,0.6) 0%,transparent 70%);
+  padding:22px 16px 20px;
+}
+.hero-int{
+  background:linear-gradient(135deg,#ddeeff 0%,var(--b) 120%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+  font-size:3rem;letter-spacing:-0.03em;
+}
+.hero-dec{opacity:0.45}
+.hero-lbl{letter-spacing:.16em;font-size:.55rem}
+
+/* ── Pill badge glow ── */
+.pill-up{background:rgba(0,230,118,0.1);color:var(--g);box-shadow:0 0 12px var(--glow-g)}
+.pill-dn{background:rgba(255,51,102,0.09);color:var(--r);box-shadow:0 0 12px var(--glow-r)}
+
+/* ── Glass stat cards ── */
+.qcard{
+  background:var(--glass);
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  border:1px solid var(--bd);
+  border-radius:16px;
+  box-shadow:0 4px 24px rgba(0,0,0,0.3),inset 0 1px 0 rgba(255,255,255,0.05);
+}
+.qcard::before{border-radius:16px 0 0 16px}
+.qcard-val{font-size:1.35rem;letter-spacing:-0.01em}
+
+/* ── Color value glow ── */
+.c-g{color:var(--g);text-shadow:0 0 14px var(--glow-g)}
+.c-r{color:var(--r);text-shadow:0 0 14px var(--glow-r)}
+.c-b{color:var(--b);text-shadow:0 0 14px var(--glow-b)}
+
+/* ── Glass position cards ── */
+.pc{
+  background:var(--glass);
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  border:1px solid var(--bd);
+  border-radius:16px;
+  box-shadow:0 4px 24px rgba(0,0,0,0.35),inset 0 1px 0 rgba(255,255,255,0.05);
+}
+
+/* ── Glass trade rows ── */
+.trade-box{
+  background:var(--glass);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--bd);border-radius:16px;
+  box-shadow:0 4px 20px rgba(0,0,0,0.25);
+}
+
+/* ── Glass market condition tiles ── */
+.mc-tile,.scard{
+  background:var(--glass);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--bd);
+  border-radius:16px;
+  box-shadow:0 4px 20px rgba(0,0,0,0.25),inset 0 1px 0 rgba(255,255,255,0.04);
+}
+.mc-val{font-size:1.15rem;letter-spacing:-0.01em}
+
+/* ── Badges ── */
+.badge-live{
+  background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.3);color:var(--g);
+  box-shadow:0 0 10px rgba(0,230,118,0.2);
+}
+.badge-paper{background:rgba(74,122,170,0.1);border:1px solid rgba(74,122,170,0.25);color:var(--mu)}
+
+/* ── Live dot — ripple ── */
+.dot-live{background:var(--g);box-shadow:0 0 6px var(--g);animation:livepulse 2s ease-in-out infinite}
+@keyframes livepulse{
+  0%,100%{opacity:1;box-shadow:0 0 4px var(--g),0 0 0 0 rgba(0,230,118,.45)}
+  50%{opacity:.7;box-shadow:0 0 8px var(--g),0 0 0 5px rgba(0,230,118,0)}
+}
+
+/* ── Scan dot ripple ── */
+.scan-dot{width:7px;height:7px;box-shadow:0 0 6px var(--g)}
+@keyframes blink{0%,100%{opacity:1;box-shadow:0 0 6px var(--g)}50%{opacity:.3;box-shadow:none}}
+
+/* ── Section headers ── */
+.sh span{color:rgba(100,150,200,0.7);letter-spacing:.15em;font-size:.54rem}
+.sh::after{background:linear-gradient(90deg,var(--bd3),transparent)}
+
+/* ── Chip badges ── */
+.chip-l{background:rgba(0,230,118,0.1);color:var(--g);border:1px solid rgba(0,230,118,0.25)}
+.chip-s{background:rgba(255,51,102,0.08);color:var(--r);border:1px solid rgba(255,51,102,0.2)}
+
+/* ── Chart container ── */
+.chart-wrap{
+  background:var(--glass);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--bd);border-radius:16px;
+  box-shadow:0 4px 24px rgba(0,0,0,0.3);
+}
+
+/* ── Interval buttons ── */
+.iv-btn.active{background:var(--b);color:#fff;border-color:var(--b);box-shadow:0 0 12px var(--glow-b)}
+.iv-btn{border-radius:8px;border:1px solid var(--bd)}
+
+/* ── Icon buttons ── */
+.icon-btn{border-radius:12px;border:1px solid var(--bd);background:var(--glass);backdrop-filter:blur(8px)}
+.icon-btn:active{background:rgba(255,255,255,0.08)}
+
+/* ── Coin chips ── */
+.coin-chip.viewing{background:rgba(41,121,255,0.08)}
+.coin-chip.trading .coin-ico{border-color:var(--b);box-shadow:0 0 0 3px rgba(41,121,255,0.2),0 0 16px rgba(41,121,255,0.35)}
+
+/* ── Progress bars ── */
+.wr-bar{height:4px;border-radius:2px}
+.wr-fill{border-radius:2px}
+.mb-track{height:5px;border-radius:3px}
+.mb-fill{border-radius:3px}
+
+/* ── Pin lock screen ── */
+.pin-lock{background:radial-gradient(ellipse 100% 80% at 50% 0%,rgba(41,121,255,0.08) 0%,var(--bg) 50%)}
+.pin-key{border-radius:18px;border:1px solid var(--bd);background:var(--glass);
+  backdrop-filter:blur(10px);font-size:1.6rem;font-weight:500;
+  transition:background .12s,transform .08s}
+.pin-key:active{background:rgba(255,255,255,0.08);transform:scale(.95)}
+.pin-dot.filled{background:var(--b);border-color:var(--b);box-shadow:0 0 8px rgba(41,121,255,0.5)}
+
+/* ── Rank card ── */
+.xp-bar-fill{background:linear-gradient(90deg,var(--b),#7c4dff);border-radius:2px}
+
+/* ── Goals ── */
+.goal-wrap{
+  background:var(--glass);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--bd);border-radius:16px;
+}
+
+/* ── Coin strip glass ── */
+.eq-wrap,.coin-box{
+  background:var(--glass);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--bd);border-radius:16px;
+}
+
+/* ── Detail sheet ── */
+.cd-panel{
+  background:rgba(7,15,30,0.95);
+  backdrop-filter:blur(30px);-webkit-backdrop-filter:blur(30px);
+  border-top:1px solid var(--bd3);
+  border-radius:24px 24px 0 0;
+}
+.cd-stat{background:rgba(255,255,255,0.03);border-radius:12px}
+
+/* ── Heatmap cells ── */
+.hm-cell{border-radius:12px}
+.hm-cell.bull{background:rgba(0,230,118,0.07);border-color:rgba(0,230,118,0.18)}
+.hm-cell.bear{background:rgba(255,51,102,0.07);border-color:rgba(255,51,102,0.18)}
+
+/* ── Journal cards ── */
+.jnl-note-card{
+  background:var(--glass);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--bd);border-radius:16px;
+}
+
+/* ── UPNL banner ── */
+.upnl-banner{border-radius:16px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+.upnl-banner:not(.neg){box-shadow:0 0 20px rgba(0,230,118,0.08)}
+.upnl-banner.neg{box-shadow:0 0 20px rgba(255,51,102,0.08)}
 </style>
 </head>
 <body>
