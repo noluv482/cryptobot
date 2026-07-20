@@ -651,6 +651,56 @@ class Database:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS pi_pillar ON pillar_outcomes(pillar, active)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS candles (
+                    pair        TEXT    NOT NULL,
+                    interval_m  INT     NOT NULL,
+                    ts          BIGINT  NOT NULL,
+                    open        FLOAT   NOT NULL,
+                    high        FLOAT   NOT NULL,
+                    low         FLOAT   NOT NULL,
+                    close       FLOAT   NOT NULL,
+                    volume      FLOAT   NOT NULL,
+                    PRIMARY KEY (pair, interval_m, ts)
+                )
+            """)
+
+    def save_candles(self, pair, interval_m, rows):
+        """rows: raw Kraken OHLC rows [time, open, high, low, close, vwap, volume, count]"""
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                for r in rows:
+                    cur.execute("""
+                        INSERT INTO candles (pair,interval_m,ts,open,high,low,close,volume)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (pair,interval_m,ts) DO UPDATE
+                          SET open=EXCLUDED.open, high=EXCLUDED.high,
+                              low=EXCLUDED.low,  close=EXCLUDED.close, volume=EXCLUDED.volume
+                    """, (pair, interval_m, int(r[0]), float(r[1]), float(r[2]),
+                          float(r[3]), float(r[4]), float(r[6])))
+        except Exception as e:
+            log("DB", f"save_candles {pair}: {e}", "WRN")
+
+    def load_candles(self, pair, interval_m, limit):
+        """Return (closes,highs,lows,volumes,opens) from DB, or None if insufficient data."""
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ts,open,high,low,close,volume FROM candles
+                    WHERE pair=%s AND interval_m=%s
+                    ORDER BY ts DESC LIMIT %s
+                """, (pair, interval_m, limit))
+                rows = cur.fetchall()
+            if len(rows) < limit // 2:
+                return None
+            rows = list(reversed(rows))
+            return ([r[4] for r in rows], [r[2] for r in rows], [r[3] for r in rows],
+                    [r[5] for r in rows], [r[1] for r in rows])
+        except Exception as e:
+            log("DB", f"load_candles {pair}: {e}", "WRN")
+            return None
 
     def save_trade(self, t):
         if not self.conn: return
@@ -912,10 +962,15 @@ _PATTERN_TTL   = 900  # 15 minutes between rescans
 _activity_log: list = []   # last 30 scan events for dashboard activity feed
 _ACTIVITY_MAX  = 30
 
-_prices_cache: dict = {}   # pair → {price, pct} for coin strip
+_prices_cache: dict = {}   # pair → {price, pct} for coin strip — kept fresh by WS thread
 _prices_cache_ts: float = 0.0
 _PRICES_TTL = 30  # seconds
 _scan_prices: dict = {}    # fallback populated by trading loop when bulk Kraken call fails
+
+_klines_cache: dict = {}   # pair → (closes,highs,lows,volumes,opens,raw_rows,fetched_ts)
+_KLINES_TTL   = 300        # 5 min; 15-min candles only change every 15 min
+
+_last_scan_ts: float = 0.0  # updated after each trading-loop cycle; watchdog alerts on stall
 
 _btc_price_hist: list = []  # (timestamp, price) — rolling 35-min BTC tick history for momentum gate
 _BTC_HIST_SECS  = 2100      # 35 minutes kept
@@ -1068,12 +1123,27 @@ def tg_answer(cb_id, text=""):
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 def get_klines(pair, interval=None, limit=None):
+    global _klines_cache
+    lm = limit or CANDLE_LIMIT
+    cached = _klines_cache.get(pair)
+    if cached and time.time() - cached[6] < _KLINES_TTL and len(cached[0]) >= lm:
+        return cached[0], cached[1], cached[2], cached[3], cached[4]
     if USE_BINANCE:
-        return _bn_get_klines(pair, interval, limit)
+        result = _bn_get_klines(pair, interval, limit)
+        _klines_cache[pair] = result + ([], time.time())
+        return result
     if USE_FUTURES:
-        return _kf_get_klines(pair, interval, limit)
+        result = _kf_get_klines(pair, interval, limit)
+        _klines_cache[pair] = result + ([], time.time())
+        return result
     iv = interval or INTERVAL
     lm = limit or CANDLE_LIMIT
+    # Try DB on cold start (no in-memory entry yet) so startup scan skips the API
+    if db.connected and not cached:
+        db_result = db.load_candles(pair, iv, lm)
+        if db_result:
+            _klines_cache[pair] = db_result + ([], time.time() - _KLINES_TTL + 60)
+            return db_result
     r = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair, "interval": iv}, timeout=10)
     payload = r.json()
     if payload.get("error"):
@@ -1085,6 +1155,9 @@ def get_klines(pair, interval=None, limit=None):
     highs   = [float(c[2]) for c in data]
     lows    = [float(c[3]) for c in data]
     volumes = [float(c[6]) for c in data]
+    _klines_cache[pair] = (closes, highs, lows, volumes, opens, data, time.time())
+    if db.connected:
+        db.save_candles(pair, iv, data)
     return closes, highs, lows, volumes, opens
 
 def get_price(pair):
@@ -6579,7 +6652,87 @@ def trading_loop(trader):
         except Exception as e:
             log("TRADE", str(e), "ERR")
         _log_gate_summary()
+        global _last_scan_ts
+        _last_scan_ts = time.time()
         time.sleep(REFRESH_SEC)
+
+# ── Kraken WebSocket price feed ───────────────────────────────────────────────
+# Keeps _prices_cache fresh in real-time so /prices never needs a bulk REST call.
+def _kraken_ws_loop():
+    global _prices_cache, _prices_cache_ts
+    try:
+        import websocket as _ws_lib
+    except ImportError:
+        log("WS", "websocket-client not installed — falling back to REST prices", "WRN")
+        return
+
+    _ws_pair_map = {c["pair"][:-3] + "/" + c["pair"][-3:]: c["pair"] for c in SCAN_UNIVERSE}
+    ws_pairs = list(_ws_pair_map.keys())
+
+    def _on_message(ws, raw):
+        global _prices_cache, _prices_cache_ts
+        try:
+            msg = json.loads(raw)
+            if not isinstance(msg, list) or len(msg) < 4:
+                return
+            data, _, ws_pair = msg[1], msg[2], msg[3]
+            if not isinstance(data, dict) or "c" not in data:
+                return
+            pair = _ws_pair_map.get(ws_pair)
+            if not pair:
+                # try loose match (Kraken sometimes normalises pair names)
+                pair = next((v for k, v in _ws_pair_map.items() if k.replace("/","") == ws_pair.replace("/","")), None)
+            if not pair:
+                return
+            price = float(data["c"][0])
+            o_raw = data.get("o")
+            if isinstance(o_raw, dict):
+                open_p = float(o_raw.get("today") or o_raw.get("last24") or price)
+            elif o_raw:
+                open_p = float(o_raw)
+            else:
+                open_p = price
+            pct = round((price - open_p) / open_p * 100, 2) if open_p else 0.0
+            _prices_cache[pair] = {"price": price, "pct": pct}
+            _prices_cache_ts = time.time()
+        except Exception:
+            pass
+
+    def _on_open(ws):
+        ws.send(json.dumps({"event": "subscribe", "pair": ws_pairs, "subscription": {"name": "ticker"}}))
+        log("WS", f"Kraken WebSocket connected ({len(ws_pairs)} pairs)")
+
+    def _on_error(ws, err):
+        log("WS", f"WebSocket error: {err}", "WRN")
+
+    def _on_close(ws, code, msg):
+        log("WS", "WebSocket closed — reconnecting in 5s", "WRN")
+
+    while True:
+        try:
+            ws = _ws_lib.WebSocketApp("wss://ws.kraken.com",
+                on_open=_on_open, on_message=_on_message,
+                on_error=_on_error, on_close=_on_close)
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            log("WS", f"WebSocket thread: {e}", "WRN")
+        time.sleep(5)
+
+# ── Watchdog ──────────────────────────────────────────────────────────────────
+def _watchdog_loop():
+    """Alert via Telegram if the trading loop stalls for > 5 minutes."""
+    _alerted = False
+    while True:
+        time.sleep(60)
+        if _last_scan_ts == 0:
+            continue
+        age = time.time() - _last_scan_ts
+        if age > 300 and not _alerted:
+            tg(f"⚠️ *CryptoBot Warning*\nScan loop stalled — last scan {int(age // 60)}m ago")
+            _alerted = True
+        elif age <= 300 and _alerted:
+            tg("✅ *CryptoBot Recovered*\nScan loop is active again")
+            _alerted = False
 
 # ── Web Dashboard ─────────────────────────────────────────────────────────────
 _flask_app      = _Flask("cryptobot")
@@ -11551,6 +11704,19 @@ def _web_prices():
     return _Response(json.dumps(out), mimetype="application/json",
                      headers={"Cache-Control": "no-store"})
 
+@_flask_app.route("/healthz")
+def _web_healthz():
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    scan_age = round(time.time() - _last_scan_ts, 1) if _last_scan_ts else None
+    ws_live  = bool(_prices_cache and (time.time() - _prices_cache_ts) < 60)
+    return _Response(json.dumps({
+        "ok":       True,
+        "scan_age": scan_age,
+        "db":       db.connected,
+        "ws_live":  ws_live,
+        "balance":  round(trader.balance, 2) if trader else None,
+    }), mimetype="application/json")
+
 @_flask_app.route("/history")
 def _web_history():
     trader = _web_trader_ref[0] if _web_trader_ref else None
@@ -12465,6 +12631,8 @@ def main():
         ("Price alerts",      _alert_loop,          (trader,)),
         ("Morning brief",     _morning_brief_loop,  (trader,)),
         ("Trade preview",     _trade_preview_loop,  (trader,)),
+        ("Kraken WS prices",  _kraken_ws_loop,      ()),
+        ("Watchdog",          _watchdog_loop,       ()),
         ("Web dashboard",     _start_web_server,    (trader,)),
     ]
     for name, fn, args in threads:
