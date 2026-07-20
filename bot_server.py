@@ -18,6 +18,7 @@ import hmac
 import base64
 import urllib.parse
 import random
+import collections
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import matplotlib
@@ -83,6 +84,10 @@ def log(tag: str, msg: str, level: str = "INFO"):
     tag_str = _c(tcol, f"{tag:<8}")
     ts_str  = _c(_C.GREY, ts)
     print(f"{ts_str}  {lvl_str}  {tag_str}  {msg}", flush=True)
+    try:
+        _log_ring.append({"ts": ts, "tag": tag, "level": level, "msg": msg})
+    except Exception:
+        pass
 
 # ── ANSI-aware display helpers ────────────────────────────────────────────────
 _ANSI_RE = re.compile(r'\033\[[0-9;]*m')
@@ -881,6 +886,8 @@ _price_alerts   = {}
 _disabled_pairs: set = set()
 # Rolling log of the last 15 Telegram messages sent by the bot
 _tg_log: list = []
+# Public read-only ring buffer — last 200 log lines (no PIN required on /api/logs)
+_log_ring: collections.deque = collections.deque(maxlen=200)
 # Gamification: quiz state and achievement notification tracking
 _quiz_state: dict = {"idx": 0, "order": [], "current_correct": "", "correct": 0, "asked": 0}
 _notified_achievements: set = set()   # IDs we already sent a TG alert for
@@ -11806,6 +11813,32 @@ def _web_tglog():
     """Return the last 15 Telegram messages the bot sent."""
     return _Response(json.dumps({"messages": list(reversed(_tg_log))}),
                      mimetype="application/json")
+
+@_flask_app.route("/api/logs")
+def _web_api_logs():
+    """Public read-only endpoint — last N log lines, no PIN required.
+    Query params: n=<int> (default 100, max 200), tag=<TAG> (filter by tag).
+    """
+    try:
+        n   = min(int(_flask_request.args.get("n", 100)), 200)
+        tag = _flask_request.args.get("tag", "").upper() or None
+        lines = list(_log_ring)
+        if tag:
+            lines = [l for l in lines if l.get("tag", "").upper() == tag]
+        lines = lines[-n:]
+        trader = _web_trader_ref[0] if _web_trader_ref else None
+        snapshot = {
+            "balance":   round(trader.balance, 2) if trader else None,
+            "positions": len(trader.positions)    if trader else 0,
+            "paper":     _paper_mode,
+        }
+        return _Response(
+            json.dumps({"ok": True, "count": len(lines), "snapshot": snapshot, "logs": lines}),
+            mimetype="application/json",
+        )
+    except Exception as e:
+        return _Response(json.dumps({"ok": False, "error": str(e)}),
+                         status=500, mimetype="application/json")
 
 @_flask_app.route("/bestsetups")
 def _web_bestsetups():
