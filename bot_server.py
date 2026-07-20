@@ -6734,6 +6734,33 @@ def _watchdog_loop():
             tg("✅ *CryptoBot Recovered*\nScan loop is active again")
             _alerted = False
 
+# ── Hourly heartbeat ──────────────────────────────────────────────────────────
+def _heartbeat_loop(trader):
+    """Send a Telegram status ping every hour so silence = something's wrong."""
+    time.sleep(3600)  # skip the first hour (startup message already sent)
+    while True:
+        try:
+            scan_age = int(time.time() - _last_scan_ts) if _last_scan_ts else None
+            ws_ok    = bool(_prices_cache and (time.time() - _prices_cache_ts) < 60)
+            pos_n    = len(trader.positions)
+            upnl     = sum(
+                trader.unrealized_pnl(
+                    _prices_cache.get(p, {}).get("price") or trader.positions[p]["entry"], p
+                ) for p in trader.positions
+            ) if pos_n and _prices_cache else 0.0
+            scan_str = f"{scan_age}s ago" if scan_age is not None else "unknown"
+            tg(
+                f"💓 *Bot alive*\n"
+                f"Balance: `${trader.balance:.2f}`"
+                + (f" | uPnL: `{'+'if upnl>=0 else ''}{upnl:.2f}`" if pos_n else "")
+                + f"\nPositions: `{pos_n}` | Scan: `{scan_str}`\n"
+                f"DB: `{'✓' if db.connected else '✗'}` | "
+                f"WS: `{'✓' if ws_ok else '✗'}`"
+            )
+        except Exception as e:
+            log("HB", f"heartbeat error: {e}", "WRN")
+        time.sleep(3600)
+
 # ── Web Dashboard ─────────────────────────────────────────────────────────────
 _flask_app      = _Flask("cryptobot")
 _web_trader_ref: list = []   # filled in main(); list so route closures can mutate it
@@ -12633,6 +12660,7 @@ def main():
         ("Trade preview",     _trade_preview_loop,  (trader,)),
         ("Kraken WS prices",  _kraken_ws_loop,      ()),
         ("Watchdog",          _watchdog_loop,       ()),
+        ("Heartbeat",         _heartbeat_loop,      (trader,)),
         ("Web dashboard",     _start_web_server,    (trader,)),
     ]
     for name, fn, args in threads:
