@@ -1,0 +1,28 @@
+name: Deploy to Home Server
+
+on:
+  push:
+    branches:
+      - claude/bot-scan-1amdiq
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: 22
+          script: |
+            cd ~/cryptobot
+            git fetch origin
+            git checkout claude/bot-scan-1amdiq
+            git pull origin claude/bot-scan-1amdiq
+            docker compose build --no-cache bot
+            docker compose up -d bot
+            echo "Deploy complete at $(date)"
+            docker ps | grep cryptobot-bot
