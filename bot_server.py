@@ -596,7 +596,12 @@ class Database:
             except ImportError:
                 log("DB", "psycopg2 not installed — learning disabled", "WARN")
                 return
-            self.conn = psycopg2.connect(url, connect_timeout=5)
+            # Railway uses postgresql:// but psycopg2 accepts both; normalize anyway
+            url = url.replace("postgresql://", "postgres://", 1)
+            # Railway Postgres requires SSL
+            if "sslmode" not in url:
+                url += ("&" if "?" in url else "?") + "sslmode=require"
+            self.conn = psycopg2.connect(url, connect_timeout=10)
             self.conn.autocommit = True
             self._init_schema()
             log("DB", "Connected — learning enabled")
