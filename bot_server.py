@@ -3757,6 +3757,7 @@ class SignalEngine:
             plan = {"enter": price,
                     "exit":  nearest_s if nearest_s else price*0.970,
                     "stop":  nearest_r if nearest_r else price*1.015}
+        _pre_gate_sig = sig  # capture before gates run
 
         # news gate + news-triggered entry
         current_pair = pair or _current_coin["pair"]
@@ -4230,6 +4231,16 @@ class SignalEngine:
         fkey     = f"r{rsi_bin}e{ema_side}m{macd_bit}v{vol_bit}n{news_bit}"
         if sig in ("BUY", "SELL"):
             plan["fkey"] = fkey
+
+        if _pre_gate_sig in ("BUY", "SELL") and sig == "HOLD":
+            try:
+                _dbg_sp = round(_sp, 4) if isinstance(locals().get("_sp"), float) else "?"
+            except Exception:
+                _dbg_sp = "?"
+            log("GATE", f"{current_pair} {_pre_gate_sig}→HOLD  "
+                        f"adx={adx:.1f} er={er:.3f} stoch={stoch_k:.0f} "
+                        f"div={divergence} macd_div={macd_div} "
+                        f"vol_low={_very_low_vol} sp={_dbg_sp}")
 
         return sig, plan, ema, rsi, confidence
 
