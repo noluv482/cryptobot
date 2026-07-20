@@ -9681,7 +9681,7 @@ async function fetchMarket(){
       const sigCol=dis?'var(--mu)':bull?'var(--g)':bear?'var(--r)':'var(--mu)';
       const sigTxt=dis?'— OFF':bull?'▲ BULL':bear?'▼ BEAR':'— NONE';
       const str=c.strength>0?Math.round(c.strength*100)+'%':'';
-      return '<div class="hm-cell '+cls+'" style="'+(dis?'opacity:.45':'')+'" onclick="openCoinDetail(\''+c.pair+'\')">'+
+      return '<div class="hm-cell '+cls+'" data-pair="'+c.pair+'" style="'+(dis?'opacity:.45':'')+'" onclick="openCoinDetail(this.dataset.pair)">'+
         '<div style="display:flex;align-items:flex-start;justify-content:space-between">'+
           '<div class="hm-name">'+c.name+'</div>'+
           '<span class="hm-bell" data-pair="'+c.pair+'" data-name="'+c.name+'" onclick="event.stopPropagation();openAlertSheet(this.dataset.pair,this.dataset.name)">&#128276;</span>'+
@@ -10153,7 +10153,7 @@ function renderFilteredTrades(){
         '<div style="font-size:.6rem;color:var(--mu);margin-top:2px">'+dtStr+
           ' · '+(t.held_mins||0).toFixed(0)+'min · '+(t.reason||'').replace(/_/g,' ')+'</div>'+
       '</div>'+
-      '<button class="'+noteBtnCls+'" onclick="openNote(\''+nkey+'\',\''+t.coin+'\')">'+noteBtnTxt+'</button>'+
+      '<button class="'+noteBtnCls+'" data-key="'+nkey+'" data-coin="'+t.coin+'" onclick="openNote(this.dataset.key,this.dataset.coin)">'+noteBtnTxt+'</button>'+
       '<div class="'+pnlCls+'" style="font-family:var(--fn);font-size:.82rem;font-weight:700;white-space:nowrap;margin-left:8px">'+
         (t.pnl>=0?'+':'')+t.pnl.toFixed(2)+'$</div>'+
     '</div>';
@@ -11091,7 +11091,6 @@ function renderWaterfall(eqPts){
 }
 
 /* ── COIN DETAIL SHEET ── */
-let _hmCoins=[];
 function openCoinDetail(pair){
   const coin=_hmCoins.find(c=>c.pair===pair);if(!coin)return;
   const el=$('cd_sheet');if(!el)return;
@@ -11158,7 +11157,7 @@ function renderJournal(){
     const tagHtml=n.tags.length?'<div class="jnl-note-tags">'+n.tags.map(t=>'<span class="jnl-tag">'+t+'</span>').join('')+'</div>':'';
     const pnlStr=n.pnl!=null?(n.pnl>=0?'+$':'-$')+Math.abs(n.pnl).toFixed(2):'';
     const pnlCol=n.pnl>0?'color:var(--g)':n.pnl<0?'color:var(--r)':'';
-    return '<div class="jnl-note-card" onclick="openNote(\''+n.key+'\',\''+n.coin+'\')">'+
+    return '<div class="jnl-note-card" data-key="'+n.key+'" data-coin="'+n.coin+'" onclick="openNote(this.dataset.key,this.dataset.coin)">'+
       '<div class="jnl-note-hdr">'+
         '<div class="jnl-note-coin">'+n.coin+(pnlStr?' <span style="'+pnlCol+'">'+pnlStr+'</span>':'')+'</div>'+
         '<div class="jnl-note-date">'+n.date+'</div>'+
