@@ -346,7 +346,7 @@ MAX_SESSION_DD    = 0.12
 VOLUME_FILTER_MULT= 1.0        # require at least average volume (was 1.2)
 EXTREME_FUNDING   = 0.001
 ECON_BLACKOUT_MINS= 15
-MIN_CONFIDENCE    = 0.42       # confidence floor — lowered to generate more trades for learning
+MIN_CONFIDENCE    = 0.35       # confidence floor — lowered to generate more trades for learning
 ADX_PERIOD        = 14
 ADX_MIN           = 8          # allow mildly trending markets (was 18→14→11→8 for more entries)
 ER_PERIOD         = 10
@@ -3963,14 +3963,23 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["macd_div"] += 1
             sig = "HOLD"
 
-        # Stochastic RSI gate — only block at extreme readings (92/8 instead of 85/15).
-        # Trending coins hold stoch > 85 for many candles; 92 catches only true exhaustion.
-        if sig == "BUY"  and stoch_k > 92:
+        # Stochastic RSI gate — soft: overbought/oversold stoch trims confidence.
+        # Hard-blocking at 92/8 caused droughts when RSI ranged 55-65 (normal consolidation),
+        # which pushes stoch_k to 90-95 even without a real exhaustion condition.
+        # Only hard-block at truly extreme readings (>98 / <2).
+        _stoch_against = False
+        if sig == "BUY"  and stoch_k > 80:
             with _gate_counter_lock: _gate_counters["stoch_rsi"] += 1
-            sig = "HOLD"
-        if sig == "SELL" and stoch_k < 8:
+            if stoch_k > 98:
+                sig = "HOLD"   # true parabolic exhaustion only
+            else:
+                _stoch_against = True   # soft penalty below
+        if sig == "SELL" and stoch_k < 20:
             with _gate_counter_lock: _gate_counters["stoch_rsi"] += 1
-            sig = "HOLD"
+            if stoch_k < 2:
+                sig = "HOLD"
+            else:
+                _stoch_against = True
 
         # ── Refresh adaptive pillar weights (DB preferred, in-memory fallback) ──
         now_ts = time.time()
@@ -4077,11 +4086,15 @@ class SignalEngine:
         if _adx_weak and sig in ("BUY", "SELL"):
             confidence = max(0.0, round(confidence - 0.08, 2))
 
+        # Stochastic RSI soft penalty — elevated stoch trims confidence
+        if _stoch_against and sig in ("BUY", "SELL"):
+            confidence = max(0.0, round(confidence - 0.07, 2))
+
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
         # Counter here so it only fires when the signal survived all hard gates
         if choppy:
             with _gate_counter_lock: _gate_counters["choppy"] += 1
-            confidence = max(0.0, round(confidence - 0.12, 2))  # was -0.15
+            confidence = max(0.0, round(confidence - 0.08, 2))  # was -0.15
 
         # 15m soft gate — counter-trend 15m trims confidence without hard-blocking
         if _15m_against and sig in ("BUY", "SELL"):
