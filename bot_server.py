@@ -346,7 +346,7 @@ MAX_SESSION_DD    = 0.12
 VOLUME_FILTER_MULT= 1.0        # require at least average volume (was 1.2)
 EXTREME_FUNDING   = 0.001
 ECON_BLACKOUT_MINS= 15
-MIN_CONFIDENCE    = 0.47       # 47% confidence floor — lowered to generate more trades for learning
+MIN_CONFIDENCE    = 0.42       # confidence floor — lowered to generate more trades for learning
 ADX_PERIOD        = 14
 ADX_MIN           = 8          # allow mildly trending markets (was 18→14→11→8 for more entries)
 ER_PERIOD         = 10
@@ -3889,11 +3889,14 @@ class SignalEngine:
         # BB squeeze gate removed — a squeeze is a pre-breakout condition, not a reason
         # to avoid entry. Blocking at squeezes caused missing the best momentum entries.
 
-        # ADX gate — Wilder: only enter when a real trend exists (ADX > ADX_MIN)
-        # ADX measures trend *strength* without regard to direction
-        if sig in ("BUY", "SELL") and adx < ADX_MIN:
+        # ADX gate — soft: weak ADX trims confidence instead of hard-blocking.
+        # Ranging markets (ADX 5-12) are valid mean-reversion opportunities.
+        # Only hard-block near-zero ADX (< 5) which indicates truly random noise.
+        _adx_weak = sig in ("BUY", "SELL") and adx < ADX_MIN
+        if _adx_weak:
             with _gate_counter_lock: _gate_counters["adx"] += 1
-            sig = "HOLD"
+            if adx < 5:
+                sig = "HOLD"   # hard block only on truly directionless markets
 
         # Kaufman Efficiency Ratio gate — skip entries when price is moving randomly
         if sig in ("BUY", "SELL") and er < ER_MIN:
@@ -4070,11 +4073,15 @@ class SignalEngine:
         if _fg_against and sig in ("BUY", "SELL"):
             confidence = max(0.0, round(confidence - 0.08, 2))
 
+        # ADX soft penalty — weak trend trims confidence without hard-blocking
+        if _adx_weak and sig in ("BUY", "SELL"):
+            confidence = max(0.0, round(confidence - 0.08, 2))
+
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
         # Counter here so it only fires when the signal survived all hard gates
         if choppy:
             with _gate_counter_lock: _gate_counters["choppy"] += 1
-            confidence = max(0.0, round(confidence - 0.15, 2))
+            confidence = max(0.0, round(confidence - 0.12, 2))  # was -0.15
 
         # 15m soft gate — counter-trend 15m trims confidence without hard-blocking
         if _15m_against and sig in ("BUY", "SELL"):
