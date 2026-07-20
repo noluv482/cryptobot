@@ -346,11 +346,11 @@ MAX_SESSION_DD    = 0.12
 VOLUME_FILTER_MULT= 1.0        # require at least average volume (was 1.2)
 EXTREME_FUNDING   = 0.001
 ECON_BLACKOUT_MINS= 15
-MIN_CONFIDENCE    = 0.52       # 52% confidence floor (was 0.55) — more opportunities without sacrificing quality
+MIN_CONFIDENCE    = 0.47       # 47% confidence floor — lowered to generate more trades for learning
 ADX_PERIOD        = 14
-ADX_MIN           = 14         # allow mildly trending markets (was 18, most coins sit 14-18)
+ADX_MIN           = 11         # allow mildly trending markets (was 18→14→11 for more entries)
 ER_PERIOD         = 10
-ER_MIN            = 0.08       # efficiency floor (was 0.15 — most real moves sit 0.08–0.25)
+ER_MIN            = 0.05       # efficiency floor (was 0.15→0.08→0.05 for more entries)
 
 SAVE_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 TRUSTED_DEV_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trusted_devices.json")
@@ -3987,7 +3987,7 @@ class SignalEngine:
         nasdaq_pts = (1.0 if ((sig == "BUY"  and nasdaq_mood == "BULLISH") or
                               (sig == "SELL" and nasdaq_mood == "BEARISH"))
                       else 0.5 if nasdaq_mood == "NEUTRAL" else 0.0)
-        tick_pts   = (min(ticks / 5.0, 1.0) if ticks > 0
+        tick_pts   = (min(ticks / 2.0, 1.0) if ticks > 0
                       else (min(n_score / 5.0, 1.0) if sig in ("BUY","SELL") and n_score >= 3 else 0.0))
         macd_pts   = 1.0 if (sig == "BUY" and macd_bull) or (sig == "SELL" and macd_bear) else 0.0
         vol_pts    = (1.0 if vol_breakout else 0.85 if high_volume else 0.5)
