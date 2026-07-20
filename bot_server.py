@@ -3773,13 +3773,15 @@ class SignalEngine:
                 with _gate_counter_lock: _gate_counters["news"] += 1
                 sig = "HOLD"
 
-        # MACD gate — block signals that fight the momentum
-        if sig == "BUY"  and macd_bear and macd_hist / max(price, 1e-9) < -0.001:
+        # MACD gate — soft: strong MACD divergence reduces confidence instead of hard-blocking.
+        # Hard-blocking caused droughts when market-wide MACD was bearish for extended periods.
+        _macd_against = False
+        if sig == "BUY"  and macd_bear and macd_hist / max(price, 1e-9) < -0.003:
             with _gate_counter_lock: _gate_counters["macd"] += 1
-            sig = "HOLD"
-        if sig == "SELL" and macd_bull and macd_hist / max(price, 1e-9) >  0.001:
+            _macd_against = True
+        if sig == "SELL" and macd_bull and macd_hist / max(price, 1e-9) >  0.003:
             with _gate_counter_lock: _gate_counters["macd"] += 1
-            sig = "HOLD"
+            _macd_against = True
 
         # News-triggered entry: only fire on exceptional news (score ≥ 5) + MACD alignment.
         # Lower threshold (3) caused losses by bypassing confirm_ticks on borderline signals.
@@ -3893,11 +3895,11 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["econ"] += 1
             sig = "HOLD"
 
-        # Spread gate — wide bid-ask spread signals low liquidity
+        # Spread gate — only block truly illiquid pairs (>1% spread)
         if sig in ("BUY", "SELL"):
             try:
                 _sp = _spread_pct(current_pair)
-                if _sp > 0.003:
+                if _sp > 0.010:
                     with _gate_counter_lock: _gate_counters["spread"] += 1
                     sig = "HOLD"
             except Exception:
@@ -4049,6 +4051,10 @@ class SignalEngine:
                    1.0 * pw.get("chart_struct",   1.0) +
                    1.0 * pw.get("stoch_rsi",      1.0))
         confidence = round(pts / max(max_pts, 0.1), 2) if sig in ("BUY", "SELL") else 0.0
+
+        # MACD soft penalty — strong counter-trend MACD trims confidence
+        if _macd_against and sig in ("BUY", "SELL"):
+            confidence = max(0.0, round(confidence - 0.10, 2))
 
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
         # Counter here so it only fires when the signal survived all hard gates
