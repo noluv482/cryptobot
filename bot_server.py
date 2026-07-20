@@ -932,7 +932,7 @@ _trade_previews: dict = {}   # pid → {side, name, pair, target, confidence, at
 _trade_preview_mode: bool = False
 _gate_counter_lock = threading.Lock()
 _gate_log_ts: float = 0.0          # last time we printed the gate summary
-_GATE_LOG_INTERVAL = 1800          # log top blockers every 30 min
+_GATE_LOG_INTERVAL = 120           # log top blockers every 2 min
 
 # ── Trusted device registry ───────────────────────────────────────────────────
 # device_id is a UUID generated in the browser's localStorage.
@@ -6413,12 +6413,14 @@ def trading_loop(trader):
                     cname    = coin["name"]
                     sig_str  = _c(sig_col, f"{sig:<4}")
                     conf_str = _c(conf_col, f"{conf:.0%}")
+                    pre_gate = f" (raw:{sig_from_eval})" if sig != sig_from_eval else ""
                     log("TRADE", (f"{_c(_C.WHITE + _C.BOLD, cname):<12}"
                                   f"  ${price:<10.4f}"
                                   f"  RSI {rsi:<5}"
                                   f"  EMA {ema:<10.2f}"
                                   f"  {sig_str}"
-                                  f"  conf {conf_str}"))
+                                  f"  conf {conf_str}"
+                                  f"{pre_gate}"))
 
                     last_sig = last_sigs.get(pair)
                     if sig != last_sig and sig in ("BUY", "SELL"):
