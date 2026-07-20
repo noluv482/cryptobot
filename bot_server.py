@@ -915,6 +915,7 @@ _ACTIVITY_MAX  = 30
 _prices_cache: dict = {}   # pair → {price, pct} for coin strip
 _prices_cache_ts: float = 0.0
 _PRICES_TTL = 30  # seconds
+_scan_prices: dict = {}    # fallback populated by trading loop when bulk Kraken call fails
 
 _btc_price_hist: list = []  # (timestamp, price) — rolling 35-min BTC tick history for momentum gate
 _BTC_HIST_SECS  = 2100      # 35 minutes kept
@@ -6324,6 +6325,11 @@ def trading_loop(trader):
                 try:
                     closes, highs, lows, volumes, opens = get_klines(pair)
                     price = get_price(pair)
+                    try:
+                        _pct = round((closes[-1] - opens[0]) / opens[0] * 100, 2) if opens else 0.0
+                        _scan_prices[pair] = {"price": price, "pct": _pct}
+                    except Exception:
+                        pass
                     if pair not in engine_map:
                         engine_map[pair] = SignalEngine()
                     eng = engine_map[pair]
@@ -7443,6 +7449,7 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   background:linear-gradient(135deg,#ddeeff 0%,var(--b) 120%);
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;
   background-clip:text;
+  display:inline-block;
   font-size:3rem;letter-spacing:-0.03em;
 }
 .hero-dec{opacity:0.45}
@@ -8383,6 +8390,7 @@ function hsVal(id,n){const e=$(id);e.textContent=msign(n);e.className='hs-val '+
 async function fetchStatus(){
   try{
     const d=await(await fetch('/status')).json();
+    if(d.error) return;
     const live=d.mode==='LIVE';
     $('mode_badge').className='badge '+(live?'badge-live':'badge-paper');
     $('mode_dot').className='dot '+(live?'dot-live':'dot-paper');
@@ -11019,6 +11027,7 @@ _initKeyboard();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
 fetchSim();fetchNews();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();
 fetchPrices();setInterval(fetchPrices,8000);
+setInterval(fetchStatus,15000);
 initSSE();initWebPush();
 setInterval(tick,1000);
 setInterval(updateLivePnl,5000);
@@ -11538,7 +11547,8 @@ def _web_prices():
         _prices_cache_ts = now
     except Exception:
         pass
-    return _Response(json.dumps(_prices_cache), mimetype="application/json",
+    out = _prices_cache or _scan_prices
+    return _Response(json.dumps(out), mimetype="application/json",
                      headers={"Cache-Control": "no-store"})
 
 @_flask_app.route("/history")
