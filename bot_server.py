@@ -348,9 +348,9 @@ EXTREME_FUNDING   = 0.001
 ECON_BLACKOUT_MINS= 15
 MIN_CONFIDENCE    = 0.47       # 47% confidence floor — lowered to generate more trades for learning
 ADX_PERIOD        = 14
-ADX_MIN           = 11         # allow mildly trending markets (was 18→14→11 for more entries)
+ADX_MIN           = 8          # allow mildly trending markets (was 18→14→11→8 for more entries)
 ER_PERIOD         = 10
-ER_MIN            = 0.05       # efficiency floor (was 0.15→0.08→0.05 for more entries)
+ER_MIN            = 0.03       # efficiency floor (was 0.15→0.08→0.05→0.03 for more entries)
 
 SAVE_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 TRUSTED_DEV_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trusted_devices.json")
@@ -3801,14 +3801,23 @@ class SignalEngine:
         # Crypto often moves independently of equities, especially BTC itself.
         nasdaq_mood = market_mood["nasdaq"]
 
-        # Fear & Greed gate
+        # Fear & Greed gate — only hard-block true bubble/capitulation extremes.
+        # Markets stay >80 for weeks during bull runs; a hard block at 80 eliminates
+        # trading during the strongest trending conditions. Soft penalty instead.
         fg_val = fear_greed["value"]
-        if fg_val > 80 and sig == "BUY":
+        _fg_against = False
+        if fg_val > 92 and sig == "BUY":   # only truly parabolic bubble territory
             with _gate_counter_lock: _gate_counters["fear_greed"] += 1
             sig = "HOLD"
-        if fg_val < 20 and sig == "SELL":
+        elif fg_val > 75 and sig == "BUY":
+            with _gate_counter_lock: _gate_counters["fear_greed"] += 1
+            _fg_against = True              # soft -0.08 penalty below
+        if fg_val < 8 and sig == "SELL":   # only true capitulation
             with _gate_counter_lock: _gate_counters["fear_greed"] += 1
             sig = "HOLD"
+        elif fg_val < 25 and sig == "SELL":
+            with _gate_counter_lock: _gate_counters["fear_greed"] += 1
+            _fg_against = True
 
         # Bitcoin dominance gate — soft: rising dominance reduces alt confidence but doesn't block.
         # Hard-blocking caused days of no trades when dominance trended for extended periods.
@@ -4055,6 +4064,10 @@ class SignalEngine:
         # MACD soft penalty — strong counter-trend MACD trims confidence
         if _macd_against and sig in ("BUY", "SELL"):
             confidence = max(0.0, round(confidence - 0.10, 2))
+
+        # Fear & Greed soft penalty — elevated greed/fear zone trims confidence
+        if _fg_against and sig in ("BUY", "SELL"):
+            confidence = max(0.0, round(confidence - 0.08, 2))
 
         # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
         # Counter here so it only fires when the signal survived all hard gates
