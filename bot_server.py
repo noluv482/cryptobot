@@ -8954,6 +8954,7 @@ let _ema20=[],_ema50=[],_cdTrades=[],_cdOpenPos=[],_cdPatSig='NONE',_cdPair='',_
 let _botPair='',_coinPrices={},_openPairs=new Set();
 let _showBB=false,_showMACD=false;
 let _cdCountdownTimer=null;
+let _stripDragActive=false; // true while a coin chip drag is in progress — blocks tab swipe
 const _COIN_COLORS={
   SOLUSD:'#9945FF',XBTUSD:'#F7931A',ETHUSD:'#627EEA',XRPUSD:'#00AAE4',
   XDGUSD:'#C2A633',ADAUSD:'#0033AD',AVAXUSD:'#E84142',LINKUSD:'#2A5ADA',
@@ -9013,9 +9014,13 @@ function goTab(t){
 (function(){
   const pages=$('pages');
   let sx=0,sy=0,ok=false;
-  pages.addEventListener('touchstart',e=>{sx=e.touches[0].clientX;sy=e.touches[0].clientY;ok=true;},{passive:true});
+  pages.addEventListener('touchstart',e=>{
+    if(_stripDragActive){ok=false;return;} // coin drag in progress — don't arm swipe
+    sx=e.touches[0].clientX;sy=e.touches[0].clientY;ok=true;
+  },{passive:true});
   pages.addEventListener('touchend',e=>{
-    if(!ok)return;ok=false;
+    if(!ok||_stripDragActive){ok=false;return;} // coin drag consumed this gesture
+    ok=false;
     const dx=e.changedTouches[0].clientX-sx,dy=e.changedTouches[0].clientY-sy;
     if(Math.abs(dx)>55&&Math.abs(dx)>Math.abs(dy)*1.6){
       const ci=TAB_ORDER.indexOf(_tab);
@@ -9782,12 +9787,15 @@ function initStripDrag(){
     if(ghost){try{document.body.removeChild(ghost);}catch(e){}ghost=null;}
     strip.querySelectorAll('.coin-chip').forEach(c=>c.classList.remove('dragging','drop-before'));
     isDragging=false;dropIdx=-1;pressChip=null;
+    // Small delay before clearing so the swipe handler sees the flag on touchend
+    setTimeout(()=>{_stripDragActive=false;},80);
   };
   strip.addEventListener('pointerdown',e=>{
     const chip=e.target.closest('.coin-chip');if(!chip)return;
     pressChip=chip;startX=e.clientX;startY=e.clientY;
     pressTimer=setTimeout(()=>{
       isDragging=true;
+      _stripDragActive=true; // block swipe-to-change-tab while dragging
       chip.classList.add('dragging');
       ghost=chip.cloneNode(true);
       const r=chip.getBoundingClientRect();
