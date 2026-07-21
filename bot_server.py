@@ -359,6 +359,25 @@ ER_MIN            = 0.03       # efficiency floor (was 0.15→0.08→0.05→0.03
 
 SAVE_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
 TRUSTED_DEV_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trusted_devices.json")
+KEYS_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_keys.json")
+
+# ── Load API keys from disk if not provided via env vars ──────────────────────
+def _load_api_keys_from_file():
+    global KRAKEN_API_KEY, KRAKEN_API_SECRET, LIVE_MODE
+    if KRAKEN_API_KEY and KRAKEN_API_SECRET:
+        return
+    try:
+        with open(KEYS_FILE) as _kf:
+            _kd = json.load(_kf)
+        _k = _clean_env(_kd.get("kraken_key", ""))
+        _s = _clean_env(_kd.get("kraken_secret", ""))
+        if _k and _s:
+            KRAKEN_API_KEY = _k
+            KRAKEN_API_SECRET = _s
+            LIVE_MODE = True
+    except (OSError, ValueError):
+        pass
+_load_api_keys_from_file()
 
 SCAN_UNIVERSE = [
     {"name": "SOL/USD",   "pair": "SOLUSD",   "alert_buffer": 0.10},
@@ -8589,6 +8608,14 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     <div style="padding:0 16px 14px" id="diag_panel">
       <div class="no-data">Click Run Live Check above</div>
     </div>
+    <div class="set-section-lbl">API Keys</div>
+    <div class="set-row">
+      <div>
+        <div class="set-lbl">Kraken API Key</div>
+        <div class="set-sub" id="key_status_lbl">Not configured</div>
+      </div>
+      <button class="set-step-btn" onclick="openKeyModal()" style="font-size:.78rem;padding:4px 12px">&#9998; Edit</button>
+    </div>
   </div>
 </div>
 
@@ -8623,6 +8650,35 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     <div class="cb-modal-btns">
       <button class="cb-modal-cancel" onclick="closeLiveModal()">Cancel</button>
       <button class="cb-modal-ok cb-modal-danger" id="live_go_btn" onclick="confirmGoLive()">Go LIVE &#128308;</button>
+    </div>
+  </div>
+</div>
+
+<!-- API KEYS MODAL -->
+<div class="cb-modal" id="key_modal">
+  <div class="cb-modal-ov" onclick="closeKeyModal()"></div>
+  <div class="cb-modal-panel">
+    <div class="cb-modal-title">&#128273; Kraken API Keys</div>
+    <div class="cb-modal-sub">Keys are saved on the server and never logged. Test before saving.</div>
+    <div style="display:flex;flex-direction:column;gap:10px;margin:14px 0 4px">
+      <div>
+        <div style="font-size:.68rem;color:var(--mu);margin-bottom:4px;font-weight:600;letter-spacing:.04em">API KEY</div>
+        <input class="cb-bal-input" type="text" id="key_input" placeholder="Paste your Kraken API key" autocomplete="off" spellcheck="false">
+      </div>
+      <div>
+        <div style="font-size:.68rem;color:var(--mu);margin-bottom:4px;font-weight:600;letter-spacing:.04em">API SECRET</div>
+        <input class="cb-bal-input" type="password" id="secret_input" placeholder="Paste your Kraken API secret" autocomplete="off" spellcheck="false">
+      </div>
+      <div>
+        <div style="font-size:.68rem;color:var(--mu);margin-bottom:4px;font-weight:600;letter-spacing:.04em">DASHBOARD PIN</div>
+        <input class="cb-bal-input" type="password" id="key_pin_input" placeholder="Enter your PIN to authorize" autocomplete="off" maxlength="4" inputmode="numeric">
+      </div>
+    </div>
+    <div style="font-size:.65rem;min-height:18px;margin-bottom:8px" id="key_test_result"></div>
+    <div class="cb-modal-btns" style="gap:6px">
+      <button class="cb-modal-cancel" onclick="closeKeyModal()">Cancel</button>
+      <button class="cb-modal-ok" id="key_test_btn" onclick="testApiKeys()" style="background:rgba(255,152,0,.15);border-color:rgba(255,152,0,.4);color:var(--y);flex:1">Test</button>
+      <button class="cb-modal-ok" id="key_save_btn" onclick="saveApiKeys()" style="flex:1" disabled>Save &#128308;</button>
     </div>
   </div>
 </div>
@@ -10592,6 +10648,19 @@ async function openSettings(){
     const balEl=$('set_bal_val');
     if(balEl){const b=d.paper_balance||100;balEl.textContent='$'+b.toLocaleString();}
     renderDiagnostics(d);
+    try{
+      const kd=await(await fetch('/api/keys')).json();
+      const lbl=$('key_status_lbl');
+      if(lbl){
+        if(kd.kraken_key_set){
+          lbl.textContent='• Set: '+kd.kraken_key_masked;
+          lbl.style.color='var(--g)';
+        }else{
+          lbl.textContent='Not configured — tap Edit to add';
+          lbl.style.color='var(--mu)';
+        }
+      }
+    }catch(e){}
   }catch(e){console.warn('settings',e);}
   $('set_sheet').classList.add('open');
 }
@@ -10675,6 +10744,91 @@ function openLiveModal(){
   _buildLiveChecklist();
 }
 function closeLiveModal(){$('live_modal').classList.remove('open');}
+
+/* ── API KEYS MODAL ── */
+let _keysTested=false;
+async function openKeyModal(){
+  _keysTested=false;
+  const ki=$('key_input'),si=$('secret_input'),pi=$('key_pin_input');
+  const tr=$('key_test_result'),sb=$('key_save_btn');
+  if(ki)ki.value='';
+  if(si)si.value='';
+  if(pi)pi.value='';
+  if(tr){tr.textContent='';tr.style.color='var(--mu)';}
+  if(sb)sb.disabled=true;
+  try{
+    const d=await(await fetch('/api/keys')).json();
+    if(d.kraken_key_set&&ki)ki.placeholder='Current: '+d.kraken_key_masked+' (paste new to replace)';
+  }catch(e){}
+  $('key_modal').classList.add('open');
+  setTimeout(()=>{if(ki)ki.focus();},220);
+}
+function closeKeyModal(){
+  $('key_modal').classList.remove('open');
+  _keysTested=false;
+}
+async function testApiKeys(){
+  const ki=$('key_input'),si=$('secret_input'),pi=$('key_pin_input');
+  const k=ki?ki.value.trim():'',s=si?si.value.trim():'',pin=pi?pi.value.trim():'';
+  const tr=$('key_test_result');
+  if(!k||!s){
+    if(tr){tr.textContent='Paste both API key and secret first.';tr.style.color='var(--y)';}
+    return;
+  }
+  const btn=$('key_test_btn');
+  if(btn){btn.disabled=true;btn.textContent='Testing…';}
+  if(tr){tr.textContent='Connecting to Kraken…';tr.style.color='var(--mu)';}
+  try{
+    const r=await fetch('/api/keys/test',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kraken_key:k,kraken_secret:s,pin})});
+    const d=await r.json();
+    if(d.ok){
+      _keysTested=true;
+      const usd='$'+(d.usd_balance||0).toLocaleString();
+      if(tr){tr.textContent='✓ Keys valid • USD balance '+usd;tr.style.color='var(--g)';}
+      const sb=$('key_save_btn');if(sb)sb.disabled=false;
+    }else{
+      _keysTested=false;
+      if(tr){tr.textContent='✗ '+(d.error||'Invalid keys');tr.style.color='var(--r)';}
+    }
+  }catch(e){
+    if(tr){tr.textContent='Network error — check connection';tr.style.color='var(--r)';}
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='Test';}
+  }
+}
+async function saveApiKeys(){
+  const tr=$('key_test_result');
+  if(!_keysTested){
+    if(tr){tr.textContent='Test the keys first before saving.';tr.style.color='var(--y)';}
+    return;
+  }
+  const ki=$('key_input'),si=$('secret_input'),pi=$('key_pin_input');
+  const k=ki?ki.value.trim():'',s=si?si.value.trim():'',pin=pi?pi.value.trim():'';
+  if(!k||!s){showToast('Missing fields','Enter both API key and secret','loss',2500);return;}
+  const sb=$('key_save_btn');
+  if(sb){sb.disabled=true;sb.textContent='Saving…';}
+  try{
+    const r=await fetch('/api/keys',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kraken_key:k,kraken_secret:s,pin})});
+    const d=await r.json();
+    if(d.ok){
+      closeKeyModal();
+      showToast('🔑 API keys saved','Bot switching to live trading mode','win',4000);
+      setTimeout(fetchStatus,1500);
+      setTimeout(openSettings,2800);
+    }else{
+      if(tr){tr.textContent='✗ '+(d.error||'Save failed');tr.style.color='var(--r)';}
+      if(sb){sb.disabled=false;sb.textContent='Save 🔴';}
+    }
+  }catch(e){
+    showToast('Network error','Could not save keys','loss',2500);
+    if(sb){sb.disabled=false;sb.textContent='Save 🔴';}
+  }
+}
+
 async function _buildLiveChecklist(){
   let status={},health={};
   try{status=await(await fetch('/status')).json();}catch(e){}
@@ -10682,7 +10836,7 @@ async function _buildLiveChecklist(){
   const checks=[];
   const api=status.keys_loaded;
   checks.push({label:'Kraken API keys loaded',ok:!!api,critical:true,
-    note:api?'Ready to place orders':'Add API keys to .env file'});
+    note:api?'Ready to place orders':'Add keys via Settings → API Keys'});
   const db=health.db||status.db;
   checks.push({label:'Database connected',ok:!!db,critical:false,
     note:db?'Learning from trade history':'Bot will still trade without DB'});
@@ -12435,6 +12589,88 @@ def _web_settings():
         "daily_limits":       _daily_limits,
         "paper_balance":      round(trader.balance, 2) if trader else PAPER_START,
     }), mimetype="application/json")
+
+@_flask_app.route("/api/keys", methods=["GET", "POST"])
+def _web_api_keys():
+    global KRAKEN_API_KEY, KRAKEN_API_SECRET, LIVE_MODE
+    def _mask(k):
+        if not k:
+            return ""
+        return k[:4] + "****" if len(k) > 4 else "****"
+    if _flask_request.method == "GET":
+        return _Response(json.dumps({
+            "kraken_key_set":    bool(KRAKEN_API_KEY),
+            "kraken_key_masked": _mask(KRAKEN_API_KEY),
+            "kraken_secret_set": bool(KRAKEN_API_SECRET),
+        }), mimetype="application/json")
+    body       = _flask_request.get_json(silent=True) or {}
+    pin        = body.get("pin", "")
+    if DASHBOARD_PIN and pin != DASHBOARD_PIN:
+        return _Response(json.dumps({"ok": False, "error": "wrong pin"}),
+                         mimetype="application/json", status=403)
+    new_key    = _clean_env(body.get("kraken_key", ""))
+    new_secret = _clean_env(body.get("kraken_secret", ""))
+    if not new_key or not new_secret:
+        return _Response(json.dumps({"ok": False, "error": "key and secret required"}),
+                         mimetype="application/json")
+    try:
+        with open(KEYS_FILE, "w") as _kf:
+            json.dump({"kraken_key": new_key, "kraken_secret": new_secret}, _kf)
+    except Exception as _e:
+        return _Response(json.dumps({"ok": False, "error": f"disk error: {_e}"}),
+                         mimetype="application/json")
+    KRAKEN_API_KEY    = new_key
+    KRAKEN_API_SECRET = new_secret
+    LIVE_MODE         = True
+    threading.Thread(target=tg, args=(
+        "🔑 *API keys saved* via dashboard\n"
+        "Kraken spot keys are set — bot will trade live on the next signal.",
+    ), daemon=True).start()
+    return _Response('{"ok":true}', mimetype="application/json")
+
+@_flask_app.route("/api/keys/test", methods=["POST"])
+def _web_api_keys_test():
+    """Validate provided Kraken API keys by calling the Balance endpoint. Does not save them."""
+    body = _flask_request.get_json(silent=True) or {}
+    pin  = body.get("pin", "")
+    if DASHBOARD_PIN and pin != DASHBOARD_PIN:
+        return _Response(json.dumps({"ok": False, "error": "wrong pin"}),
+                         mimetype="application/json", status=403)
+    test_key    = _clean_env(body.get("kraken_key", ""))
+    test_secret = _clean_env(body.get("kraken_secret", ""))
+    if not test_key or not test_secret:
+        return _Response(json.dumps({"ok": False, "error": "key and secret required"}),
+                         mimetype="application/json")
+    try:
+        nonce     = str(int(time.time() * 1000))
+        post_data = urllib.parse.urlencode({"nonce": nonce})
+        url_path  = "/0/private/Balance"
+        msg       = url_path.encode() + hashlib.sha256((nonce + post_data).encode()).digest()
+        secret_b  = base64.b64decode(test_secret)
+        signature = base64.b64encode(hmac.new(secret_b, msg, hashlib.sha512).digest()).decode()
+        headers   = {"API-Key": test_key, "API-Sign": signature,
+                     "Content-Type": "application/x-www-form-urlencoded"}
+        r = requests.post("https://api.kraken.com/0/private/Balance",
+                          headers=headers, data=post_data, timeout=15)
+        r.raise_for_status()
+        data   = r.json()
+        errors = data.get("error") or []
+        if errors:
+            return _Response(json.dumps({"ok": False,
+                                         "error": "; ".join(str(e) for e in errors)}),
+                             mimetype="application/json")
+        usd = 0.0
+        for _k, _v in (data.get("result") or {}).items():
+            if "USD" in _k.upper():
+                try:
+                    usd += float(_v)
+                except (ValueError, TypeError):
+                    pass
+        return _Response(json.dumps({"ok": True, "usd_balance": round(usd, 2)}),
+                         mimetype="application/json")
+    except Exception as _e:
+        return _Response(json.dumps({"ok": False, "error": str(_e)}),
+                         mimetype="application/json")
 
 @_flask_app.route("/control", methods=["POST"])
 def _web_control():
