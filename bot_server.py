@@ -2566,8 +2566,9 @@ class PaperTrader:
         self._wr_cache     = {}   # pair → {"n": n, "wr": wr}
         self._wr_ts        = 0.0
         # Loss streak global entry cooldown (15-min pause after ≥4 consecutive losses)
-        self._streak_cool_until = 0.0
-        self._streak_reset_len  = 0    # manual reset: only count trades after this index
+        self._streak_cool_until    = 0.0
+        self._streak_gate_disabled = False   # when True, streak cooldown never fires
+        self._streak_reset_len     = 0    # manual reset: only count trades after this index
         self._saved_setups      = []   # guard-mode winning setups (capped at 50)
         self._quiz_xp           = 0    # XP earned from quiz correct answers
         # Volatility-adaptive sizing: EMA of ATR per pair to detect elevated volatility
@@ -2657,8 +2658,9 @@ class PaperTrader:
         else:
             self.positions = pos_data
         # Restore weekly peak
-        self._weekly_peak      = d.get("weekly_peak", self.balance)
-        self._weekly_dd_paused = d.get("weekly_dd_paused", False)
+        self._weekly_peak          = d.get("weekly_peak", self.balance)
+        self._weekly_dd_paused     = d.get("weekly_dd_paused", False)
+        self._streak_gate_disabled = d.get("streak_gate_disabled", False)
         # Restore per-pair daily P&L (only if same day)
         saved_pair_date = d.get("pair_day_date", {})
         saved_pair_pnl  = d.get("pair_day_pnl",  {})
@@ -2719,10 +2721,11 @@ class PaperTrader:
                 "day_trades":         self.day_trades,
                 "streak_reset_len":   self._streak_reset_len,
                 "streak_cool_until":  self._streak_cool_until,
-                "weekly_peak":        self._weekly_peak,
-                "weekly_dd_paused":   self._weekly_dd_paused,
-                "pair_day_pnl":       dict(self._pair_day_pnl),
-                "pair_day_date":      dict(self._pair_day_date)}
+                "weekly_peak":          self._weekly_peak,
+                "weekly_dd_paused":     self._weekly_dd_paused,
+                "streak_gate_disabled": self._streak_gate_disabled,
+                "pair_day_pnl":         dict(self._pair_day_pnl),
+                "pair_day_date":        dict(self._pair_day_date)}
 
     def _save_file(self):
         try:
@@ -3262,8 +3265,8 @@ class PaperTrader:
         if pair not in self.positions and not closed_this_tick:
             if time.time() < self._cooldown.get(pair, 0):
                 return
-            if time.time() < self._streak_cool_until:
-                return   # global pause: ≥3 consecutive losses; wait for market to settle
+            if not self._streak_gate_disabled and time.time() < self._streak_cool_until:
+                return   # global pause: ≥4 consecutive losses; wait for market to settle
             # Daily gain hard ceiling — protect the day's profits
             _dgain = (self.balance - self.day_start_bal) / max(self.day_start_bal, 0.01)
             if _dgain >= DAILY_GAIN_HARD:
@@ -3763,7 +3766,7 @@ class PaperTrader:
             self._cooldown[pair] = time.time() + cooldown
             log("PAPER", f"{name} cooldown {cooldown//60}m after {reason} loss")
             # Loss streak global cooldown: ≥4 in a row → 15-min pause on all new entries
-            if self.consecutive_losses >= 4:
+            if not self._streak_gate_disabled and self.consecutive_losses >= 4:
                 self._streak_cool_until = time.time() + 900
                 log("PAPER", f"Loss streak {self.consecutive_losses} → 15-min entry pause", "WARN")
             if not self._force_paper:
@@ -4922,9 +4925,13 @@ _TEXT_ACTION: dict = {
     "scan":           "scan",
     "/signals":       "scan",
     "signals":        "scan",
-    "/resetstreak":   "resetstreak",
-    "/reset streak":  "resetstreak",
-    "reset streak":   "resetstreak",
+    "/resetstreak":    "resetstreak",
+    "/reset streak":   "resetstreak",
+    "reset streak":    "resetstreak",
+    "/togglestreak":   "togglestreak",
+    "/streak":         "togglestreak",
+    "disable streak":  "togglestreak",
+    "enable streak":   "togglestreak",
 }
 
 def _parse_alert_command(txt):
@@ -5925,6 +5932,22 @@ def _dispatch_callback(data, query, trader):
             f"✅ *Streak Reset*\n"
             f"Previous streak: `{old_streak}` consecutive loss{'es' if old_streak != 1 else ''} cleared.\n"
             f"_Bot will resume normal entry sizing and confidence gate immediately._",
+            [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+        )
+
+    elif data == "togglestreak":
+        trader._streak_gate_disabled = not trader._streak_gate_disabled
+        trader._streak_cool_until    = 0.0
+        trader._streak_reset_len     = len(trader.trades)
+        trader._save()
+        state = "DISABLED" if trader._streak_gate_disabled else "ENABLED"
+        log("LIVE", f"Streak gate {state} via Telegram", "WARN")
+        icon  = "🔓" if trader._streak_gate_disabled else "🔒"
+        note  = ("_Bot trades through any losing streak — no pauses._"
+                 if trader._streak_gate_disabled else
+                 "_Streak cooldown is back on (4 losses → 15-min pause)._")
+        tg_buttons(
+            f"{icon} *Streak Gate {state}*\n{note}",
             [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
         )
 
@@ -8793,7 +8816,10 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <button class="bt-run-btn" id="livecheck_btn" onclick="runLiveCheck()" style="flex:1;margin:0">&#128269; Run Live Check</button>
       <button class="bt-run-btn" id="resetstreak_btn" onclick="resetStreak()" style="flex:1;margin:0;background:rgba(255,152,0,.15);border-color:rgba(255,152,0,.4);color:var(--y)" title="Clear loss streak — lifts confidence gate and cooldown">&#128260; Reset Streak</button>
     </div>
-    <div style="font-size:.58rem;color:var(--mu);margin-top:2px;padding:0 18px 6px">Live Check also sends a report to Telegram &middot; Reset Streak clears the loss-streak gate</div>
+    <div style="padding:0 16px 8px;display:flex;gap:8px">
+      <button class="bt-run-btn" id="togglestreak_btn" onclick="toggleStreakGate()" style="flex:1;margin:0;background:rgba(244,67,54,.12);border-color:rgba(244,67,54,.4);color:var(--r)" title="Permanently disable streak cooldown — bot trades through any losing streak">&#128683; Disable Streak Gate</button>
+    </div>
+    <div style="font-size:.58rem;color:var(--mu);margin-top:2px;padding:0 18px 6px">Live Check sends a Telegram report &middot; Reset Streak clears current streak &middot; Disable Gate turns off the cooldown permanently</div>
     <div style="padding:0 16px 14px" id="diag_panel">
       <div class="no-data">Click Run Live Check above</div>
     </div>
@@ -10757,11 +10783,29 @@ function renderDiagnostics(d){
     rows.push({icon:'⏸',cls:'diag-warn',title:'Bot is PAUSED',sub:'Press the play button (▶) in the header to resume'});
   }
   // 5. Loss streak cooldown
-  if(d.streak_cooldown>0){
+  // Sync the toggle button label with the current server state
+  const sgBtn=$('togglestreak_btn');
+  if(sgBtn){
+    if(d.streak_gate_disabled){
+      sgBtn.textContent='✅ Streak Gate OFF — Click to Re-enable';
+      sgBtn.style.background='rgba(76,175,80,.15)';
+      sgBtn.style.borderColor='rgba(76,175,80,.4)';
+      sgBtn.style.color='var(--g)';
+    } else {
+      sgBtn.textContent='🚫 Disable Streak Gate';
+      sgBtn.style.background='rgba(244,67,54,.12)';
+      sgBtn.style.borderColor='rgba(244,67,54,.4)';
+      sgBtn.style.color='var(--r)';
+    }
+  }
+  if(d.streak_gate_disabled){
+    rows.push({icon:'🔓',cls:'diag-ok',title:'Streak gate permanently disabled',
+      sub:'Bot trades through any losing streak — click "Re-enable" to restore protection'});
+  } else if(d.streak_cooldown>0){
     const mins=Math.ceil(d.streak_cooldown/60);
-    rows.push({icon:'⏳',cls:'diag-warn',title:'30-min loss-streak cooldown active',
-      sub:mins+' min remaining — bot pauses new entries after 3 consecutive losses'});
-  } else if(d.loss_streak>=3){
+    rows.push({icon:'⏳',cls:'diag-warn',title:'Loss-streak cooldown active',
+      sub:mins+' min remaining — bot pauses new entries after 4 consecutive losses'});
+  } else if(d.loss_streak>=4){
     rows.push({icon:'⚠️',cls:'diag-warn',title:d.loss_streak+' consecutive losses — conf gate raised',
       sub:'Gate floor +'+Math.min(d.loss_streak*3,15)+'% — only very high-confidence signals will fire'});
   }
@@ -10790,6 +10834,25 @@ async function runLiveCheck(){
     if(el)el.innerHTML='<div class="no-data">Error — try again</div>';
     if(btn){btn.disabled=false;btn.textContent='🔍 Run Live Check';}
   }
+}
+
+async function toggleStreakGate(){
+  const btn=$('togglestreak_btn');
+  if(btn){btn.disabled=true;btn.textContent='Updating…';}
+  try{
+    const r=await fetch('/togglestreak',{method:'POST'});
+    const d=await r.json();
+    if(d.ok){
+      const dis=d.disabled;
+      if(btn){
+        btn.disabled=false;
+        btn.textContent=dis?'✅ Streak Gate OFF — Click to Re-enable':'🚫 Disable Streak Gate';
+        btn.style.background=dis?'rgba(76,175,80,.15)':'rgba(244,67,54,.12)';
+        btn.style.borderColor=dis?'rgba(76,175,80,.4)':'rgba(244,67,54,.4)';
+        btn.style.color=dis?'var(--g)':'var(--r)';
+      }
+    }
+  }catch(e){if(btn){btn.disabled=false;btn.textContent='Error';}}
 }
 
 async function resetStreak(){
@@ -12737,18 +12800,20 @@ def _web_livecheck():
     trader = _web_trader_ref[0] if _web_trader_ref else None
     with _state_lock:
         paused_now = _paused
-    loss_streak  = trader.consecutive_losses if trader else 0
-    streak_cool  = trader._streak_cool_until  if trader else 0
-    bal          = trader.balance             if trader else 0
+    loss_streak        = trader.consecutive_losses       if trader else 0
+    streak_cool        = trader._streak_cool_until        if trader else 0
+    streak_gate_off    = trader._streak_gate_disabled     if trader else False
+    bal                = trader.balance                   if trader else 0
     payload = {
-        "live_mode":       LIVE_MODE,
-        "paper_mode":      _paper_mode,
-        "paused":          paused_now,
-        "exchange":        LIVE_EXCHANGE if LIVE_MODE else "paper",
-        "kraken_margin":   KRAKEN_MARGIN,
-        "loss_streak":     loss_streak,
-        "streak_cooldown": max(0, round(streak_cool - time.time())),
-        "balance":         round(bal, 2),
+        "live_mode":           LIVE_MODE,
+        "paper_mode":          _paper_mode,
+        "paused":              paused_now,
+        "exchange":            LIVE_EXCHANGE if LIVE_MODE else "paper",
+        "kraken_margin":       KRAKEN_MARGIN,
+        "loss_streak":         loss_streak,
+        "streak_cooldown":     max(0, round(streak_cool - time.time())),
+        "streak_gate_disabled": streak_gate_off,
+        "balance":             round(bal, 2),
     }
     # Also fire the Telegram diagnostic in the background so it arrives in chat
     def _fire():
@@ -12756,6 +12821,23 @@ def _web_livecheck():
             _dispatch_callback("livecheck", {}, trader)
     threading.Thread(target=_fire, daemon=True).start()
     return _Response(json.dumps(payload), mimetype="application/json")
+
+@_flask_app.route("/togglestreak", methods=["POST"])
+def _web_togglestreak():
+    """Toggle the streak cooldown gate on or off permanently."""
+    trader = _web_trader_ref[0] if _web_trader_ref else None
+    if not trader:
+        return _Response('{"ok":false,"error":"no trader"}', mimetype="application/json")
+    trader._streak_gate_disabled = not trader._streak_gate_disabled
+    trader._streak_cool_until    = 0.0   # also clear any active cooldown
+    trader._streak_reset_len     = len(trader.trades)
+    trader._save()
+    state = "DISABLED" if trader._streak_gate_disabled else "ENABLED"
+    log("LIVE", f"Streak gate {state} via dashboard", "WARN")
+    tg(f"{'🔓' if trader._streak_gate_disabled else '🔒'} *Streak Gate {state}*\n"
+       f"{'_Bot will now trade through any losing streak without pausing._' if trader._streak_gate_disabled else '_Streak cooldown protection is back on (4 losses → 15-min pause)._'}")
+    return _Response(json.dumps({"ok": True, "disabled": trader._streak_gate_disabled}),
+                     mimetype="application/json")
 
 @_flask_app.route("/resetstreak", methods=["POST"])
 def _web_resetstreak():
