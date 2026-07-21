@@ -8085,6 +8085,19 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 /* ── Coin chips ── */
 .coin-chip.viewing{background:rgba(41,121,255,0.08)}
 .coin-chip.trading .coin-ico{border-color:var(--b);box-shadow:0 0 0 3px rgba(41,121,255,0.2),0 0 16px rgba(41,121,255,0.35)}
+.coin-chip.dragging{opacity:.3;transform:scale(.94);transition:none}
+.coin-chip.drop-before{box-shadow:-3px 0 0 var(--b);border-radius:12px}
+/* ── Indicator toggle row ── */
+.ind-row{display:flex;gap:6px;padding:0 14px 8px;align-items:center}
+.ind-btn{font-size:.58rem;font-family:var(--fn);padding:3px 9px;border-radius:7px;
+         border:1px solid var(--bd);background:transparent;color:var(--mu);cursor:pointer;
+         font-weight:600;transition:all .15s;letter-spacing:.02em;-webkit-tap-highlight-color:transparent}
+.ind-btn.active{background:rgba(88,166,255,.14);color:var(--b);border-color:rgba(88,166,255,.4)}
+/* ── Chart header extras ── */
+.ci-pnl-badge{font-size:.62rem;font-family:var(--fn);font-weight:700;
+              padding:3px 8px;border-radius:99px;font-variant-numeric:tabular-nums}
+.ci-pnl-badge.pos{background:rgba(0,204,116,.12);color:var(--g)}
+.ci-pnl-badge.neg{background:rgba(255,51,82,.10);color:var(--r)}
 
 /* ── Progress bars ── */
 .wr-bar{height:4px;border-radius:2px}
@@ -8462,6 +8475,8 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       </div>
       <div class="ci-price c-tx" id="ci_price">—</div>
       <div class="ci-chg fl" id="ci_chg">—</div>
+      <div id="ci_pnl_badge" class="ci-pnl-badge" style="display:none">—</div>
+      <div id="ci_countdown" style="font-size:.52rem;color:var(--mu);font-family:var(--fn);font-variant-numeric:tabular-nums;opacity:.65;margin-left:auto;display:none">&#9200; <span id="ci_cd_val">—</span></div>
     </div>
     <div id="pat_badge_wrap" style="padding:0 12px 8px;display:none">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -8489,6 +8504,11 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <button class="iv-btn active" data-iv="15" onclick="setCdInterval(15)">15m</button>
       <button class="iv-btn" data-iv="60" onclick="setCdInterval(60)">1h</button>
       <button class="iv-btn" data-iv="240" onclick="setCdInterval(240)">4h</button>
+    </div>
+    <div class="ind-row">
+      <button class="ind-btn" id="btn_bb" onclick="toggleBB()" title="Bollinger Bands (20,2)">BB</button>
+      <button class="ind-btn" id="btn_macd" onclick="toggleMACD()" title="MACD (12,26,9)">MACD</button>
+      <span style="font-size:.5rem;color:var(--mu);opacity:.6;margin-left:auto">Hold chip to reorder</span>
     </div>
     <div class="chart-wrap">
       <canvas id="cd_cv" style="display:block;width:100%" height="376"></canvas>
@@ -8932,6 +8952,8 @@ let _tab='home',_paused=false,_notif=false;
 let _eqData=[],_cdData=[],_cdHover=-1,_tick=30;
 let _ema20=[],_ema50=[],_cdTrades=[],_cdOpenPos=[],_cdPatSig='NONE',_cdPair='',_cdIv=15;
 let _botPair='',_coinPrices={},_openPairs=new Set();
+let _showBB=false,_showMACD=false;
+let _cdCountdownTimer=null;
 const _COIN_COLORS={
   SOLUSD:'#9945FF',XBTUSD:'#F7931A',ETHUSD:'#627EEA',XRPUSD:'#00AAE4',
   XDGUSD:'#C2A633',ADAUSD:'#0033AD',AVAXUSD:'#E84142',LINKUSD:'#2A5ADA',
@@ -8952,6 +8974,19 @@ const _SCAN_PAIRS=[
   {pair:'PEPEUSD',sym:'PEPE'},{pair:'BONKUSD',sym:'BONK'},{pair:'SHIBUSD',sym:'SHIB'},
   {pair:'WIFUSD',sym:'WIF'},{pair:'FLOKIUSD',sym:'FLOKI'}
 ];
+/* Persisted coin strip order — user can drag-to-reorder */
+(function(){
+  try{
+    const saved=JSON.parse(localStorage.getItem('stripOrder')||'null');
+    if(saved&&Array.isArray(saved)&&saved.length===_SCAN_PAIRS.length){
+      const byPair=Object.fromEntries(_SCAN_PAIRS.map(c=>[c.pair,c]));
+      _SCAN_PAIRS.length=0;
+      saved.forEach(p=>{if(byPair[p])_SCAN_PAIRS.push(byPair[p]);});
+      // Restore any pairs missing from saved order
+      Object.values(byPair).forEach(c=>{if(!_SCAN_PAIRS.find(x=>x.pair===c.pair))_SCAN_PAIRS.push(c);});
+    }
+  }catch(e){}
+})();
 
 const fmt=(n,d=2)=>Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const msign=n=>(n>=0?'+$':'\u2212$')+fmt(Math.abs(n));
@@ -9136,6 +9171,7 @@ async function fetchStatus(){
     _cdOpenPos=(d.open_positions||[]).filter(p=>p.pair===_cdPair);
     _cdTrades=(d.recent_trades||[]).filter(t=>t.pair===_cdPair);
     _cdPatSig=d.chart_pattern_signal||'NONE';
+    _updateChartPnL();
     renderCoinStrip();
     renderLivePrices();
     if(_tab==='chart')drawCandles();
@@ -9578,6 +9614,76 @@ function drawDownChart(){
   ctx.fillText(minDD.toFixed(1)+'%',xS(minIdx),yS(minDD)-5);
 }
 
+/* ── INDICATOR TOGGLES ── */
+function toggleBB(){
+  _showBB=!_showBB;
+  const b=$('btn_bb');if(b)b.classList.toggle('active',_showBB);
+  if(_cdData.length)drawCandles();
+}
+function toggleMACD(){
+  _showMACD=!_showMACD;
+  const b=$('btn_macd');if(b)b.classList.toggle('active',_showMACD);
+  if(_cdData.length)drawCandles();
+}
+/* ── BOLLINGER BANDS (20,2) ── */
+function _calcBB(data,period=20,mult=2){
+  const closes=data.map(c=>c.c);
+  const mid=new Array(data.length).fill(null);
+  const upper=new Array(data.length).fill(null);
+  const lower=new Array(data.length).fill(null);
+  for(let i=period-1;i<data.length;i++){
+    const sl=closes.slice(i-period+1,i+1);
+    const mean=sl.reduce((a,b)=>a+b,0)/period;
+    const std=Math.sqrt(sl.reduce((a,b)=>a+(b-mean)**2,0)/period);
+    mid[i]=mean;upper[i]=mean+mult*std;lower[i]=mean-mult*std;
+  }
+  return{mid,upper,lower};
+}
+/* ── MACD (12,26,9) ── */
+function _calcMACD(data){
+  const ema12=_ema(data,12);
+  const ema26=_ema(data,26);
+  const macdLine=ema12.map((v,i)=>v!==null&&ema26[i]!==null?v-ema26[i]:null);
+  // Signal: 9-period EMA of macd
+  const k=2/10;
+  const signal=new Array(data.length).fill(null);
+  let started=false,prev=0;
+  for(let i=0;i<data.length;i++){
+    if(macdLine[i]===null)continue;
+    if(!started){prev=macdLine[i];signal[i]=prev;started=true;}
+    else{prev=macdLine[i]*k+prev*(1-k);signal[i]=prev;}
+  }
+  const hist=macdLine.map((v,i)=>v!==null&&signal[i]!==null?v-signal[i]:null);
+  return{macdLine,signal,hist};
+}
+/* ── CANDLE COUNTDOWN ── */
+function _startCandleCountdown(){
+  clearInterval(_cdCountdownTimer);
+  const cdEl=$('ci_countdown'),valEl=$('ci_cd_val');
+  if(!cdEl||!valEl)return;
+  cdEl.style.display='block';
+  const update=()=>{
+    const now=Date.now()/1000;
+    const ivSec=_cdIv*60;
+    const rem=ivSec-(now%ivSec);
+    const mm=Math.floor(rem/60);
+    const ss=Math.floor(rem%60);
+    valEl.textContent=mm+':'+String(ss).padStart(2,'0');
+  };
+  update();
+  _cdCountdownTimer=setInterval(update,1000);
+}
+/* ── CHART P&L BADGE ── */
+function _updateChartPnL(){
+  const badge=$('ci_pnl_badge');if(!badge)return;
+  const pos=_cdOpenPos[0];
+  if(!pos){badge.style.display='none';return;}
+  const price=(_coinPrices[pos.pair]||{}).price||pos.entry;
+  const raw=(price-pos.entry)/pos.entry*(pos.side==='LONG'?1:-1)*100;
+  badge.style.display='';
+  badge.className='ci-pnl-badge '+(raw>=0?'pos':'neg');
+  badge.textContent=(raw>=0?'+':'')+raw.toFixed(2)+'%';
+}
 /* ── CANDLES ── */
 async function fetchCandles(){
   try{
@@ -9601,6 +9707,8 @@ async function fetchCandles(){
       const lbl=$('ci_iv_lbl');if(lbl)lbl.textContent=(ivNames[_cdIv]||_cdIv+'m')+' · '+data.length+' bars';
       const cp=_coinPrices[_cdPair||_botPair];
       if(cp){const c=_SCAN_PAIRS.find(x=>x.pair===(_cdPair||_botPair));if(c)_updateStripChip(c.pair,cp);}
+      _startCandleCountdown();
+      _updateChartPnL();
       if(_tab==='chart')drawCandles();
     }
   }catch(e){console.warn('candles',e);}
@@ -9662,6 +9770,73 @@ function renderCoinStrip(){
       viewing_chip.scrollIntoView({inline:'center',behavior:'smooth',block:'nearest'});
     }
   }
+}
+/* ── COIN STRIP DRAG-TO-REORDER ── */
+function initStripDrag(){
+  const strip=$('coin_strip');if(!strip)return;
+  let pressTimer=null,pressChip=null,isDragging=false,ghost=null,ghostOffX=0,dropIdx=-1,startX=0,startY=0;
+  const cleanup=()=>{
+    clearTimeout(pressTimer);
+    if(ghost){try{document.body.removeChild(ghost);}catch(e){}ghost=null;}
+    strip.querySelectorAll('.coin-chip').forEach(c=>c.classList.remove('dragging','drop-before'));
+    isDragging=false;dropIdx=-1;pressChip=null;
+  };
+  strip.addEventListener('pointerdown',e=>{
+    const chip=e.target.closest('.coin-chip');if(!chip)return;
+    pressChip=chip;startX=e.clientX;startY=e.clientY;
+    pressTimer=setTimeout(()=>{
+      isDragging=true;
+      chip.classList.add('dragging');
+      ghost=chip.cloneNode(true);
+      const r=chip.getBoundingClientRect();
+      ghostOffX=e.clientX-r.left;
+      ghost.style.cssText='position:fixed;left:'+r.left+'px;top:'+(r.top-4)+'px;'+
+        'width:'+chip.offsetWidth+'px;opacity:.88;pointer-events:none;z-index:9999;'+
+        'transform:scale(1.1) rotate(2deg);border-radius:12px;'+
+        'box-shadow:0 8px 24px rgba(0,0,0,.55);transition:none;background:var(--s1)';
+      document.body.appendChild(ghost);
+      try{strip.setPointerCapture(e.pointerId);}catch(ex){}
+      try{if(navigator.vibrate)navigator.vibrate(40);}catch(ex){}
+    },360);
+  });
+  strip.addEventListener('pointermove',e=>{
+    if(!pressChip)return;
+    const dx=e.clientX-startX,dy=e.clientY-startY;
+    if(!isDragging){
+      if(Math.abs(dx)>8||Math.abs(dy)>8){clearTimeout(pressTimer);pressChip=null;}
+      return;
+    }
+    e.preventDefault();
+    if(ghost)ghost.style.left=(e.clientX-ghostOffX)+'px';
+    const chips=[...strip.querySelectorAll('.coin-chip:not(.dragging)')];
+    chips.forEach(c=>c.classList.remove('drop-before'));
+    dropIdx=-1;
+    const hit=chips.findIndex(c=>{const r=c.getBoundingClientRect();return e.clientX>=r.left&&e.clientX<=r.right;});
+    if(hit>=0){chips[hit].classList.add('drop-before');dropIdx=hit;}
+  },{passive:false});
+  const finish=()=>{
+    if(!isDragging||!pressChip){cleanup();return;}
+    const dragPair=pressChip.dataset.pair;
+    if(dragPair&&dropIdx>=0){
+      // Get current visible order from DOM (excluding dragging chip)
+      const chips=[...strip.querySelectorAll('.coin-chip')];
+      const orderedPairs=chips.map(c=>c.dataset.pair);
+      const fromIdx=orderedPairs.indexOf(dragPair);
+      if(fromIdx>=0){
+        // Rebuild _SCAN_PAIRS with new order
+        const pairMap=Object.fromEntries(_SCAN_PAIRS.map(c=>[c.pair,c]));
+        orderedPairs.splice(fromIdx,1);
+        orderedPairs.splice(dropIdx,0,dragPair);
+        _SCAN_PAIRS.length=0;
+        orderedPairs.forEach(p=>{if(pairMap[p])_SCAN_PAIRS.push(pairMap[p]);});
+        try{localStorage.setItem('stripOrder',JSON.stringify(orderedPairs));}catch(ex){}
+        renderCoinStrip();
+      }
+    }
+    cleanup();
+  };
+  strip.addEventListener('pointerup',finish);
+  strip.addEventListener('pointercancel',cleanup);
 }
 /* ── LIVE PRICES GRID ── */
 const _PRICE_PAIRS=[
@@ -9753,7 +9928,7 @@ function _calcRSI(data,period=14){
 function drawCandles(){
   const cv=$('cd_cv');
   const W=cv.parentElement.clientWidth||320;
-  const RSI_H=50,H=320+RSI_H+6,PR=devicePixelRatio||1;
+  const RSI_H=50,MACD_H=_showMACD?55:0,H=320+RSI_H+6+(MACD_H?MACD_H+6:0),PR=devicePixelRatio||1;
   cv.width=W*PR;cv.height=H*PR;cv.style.width=W+'px';cv.style.height=H+'px';
   const ctx=cv.getContext('2d');ctx.scale(PR,PR);
   const data=_cdData;if(!data.length)return;
@@ -9766,6 +9941,8 @@ function drawCandles(){
   _cdOpenPos.forEach(p=>{lo=Math.min(lo,p.entry);hi=Math.max(hi,p.entry);});
   _ema20.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
   _ema50.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
+  // Expand range for Bollinger Bands
+  if(_showBB){const bb=_calcBB(data);bb.upper.forEach(v=>{if(v!==null)hi=Math.max(hi,v);});bb.lower.forEach(v=>{if(v!==null)lo=Math.min(lo,v);});}
   const rng=(hi-lo)*0.04;lo-=rng;hi+=rng;
   if(hi===lo){hi*=1.001;lo*=0.999;}
   const xC=i=>P.l+(i+.5)*slotW;
@@ -9825,6 +10002,28 @@ function drawCandles(){
   ctx.font='7.5px monospace';ctx.textAlign='left';
   ctx.fillStyle='#58a6ff';ctx.fillText('EMA20',P.l+2,P.t+9);
   ctx.fillStyle='#f0883e';ctx.fillText('EMA50',P.l+44,P.t+9);
+  // Bollinger Bands overlay
+  if(_showBB){
+    const bb=_calcBB(data);
+    const drawBBLine=(arr,color,dash=[])=>{
+      ctx.save();ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1;
+      if(dash.length)ctx.setLineDash(dash);
+      let s=false;
+      arr.forEach((v,i)=>{if(v===null)return;const x=xC(i),y=yP(v);s?(ctx.lineTo(x,y)):(ctx.moveTo(x,y),s=true);});
+      if(s)ctx.stroke();ctx.restore();
+    };
+    // Fill between bands
+    ctx.save();ctx.beginPath();
+    let fs=false;
+    bb.upper.forEach((v,i)=>{if(v===null)return;fs?(ctx.lineTo(xC(i),yP(v))):(ctx.moveTo(xC(i),yP(v)),fs=true);});
+    for(let i=data.length-1;i>=0;i--){if(bb.lower[i]===null)continue;ctx.lineTo(xC(i),yP(bb.lower[i]));}
+    ctx.closePath();ctx.fillStyle='rgba(120,80,255,.045)';ctx.fill();ctx.restore();
+    drawBBLine(bb.upper,'rgba(148,103,255,.55)',[3,3]);
+    drawBBLine(bb.lower,'rgba(148,103,255,.55)',[3,3]);
+    drawBBLine(bb.mid,'rgba(148,103,255,.3)');
+    ctx.fillStyle='rgba(148,103,255,.7)';ctx.font='7px monospace';ctx.textAlign='left';
+    ctx.fillText('BB',P.l+86,P.t+9);
+  }
   // Open position entry / trail stop / R1 / R2 lines
   _cdOpenPos.forEach(pos=>{
     const ey=yP(pos.entry);
@@ -9951,6 +10150,52 @@ function drawCandles(){
       ctx.fillText(Math.round(lastRsi),bx,by+3);
     }
   }
+  // ── MACD Panel ──
+  if(_showMACD&&MACD_H>0){
+    const macdTop=320+RSI_H+6+6;
+    const macdH=MACD_H-10;
+    const {macdLine,signal,hist}=_calcMACD(data);
+    // Panel divider
+    ctx.strokeStyle='rgba(22,37,64,.8)';ctx.lineWidth=.5;
+    ctx.beginPath();ctx.moveTo(P.l,macdTop-3);ctx.lineTo(W-P.r,macdTop-3);ctx.stroke();
+    ctx.fillStyle='#4d6f94';ctx.font='7px monospace';ctx.textAlign='left';
+    ctx.fillText('MACD',P.l,macdTop+macdH+5);
+    // Find MACD range
+    const vals=[...macdLine,...signal,...hist].filter(v=>v!==null);
+    if(!vals.length){return;}
+    const mlo=Math.min(...vals),mhi=Math.max(...vals);
+    const mrng=Math.max(Math.abs(mlo),Math.abs(mhi))||0.001;
+    const yM=v=>macdTop+macdH/2-(v/mrng)*(macdH/2);
+    // Zero line
+    ctx.strokeStyle='rgba(77,111,148,.4)';ctx.lineWidth=.5;
+    ctx.beginPath();ctx.moveTo(P.l,yM(0));ctx.lineTo(W-P.r,yM(0));ctx.stroke();
+    // Histogram bars
+    hist.forEach((v,i)=>{
+      if(v===null)return;
+      const x=xC(i),bh=barW/2;
+      const y0=yM(0),yv=yM(v);
+      ctx.fillStyle=v>=0?'rgba(0,204,116,.5)':'rgba(255,51,82,.45)';
+      ctx.fillRect(x-bh,Math.min(y0,yv),barW,Math.abs(yv-y0));
+    });
+    // MACD line (blue)
+    ctx.save();ctx.lineJoin='round';ctx.lineWidth=1.1;ctx.beginPath();
+    let ms=false;
+    macdLine.forEach((v,i)=>{if(v===null)return;ms?(ctx.lineTo(xC(i),yM(v))):(ctx.moveTo(xC(i),yM(v)),ms=true);});
+    ctx.strokeStyle='#58a6ff';if(ms)ctx.stroke();ctx.restore();
+    // Signal line (orange)
+    ctx.save();ctx.lineJoin='round';ctx.lineWidth=1;ctx.setLineDash([3,2]);ctx.beginPath();
+    let ss2=false;
+    signal.forEach((v,i)=>{if(v===null)return;ss2?(ctx.lineTo(xC(i),yM(v))):(ctx.moveTo(xC(i),yM(v)),ss2=true);});
+    ctx.strokeStyle='#f0883e';if(ss2)ctx.stroke();ctx.restore();
+    // Current MACD value badge
+    const lastM=macdLine.filter(v=>v!==null).slice(-1)[0];
+    if(lastM!==undefined){
+      const lastMIdx=macdLine.reduce((li,v,i)=>v!==null?i:li,-1);
+      ctx.fillStyle=lastM>=0?'#00cc74':'#ff3352';ctx.font='bold 7px monospace';ctx.textAlign='left';
+      const mp=lastM>=100?lastM.toFixed(1):Math.abs(lastM)<0.01?lastM.toFixed(4):lastM.toFixed(2);
+      ctx.fillText((lastM>=0?'+':'')+mp,xC(lastMIdx)+4,yM(lastM)-2);
+    }
+  }
 }
 function initCandleHover(){
   const cv=$('cd_cv'),tip=$('cv_tip');
@@ -9964,6 +10209,7 @@ function initCandleHover(){
     const c=_cdData[i],bull=c.c>=c.o;
     const ts=new Date(c.t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
     const f6=v=>v>=100?v.toFixed(2):v.toPrecision(6);
+    const _fmtVol=v=>{if(v>=1e9)return (v/1e9).toFixed(2)+'B';if(v>=1e6)return (v/1e6).toFixed(2)+'M';if(v>=1e3)return (v/1e3).toFixed(1)+'K';return v.toFixed(0);};
     const e20=_ema20[i],e50=_ema50[i];
     const _rsiTip=_calcRSI(_cdData)[i];const _rsiTipCol=_rsiTip!==null&&_rsiTip>=70?'var(--r)':_rsiTip!==null&&_rsiTip<=30?'var(--g)':'#58a6ff';
     tip.innerHTML='<b>'+ts+'</b>&nbsp; O&nbsp;'+f6(c.o)+
@@ -9972,7 +10218,8 @@ function initCandleHover(){
       '&nbsp; C&nbsp;<span style="color:'+(bull?'var(--g)':'var(--r)')+'">'+f6(c.c)+'</span>'+
       (e20!==null?'<br><span style="color:#58a6ff">EMA20 '+f6(e20)+'</span>':'')+
       (e50!==null?'&nbsp;<span style="color:#f0883e">EMA50 '+f6(e50)+'</span>':'')+
-      (_rsiTip!==null?'&nbsp;<span style="color:'+_rsiTipCol+'">RSI '+Math.round(_rsiTip)+'</span>':'');
+      (_rsiTip!==null?'&nbsp;<span style="color:'+_rsiTipCol+'">RSI '+Math.round(_rsiTip)+'</span>':'');+
+      (c.v?'&nbsp;<span style="color:var(--mu)">Vol '+_fmtVol(c.v)+'</span>':'');
     tip.style.display='block';
   };
   cv.addEventListener('mousemove',e=>show(idx(e.clientX)));
@@ -12007,6 +12254,7 @@ initCandleHover();
 applyTheme(_theme);
 _initSoundBtn();
 _initKeyboard();
+initStripDrag();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
 fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();
 fetchPrices();setInterval(fetchPrices,8000);
