@@ -10841,13 +10841,29 @@ async function saveApiKeys(){
 }
 
 async function _buildLiveChecklist(){
-  let status={},health={};
+  let status={},health={},ready={};
   try{status=await(await fetch('/status')).json();}catch(e){}
   try{health=await(await fetch('/healthz')).json();}catch(e){}
+  try{ready=await(await fetch('/api/live-ready')).json();}catch(e){}
   const checks=[];
   const api=status.keys_loaded;
   checks.push({label:'Kraken API keys loaded',ok:!!api,critical:true,
     note:api?'Ready to place orders':'Add keys via Settings → API Keys'});
+  // Real Kraken balance
+  if(api){
+    const kbal=ready.kraken_balance_usd;
+    const kbalOk=ready.kraken_balance_ok;
+    const kErr=ready.kraken_error;
+    checks.push({label:'Kraken account balance'+(kbal!=null?' $'+kbal.toLocaleString():''),ok:!!kbalOk,critical:true,
+      note:kbalOk?'Sufficient funds':'Need ≥ $10 in your Kraken account'+(kErr?' · '+kErr:'')});
+    const canTrade=ready.kraken_can_trade;
+    checks.push({label:'API key has trading permission',ok:!!canTrade,critical:true,
+      note:canTrade?'Key can place orders':'In Kraken → API → Settings, enable Orders & Trades permission'});
+  }
+  // Telegram
+  const tgOk=ready.telegram_ok;
+  checks.push({label:'Telegram bot reachable',ok:!!tgOk,critical:true,
+    note:tgOk?'Alerts will reach you':'Check TG_TOKEN — you need notifications when orders fire'+(ready.telegram_error?' · '+ready.telegram_error:'')});
   const db=health.db||status.db;
   checks.push({label:'Database connected',ok:!!db,critical:false,
     note:db?'Learning from trade history':'Bot will still trade without DB'});
@@ -12692,6 +12708,71 @@ def _web_api_keys_test():
     except Exception as _e:
         return _Response(json.dumps({"ok": False, "error": str(_e)}),
                          mimetype="application/json")
+
+@_flask_app.route("/api/live-ready")
+def _web_live_ready():
+    """Pre-live checks: Kraken USD balance, trading permission, Telegram reachability."""
+    result = {
+        "kraken_balance_usd": None,
+        "kraken_balance_ok":  False,
+        "kraken_can_trade":   False,
+        "telegram_ok":        False,
+        "kraken_error":       None,
+        "telegram_error":     None,
+    }
+    # ── Kraken: balance + trading permission ─────────────────────────────────
+    if KRAKEN_API_KEY and KRAKEN_API_SECRET:
+        def _kraken_signed(path, post_data_str=""):
+            nonce = str(int(time.time() * 1000))
+            body  = f"nonce={nonce}" + (f"&{post_data_str}" if post_data_str else "")
+            msg   = path.encode() + hashlib.sha256((nonce + body).encode()).digest()
+            sig   = base64.b64encode(
+                hmac.new(base64.b64decode(KRAKEN_API_SECRET), msg, hashlib.sha512).digest()
+            ).decode()
+            return {"API-Key": KRAKEN_API_KEY, "API-Sign": sig,
+                    "Content-Type": "application/x-www-form-urlencoded"}, body
+        try:
+            hdrs, body = _kraken_signed("/0/private/Balance")
+            r = requests.post("https://api.kraken.com/0/private/Balance",
+                              headers=hdrs, data=body, timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            if d.get("error"):
+                result["kraken_error"] = "; ".join(str(e) for e in d["error"])
+            else:
+                usd = sum(float(v) for k, v in (d.get("result") or {}).items() if "USD" in k.upper())
+                result["kraken_balance_usd"] = round(usd, 2)
+                result["kraken_balance_ok"]  = usd >= 10.0
+        except Exception as _e:
+            result["kraken_error"] = str(_e)
+        # Check trading permission by querying open orders (requires Orders permission)
+        try:
+            hdrs, body = _kraken_signed("/0/private/OpenOrders")
+            r = requests.post("https://api.kraken.com/0/private/OpenOrders",
+                              headers=hdrs, data=body, timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            if d.get("error") and any("permission" in str(e).lower() for e in d["error"]):
+                result["kraken_can_trade"] = False
+                result["kraken_error"] = "API key missing Orders permission — enable in Kraken API settings"
+            else:
+                result["kraken_can_trade"] = not bool(d.get("error"))
+        except Exception:
+            result["kraken_can_trade"] = False
+    # ── Telegram reachability ─────────────────────────────────────────────────
+    if TG_TOKEN and TG_CHAT_ID:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getMe", timeout=8
+            )
+            r.raise_for_status()
+            d = r.json()
+            result["telegram_ok"] = bool(d.get("ok") and d.get("result", {}).get("id"))
+            if not result["telegram_ok"]:
+                result["telegram_error"] = "Bot token invalid"
+        except Exception as _e:
+            result["telegram_error"] = str(_e)
+    return _Response(json.dumps(result), mimetype="application/json")
 
 @_flask_app.route("/control", methods=["POST"])
 def _web_control():
