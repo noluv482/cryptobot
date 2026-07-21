@@ -8995,11 +8995,13 @@ const pc=n=>n>0?'c-g':n<0?'c-r':'c-mu';
 /* ── TAB NAVIGATION ── */
 function goTab(t){
   if(_tab===t)return;
+  const pg=$('pg-'+t),tb=$('tab-'+t);
+  if(!pg||!tb)return; // unknown tab id — ignore rather than crashing
   _tab=t;
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
-  $('pg-'+t).classList.add('active');
-  $('tab-'+t).classList.add('active');
+  pg.classList.add('active');
+  tb.classList.add('active');
   if(t==='chart'){drawCandles();}
   if(t==='home'){drawEquity();}
   if(t==='market'){fetchMarket();fetchForecast();loadQuiz();}
@@ -11690,7 +11692,7 @@ function _initKeyboard(){
     if(e.metaKey||e.ctrlKey||e.altKey)return;
     switch(e.key){
       case '1':goTab('home');break;
-      case '2':goTab('trades');break;
+      case '2':goTab('pos');break;
       case '3':goTab('stats');break;
       case '4':goTab('chart');break;
       case '5':goTab('market');break;
