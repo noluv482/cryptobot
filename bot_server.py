@@ -7438,6 +7438,38 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .set-step-btn:active{opacity:.6}
 .set-num{font-family:var(--fn);font-size:.9rem;font-weight:700;min-width:22px;text-align:center}
 .set-info-val{font-family:var(--fn);font-size:.82rem;font-weight:700;color:var(--mu)}
+/* ── MODAL PANEL (balance picker + live checklist) ── */
+.cb-modal{position:fixed;inset:0;z-index:500;display:none}
+.cb-modal.open{display:block}
+.cb-modal-ov{position:absolute;inset:0;background:rgba(0,0,0,.7)}
+.cb-modal-panel{position:absolute;bottom:0;left:0;right:0;background:var(--s0);
+  border-radius:20px 20px 0 0;padding:22px 20px calc(22px + var(--sb));
+  border-top:1px solid var(--bd2);max-height:80vh;overflow-y:auto}
+.cb-modal-panel.danger-border{border-top-color:rgba(255,51,82,.5)}
+.cb-modal-title{font-weight:800;font-size:1rem;margin-bottom:6px}
+.cb-modal-sub{font-size:.68rem;color:var(--mu);margin-bottom:16px;line-height:1.5}
+.cb-check-row{display:flex;align-items:center;gap:10px;padding:8px 0;
+  border-bottom:1px solid var(--bd);font-size:.75rem;font-weight:600}
+.cb-check-row:last-child{border-bottom:none}
+.cb-check-ico{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;
+  justify-content:center;font-size:.6rem;flex-shrink:0;font-weight:900}
+.cbi-ok{background:rgba(0,204,116,.15);color:#00cc74;border:1px solid rgba(0,204,116,.3)}
+.cbi-fail{background:rgba(255,51,82,.15);color:#ff3352;border:1px solid rgba(255,51,82,.3)}
+.cbi-warn{background:rgba(245,161,28,.15);color:#f5a11c;border:1px solid rgba(245,161,28,.3)}
+.cb-modal-btns{display:flex;gap:8px;margin-top:18px}
+.cb-modal-cancel{flex:1;padding:12px;border-radius:12px;border:1px solid var(--bd2);
+  background:var(--bg);color:var(--mu);font-weight:700;cursor:pointer;font-size:.82rem}
+.cb-modal-ok{flex:1;padding:12px;border-radius:12px;border:1px solid rgba(74,143,255,.4);
+  background:rgba(74,143,255,.12);color:var(--b);font-weight:700;cursor:pointer;font-size:.82rem}
+.cb-modal-danger{border-color:rgba(255,51,82,.45);background:rgba(255,51,82,.12);color:var(--r)}
+.cb-presets{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:14px}
+.cb-preset{padding:9px 4px;border-radius:9px;border:1px solid var(--bd2);
+  background:var(--bg);color:var(--tx);font-size:.7rem;font-weight:700;cursor:pointer;text-align:center}
+.cb-preset.sel,.cb-preset:active{background:rgba(74,143,255,.12);border-color:rgba(74,143,255,.4);color:var(--b)}
+.cb-bal-input{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--bd2);
+  background:var(--bg);color:var(--tx);font-size:.9rem;font-family:var(--fn);
+  box-sizing:border-box;outline:none}
+.cb-bal-input:focus{border-color:var(--b)}
 /* ── INSTALL BUTTON ── */
 #install_btn{display:none;padding:5px 10px;border-radius:8px;font-size:.65rem;font-weight:700;
   cursor:pointer;border:1px solid rgba(74,143,255,.4);background:rgba(74,143,255,.12);color:var(--b)}
@@ -8433,6 +8465,17 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <label class="set-toggle-wrap"><input type="checkbox" id="set_paper" onchange="saveSetting('paper')"><span class="set-slider"></span></label>
     </div>
     <div class="set-row">
+      <div><div class="set-lbl">Paper Balance</div><div class="set-sub">Adjust your virtual trading balance</div></div>
+      <div class="set-ctrl">
+        <div class="set-num" id="set_bal_val" style="min-width:54px">$100</div>
+        <button class="set-step-btn" onclick="openBalModal()" title="Change balance" style="font-size:.8rem">&#128393;</button>
+      </div>
+    </div>
+    <div class="set-row">
+      <div><div class="set-lbl">Daily Limits</div><div class="set-sub">Stop at 10 trades or −10% day loss</div></div>
+      <label class="set-toggle-wrap"><input type="checkbox" id="set_daily_limits" onchange="saveSetting('daily_limits')"><span class="set-slider"></span></label>
+    </div>
+    <div class="set-row">
       <div><div class="set-lbl">Sim Trader ($2,000)</div><div class="set-sub">Parallel virtual account</div></div>
       <label class="set-toggle-wrap"><input type="checkbox" id="set_sim" onchange="saveSetting('sim')"><span class="set-slider"></span></label>
     </div>
@@ -8486,6 +8529,41 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     <div style="font-size:.58rem;color:var(--mu);margin-top:2px;padding:0 18px 6px">Live Check also sends a report to Telegram &middot; Reset Streak clears the loss-streak gate</div>
     <div style="padding:0 16px 14px" id="diag_panel">
       <div class="no-data">Click Run Live Check above</div>
+    </div>
+  </div>
+</div>
+
+<!-- BALANCE PICKER MODAL -->
+<div class="cb-modal" id="bal_modal">
+  <div class="cb-modal-ov" onclick="closeBalModal()"></div>
+  <div class="cb-modal-panel">
+    <div class="cb-modal-title">&#128200; Set Paper Balance</div>
+    <div class="cb-modal-sub">Choose a preset or enter a custom amount. Your trade history is kept — only the balance changes.</div>
+    <div class="cb-presets">
+      <div class="cb-preset" onclick="selectBalPreset(100)">$100</div>
+      <div class="cb-preset" onclick="selectBalPreset(500)">$500</div>
+      <div class="cb-preset" onclick="selectBalPreset(1000)">$1K</div>
+      <div class="cb-preset" onclick="selectBalPreset(5000)">$5K</div>
+      <div class="cb-preset" onclick="selectBalPreset(10000)">$10K</div>
+    </div>
+    <input class="cb-bal-input" type="number" id="bal_input" placeholder="Custom amount (e.g. 2500)" min="10" max="1000000" oninput="onBalInput()">
+    <div class="cb-modal-btns">
+      <button class="cb-modal-cancel" onclick="closeBalModal()">Cancel</button>
+      <button class="cb-modal-ok" id="bal_confirm_btn" onclick="confirmSetBal()">Set Balance</button>
+    </div>
+  </div>
+</div>
+
+<!-- PRE-LIVE CHECKLIST MODAL -->
+<div class="cb-modal" id="live_modal">
+  <div class="cb-modal-ov" onclick="closeLiveModal()"></div>
+  <div class="cb-modal-panel danger-border">
+    <div class="cb-modal-title" style="color:var(--r)">&#9888; Switch to LIVE Mode</div>
+    <div class="cb-modal-sub">Real money will be used. Every check below should be green before you continue.</div>
+    <div id="live_checklist"></div>
+    <div class="cb-modal-btns">
+      <button class="cb-modal-cancel" onclick="closeLiveModal()">Cancel</button>
+      <button class="cb-modal-ok cb-modal-danger" id="live_go_btn" onclick="confirmGoLive()">Go LIVE &#128308;</button>
     </div>
   </div>
 </div>
@@ -9665,18 +9743,22 @@ async function togglePause(){
 
 async function toggleMode(){
   const currentlyLive=$('mode_txt').textContent.startsWith('LIVE');
-  const msg=currentlyLive
-    ?'Switch to PAPER trading? No real orders will be placed.'
-    :'Switch to LIVE trading? Real money will be used!';
-  if(!confirm(msg))return;
+  if(!currentlyLive){
+    // Switching to LIVE — show safety checklist first
+    openLiveModal();
+    return;
+  }
+  // Switching back to PAPER — simple confirm
+  if(!confirm('Switch to PAPER trading? No real orders will be placed.'))return;
   try{
     const d=await(await fetch('/control',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:'toggle_mode'})})).json();
+      body:JSON.stringify({action:'paper'})})).json();
     const live=d.mode==='LIVE';
     $('mode_badge').className='badge '+(live?'badge-live':'badge-paper');
     $('mode_dot').className='dot '+(live?'dot-live':'dot-paper');
     $('mode_txt').textContent=live?'LIVE':'PAPER';
+    showToast('Paper Mode','No real orders will be placed','open',2500);
   }catch(e){console.warn('toggleMode',e);}
 }
 
@@ -10446,6 +10528,10 @@ async function openSettings(){
     if(themeChk)themeChk.checked=(_theme==='light');
     const prevChk=$('set_preview');
     if(prevChk)prevChk.checked=!!d.trade_preview_mode;
+    const dlChk=$('set_daily_limits');
+    if(dlChk)dlChk.checked=!!d.daily_limits;
+    const balEl=$('set_bal_val');
+    if(balEl){const b=d.paper_balance||100;balEl.textContent='$'+b.toLocaleString();}
     renderDiagnostics(d);
   }catch(e){console.warn('settings',e);}
   $('set_sheet').classList.add('open');
@@ -10467,6 +10553,12 @@ async function saveSetting(key){
       await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({trade_preview:on})});
       showToast(on?'Preview ON 🔔':'Preview OFF','Trade preview mode '+(on?'enabled':'disabled'),'open',2500);
+    } else if(key==='daily_limits'){
+      const on=$('set_daily_limits').checked;
+      await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({daily_limits:on})});
+      showToast(on?'Daily Limits ON 🔒':'Daily Limits OFF 🔓',
+        on?'Stops at 10 trades or −10% daily loss':'No daily trade/loss cap','open',3000);
     }
   }catch(e){console.warn('saveSetting',e);}
 }
@@ -10477,6 +10569,109 @@ async function stepMaxPos(delta){
     await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({max_positions:_setMaxPos})});
   }catch(e){console.warn('stepMaxPos',e);}
+}
+
+/* ── BALANCE PICKER MODAL ── */
+let _balPickerVal=100;
+function openBalModal(){
+  _balPickerVal=0;
+  const inp=$('bal_input');if(inp)inp.value='';
+  document.querySelectorAll('.cb-preset').forEach(e=>e.classList.remove('sel'));
+  $('bal_modal').classList.add('open');
+  setTimeout(()=>{if(inp)inp.focus();},200);
+}
+function closeBalModal(){$('bal_modal').classList.remove('open');}
+function selectBalPreset(v){
+  _balPickerVal=v;
+  document.querySelectorAll('.cb-preset').forEach(e=>e.classList.remove('sel'));
+  event.currentTarget.classList.add('sel');
+  const inp=$('bal_input');if(inp)inp.value='';
+}
+function onBalInput(){
+  _balPickerVal=0;
+  document.querySelectorAll('.cb-preset').forEach(e=>e.classList.remove('sel'));
+}
+async function confirmSetBal(){
+  const inp=$('bal_input');
+  const custom=inp?parseFloat(inp.value):0;
+  const val=custom>0?custom:_balPickerVal;
+  if(!val||val<10){showToast('Enter an amount','Min $10 required','loss',2000);return;}
+  try{
+    await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({paper_balance:val})});
+    const balEl=$('set_bal_val');
+    if(balEl)balEl.textContent='$'+val.toLocaleString();
+    closeBalModal();
+    showToast('Balance set to $'+val.toLocaleString(),'Trade history kept','win',2500);
+    setTimeout(fetchStatus,600);
+  }catch(e){showToast('Error','Could not set balance','loss',2000);}
+}
+
+/* ── PRE-LIVE CHECKLIST MODAL ── */
+function openLiveModal(){
+  const cl=$('live_checklist');
+  if(!cl)return;
+  cl.innerHTML='<div style="text-align:center;padding:12px;color:var(--mu);font-size:.72rem">Checking systems…</div>';
+  $('live_modal').classList.add('open');
+  _buildLiveChecklist();
+}
+function closeLiveModal(){$('live_modal').classList.remove('open');}
+async function _buildLiveChecklist(){
+  let status={},health={};
+  try{status=await(await fetch('/status')).json();}catch(e){}
+  try{health=await(await fetch('/healthz')).json();}catch(e){}
+  const checks=[];
+  const api=status.keys_loaded;
+  checks.push({label:'Kraken API keys loaded',ok:!!api,critical:true,
+    note:api?'Ready to place orders':'Add API keys to .env file'});
+  const db=health.db||status.db;
+  checks.push({label:'Database connected',ok:!!db,critical:false,
+    note:db?'Learning from trade history':'Bot will still trade without DB'});
+  const ws=health.ws_live||status.ws_live;
+  checks.push({label:'WebSocket prices live',ok:!!ws,critical:false,
+    note:ws?'Real-time prices active':'Using REST fallback — slightly slower'});
+  const scanAge=health.scan_age;
+  const scanOk=scanAge!=null&&scanAge<300;
+  checks.push({label:'Scanner running',ok:scanOk,critical:false,
+    note:scanOk?'Last scan '+(scanAge<60?Math.round(scanAge)+'s':Math.round(scanAge/60)+'m')+' ago':'Scanner may have stalled'});
+  const paused=status.paused;
+  checks.push({label:'Bot not paused',ok:!paused,critical:true,
+    note:paused?'Tap Resume before going live':'Good to go'});
+  const wr=status.win_rate||0;const trades=status.trades||0;
+  const wrOk=wr>=45;
+  checks.push({label:'Win rate '+wr.toFixed(0)+'% ('+trades+' trades)',ok:wrOk,critical:false,
+    note:wrOk?'Profitable on paper':'Consider more paper trading first'});
+  const bal=status.balance||0;
+  checks.push({label:'Paper balance $'+bal.toLocaleString(),ok:bal>=20,critical:false,
+    note:bal>=20?'Balance looks good':'Balance very low'});
+  const cl=$('live_checklist');
+  if(!cl)return;
+  const critFail=checks.filter(c=>c.critical&&!c.ok);
+  cl.innerHTML=checks.map(c=>{
+    const cls=c.ok?'cbi-ok':c.critical?'cbi-fail':'cbi-warn';
+    const ico=c.ok?'✓':c.critical?'✗':'!';
+    return '<div class="cb-check-row"><div class="cb-check-ico '+cls+'">'+ico+'</div>'+
+           '<div><div>'+c.label+'</div>'+
+           '<div style="font-size:.6rem;color:var(--mu);font-weight:400;margin-top:1px">'+c.note+'</div></div></div>';
+  }).join('');
+  const goBtn=$('live_go_btn');
+  if(goBtn){
+    goBtn.disabled=critFail.length>0;
+    goBtn.style.opacity=critFail.length>0?'.4':'1';
+    goBtn.title=critFail.length>0?'Fix critical issues first':'Confirm — real money will be used';
+  }
+}
+async function confirmGoLive(){
+  closeLiveModal();
+  try{
+    const d=await(await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'live'})})).json();
+    const live=d.mode==='LIVE';
+    $('mode_badge').className='badge '+(live?'badge-live':'badge-paper');
+    $('mode_dot').className='dot '+(live?'dot-live':'dot-paper');
+    $('mode_txt').textContent=live?'LIVE':'PAPER';
+    if(live)showToast('LIVE MODE ON 🔴','Real orders will now be placed','loss',4000);
+  }catch(e){console.warn('confirmGoLive',e);}
 }
 
 /* ── BACKTEST ── */
@@ -12127,7 +12322,7 @@ def _web_bestsetups():
 
 @_flask_app.route("/settings", methods=["GET", "POST"])
 def _web_settings():
-    global _rt_max_positions, _paper_mode, _rt_max_drawdown, _trade_preview_mode
+    global _rt_max_positions, _paper_mode, _rt_max_drawdown, _trade_preview_mode, _daily_limits
     if _flask_request.method == "POST":
         body = _flask_request.get_json(silent=True) or {}
         if "max_positions" in body:
@@ -12139,6 +12334,27 @@ def _web_settings():
             _rt_max_drawdown = max(0.0, min(50.0, v))
         if "trade_preview" in body:
             _trade_preview_mode = bool(body["trade_preview"])
+        if "paper_balance" in body:
+            v = float(body["paper_balance"])
+            if 10.0 <= v <= 1_000_000:
+                t = _web_trader_ref[0] if _web_trader_ref else None
+                if t:
+                    old_bal = t.balance
+                    t.balance = round(v, 2)
+                    t.peak = max(t.peak, round(v, 2))
+                    t.session_start = round(v, 2)
+                    t._start_balance = round(v, 2)
+                    t.day_start_bal = round(v, 2)
+                    threading.Thread(target=tg, args=(
+                        f"💰 *Paper balance adjusted* via dashboard\n"
+                        f"`${old_bal:.2f}` → `${v:,.2f}`",), daemon=True).start()
+        if "daily_limits" in body:
+            was = _daily_limits
+            _daily_limits = bool(body["daily_limits"])
+            if _daily_limits != was:
+                status = "ON — stops after 10 trades or -10% day loss" if _daily_limits else "OFF"
+                threading.Thread(target=tg, args=(
+                    f"{'🔒' if _daily_limits else '🔓'} *Daily Limits {('ON' if _daily_limits else 'OFF')}* via dashboard\n_{status}_",), daemon=True).start()
     trader = _web_trader_ref[0] if _web_trader_ref else None
     loss_streak = trader.consecutive_losses if trader else 0
     streak_cool = trader._streak_cool_until if trader else 0
@@ -12157,6 +12373,8 @@ def _web_settings():
         "loss_streak":        loss_streak,
         "streak_cooldown":    max(0, round(streak_cool - time.time())),
         "trade_preview_mode": _trade_preview_mode,
+        "daily_limits":       _daily_limits,
+        "paper_balance":      round(trader.balance, 2) if trader else PAPER_START,
     }), mimetype="application/json")
 
 @_flask_app.route("/control", methods=["POST"])
