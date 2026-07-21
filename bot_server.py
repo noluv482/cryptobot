@@ -7548,16 +7548,24 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   color:var(--r);font-size:.72rem;font-weight:600;align-items:center;gap:8px}
 .dd-alert.show{display:flex}
 /* ── QUICK ACTION BAR ── */
-.qa-bar{display:flex;gap:8px;padding:0 16px 14px;flex-wrap:wrap}
-.qa-btn{flex:1;min-width:0;padding:10px 8px;border-radius:11px;border:1px solid var(--bd2);
-  background:var(--s0);color:var(--tx);font-size:.72rem;font-weight:700;cursor:pointer;
-  display:flex;flex-direction:column;align-items:center;gap:3px;transition:all .15s}
-.qa-btn:active{opacity:.7}
+.qa-bar{display:flex;gap:6px;padding:0 16px 10px;align-items:center}
+.qa-btn{flex:none;padding:6px 13px;border-radius:20px;border:1px solid var(--bd2);
+  background:var(--s0);color:var(--tx);font-size:.68rem;font-weight:700;cursor:pointer;
+  display:flex;align-items:center;gap:5px;transition:all .15s;white-space:nowrap;touch-action:manipulation}
+.qa-btn:active{opacity:.7;transform:scale(.96)}
 .qa-btn.qa-pause{border-color:rgba(245,161,28,.4);background:rgba(245,161,28,.08);color:var(--y)}
 .qa-btn.qa-close-all{border-color:rgba(255,51,82,.35);background:rgba(255,51,82,.07);color:var(--r)}
 .qa-btn.qa-preview.on{border-color:rgba(74,143,255,.45);background:rgba(74,143,255,.1);color:var(--b)}
-.qa-ico{font-size:1.1rem}
-.qa-lbl{font-size:.57rem;color:var(--mu);font-weight:600;text-align:center}
+.qa-ico{font-size:.82rem;line-height:1}
+.qa-lbl{font-size:.65rem;font-weight:600}
+/* ── HEALTH BAR ── */
+.health-bar{display:flex;gap:6px;padding:0 16px 10px;flex-wrap:wrap;align-items:center}
+.hb-item{display:flex;align-items:center;gap:4px;font-size:.58rem;font-weight:600;
+  background:var(--s0);border:1px solid var(--bd);border-radius:8px;padding:3px 8px;color:var(--mu)}
+.hb-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0;background:var(--mu)}
+.hb-ok{background:#00cc74}
+.hb-warn{background:#f5a11c}
+.hb-err{background:#ff3352}
 /* ── LIVE P&L TICKER ── */
 #live_pnl_tick{font-family:var(--fn);font-size:.72rem;font-weight:700;padding:2px 8px;
   border-radius:6px;margin-left:6px;transition:color .3s;display:none}
@@ -7716,16 +7724,16 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 
 /* ── Badges ── */
 .badge-live{
-  background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.3);color:var(--g);
-  box-shadow:0 0 10px rgba(0,230,118,0.2);
+  background:rgba(255,51,82,0.12);border:1px solid rgba(255,51,82,0.45);color:var(--r);
+  box-shadow:0 0 10px rgba(255,51,82,0.18);font-weight:900;letter-spacing:.12em;
 }
 .badge-paper{background:rgba(74,122,170,0.1);border:1px solid rgba(74,122,170,0.25);color:var(--mu)}
 
-/* ── Live dot — ripple ── */
-.dot-live{background:var(--g);box-shadow:0 0 6px var(--g);animation:livepulse 2s ease-in-out infinite}
+/* ── Live dot — red ripple ── */
+.dot-live{background:var(--r);box-shadow:0 0 6px var(--r);animation:livepulse 1.5s ease-in-out infinite}
 @keyframes livepulse{
-  0%,100%{opacity:1;box-shadow:0 0 4px var(--g),0 0 0 0 rgba(0,230,118,.45)}
-  50%{opacity:.7;box-shadow:0 0 8px var(--g),0 0 0 5px rgba(0,230,118,0)}
+  0%,100%{opacity:1;box-shadow:0 0 4px var(--r),0 0 0 0 rgba(255,51,82,.5)}
+  50%{opacity:.75;box-shadow:0 0 10px var(--r),0 0 0 6px rgba(255,51,82,0)}
 }
 
 /* ── Scan dot ripple ── */
@@ -7901,16 +7909,16 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 
     <div class="qa-bar">
       <button class="qa-btn qa-pause" id="qa_pause" onclick="qaTogglePause()">
-        <div class="qa-ico" id="qa_pause_ico">&#9208;</div>
-        <div class="qa-lbl" id="qa_pause_lbl">Pause</div>
+        <span class="qa-ico" id="qa_pause_ico">&#9208;</span>
+        <span class="qa-lbl" id="qa_pause_lbl">Pause</span>
       </button>
       <button class="qa-btn qa-close-all" onclick="qaCloseAll()">
-        <div class="qa-ico">&#128683;</div>
-        <div class="qa-lbl">Close All</div>
+        <span class="qa-ico">&#128683;</span>
+        <span class="qa-lbl">Close All</span>
       </button>
       <button class="qa-btn qa-preview" id="qa_preview" onclick="qaTogglePreview()">
-        <div class="qa-ico">&#128064;</div>
-        <div class="qa-lbl">Preview</div>
+        <span class="qa-ico">&#128064;</span>
+        <span class="qa-lbl">Preview</span>
       </button>
     </div>
 
@@ -7918,6 +7926,13 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <div class="scan-dot" id="scan_dot"></div>
       <span id="scan_msg">Scanning markets…</span>
       <span style="margin-left:auto;font-family:var(--fn);font-size:.55rem;opacity:.7" id="scan_time"></span>
+    </div>
+
+    <div class="health-bar" id="health_bar">
+      <div class="hb-item"><div class="hb-dot" id="hb_db"></div><span>DB</span></div>
+      <div class="hb-item"><div class="hb-dot" id="hb_ws"></div><span>WS</span></div>
+      <div class="hb-item" id="hb_scan_item"><div class="hb-dot" id="hb_scan_dot"></div><span id="hb_scan_lbl">Scan: —</span></div>
+      <div class="hb-item" id="hb_daily" style="display:none"><span id="hb_daily_lbl">Today: —</span></div>
     </div>
 
     <div id="sharpe_row" class="sharpe-row" style="display:none">
@@ -8701,6 +8716,7 @@ async function fetchStatus(){
     renderRiskGauge(d);
     renderProjection(d.balance_projection||null);
     _updateLiveStats(d);
+    updateHealthBar(d);
     const _curDd=d.peak>0?Math.round((d.peak-d.balance)/d.peak*100):0;
     const _ddAlertEl=$('dd_alert');
     if(_ddAlertEl)_ddAlertEl.style.display=(_setDdLimit>0&&_curDd>=_setDdLimit)?'':'none';
@@ -10854,6 +10870,27 @@ function _updateLiveStats(d){
     _liveStats.avg=d.trades>0&&tot!=null?tot/d.trades:null;
   }
 }
+function updateHealthBar(d){
+  const dbDot=$('hb_db');
+  if(dbDot)dbDot.className='hb-dot '+(d.db?'hb-ok':'hb-err');
+  const wsDot=$('hb_ws');
+  if(wsDot)wsDot.className='hb-dot '+(d.ws_live?'hb-ok':'hb-warn');
+  const scanDot=$('hb_scan_dot'),scanLbl=$('hb_scan_lbl');
+  if(scanDot&&scanLbl&&d.scan_age!=null){
+    const age=Math.round(d.scan_age);
+    scanDot.className='hb-dot '+(age<120?'hb-ok':age<300?'hb-warn':'hb-err');
+    scanLbl.textContent='Scan: '+(age<60?age+'s':Math.round(age/60)+'m')+' ago';
+  }
+  const dailyDiv=$('hb_daily'),dailyLbl=$('hb_daily_lbl');
+  if(dailyDiv&&dailyLbl){
+    const dp=d.day_pnl;
+    if(dp!=null&&dp!==0){
+      dailyDiv.style.display='';
+      dailyLbl.textContent='Today: '+(dp>=0?'+':'')+msign(dp);
+      dailyLbl.style.color=dp>=0?'var(--g)':'var(--r)';
+    }
+  }
+}
 function _renderBtvsLive(r){
   const wrap=$('bt_compare');if(!wrap)return;
   if(!r||_liveStats.wr==null){wrap.style.display='none';return;}
@@ -11675,6 +11712,9 @@ def _web_status():
         "weekly_peak":           round(trader._weekly_peak, 2),
         "weekly_dd_paused":      trader._weekly_dd_paused,
         "trade_preview_mode":    _trade_preview_mode,
+        "db":                    db.connected,
+        "ws_live":               bool(_prices_cache and (time.time() - _prices_cache_ts) < 60),
+        "scan_age":              round(time.time() - _last_scan_ts, 1) if _last_scan_ts else None,
     }
     return _Response(json.dumps(payload), mimetype="application/json")
 
