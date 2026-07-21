@@ -357,9 +357,10 @@ ADX_MIN           = 8          # allow mildly trending markets (was 18→14→11
 ER_PERIOD         = 10
 ER_MIN            = 0.03       # efficiency floor (was 0.15→0.08→0.05→0.03 for more entries)
 
-SAVE_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
-TRUSTED_DEV_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trusted_devices.json")
-KEYS_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_keys.json")
+_DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+SAVE_FILE          = os.path.join(_DATA_DIR, "paper_state.json")
+TRUSTED_DEV_FILE   = os.path.join(_DATA_DIR, "trusted_devices.json")
+KEYS_FILE          = os.path.join(_DATA_DIR, "api_keys.json")
 
 # ── Load API keys from disk if not provided via env vars ──────────────────────
 def _load_api_keys_from_file():

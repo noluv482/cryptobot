@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cryptobot
+      POSTGRES_USER: cryptobot
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cryptobot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      TG_TOKEN: ${TG_TOKEN}
+      TG_CHAT_ID: ${TG_CHAT_ID}
+      DASHBOARD_PIN: ${DASHBOARD_PIN}
+      DATABASE_URL: postgresql://cryptobot:${DB_PASSWORD}@db:5432/cryptobot
+      DATA_DIR: /data
+      # Optional — leave blank to use dashboard API Keys instead
+      KRAKEN_KEY: ${KRAKEN_KEY:-}
+      KRAKEN_SECRET: ${KRAKEN_SECRET:-}
+      DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
+    depends_on:
+      db:
+        condition: service_healthy

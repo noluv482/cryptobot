@@ -3,3 +3,7 @@ __pycache__/
 *.pyo
 paper_state.json
 trusted_devices.json
+api_keys.json
+.env
+data/
+pgdata/
