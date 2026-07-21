@@ -11036,7 +11036,9 @@ function _updateGoalTracker(dp){
 
 /* ── QUICK ACTIONS ── */
 async function qaTogglePause(){
-  await fetch('/pause',{method:'POST'});
+  const paused=!!_paused;
+  await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:paused?'resume':'pause'})});
   await fetchStatus();
 }
 async function qaCloseAll(){
@@ -12076,9 +12078,11 @@ def _web_togglepair():
     if enabled:
         _disabled_pairs.discard(pair)
         log("LIVE", f"Pair {pair} re-enabled via dashboard")
+        threading.Thread(target=tg, args=(f"✅ *{pair} re-enabled* via dashboard",), daemon=True).start()
     else:
         _disabled_pairs.add(pair)
         log("LIVE", f"Pair {pair} disabled via dashboard")
+        threading.Thread(target=tg, args=(f"🚫 *{pair} disabled* via dashboard — no new signals for this pair",), daemon=True).start()
     return _Response(json.dumps({"ok": True, "disabled": list(_disabled_pairs)}),
                      mimetype="application/json")
 
@@ -12163,17 +12167,30 @@ def _web_control():
         action = body.get("action", "toggle")
     except Exception:
         action = "toggle"
+    tg_msg = None
     with _state_lock:
         if action == "pause":
-            _paused = True
+            if not _paused:
+                _paused = True
+                tg_msg = "⏸ *Trading PAUSED* via dashboard\nThe bot will not open new trades."
         elif action == "resume":
-            _paused = False
+            if _paused:
+                _paused = False
+                tg_msg = "▶ *Trading RESUMED* via dashboard\nThe bot is back to scanning for signals."
         elif action == "paper":
-            _paper_mode = True
+            if not _paper_mode:
+                _paper_mode = True
+                tg_msg = "📄 *Switched to PAPER mode* via dashboard\nNo real orders will be placed."
         elif action == "live":
-            _paper_mode = False
+            if _paper_mode:
+                _paper_mode = False
+                tg_msg = "🔴 *Switched to LIVE mode* via dashboard\n⚠️ Real orders will now be placed!"
         elif action == "toggle_mode":
             _paper_mode = not _paper_mode
+            if _paper_mode:
+                tg_msg = "📄 *Switched to PAPER mode* via dashboard\nNo real orders will be placed."
+            else:
+                tg_msg = "🔴 *Switched to LIVE mode* via dashboard\n⚠️ Real orders will now be placed!"
         elif action == "sim_on":
             _sim_enabled = True
         elif action == "sim_off":
@@ -12182,9 +12199,14 @@ def _web_control():
             _sim_enabled = not _sim_enabled
         else:
             _paused = not _paused
+            tg_msg = ("⏸ *Trading PAUSED* via dashboard\nThe bot will not open new trades."
+                      if _paused else
+                      "▶ *Trading RESUMED* via dashboard\nThe bot is back to scanning for signals.")
         now_paused  = _paused
         now_paper   = _paper_mode
         now_sim     = _sim_enabled
+    if tg_msg:
+        threading.Thread(target=tg, args=(tg_msg,), daemon=True).start()
     _push_sse("control", {"paused": now_paused, "paper_mode": now_paper, "sim_enabled": now_sim})
     return _Response(json.dumps({"paused": now_paused, "paper_mode": now_paper,
                                   "mode": "PAPER" if now_paper else "LIVE",
@@ -12301,16 +12323,23 @@ def _web_close_all():
     if not trader:
         return _Response('{"error":"not ready"}', status=503, mimetype="application/json")
     closed = 0
+    names = []
     for pair in list(trader.positions.keys()):
         p = trader.positions.get(pair)
         if not p:
             continue
         try:
             price = get_price(pair)
+            names.append(p.get("name", pair))
             trader._close(price, p.get("name", pair), "web close all", pair)
             closed += 1
         except Exception:
             pass
+    if closed:
+        coins = ", ".join(f"`{n}`" for n in names)
+        threading.Thread(target=tg, args=(
+            f"🛑 *Close All — {closed} position{'s' if closed != 1 else ''} closed via dashboard*\n"
+            f"{coins}",), daemon=True).start()
     return _Response(json.dumps({"ok": True, "closed": closed}), mimetype="application/json")
 
 @_flask_app.route("/close/<pair>", methods=["POST"])
@@ -12323,7 +12352,9 @@ def _web_close_position(pair):
         return _Response('{"error":"no position"}', status=404, mimetype="application/json")
     try:
         price = get_price(pair)
-        trader._close(price, p.get("name", pair), "web close", pair)
+        name = p.get("name", pair)
+        trader._close(price, name, "web close", pair)
+        # Note: _close() already sends its own Telegram "Trade CLOSED" message
         return _Response('{"ok":true}', mimetype="application/json")
     except Exception as e:
         return _Response(json.dumps({"error": str(e)}), status=500, mimetype="application/json")
