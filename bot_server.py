@@ -10228,7 +10228,7 @@ function initCandleHover(){
       '&nbsp; C&nbsp;<span style="color:'+(bull?'var(--g)':'var(--r)')+'">'+f6(c.c)+'</span>'+
       (e20!==null?'<br><span style="color:#58a6ff">EMA20 '+f6(e20)+'</span>':'')+
       (e50!==null?'&nbsp;<span style="color:#f0883e">EMA50 '+f6(e50)+'</span>':'')+
-      (_rsiTip!==null?'&nbsp;<span style="color:'+_rsiTipCol+'">RSI '+Math.round(_rsiTip)+'</span>':'');+
+      (_rsiTip!==null?'&nbsp;<span style="color:'+_rsiTipCol+'">RSI '+Math.round(_rsiTip)+'</span>':'')+
       (c.v?'&nbsp;<span style="color:var(--mu)">Vol '+_fmtVol(c.v)+'</span>':'');
     tip.style.display='block';
   };
@@ -13261,6 +13261,7 @@ def _web_settings():
         "trade_preview_mode": _trade_preview_mode,
         "daily_limits":       _daily_limits,
         "paper_balance":      round(trader.balance, 2) if trader else PAPER_START,
+        "streak_gate_disabled": trader._streak_gate_disabled if trader else False,
     }), mimetype="application/json")
 
 @_flask_app.route("/api/keys", methods=["GET", "POST"])
@@ -13471,7 +13472,7 @@ def _web_control():
         threading.Thread(target=tg, args=(tg_msg,), daemon=True).start()
     _push_sse("control", {"paused": now_paused, "paper_mode": now_paper, "sim_enabled": now_sim})
     return _Response(json.dumps({"paused": now_paused, "paper_mode": now_paper,
-                                  "mode": "PAPER" if now_paper else "LIVE",
+                                  "mode": "LIVE" if is_live() else "PAPER",
                                   "sim_enabled": now_sim}),
                      mimetype="application/json")
 
