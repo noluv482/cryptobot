@@ -602,6 +602,64 @@ BEARISH_WORDS = ["crash","drop","dump","ban","hack","exploit","lawsuit","sec",
                  "bearish","fear","panic","liquidation","outflow","falls",
                  "plunges","tumbles","decline","warning","investigation"]
 
+# ── Named trading strategies ──────────────────────────────────────────────────
+# Each strategy requires specific pillars to be true + a minimum confidence.
+# A trade only enters when at least one strategy matches — no match = no trade.
+_STRATEGIES = {
+    "MULTI_SIGNAL": {
+        "name": "Multi-Signal",    "emoji": "✨",
+        "min_conf": 0.65,          "min_pillars": 7,
+        "desc": "7+ pillars aligned — highest-conviction setup",
+    },
+    "MOMENTUM_BREAKOUT": {
+        "name": "Momentum Breakout", "emoji": "🚀",
+        "min_conf": 0.55,            "required": {"macd_align", "high_volume"},
+        "desc": "High-volume breakout with MACD confirmation",
+    },
+    "TREND_CONTINUATION": {
+        "name": "Trend Continuation", "emoji": "📈",
+        "min_conf": 0.50,             "required": {"nasdaq_align", "tick_strength", "vwap_align"},
+        "desc": "Riding an established trend with macro + VWAP confirmation",
+    },
+    "RSI_REVERSAL": {
+        "name": "RSI Reversal",   "emoji": "🔄",
+        "min_conf": 0.50,         "required": {"rsi_zone", "stoch_rsi"},
+        "desc": "Oversold/overbought reversal with RSI + Stoch confirmation",
+    },
+    "NEWS_CATALYST": {
+        "name": "News Catalyst",  "emoji": "📰",
+        "min_conf": 0.45,         "required": {"news_align"}, "min_news": 2,
+        "desc": "News-driven move with technical confirmation",
+    },
+    "PATTERN_BREAKOUT": {
+        "name": "Pattern Breakout", "emoji": "📐",
+        "min_conf": 0.50,           "required_any": {"chart_struct", "candle_pattern"},
+        "desc": "Chart or candlestick pattern completion",
+    },
+}
+
+def _classify_strategy(sig: str, pillars: dict, confidence: float, pair: str) -> tuple:
+    """Return (strategy_key, strategy_dict) for the best matching named strategy, or (None, None)."""
+    if sig not in ("BUY", "SELL") or not pillars:
+        return None, None
+    p        = pillars
+    n_score  = news_sentiment.get(pair, {}).get("score", 0)
+    n_true   = sum(1 for v in p.values() if v)
+    # Check best quality first
+    if n_true >= 7 and confidence >= 0.65:
+        return "MULTI_SIGNAL", _STRATEGIES["MULTI_SIGNAL"]
+    if p.get("macd_align") and p.get("high_volume") and confidence >= 0.55:
+        return "MOMENTUM_BREAKOUT", _STRATEGIES["MOMENTUM_BREAKOUT"]
+    if p.get("nasdaq_align") and p.get("tick_strength") and p.get("vwap_align") and confidence >= 0.50:
+        return "TREND_CONTINUATION", _STRATEGIES["TREND_CONTINUATION"]
+    if p.get("rsi_zone") and p.get("stoch_rsi") and confidence >= 0.50:
+        return "RSI_REVERSAL", _STRATEGIES["RSI_REVERSAL"]
+    if p.get("news_align") and n_score >= 2 and confidence >= 0.45:
+        return "NEWS_CATALYST", _STRATEGIES["NEWS_CATALYST"]
+    if (p.get("chart_struct") or p.get("candle_pattern")) and confidence >= 0.50:
+        return "PATTERN_BREAKOUT", _STRATEGIES["PATTERN_BREAKOUT"]
+    return None, None
+
 # ── Database ──────────────────────────────────────────────────────────────────
 class Database:
     def __init__(self):
@@ -1015,7 +1073,7 @@ _gate_counters = {
     "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
     "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0, "15m_trend": 0,
     "orderbook_wall": 0, "daily_trend": 0, "pair_profit_cap": 0,
-    "ttl_expired": 0, "low_liq_hours": 0,
+    "ttl_expired": 0, "low_liq_hours": 0, "no_strategy": 0,
 }
 
 # Trade preview / confirmation state
@@ -3222,6 +3280,12 @@ class PaperTrader:
             if sig in ("BUY", "SELL") and confidence < min_conf:
                 with _gate_counter_lock: _gate_counters["min_conf"] += 1
                 return
+            # Strategy gate: require a named setup before any entry
+            _strat_key, _strat = _classify_strategy(sig, pillars or {}, confidence, pair)
+            if _strat_key is None:
+                with _gate_counter_lock: _gate_counters["no_strategy"] += 1
+                log("GATE", f"{name} blocked — no strategy match (conf={confidence:.2f})")
+                return
             if sig == "BUY" and self.can_open_new():
                 _open_side = "LONG"
             elif sig == "SELL" and self.can_open_new():
@@ -3232,16 +3296,19 @@ class PaperTrader:
                 _open_side = "SHORT"
             else:
                 return
+            _strat_emoji = _strat.get("emoji", "")
+            _strat_name  = _strat.get("name", "")
             # Trade preview mode: queue for Telegram confirmation instead of immediate entry
             if _trade_preview_mode and not self._is_live():
                 pid = str(abs(hash(f"{pair}{time.time()}")))[-6:]
                 _trade_previews[pid] = {
                     "side": _open_side, "name": name, "pair": pair, "target": target,
                     "confidence": confidence, "atr": atr, "fkey": fkey, "stop": stop,
-                    "pillars": pillars, "ts": time.time(),
+                    "pillars": pillars, "ts": time.time(), "strategy": _strat_key,
                 }
                 tg_buttons(
                     f"🔔 *Trade Signal — {name}*\n"
+                    f"Strategy: {_strat_emoji} *{_strat_name}*\n"
                     f"{'🟢 BUY' if _open_side=='LONG' else '🔴 SELL'} | Conf: `{int(confidence*100)}%`\n"
                     f"Entry: `${price:.4f}` | `{pair}`\n"
                     f"⏱ Auto-executes in 60s if no action",
@@ -3249,9 +3316,9 @@ class PaperTrader:
                       {"text": "⏭ Skip",  "callback_data": f"skip_trade:{pid}"}]]
                 )
                 return
-            self._open(_open_side, price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars, signal_ts=signal_ts)
+            self._open(_open_side, price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars, signal_ts=signal_ts, strategy=_strat_key)
 
-    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None, signal_ts=None):
+    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None, signal_ts=None, strategy=None):
         # Order TTL: if the signal is older than ORDER_TTL_SECS don't place the order.
         # Gates and API calls between evaluate() and here can add several seconds of lag;
         # acting on a stale signal risks entering at a price the market has already moved past.
@@ -3511,6 +3578,7 @@ class PaperTrader:
                                 "entry_nasdaq": market_mood["nasdaq"],
                                 "entry_news": news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"),
                                 "pillars": pillars or {},
+                                "strategy": strategy or "",
                                 "guard_mode": self.consecutive_losses >= 3,
                                 "streak_at_entry": self.consecutive_losses}
         self._save()
@@ -3531,7 +3599,11 @@ class PaperTrader:
         _is_spot_live = self._is_live() and LIVE_EXCHANGE != "kraken_futures"
         lev_str      = "1x spot" if _is_spot_live else f"*{leverage}× {contract_tier}* {_tier_emoji}"
         _sim_pfx     = "📄 *[SIM]* " if self._force_paper else ""
+        _strat_info  = _STRATEGIES.get(strategy or "", {})
+        _strat_line  = (f"Strategy: {_strat_info.get('emoji','')} *{_strat_info.get('name','')}* "
+                        f"— _{_strat_info.get('desc','')}_\n") if _strat_info else ""
         tg(f"{_sim_pfx}📂 *Trade OPENED — {name}*{live_note}\n"
+           f"{_strat_line}"
            f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'} @ `${fill:.4f}` (slip+fee: `${fee:.3f}`)\n"
            f"Confidence: `{conf_pct}%` | Contract: {lev_str}\n"
            f"Margin: `${margin:.2f}` | Size: `{risk*100:.1f}%` of balance{dd_note}{vol_note}{kelly_note}{streak_note}{session_note}{gain_note}\n"
@@ -3730,7 +3802,11 @@ class PaperTrader:
         move_pct    = round((fill - p["entry"]) / p["entry"] * 100 * (1 if p["side"]=="LONG" else -1), 2)
         fkey_note   = f"\n📊 Signal: `{fkey}`" if fkey else ""
         _sim_pfx    = "📄 *[SIM]* " if self._force_paper else ""
+        _strat_key_c = p.get("strategy", "")
+        _strat_c     = _STRATEGIES.get(_strat_key_c, {})
+        _strat_close = (f"{_strat_c.get('emoji','')} {_strat_c.get('name','')}\n") if _strat_c else ""
         tg(f"{_sim_pfx}{emoji} *Trade CLOSED — {name}*\n"
+           f"{_strat_close}"
            f"{'🟢 L' if p['side']=='LONG' else '🔴 S'} "
            f"`${p['entry']:.4f}` → `${fill:.4f}` ({move_pct:+.2f}%)\n"
            f"Reason: `{reason}` | Held: `{held_mins:.0f} min`\n"
@@ -4811,6 +4887,8 @@ _TEXT_ACTION: dict = {
     "/news":       "news",
     "/forecast":   "forecast",
     "/intel":      "intelligence",
+    "/strategy":   "strategy",
+    "/strategies": "strategy",
     "/learn":      "learn",
     "/why":        "why",
     "/chart":      "chart",
@@ -5557,6 +5635,7 @@ def _cmd_why(trader=None):
         "efficiency":   "〰️ Random walk (Kaufman ER)",
         "daily_gain":   "🎯 Daily gain ceiling hit",
         "min_conf":     "🔒 Below confidence floor",
+        "no_strategy":  "📋 No strategy match",
     }
     rows = [(gate_labels.get(k, k), v) for k, v in sorted(counts.items(), key=lambda x: -x[1]) if v > 0]
     if rows:
@@ -5995,6 +6074,27 @@ def _dispatch_callback(data, query, trader):
             trader._close(price, p["name"], "manual close", pr)
             tg_buttons(f"🚨 *Closed {p['name']}* @ `${price:.4f}`",
                        [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data == "strategy":
+        lines = ["*📋 Trading Strategies*", "━━━━━━━━━━━━━━━━━━━━",
+                 "_Only trades that match a named strategy are entered._\n"]
+        for key, s in _STRATEGIES.items():
+            lines.append(f"{s['emoji']} *{s['name']}*")
+            lines.append(f"   Min confidence: `{int(s['min_conf']*100)}%`")
+            lines.append(f"   _{s['desc']}_")
+            if "required" in s:
+                reqs = ", ".join(r.replace("_"," ").title() for r in s["required"])
+                lines.append(f"   Requires: `{reqs}`")
+            elif "required_any" in s:
+                reqs = " or ".join(r.replace("_"," ").title() for r in s["required_any"])
+                lines.append(f"   Requires: `{reqs}`")
+            elif "min_pillars" in s:
+                lines.append(f"   Requires: `{s['min_pillars']}+ pillars aligned`")
+            lines.append("")
+        # Show gate stats
+        blocked = _gate_counters.get("no_strategy", 0)
+        lines.append(f"📊 Signals blocked today (no strategy match): `{blocked}`")
+        tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data == "intelligence":
         try:
