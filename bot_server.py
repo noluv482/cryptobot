@@ -975,6 +975,8 @@ _KLINES_TTL   = 300        # 5 min; 15-min candles only change every 15 min
 
 _last_scan_ts: float = 0.0  # updated after each trading-loop cycle; watchdog alerts on stall
 
+_ob_cache: dict = {}       # pair → {"ratio": float, "ts": float} from WS ticker bid/ask qty
+
 _btc_price_hist: list = []  # (timestamp, price) — rolling 35-min BTC tick history for momentum gate
 _BTC_HIST_SECS  = 2100      # 35 minutes kept
 
@@ -990,7 +992,7 @@ _gate_counters = {
     "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
     "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0, "15m_trend": 0,
     "orderbook_wall": 0, "daily_trend": 0, "pair_profit_cap": 0,
-    "ttl_expired": 0,
+    "ttl_expired": 0, "low_liq_hours": 0,
 }
 
 # Trade preview / confirmation state
@@ -1737,13 +1739,17 @@ def calc_bb_squeeze(closes, period=20, std_dev=2.0):
     return avg > 0 and current < avg * 0.55  # current < 55% of recent average = squeeze
 
 def _get_ob_imbalance(pair):
-    """Fetch top-10 order book levels and return bid_vol / ask_vol ratio.
-    Routes to Binance, Kraken Futures, or Kraken spot depending on EXCHANGE setting.
-    Returns None on error. Ratio > 1 = more bid pressure; < 1 = more ask pressure."""
+    """Return bid_vol / ask_vol ratio. Checks real-time WS cache first (updated every
+    ticker message), falls back to REST top-10 depth. Ratio >1 = bid pressure; <1 = ask."""
     if USE_BINANCE:
         return _bn_get_ob_imbalance(pair)
     if USE_FUTURES:
         return _kf_get_ob_imbalance(pair)
+    # Use live WS bid/ask qty if fresh (< 60s) — eliminates REST call per scan cycle
+    cached = _ob_cache.get(pair)
+    if cached and time.time() - cached["ts"] < 60:
+        return cached["ratio"]
+    # REST fallback when WS hasn't seen this pair yet
     try:
         r = requests.get(f"{BASE_URL}/Depth", params={"pair": pair, "count": 10}, timeout=5)
         if not r.ok:
@@ -2137,6 +2143,9 @@ def rank_coins():
                 n  = db_rates[pair]["n"]
                 if   wr >= 65: score += 20; learned = f"Learned {wr:.0f}%WR✅"
                 elif wr >= 55: score += 10; learned = f"Learned {wr:.0f}%WR"
+                elif wr <= 35 and n >= 20:
+                    score = -1000          # hard exclusion — consistently losing, skip entirely
+                    learned = f"Excluded {wr:.0f}%WR❌ ({n}t)"
                 elif wr <= 35: score -= 20; learned = f"Learned {wr:.0f}%WR❌"
                 elif wr <= 45: score -= 10; learned = f"Learned {wr:.0f}%WR"
 
@@ -6500,6 +6509,14 @@ def trading_loop(trader):
                             elif sig == "SELL" and trend_1h != "DOWN":
                                 with _gate_counter_lock: _gate_counters["1h_trend"] += 1
 
+                    # Low-liquidity hour gate: 02:00–06:00 UTC altcoin markets are thin.
+                    # Only BTC and ETH trade with enough depth during these hours.
+                    if sig in ("BUY", "SELL") and pair not in ("XBTUSD", "ETHUSD"):
+                        _utc_hour = __import__('datetime').datetime.utcnow().hour
+                        if 2 <= _utc_hour < 6:
+                            conf = max(round(conf - 0.15, 2), 0.0)
+                            with _gate_counter_lock: _gate_counters["low_liq_hours"] += 1
+
                     # Regime-adaptive pullback filter: in a TRENDING market, wait for
                     # a 1-candle pullback to get a better entry price
                     if sig in ("BUY", "SELL") and len(closes) >= 2:
@@ -6673,7 +6690,7 @@ def _kraken_ws_loop():
     ws_pairs = list(_ws_pair_map.keys())
 
     def _on_message(ws, raw):
-        global _prices_cache, _prices_cache_ts
+        global _prices_cache, _prices_cache_ts, _ob_cache
         try:
             msg = json.loads(raw)
             if not isinstance(msg, list) or len(msg) < 4:
@@ -6698,6 +6715,18 @@ def _kraken_ws_loop():
             pct = round((price - open_p) / open_p * 100, 2) if open_p else 0.0
             _prices_cache[pair] = {"price": price, "pct": pct}
             _prices_cache_ts = time.time()
+            # Extract bid/ask lot volumes from ticker for real-time OB imbalance
+            # b[1] = whole lot volume at best bid; a[1] = whole lot volume at best ask
+            try:
+                b_raw = data.get("b")
+                a_raw = data.get("a")
+                if b_raw and a_raw:
+                    bid_qty = float(b_raw[1])
+                    ask_qty = float(a_raw[1])
+                    if ask_qty > 0:
+                        _ob_cache[pair] = {"ratio": bid_qty / ask_qty, "ts": time.time()}
+            except Exception:
+                pass
         except Exception:
             pass
 
