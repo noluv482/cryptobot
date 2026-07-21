@@ -636,6 +636,11 @@ _STRATEGIES = {
         "min_conf": 0.50,           "required_any": {"chart_struct", "candle_pattern"},
         "desc": "Chart or candlestick pattern completion",
     },
+    "CONFLUENCE": {
+        "name": "Confluence",  "emoji": "🔀",
+        "min_conf": 0.52,      "min_pillars": 4,
+        "desc": "4+ indicators aligned — broad multi-factor confirmation",
+    },
 }
 
 def _classify_strategy(sig: str, pillars: dict, confidence: float, pair: str) -> tuple:
@@ -658,6 +663,9 @@ def _classify_strategy(sig: str, pillars: dict, confidence: float, pair: str) ->
         return "NEWS_CATALYST", _STRATEGIES["NEWS_CATALYST"]
     if (p.get("chart_struct") or p.get("candle_pattern")) and confidence >= 0.50:
         return "PATTERN_BREAKOUT", _STRATEGIES["PATTERN_BREAKOUT"]
+    # Fallback: any signal with 4+ pillars aligned at decent confidence
+    if n_true >= 4 and confidence >= 0.52:
+        return "CONFLUENCE", _STRATEGIES["CONFLUENCE"]
     return None, None
 
 # ── Database ──────────────────────────────────────────────────────────────────
