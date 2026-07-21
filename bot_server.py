@@ -1179,25 +1179,34 @@ def get_price(pair):
 
 # ── Kraken private API (live trading mode) ───────────────────────────────────
 
-def _kraken_private(method, params=None):
-    """Sign and send a Kraken private REST request. Returns result dict or raises."""
+def _kraken_private(method, params=None, _retries=3):
+    """Sign and send a Kraken private REST request. Retries up to 3× on rate-limit errors."""
     params = dict(params or {})
-    nonce  = str(int(time.time() * 1000))
-    params["nonce"] = nonce
-    post_data = urllib.parse.urlencode(params)
-    url_path  = f"/0/private/{method}"
-    msg       = url_path.encode() + hashlib.sha256((nonce + post_data).encode()).digest()
-    secret    = base64.b64decode(KRAKEN_API_SECRET)
-    signature = base64.b64encode(hmac.new(secret, msg, hashlib.sha512).digest()).decode()
-    headers   = {"API-Key": KRAKEN_API_KEY, "API-Sign": signature,
-                 "Content-Type": "application/x-www-form-urlencoded"}
-    r = requests.post(f"https://api.kraken.com{url_path}",
-                      headers=headers, data=post_data, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise RuntimeError(f"Kraken API error: {data['error']}")
-    return data["result"]
+    for attempt in range(_retries):
+        nonce     = str(int(time.time() * 1000))
+        _p        = dict(params)
+        _p["nonce"] = nonce
+        post_data = urllib.parse.urlencode(_p)
+        url_path  = f"/0/private/{method}"
+        msg       = url_path.encode() + hashlib.sha256((nonce + post_data).encode()).digest()
+        secret    = base64.b64decode(KRAKEN_API_SECRET)
+        signature = base64.b64encode(hmac.new(secret, msg, hashlib.sha512).digest()).decode()
+        headers   = {"API-Key": KRAKEN_API_KEY, "API-Sign": signature,
+                     "Content-Type": "application/x-www-form-urlencoded"}
+        r = requests.post(f"https://api.kraken.com{url_path}",
+                          headers=headers, data=post_data, timeout=20)
+        r.raise_for_status()
+        data   = r.json()
+        errors = data.get("error") or []
+        if errors:
+            if any("Rate limit" in str(e) or "EAPI:Rate limit" in str(e) for e in errors):
+                wait = 2 ** (attempt + 1)
+                log("LIVE", f"Kraken rate limit on {method} — retrying in {wait}s (attempt {attempt+1}/{_retries})", "WRN")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Kraken API error: {errors}")
+        return data["result"]
+    raise RuntimeError(f"Kraken rate limit — gave up after {_retries} retries on {method}")
 
 def _kraken_get_usd_balance():
     """Return available USD balance from Kraken. Returns 0.0 on failure."""
@@ -3022,12 +3031,22 @@ class PaperTrader:
         if not self._is_live() and self.balance >= PAPER_TARGET: return
         if pair in _disabled_pairs: return
         self._reset_day_if_needed()
-        if _daily_limits:
+        if _daily_limits or self._is_live():
             if self.day_trades >= MAX_TRADES_DAY: return
             if (self.balance - self.day_start_bal) / max(self.day_start_bal, 0.01) <= -DAILY_LOSS_LIMIT: return
 
         closed_this_tick = False
         p = self.positions.get(pair)
+        # Retry a previously-failed close before any other position logic
+        if p and p.get("close_pending"):
+            try:
+                retry_price = get_price(pair)
+                p.pop("close_pending", None)
+                _pending_reason = p.pop("close_reason", "retry close")
+                self._close(retry_price, p.get("name", pair), _pending_reason, pair)
+            except Exception as _re:
+                log("LIVE", f"Close retry failed for {name}: {_re}", "ERR")
+            return
         if p:
             side = p["side"]
             move = (price - p["entry"]) / p["entry"]
@@ -3156,7 +3175,8 @@ class PaperTrader:
             if _dgain >= DAILY_GAIN_HARD:
                 with _gate_counter_lock: _gate_counters["daily_gain"] += 1
                 return
-            min_conf = max(MIN_CONFIDENCE,
+            _live_floor = 0.50 if self._is_live() else 0.0
+            min_conf = max(MIN_CONFIDENCE, _live_floor,
                            self._min_conf_threshold(pair),
                            self._dynamic_conf_gate(),
                            self._hourly_conf_gate())
@@ -3378,6 +3398,21 @@ class PaperTrader:
                     txid = _kraken_place_order(pair, order_side, contracts, leverage=lev_arg,
                                                price_limit=_slip_limit)
                     self._live_orders[pair] = txid
+                    # Verify actual fill — Kraken may have partially filled or used a different price
+                    time.sleep(0.5)
+                    try:
+                        _finfo = _kraken_private("QueryOrders", {"txid": txid, "trades": "true"})
+                        _ord   = (_finfo or {}).get(txid, {})
+                        _filled_vol = float(_ord.get("vol_exec") or 0)
+                        _avg_price  = float(_ord.get("price") or fill)
+                        if _filled_vol > 0:
+                            contracts = _filled_vol
+                            fill      = _avg_price
+                            log("LIVE", f"Fill confirmed: {_filled_vol} {pair} @ ${_avg_price:.4f}")
+                        else:
+                            log("LIVE", f"Order {txid} not yet fully filled — using estimated qty", "WRN")
+                    except Exception as _qe:
+                        log("LIVE", f"QueryOrders failed ({_qe}) — using estimated fill", "WRN")
                     real_usd = _kraken_get_usd_balance()
                 except Exception as exc:
                     log("LIVE", f"Order FAILED for {name}: {exc}", "ERR")
@@ -3512,7 +3547,10 @@ class PaperTrader:
             except Exception as exc:
                 exch = LIVE_EXCHANGE.replace("_", " ").title()
                 log("LIVE", f"Close order FAILED for {name}: {exc}", "ERR")
-                tg(f"⚠️ *Live close FAILED — {name}*\n`{exc}`\n_Position still open on {exch} — check manually!_")
+                if pair in self.positions:
+                    self.positions[pair]["close_pending"] = True
+                    self.positions[pair]["close_reason"]  = reason
+                tg(f"⚠️ *Live close FAILED — {name}*\n`{exc}`\n_Marked for retry on next scan — check {exch} if it persists._")
                 return
             pnl  = round(real_usd_after - self.balance, 4) if real_usd_after > 0 else 0.0
             if real_usd_after > 0:
@@ -4001,11 +4039,12 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["econ"] += 1
             sig = "HOLD"
 
-        # Spread gate — only block truly illiquid pairs (>1% spread)
+        # Spread gate — block wide spreads; threshold tighter in live mode
         if sig in ("BUY", "SELL"):
             try:
                 _sp = _spread_pct(current_pair)
-                if _sp > 0.010:
+                _sp_limit = 0.003 if is_live() else 0.010
+                if _sp > _sp_limit:
                     with _gate_counter_lock: _gate_counters["spread"] += 1
                     sig = "HOLD"
             except Exception:
@@ -4183,11 +4222,13 @@ class SignalEngine:
         if _stoch_against and sig in ("BUY", "SELL"):
             confidence = max(0.0, round(confidence - 0.07, 2))
 
-        # Choppy-regime confidence penalty (soft gate — trade allowed but smaller)
-        # Counter here so it only fires when the signal survived all hard gates
+        # Choppy-regime gate — hard block in live mode (fees eat you in choppy), soft in paper
         if choppy:
             with _gate_counter_lock: _gate_counters["choppy"] += 1
-            confidence = max(0.0, round(confidence - 0.08, 2))  # was -0.15
+            if is_live():
+                sig = "HOLD"
+            else:
+                confidence = max(0.0, round(confidence - 0.08, 2))
 
         # 15m soft gate — counter-trend 15m trims confidence without hard-blocking
         if _15m_against and sig in ("BUY", "SELL"):
@@ -6752,19 +6793,37 @@ def _kraken_ws_loop():
 
 # ── Watchdog ──────────────────────────────────────────────────────────────────
 def _watchdog_loop():
-    """Alert via Telegram if the trading loop stalls for > 5 minutes."""
-    _alerted = False
+    """Alert via Telegram if scan stalls, DB drops, or WS prices go stale."""
+    _scan_alerted = False
+    _db_alerted   = False
+    _ws_alerted   = False
     while True:
         time.sleep(60)
         if _last_scan_ts == 0:
             continue
+        # Scan loop stall
         age = time.time() - _last_scan_ts
-        if age > 300 and not _alerted:
-            tg(f"⚠️ *CryptoBot Warning*\nScan loop stalled — last scan {int(age // 60)}m ago")
-            _alerted = True
-        elif age <= 300 and _alerted:
-            tg("✅ *CryptoBot Recovered*\nScan loop is active again")
-            _alerted = False
+        if age > 300 and not _scan_alerted:
+            tg(f"⚠️ *Scan loop stalled* — last scan {int(age // 60)}m ago\n_Positions have no stop management while stalled!_")
+            _scan_alerted = True
+        elif age <= 300 and _scan_alerted:
+            tg("✅ *Scan loop recovered* — bot is active again")
+            _scan_alerted = False
+        # DB connectivity
+        if not db.connected and not _db_alerted:
+            tg("⚠️ *Database disconnected* — learning paused, running on JSON fallback")
+            _db_alerted = True
+        elif db.connected and _db_alerted:
+            tg("✅ *Database reconnected*")
+            _db_alerted = False
+        # WebSocket price freshness
+        _ws_ok = bool(_prices_cache and (time.time() - _prices_cache_ts) < 120)
+        if not _ws_ok and not _ws_alerted:
+            tg("⚠️ *WebSocket prices stale* — using REST fallback; fills may be slower")
+            _ws_alerted = True
+        elif _ws_ok and _ws_alerted:
+            tg("✅ *WebSocket prices restored*")
+            _ws_alerted = False
 
 # ── Hourly heartbeat ──────────────────────────────────────────────────────────
 def _heartbeat_loop(trader):
@@ -12379,7 +12438,7 @@ def _web_settings():
 
 @_flask_app.route("/control", methods=["POST"])
 def _web_control():
-    global _paused, _paper_mode, _sim_enabled
+    global _paused, _paper_mode, _sim_enabled, _daily_limits
     try:
         body = _flask_request.get_json(silent=True) or {}
         action = body.get("action", "toggle")
@@ -12402,7 +12461,8 @@ def _web_control():
         elif action == "live":
             if _paper_mode:
                 _paper_mode = False
-                tg_msg = "🔴 *Switched to LIVE mode* via dashboard\n⚠️ Real orders will now be placed!"
+                _daily_limits = True
+                tg_msg = "🔴 *Switched to LIVE mode* via dashboard\n⚠️ Real orders will now be placed!\n🔒 Daily limits auto-enabled (10 trades / −10% day cap)."
         elif action == "toggle_mode":
             _paper_mode = not _paper_mode
             if _paper_mode:
