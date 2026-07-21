@@ -338,7 +338,7 @@ ORDER_TTL_SECS          = 45      # max seconds from signal to order placement; 
 LIVE_SLIPPAGE_TOLERANCE = 0.003   # 0.3% worst acceptable fill vs signal price on live orders
 MAX_TRADES_DAY   = 10
 DAILY_LOSS_LIMIT = 0.10
-ACTIVE_HOURS_UTC  = (5, 23)
+ACTIVE_HOURS_UTC  = (0, 24)   # 24/7 — crypto never closes; covers Asian session
 FUNDING_THRESHOLD = 0.0005
 MAX_POSITIONS     = 2          # max 2 simultaneous positions (was 3) — focus on quality
 MAX_TOTAL_RISK    = 0.25       # total margin ≤ 25% (was 40%) — reduce correlated exposure
@@ -5912,6 +5912,8 @@ def _dispatch_callback(data, query, trader):
         h = _dt.utcnow().hour
         if not (ACTIVE_HOURS_UTC[0] <= h < ACTIVE_HOURS_UTC[1]):
             lines.append(f"🌙 Outside trading hours (UTC {h:02d}:xx) — resumes at {ACTIVE_HOURS_UTC[0]:02d}:00 UTC")
+        elif ACTIVE_HOURS_UTC == (0, 24):
+            lines.append(f"✅ 24/7 trading active (UTC {h:02d}:xx) — Asian + EU + US sessions")
         else:
             lines.append(f"✅ Inside active trading window (UTC {h:02d}:xx)")
         # 8. Overall verdict
