@@ -17,7 +17,7 @@ jobs:
           git checkout claude/bot-scan-1amdiq
           git reset --hard origin/claude/bot-scan-1amdiq
           cp bot_server.py app/bot_server.py
-          docker compose build --no-cache bot
+          docker compose build bot
           docker compose up -d bot
           echo "Deploy complete at $(date)"
           docker ps | grep cryptobot-bot
