@@ -1027,6 +1027,9 @@ _GATE_LOG_INTERVAL = 120           # log top blockers every 2 min
 # {"<uuid>": {"label": "iPhone/iPad", "added_ts": 1234567890}}
 _trusted_devices: dict = {}
 _pending_devices: dict = {}   # {dev_id: {"label","ip","ts","status":"pending"|"allowed"|"blocked"}}
+_auth_failures:   dict = {}   # {ip: (count, first_fail_ts)} — brute-force tracking
+_AUTH_MAX_FAILS   = 5
+_AUTH_LOCKOUT_S   = 300       # 5-minute lockout after 5 wrong PINs
 _PENDING_EXPIRY   = 600       # seconds before an unanswered approval request expires
 
 def _load_trusted_devices():
@@ -3060,10 +3063,12 @@ class PaperTrader:
         # Retry a previously-failed close before any other position logic
         if p and p.get("close_pending"):
             try:
-                retry_price = get_price(pair)
-                p.pop("close_pending", None)
-                _pending_reason = p.pop("close_reason", "retry close")
+                retry_price    = get_price(pair)
+                _pending_reason = p.get("close_reason", "retry close")
                 self._close(retry_price, p.get("name", pair), _pending_reason, pair)
+                # Only clear the flag after a confirmed successful close
+                p.pop("close_pending", None)
+                p.pop("close_reason", None)
             except Exception as _re:
                 log("LIVE", f"Close retry failed for {name}: {_re}", "ERR")
             return
@@ -10748,14 +10753,19 @@ function closeLiveModal(){$('live_modal').classList.remove('open');}
 
 /* ── API KEYS MODAL ── */
 let _keysTested=false;
+let _testedKey='',_testedSecret='';
+function _resetKeyTest(){
+  _keysTested=false;_testedKey='';_testedSecret='';
+  const sb=$('key_save_btn');if(sb)sb.disabled=true;
+  const tr=$('key_test_result');if(tr){tr.textContent='';tr.style.color='var(--mu)';}
+}
 async function openKeyModal(){
-  _keysTested=false;
+  _resetKeyTest();
   const ki=$('key_input'),si=$('secret_input'),pi=$('key_pin_input');
-  const tr=$('key_test_result'),sb=$('key_save_btn');
-  if(ki)ki.value='';
-  if(si)si.value='';
+  const sb=$('key_save_btn');
+  if(ki){ki.value='';ki.oninput=_resetKeyTest;}
+  if(si){si.value='';si.oninput=_resetKeyTest;}
   if(pi)pi.value='';
-  if(tr){tr.textContent='';tr.style.color='var(--mu)';}
   if(sb)sb.disabled=true;
   try{
     const d=await(await fetch('/api/keys')).json();
@@ -12606,7 +12616,11 @@ def _web_api_keys():
         }), mimetype="application/json")
     body       = _flask_request.get_json(silent=True) or {}
     pin        = body.get("pin", "")
-    if DASHBOARD_PIN and pin != DASHBOARD_PIN:
+    if not DASHBOARD_PIN:
+        return _Response(json.dumps({"ok": False,
+                                     "error": "Set DASHBOARD_PIN in your .env to enable API key management"}),
+                         mimetype="application/json", status=403)
+    if pin != DASHBOARD_PIN:
         return _Response(json.dumps({"ok": False, "error": "wrong pin"}),
                          mimetype="application/json", status=403)
     new_key    = _clean_env(body.get("kraken_key", ""))
@@ -12615,8 +12629,10 @@ def _web_api_keys():
         return _Response(json.dumps({"ok": False, "error": "key and secret required"}),
                          mimetype="application/json")
     try:
-        with open(KEYS_FILE, "w") as _kf:
+        _tmp_keys = KEYS_FILE + ".tmp"
+        with open(_tmp_keys, "w") as _kf:
             json.dump({"kraken_key": new_key, "kraken_secret": new_secret}, _kf)
+        os.replace(_tmp_keys, KEYS_FILE)
     except Exception as _e:
         return _Response(json.dumps({"ok": False, "error": f"disk error: {_e}"}),
                          mimetype="application/json")
@@ -12634,7 +12650,11 @@ def _web_api_keys_test():
     """Validate provided Kraken API keys by calling the Balance endpoint. Does not save them."""
     body = _flask_request.get_json(silent=True) or {}
     pin  = body.get("pin", "")
-    if DASHBOARD_PIN and pin != DASHBOARD_PIN:
+    if not DASHBOARD_PIN:
+        return _Response(json.dumps({"ok": False,
+                                     "error": "Set DASHBOARD_PIN in your .env to enable API key management"}),
+                         mimetype="application/json", status=403)
+    if pin != DASHBOARD_PIN:
         return _Response(json.dumps({"ok": False, "error": "wrong pin"}),
                          mimetype="application/json", status=403)
     test_key    = _clean_env(body.get("kraken_key", ""))
@@ -12736,9 +12756,20 @@ def _web_auth():
     body = _flask_request.get_json(silent=True) or {}
     if not DASHBOARD_PIN:
         return _Response('{"ok":true,"trusted":true}', mimetype="application/json")
+    # Brute-force protection: lock out IP after 5 wrong PINs for 5 minutes
+    raw_ip = (_flask_request.headers.get("X-Forwarded-For", "")
+              or _flask_request.remote_addr or "unknown")
+    _client_ip = raw_ip.split(",")[0].strip()
+    _fail_count, _fail_ts = _auth_failures.get(_client_ip, (0, 0.0))
+    if _fail_count >= _AUTH_MAX_FAILS and time.time() - _fail_ts < _AUTH_LOCKOUT_S:
+        return _Response(json.dumps({"ok": False, "error": "too many attempts — try again later"}),
+                         mimetype="application/json", status=429)
     ok = body.get("pin", "") == DASHBOARD_PIN
     if not ok:
+        _auth_failures[_client_ip] = (_fail_count + 1,
+                                       _fail_ts if _fail_count > 0 else time.time())
         return _Response(json.dumps({"ok": False}), mimetype="application/json")
+    _auth_failures.pop(_client_ip, None)
 
     raw_ip = (_flask_request.headers.get("X-Forwarded-For", "")
               or _flask_request.remote_addr or "unknown")
