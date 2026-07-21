@@ -608,37 +608,37 @@ BEARISH_WORDS = ["crash","drop","dump","ban","hack","exploit","lawsuit","sec",
 _STRATEGIES = {
     "MULTI_SIGNAL": {
         "name": "Multi-Signal",    "emoji": "✨",
-        "min_conf": 0.65,          "min_pillars": 7,
+        "min_conf": 0.65,          "min_pillars": 7,   "max_mins": 180,
         "desc": "7+ pillars aligned — highest-conviction setup",
     },
     "MOMENTUM_BREAKOUT": {
         "name": "Momentum Breakout", "emoji": "🚀",
-        "min_conf": 0.55,            "required": {"macd_align", "high_volume"},
+        "min_conf": 0.55,            "required": {"macd_align", "high_volume"}, "max_mins": 90,
         "desc": "High-volume breakout with MACD confirmation",
     },
     "TREND_CONTINUATION": {
         "name": "Trend Continuation", "emoji": "📈",
-        "min_conf": 0.50,             "required": {"nasdaq_align", "tick_strength", "vwap_align"},
+        "min_conf": 0.50,             "required": {"nasdaq_align", "tick_strength", "vwap_align"}, "max_mins": 180,
         "desc": "Riding an established trend with macro + VWAP confirmation",
     },
     "RSI_REVERSAL": {
         "name": "RSI Reversal",   "emoji": "🔄",
-        "min_conf": 0.50,         "required": {"rsi_zone", "stoch_rsi"},
+        "min_conf": 0.50,         "required": {"rsi_zone", "stoch_rsi"}, "max_mins": 60,
         "desc": "Oversold/overbought reversal with RSI + Stoch confirmation",
     },
     "NEWS_CATALYST": {
         "name": "News Catalyst",  "emoji": "📰",
-        "min_conf": 0.45,         "required": {"news_align"}, "min_news": 2,
+        "min_conf": 0.45,         "required": {"news_align"}, "min_news": 2, "max_mins": 45,
         "desc": "News-driven move with technical confirmation",
     },
     "PATTERN_BREAKOUT": {
         "name": "Pattern Breakout", "emoji": "📐",
-        "min_conf": 0.50,           "required_any": {"chart_struct", "candle_pattern"},
+        "min_conf": 0.50,           "required_any": {"chart_struct", "candle_pattern"}, "max_mins": 60,
         "desc": "Chart or candlestick pattern completion",
     },
     "CONFLUENCE": {
         "name": "Confluence",  "emoji": "🔀",
-        "min_conf": 0.52,      "min_pillars": 4,
+        "min_conf": 0.52,      "min_pillars": 4,   "max_mins": 90,
         "desc": "4+ indicators aligned — broad multi-factor confirmation",
     },
 }
@@ -3248,7 +3248,7 @@ class PaperTrader:
                 self._close(price, name, "profit cap",   pair); closed_this_tick = True
             elif hit_trail:
                 self._close(price, name, "trailing stop", pair); closed_this_tick = True
-            elif mins_open >= MAX_TRADE_MINS:
+            elif mins_open >= _STRATEGIES.get(p.get("strategy", ""), {}).get("max_mins", MAX_TRADE_MINS):
                 self._close(price, name, "time limit",   pair); closed_this_tick = True
             elif mins_open >= 45 and abs(move) * p["entry"] < atr_dist:
                 self._close(price, name, "stale exit",   pair); closed_this_tick = True
@@ -4325,6 +4325,14 @@ class SignalEngine:
         # Fear & Greed soft penalty — elevated greed/fear zone trims confidence
         if _fg_against and sig in ("BUY", "SELL"):
             confidence = max(0.0, round(confidence - 0.08, 2))
+
+        # Contrarian divergence boost: entering AGAINST the crowd, but news backs the trade.
+        # Extreme fear (<25) + bullish news + BUY = smart money buys panic → +6% boost.
+        # Extreme greed (>75) + bearish news + SELL = distribution into euphoria → +6% boost.
+        if sig == "BUY"  and fg_val < 25 and n_sent == "BULLISH":
+            confidence = min(1.0, round(confidence + 0.06, 2))
+        elif sig == "SELL" and fg_val > 75 and n_sent == "BEARISH":
+            confidence = min(1.0, round(confidence + 0.06, 2))
 
         # ADX soft penalty — weak trend trims confidence without hard-blocking
         if _adx_weak and sig in ("BUY", "SELL"):
@@ -6088,7 +6096,7 @@ def _dispatch_callback(data, query, trader):
                  "_Only trades that match a named strategy are entered._\n"]
         for key, s in _STRATEGIES.items():
             lines.append(f"{s['emoji']} *{s['name']}*")
-            lines.append(f"   Min confidence: `{int(s['min_conf']*100)}%`")
+            lines.append(f"   Min confidence: `{int(s['min_conf']*100)}%` | Max hold: `{s.get('max_mins', MAX_TRADE_MINS)} min`")
             lines.append(f"   _{s['desc']}_")
             if "required" in s:
                 reqs = ", ".join(r.replace("_"," ").title() for r in s["required"])
@@ -6267,6 +6275,26 @@ def _weekly_summary(trader):
         coin_pnl[t.get("coin", "?")] = coin_pnl.get(t.get("coin", "?"), 0) + t["pnl"]
     top_coin  = max(coin_pnl, key=lambda k: coin_pnl[k])
     bot_coin  = min(coin_pnl, key=lambda k: coin_pnl[k])
+    # Exit reason breakdown — which reasons win vs lose
+    reason_stats: dict = {}
+    for t in week:
+        r = t.get("reason", "unknown")
+        rs = reason_stats.setdefault(r, {"n": 0, "wins": 0, "pnl": 0.0})
+        rs["n"] += 1; rs["pnl"] += t["pnl"]
+        if t["pnl"] > 0: rs["wins"] += 1
+    top_reasons = sorted(reason_stats.items(), key=lambda x: -x[1]["n"])[:4]
+    reason_lines = "\n".join(
+        f"  {r.replace('_',' ')}: `{d['wins']}/{d['n']}` `{d['pnl']:+.2f}$`"
+        for r, d in top_reasons
+    )
+    # Best performing strategy
+    strat_pnl: dict = {}
+    for t in week:
+        s = t.get("strategy", "?") or "?"
+        sp = strat_pnl.setdefault(s, {"n": 0, "pnl": 0.0})
+        sp["n"] += 1; sp["pnl"] += t["pnl"]
+    best_strat = max(strat_pnl, key=lambda k: strat_pnl[k]["pnl"]) if strat_pnl else "?"
+    bs_data    = strat_pnl.get(best_strat, {})
     tg(f"📆 *Weekly Summary*\n"
        f"━━━━━━━━━━━━━━━━━━━━\n"
        f"Trades: `{len(week)}` | W: `{len(wins)}` L: `{len(losses)}`\n"
@@ -6275,8 +6303,12 @@ def _weekly_summary(trader):
        f"Best trade:  `+{best['pnl']:.2f}$` ({best.get('coin','?')})\n"
        f"Worst trade: `{worst['pnl']:.2f}$` ({worst.get('coin','?')})\n"
        f"━━━━━━━━━━━━━━━━━━━━\n"
-       f"Top coin: *{top_coin}* `{coin_pnl[top_coin]:+.2f}$`\n"
+       f"Top coin:  *{top_coin}* `{coin_pnl[top_coin]:+.2f}$`\n"
        f"Worst coin: *{bot_coin}* `{coin_pnl[bot_coin]:+.2f}$`\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"🏆 Best strategy: *{best_strat}* `{bs_data.get('pnl',0):+.2f}$` ({bs_data.get('n',0)} trades)\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"Exit breakdown:\n{reason_lines}\n"
        f"━━━━━━━━━━━━━━━━━━━━\n"
        f"Balance: `${trader.balance:.2f}` | {rank['emoji']} {rank['name']}")
 
