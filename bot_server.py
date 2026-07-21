@@ -2565,7 +2565,7 @@ class PaperTrader:
         # Per-pair win-rate cache for stake sizing
         self._wr_cache     = {}   # pair → {"n": n, "wr": wr}
         self._wr_ts        = 0.0
-        # Loss streak global entry cooldown (30-min pause after ≥3 consecutive losses)
+        # Loss streak global entry cooldown (15-min pause after ≥4 consecutive losses)
         self._streak_cool_until = 0.0
         self._streak_reset_len  = 0    # manual reset: only count trades after this index
         self._saved_setups      = []   # guard-mode winning setups (capped at 50)
@@ -3762,10 +3762,10 @@ class PaperTrader:
                 cooldown = 900
             self._cooldown[pair] = time.time() + cooldown
             log("PAPER", f"{name} cooldown {cooldown//60}m after {reason} loss")
-            # Loss streak global cooldown: ≥3 in a row → 30-min pause on all new entries
-            if self.consecutive_losses >= 3:
-                self._streak_cool_until = time.time() + 1800
-                log("PAPER", f"Loss streak {self.consecutive_losses} → 30-min entry pause", "WARN")
+            # Loss streak global cooldown: ≥4 in a row → 15-min pause on all new entries
+            if self.consecutive_losses >= 4:
+                self._streak_cool_until = time.time() + 900
+                log("PAPER", f"Loss streak {self.consecutive_losses} → 15-min entry pause", "WARN")
             if not self._force_paper:
                 _post_loss_analysis(p, pnl, reason, held_mins)
         else:
@@ -4916,12 +4916,15 @@ _TEXT_ACTION: dict = {
     "/close":      "force_close",
     "/status":     "balance",
     "/alerts":     "alert_list",
-    "/livecheck":  "livecheck",
-    "livecheck":   "livecheck",
-    "/scan":       "scan",
-    "scan":        "scan",
-    "/signals":    "scan",
-    "signals":     "scan",
+    "/livecheck":     "livecheck",
+    "livecheck":      "livecheck",
+    "/scan":          "scan",
+    "scan":           "scan",
+    "/signals":       "scan",
+    "signals":        "scan",
+    "/resetstreak":   "resetstreak",
+    "/reset streak":  "resetstreak",
+    "reset streak":   "resetstreak",
 }
 
 def _parse_alert_command(txt):
@@ -5911,6 +5914,19 @@ def _dispatch_callback(data, query, trader):
         else:
             lines.append("🔴 *One or more issues above need fixing*")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
+
+    elif data == "resetstreak":
+        old_streak = trader.consecutive_losses
+        trader._streak_reset_len  = len(trader.trades)
+        trader._streak_cool_until = 0.0
+        trader._save()
+        log("LIVE", f"Loss streak manually reset (was {old_streak}) via Telegram", "WARN")
+        tg_buttons(
+            f"✅ *Streak Reset*\n"
+            f"Previous streak: `{old_streak}` consecutive loss{'es' if old_streak != 1 else ''} cleared.\n"
+            f"_Bot will resume normal entry sizing and confidence gate immediately._",
+            [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]]
+        )
 
     elif data == "scan":
         def _do_scan():
