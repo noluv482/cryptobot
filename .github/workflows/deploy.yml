@@ -15,7 +15,7 @@ jobs:
           cd ~/cryptobot
           git fetch origin
           git checkout claude/bot-scan-1amdiq
-          git pull origin claude/bot-scan-1amdiq
+          git reset --hard origin/claude/bot-scan-1amdiq
           cp bot_server.py app/bot_server.py
           docker compose build --no-cache bot
           docker compose up -d bot
