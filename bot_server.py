@@ -941,6 +941,9 @@ _last_update_id = 0
 _seen_headlines = set()
 _news_log: list = []   # rolling list of recent news for the web dashboard (max 40)
 _NEWS_LOG_MAX   = 40
+# Sentiment history: pair → list of (timestamp, "BULLISH"|"BEARISH"|"NEUTRAL") last 24h
+_sentiment_history: dict = {p: [] for p in COIN_KEYWORDS}
+_SENT_HISTORY_MAX = 48  # keep 48 readings (one per ~30-min news cycle = 24h)
 _btc_benchmark_start: float = 0.0   # BTC price at bot startup (equity benchmark)
 _backtest_state: dict = {"running": False, "result": None, "pair": None, "started_at": 0.0}
 _rt_max_positions: int = 0           # 0 = use MAX_POSITIONS constant
@@ -4461,8 +4464,17 @@ def _news_loop():
                                         _news_log.pop(0)
                 except Exception:
                     pass
+            now = time.time()
+            cutoff = now - 86400  # drop readings older than 24h
             for pair in COIN_KEYWORDS:
                 news_sentiment[pair] = new_scores[pair]
+                hist = _sentiment_history.setdefault(pair, [])
+                hist.append((now, new_scores[pair]["sentiment"]))
+                # Trim old entries
+                while hist and hist[0][0] < cutoff:
+                    hist.pop(0)
+                if len(hist) > _SENT_HISTORY_MAX:
+                    del hist[:-_SENT_HISTORY_MAX]
         except Exception as e:
             log("NEWS", str(e), "ERR")
         time.sleep(120)
@@ -4797,6 +4809,7 @@ _TEXT_ACTION: dict = {
     "/rankings":   "rankings",
     "/history":    "history",
     "/news":       "news",
+    "/forecast":   "forecast",
     "/intel":      "intelligence",
     "/learn":      "learn",
     "/why":        "why",
@@ -6058,17 +6071,27 @@ def _dispatch_callback(data, query, trader):
     elif data == "equity":
         _cmd_equity(trader)
 
-    elif data == "news":
-        active = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] != "NEUTRAL"]
-        neutral = [(p, i) for p, i in news_sentiment.items() if i["sentiment"] == "NEUTRAL"]
-        lines = ["*📰 News Sentiment*", "━━━━━━━━━━━━━━━━━━━━"]
-        for pair, info in active:
-            name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
-            icon = "🟢" if info["sentiment"] == "BULLISH" else "🔴"
-            hl   = f"\n   _{info['headline']}_" if info["headline"] else ""
-            lines.append(f"{icon} *{name}*: `{info['sentiment']}`{hl}")
-        if neutral:
-            lines.append(f"⚫ {len(neutral)} coins neutral")
+    elif data in ("news", "forecast"):
+        fg_val   = fear_greed.get("value", 50)
+        fg_label = fear_greed.get("label", "Neutral")
+        fg_icon  = "😱" if fg_val < 25 else "😨" if fg_val < 45 else "😐" if fg_val < 55 else "😄" if fg_val < 75 else "🤑"
+        lines = [f"*📰 News Forecast*   {fg_icon} F&G: `{fg_val}` _{fg_label}_",
+                 "━━━━━━━━━━━━━━━━━━━━"]
+        forecasts = []
+        for c in SCAN_UNIVERSE:
+            pair = c["pair"]
+            fc   = _compute_forecast(pair)
+            if fc["sentiment"] != "NEUTRAL" or abs(fc["score"] - 50) >= 8:
+                forecasts.append((c["name"], pair, fc))
+        forecasts.sort(key=lambda x: abs(x[2]["score"] - 50), reverse=True)
+        for name, pair, fc in forecasts[:10]:
+            sent_icon = "🟢" if fc["score"] >= 58 else "🔴" if fc["score"] <= 42 else "⚫"
+            trend_icon = "↑" if fc["trend"] == "improving" else "↓" if fc["trend"] == "declining" else "→"
+            hl = news_sentiment.get(pair, {}).get("headline", "")
+            hl_str = f"\n   _{hl[:90]}_" if hl else ""
+            lines.append(f"{sent_icon} *{name}*: `{fc['label']}` ({fc['score']}) {trend_icon}{hl_str}")
+        if not forecasts:
+            lines.append("No strong signals — all coins neutral")
         tg_buttons("\n".join(lines), [[{"text": "🔙 Back to Menu", "callback_data": "menu"}]])
 
     elif data.startswith("allow_dev:"):
@@ -8491,6 +8514,10 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     <div id="coin_ctrl_list" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;overflow:hidden">
       <div class="no-data">Loading&#8230;</div>
     </div>
+    <div class="sh"><span>News Forecast</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">score · trend · sentiment</span></div>
+    <div id="forecast_panel" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;padding:12px 14px">
+      <div class="no-data" style="padding:8px 0">Loading&#8230;</div>
+    </div>
     <div class="sh"><span>Crypto News</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">sentiment scan</span></div>
     <div id="news_feed" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 16px;padding:0 14px">
       <div class="no-data" style="padding:16px 0">Loading&#8230;</div>
@@ -8758,7 +8785,7 @@ function goTab(t){
   $('tab-'+t).classList.add('active');
   if(t==='chart'){drawCandles();}
   if(t==='home'){drawEquity();}
-  if(t==='market'){fetchMarket();fetchNews();loadQuiz();}
+  if(t==='market'){fetchMarket();fetchForecast();loadQuiz();}
   if(t==='stats'){drawDownChart();fetchCalibration();}
   if(t==='journal'){fetchDailyPnl();renderJournal();}
 }
@@ -8788,7 +8815,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchNews();fetchBestSetups();fetchBotMsgs();renderJournal();}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();renderJournal();}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -10284,7 +10311,7 @@ function renderExitReasons(trades){
 function tick(){
   if(--_tick<=0){
     fetchStatus();fetchCandles();fetchHistory();fetchSim();
-    if(_tab==='market'){fetchMarket();fetchNews();}
+    if(_tab==='market'){fetchMarket();fetchForecast();}
     if(_tab==='stats'){fetchHourly();drawDownChart();}
     _tick=30;
   }
@@ -11055,6 +11082,58 @@ async function toggleSim(){
   }catch(e){console.warn('toggleSim',e);}
 }
 
+/* ── NEWS FORECAST ── */
+async function fetchForecast(){
+  try{
+    const d=await(await fetch('/api/forecast')).json();
+    renderForecast(d);
+    fetchNews();
+  }catch(e){console.warn('forecast',e);}
+}
+function renderForecast(d){
+  const el=$('forecast_panel');if(!el)return;
+  const fg=d.fear_greed||50;
+  const fgLbl=d.fear_greed_label||'Neutral';
+  const fgIcon=fg<25?'😱':fg<45?'😨':fg<55?'😐':fg<75?'😄':'🤑';
+  const fgColor=fg<25?'var(--r)':fg<45?'#f59e0b':fg<55?'var(--mu)':fg<75?'var(--g)':'#a855f7';
+  const coins=(d.coins||[]).filter(c=>Math.abs(c.score-50)>=5).slice(0,8);
+  let html='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--bd)">'
+    +'<span style="font-size:1.2rem">'+fgIcon+'</span>'
+    +'<div><div style="font-size:.65rem;color:var(--mu);font-weight:600;letter-spacing:.05em">FEAR & GREED</div>'
+    +'<div style="font-size:.85rem;font-weight:700;color:'+fgColor+'">'+fg+' — '+fgLbl+'</div></div>'
+    +'<div style="margin-left:auto;text-align:right">'
+    +'<div style="font-size:.55rem;color:var(--mu)">Market outlook</div>'
+    +'<div style="font-size:.75rem;font-weight:700;color:'+fgColor+'">'+(fg>=58?'↑ Risk-On':fg<=42?'↓ Risk-Off':'→ Neutral')+'</div>'
+    +'</div></div>';
+  if(!coins.length){
+    html+='<div style="font-size:.65rem;color:var(--mu);text-align:center;padding:6px 0">All coins neutral — no strong sentiment signals</div>';
+  } else {
+    html+=coins.map(c=>{
+      const bull=c.score>=58,bear=c.score<=42;
+      const scoreColor=bull?'var(--g)':bear?'var(--r)':'var(--mu)';
+      const trendIcon=c.trend==='improving'?'↑':c.trend==='declining'?'↓':'→';
+      const trendColor=c.trend==='improving'?'var(--g)':c.trend==='declining'?'var(--r)':'var(--mu)';
+      const bar=Math.round(c.score);
+      const barW=bar+'%';
+      const barColor=bull?'var(--g)':bear?'var(--r)':'var(--bd2)';
+      return '<div style="margin-bottom:9px">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:3px">'
+        +'<span style="font-size:.65rem;font-weight:600">'+c.name+'</span>'
+        +'<div style="display:flex;align-items:center;gap:6px">'
+        +'<span style="font-size:.6rem;color:'+trendColor+'">'+trendIcon+' '+c.trend+'</span>'
+        +'<span style="font-size:.65rem;font-weight:700;color:'+scoreColor+'">'+c.label+'</span>'
+        +'<span style="font-size:.6rem;color:var(--mu);min-width:24px;text-align:right">'+bar+'</span>'
+        +'</div></div>'
+        +'<div style="background:var(--bd);border-radius:3px;height:4px;overflow:hidden">'
+        +'<div style="background:'+barColor+';width:'+barW+';height:100%;border-radius:3px;transition:width .4s"></div>'
+        +'</div>'
+        +(c.headline?'<div style="font-size:.55rem;color:var(--mu);margin-top:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">'+c.headline+'</div>':'')
+        +'</div>';
+    }).join('');
+  }
+  el.innerHTML=html;
+}
+
 /* ── NEWS FEED ── */
 async function fetchNews(){
   try{
@@ -11710,7 +11789,7 @@ applyTheme(_theme);
 _initSoundBtn();
 _initKeyboard();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
-fetchSim();fetchNews();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();
+fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();
 fetchPrices();setInterval(fetchPrices,8000);
 setInterval(fetchStatus,15000);
 initSSE();initWebPush();
@@ -12298,6 +12377,77 @@ def _secs_ago(ts):
     if s < 60:   return f"{s}s ago"
     if s < 3600: return f"{s//60}m ago"
     return f"{s//3600}h ago"
+
+def _compute_forecast(pair: str) -> dict:
+    """Return a forecast dict for one pair: score 0-100, label, trend direction."""
+    fg   = fear_greed.get("value", 50)
+    sent = news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL")
+    hist = _sentiment_history.get(pair, [])
+    now  = time.time()
+
+    # Sentiment score: BULLISH=+1, BEARISH=-1, NEUTRAL=0
+    def _sv(s): return 1 if s == "BULLISH" else -1 if s == "BEARISH" else 0
+
+    # Momentum: compare last 6h vs previous 6h
+    recent = [_sv(s) for ts, s in hist if ts > now - 21600]    # last 6h
+    older  = [_sv(s) for ts, s in hist if now - 43200 < ts <= now - 21600]  # 6-12h ago
+    r_avg  = sum(recent) / len(recent) if recent else 0.0
+    o_avg  = sum(older)  / len(older)  if older  else 0.0
+    momentum_delta = r_avg - o_avg   # positive = improving sentiment
+
+    # Forecast score (0-100)
+    base  = 50
+    # Fear & Greed contribution (-20 to +20)
+    fg_contrib = round((fg - 50) * 0.4, 1)
+    # Current sentiment contribution (-20 to +20)
+    sent_contrib = _sv(sent) * 20
+    # Momentum contribution (-10 to +10)
+    mom_contrib = round(momentum_delta * 10, 1)
+    score = int(max(0, min(100, base + fg_contrib + sent_contrib + mom_contrib)))
+
+    # Trend label
+    if momentum_delta > 0.3:   trend = "improving"
+    elif momentum_delta < -0.3: trend = "declining"
+    else:                       trend = "stable"
+
+    # Forecast label
+    if score >= 70:   label = "Bullish"
+    elif score >= 58: label = "Slightly Bullish"
+    elif score >= 42: label = "Neutral"
+    elif score >= 30: label = "Slightly Bearish"
+    else:             label = "Bearish"
+
+    return {
+        "score":    score,
+        "label":    label,
+        "trend":    trend,
+        "sentiment": sent,
+        "readings":  len(hist),
+    }
+
+@_flask_app.route("/api/forecast")
+def _web_forecast():
+    """Per-coin news forecast scores combining sentiment, Fear & Greed, and momentum."""
+    fg_val   = fear_greed.get("value", 50)
+    fg_label = fear_greed.get("label", "Neutral")
+    coins = []
+    for c in SCAN_UNIVERSE:
+        pair = c["pair"]
+        fc   = _compute_forecast(pair)
+        coins.append({
+            "pair":      pair,
+            "name":      c["name"],
+            "headline":  news_sentiment.get(pair, {}).get("headline", ""),
+            **fc,
+        })
+    # Sort most extreme forecasts first
+    coins.sort(key=lambda x: abs(x["score"] - 50), reverse=True)
+    return _Response(json.dumps({
+        "fear_greed":       fg_val,
+        "fear_greed_label": fg_label,
+        "coins":            coins,
+        "ts":               int(time.time()),
+    }), mimetype="application/json")
 
 @_flask_app.route("/sim")
 def _web_sim():
