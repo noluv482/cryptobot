@@ -12715,6 +12715,7 @@ def _web_status():
         "pair_day_pnl":          {pr: round(v, 2) for pr, v in trader._pair_day_pnl.items()},
         "weekly_peak":           round(trader._weekly_peak, 2),
         "weekly_dd_paused":      trader._weekly_dd_paused,
+        "streak_gate_disabled":  trader._streak_gate_disabled,
         "trade_preview_mode":    _trade_preview_mode,
         "db":                    db.connected,
         "ws_live":               bool(_prices_cache and (time.time() - _prices_cache_ts) < 60),
