@@ -9953,8 +9953,9 @@ function drawCandles(){
   _cdOpenPos.forEach(p=>{lo=Math.min(lo,p.entry);hi=Math.max(hi,p.entry);});
   _ema20.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
   _ema50.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
-  // Expand range for Bollinger Bands
-  if(_showBB){const bb=_calcBB(data);bb.upper.forEach(v=>{if(v!==null)hi=Math.max(hi,v);});bb.lower.forEach(v=>{if(v!==null)lo=Math.min(lo,v);});}
+  // Expand range for Bollinger Bands (compute once, reused in drawing block below)
+  const _bb=_showBB?_calcBB(data):null;
+  if(_bb){_bb.upper.forEach(v=>{if(v!==null)hi=Math.max(hi,v);});_bb.lower.forEach(v=>{if(v!==null)lo=Math.min(lo,v);});}
   const rng=(hi-lo)*0.04;lo-=rng;hi+=rng;
   if(hi===lo){hi*=1.001;lo*=0.999;}
   const xC=i=>P.l+(i+.5)*slotW;
@@ -10015,8 +10016,8 @@ function drawCandles(){
   ctx.fillStyle='#58a6ff';ctx.fillText('EMA20',P.l+2,P.t+9);
   ctx.fillStyle='#f0883e';ctx.fillText('EMA50',P.l+44,P.t+9);
   // Bollinger Bands overlay
-  if(_showBB){
-    const bb=_calcBB(data);
+  if(_showBB&&_bb){
+    const bb=_bb;
     const drawBBLine=(arr,color,dash=[])=>{
       ctx.save();ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1;
       if(dash.length)ctx.setLineDash(dash);
