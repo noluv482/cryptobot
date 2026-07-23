@@ -365,18 +365,21 @@ KEYS_FILE          = os.path.join(_DATA_DIR, "api_keys.json")
 
 # ── Load API keys from disk if not provided via env vars ──────────────────────
 def _load_api_keys_from_file():
-    global KRAKEN_API_KEY, KRAKEN_API_SECRET, LIVE_MODE
-    if KRAKEN_API_KEY and KRAKEN_API_SECRET:
-        return
+    global KRAKEN_API_KEY, KRAKEN_API_SECRET, LIVE_MODE, ANTHROPIC_API_KEY
     try:
         with open(KEYS_FILE) as _kf:
             _kd = json.load(_kf)
-        _k = _clean_env(_kd.get("kraken_key", ""))
-        _s = _clean_env(_kd.get("kraken_secret", ""))
-        if _k and _s:
-            KRAKEN_API_KEY = _k
-            KRAKEN_API_SECRET = _s
-            LIVE_MODE = True
+        if not (KRAKEN_API_KEY and KRAKEN_API_SECRET):
+            _k = _clean_env(_kd.get("kraken_key", ""))
+            _s = _clean_env(_kd.get("kraken_secret", ""))
+            if _k and _s:
+                KRAKEN_API_KEY    = _k
+                KRAKEN_API_SECRET = _s
+                LIVE_MODE         = True
+        if not ANTHROPIC_API_KEY:
+            _ak = _clean_env(_kd.get("anthropic_key", ""))
+            if _ak:
+                ANTHROPIC_API_KEY = _ak
     except (OSError, ValueError):
         pass
 _load_api_keys_from_file()
@@ -8982,6 +8985,13 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       </div>
       <button class="set-step-btn" onclick="openKeyModal()" style="font-size:.78rem;padding:4px 12px">&#9998; Edit</button>
     </div>
+    <div class="set-row">
+      <div>
+        <div class="set-lbl">Claude AI Key</div>
+        <div class="set-sub" id="claude_key_status_lbl">Not configured — news uses keywords</div>
+      </div>
+      <button class="set-step-btn" onclick="openClaudeKeyModal()" style="font-size:.78rem;padding:4px 12px">&#9998; Edit</button>
+    </div>
   </div>
 </div>
 
@@ -9045,6 +9055,31 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <button class="cb-modal-cancel" onclick="closeKeyModal()">Cancel</button>
       <button class="cb-modal-ok" id="key_test_btn" onclick="testApiKeys()" style="background:rgba(255,152,0,.15);border-color:rgba(255,152,0,.4);color:var(--y);flex:1">Test</button>
       <button class="cb-modal-ok" id="key_save_btn" onclick="saveApiKeys()" style="flex:1" disabled>Save &#128308;</button>
+    </div>
+  </div>
+</div>
+
+<!-- CLAUDE API KEY MODAL -->
+<div class="cb-modal" id="claude_key_modal">
+  <div class="cb-modal-ov" onclick="closeClaudeKeyModal()"></div>
+  <div class="cb-modal-panel">
+    <div class="cb-modal-title">&#129302; Claude AI Key</div>
+    <div class="cb-modal-sub">Enables AI-powered news sentiment. Get a free key at <b>console.anthropic.com</b> &rarr; API Keys.</div>
+    <div style="display:flex;flex-direction:column;gap:10px;margin:14px 0 4px">
+      <div>
+        <div style="font-size:.68rem;color:var(--mu);margin-bottom:4px;font-weight:600;letter-spacing:.04em">ANTHROPIC API KEY</div>
+        <input class="cb-bal-input" type="text" id="claude_key_input" placeholder="sk-ant-api03-..." autocomplete="off" spellcheck="false">
+      </div>
+      <div>
+        <div style="font-size:.68rem;color:var(--mu);margin-bottom:4px;font-weight:600;letter-spacing:.04em">DASHBOARD PIN</div>
+        <input class="cb-bal-input" type="password" id="claude_pin_input" placeholder="Enter your PIN to authorize" autocomplete="off" maxlength="4" inputmode="numeric">
+      </div>
+    </div>
+    <div style="font-size:.65rem;min-height:18px;margin-bottom:8px" id="claude_key_result"></div>
+    <div class="cb-modal-btns" style="gap:6px">
+      <button class="cb-modal-cancel" onclick="closeClaudeKeyModal()">Cancel</button>
+      <button class="cb-modal-ok" id="claude_test_btn" onclick="testClaudeKey()" style="background:rgba(255,152,0,.15);border-color:rgba(255,152,0,.4);color:var(--y);flex:1">Test</button>
+      <button class="cb-modal-ok" id="claude_save_btn" onclick="saveClaudeKey()" style="flex:1" disabled>Save &#129302;</button>
     </div>
   </div>
 </div>
@@ -11301,6 +11336,16 @@ async function openSettings(){
           lbl.style.color='var(--mu)';
         }
       }
+      const cl=$('claude_key_status_lbl');
+      if(cl){
+        if(kd.anthropic_key_set){
+          cl.textContent='• Set: '+kd.anthropic_key_masked+' — AI news active 🤖';
+          cl.style.color='var(--g)';
+        }else{
+          cl.textContent='Not configured — news uses keywords';
+          cl.style.color='var(--mu)';
+        }
+      }
     }catch(e){}
   }catch(e){console.warn('settings',e);}
   $('set_sheet').classList.add('open');
@@ -11472,6 +11517,83 @@ async function saveApiKeys(){
   }catch(e){
     showToast('Network error','Could not save keys','loss',2500);
     if(sb){sb.disabled=false;sb.textContent='Save 🔴';}
+  }
+}
+
+/* ── CLAUDE API KEY MODAL ── */
+let _claudeKeyTested=false;
+function _resetClaudeKeyTest(){
+  _claudeKeyTested=false;
+  const sb=$('claude_save_btn');if(sb)sb.disabled=true;
+  const tr=$('claude_key_result');if(tr){tr.textContent='';tr.style.color='var(--mu)';}
+}
+async function openClaudeKeyModal(){
+  _resetClaudeKeyTest();
+  const ki=$('claude_key_input'),pi=$('claude_pin_input');
+  if(ki){ki.value='';ki.oninput=_resetClaudeKeyTest;}
+  if(pi)pi.value='';
+  try{
+    const d=await(await fetch('/api/keys')).json();
+    if(d.anthropic_key_set&&ki)ki.placeholder='Current: '+d.anthropic_key_masked+' (paste new to replace)';
+  }catch(e){}
+  $('claude_key_modal').classList.add('open');
+  setTimeout(()=>{if(ki)ki.focus();},220);
+}
+function closeClaudeKeyModal(){$('claude_key_modal').classList.remove('open');_claudeKeyTested=false;}
+async function testClaudeKey(){
+  const ki=$('claude_key_input'),pi=$('claude_pin_input');
+  const k=ki?ki.value.trim():'',pin=pi?pi.value.trim():'';
+  const tr=$('claude_key_result');
+  if(!k){if(tr){tr.textContent='Paste your Anthropic API key first.';tr.style.color='var(--y)';}return;}
+  const btn=$('claude_test_btn');
+  if(btn){btn.disabled=true;btn.textContent='Testing…';}
+  if(tr){tr.textContent='Connecting to Anthropic…';tr.style.color='var(--mu)';}
+  try{
+    const r=await fetch('/api/claude-key/test',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({anthropic_key:k,pin})});
+    const d=await r.json();
+    if(d.ok){
+      _claudeKeyTested=true;
+      if(tr){tr.textContent='✓ Key valid — AI news scoring ready';tr.style.color='var(--g)';}
+      const sb=$('claude_save_btn');if(sb)sb.disabled=false;
+    }else{
+      _claudeKeyTested=false;
+      if(tr){tr.textContent='✗ '+(d.error||'Invalid key');tr.style.color='var(--r)';}
+    }
+  }catch(e){
+    if(tr){tr.textContent='Network error — check connection';tr.style.color='var(--r)';}
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='Test';}
+  }
+}
+async function saveClaudeKey(){
+  const tr=$('claude_key_result');
+  if(!_claudeKeyTested){
+    if(tr){tr.textContent='Test the key first before saving.';tr.style.color='var(--y)';}
+    return;
+  }
+  const ki=$('claude_key_input'),pi=$('claude_pin_input');
+  const k=ki?ki.value.trim():'',pin=pi?pi.value.trim():'';
+  const sb=$('claude_save_btn');
+  if(sb){sb.disabled=true;sb.textContent='Saving…';}
+  try{
+    const r=await fetch('/api/claude-key',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({anthropic_key:k,pin})});
+    const d=await r.json();
+    if(d.ok){
+      closeClaudeKeyModal();
+      showToast('🤖 Claude key saved','AI news sentiment is now active','win',4000);
+      setTimeout(fetchStatus,1500);
+      setTimeout(openSettings,2800);
+    }else{
+      if(tr){tr.textContent='✗ '+(d.error||'Save failed');tr.style.color='var(--r)';}
+      if(sb){sb.disabled=false;sb.textContent='Save 🤖';}
+    }
+  }catch(e){
+    showToast('Network error','Could not save key','loss',2500);
+    if(sb){sb.disabled=false;sb.textContent='Save 🤖';}
   }
 }
 
@@ -13406,9 +13528,11 @@ def _web_api_keys():
         return k[:4] + "****" if len(k) > 4 else "****"
     if _flask_request.method == "GET":
         return _Response(json.dumps({
-            "kraken_key_set":    bool(KRAKEN_API_KEY),
-            "kraken_key_masked": _mask(KRAKEN_API_KEY),
-            "kraken_secret_set": bool(KRAKEN_API_SECRET),
+            "kraken_key_set":      bool(KRAKEN_API_KEY),
+            "kraken_key_masked":   _mask(KRAKEN_API_KEY),
+            "kraken_secret_set":   bool(KRAKEN_API_SECRET),
+            "anthropic_key_set":   bool(ANTHROPIC_API_KEY),
+            "anthropic_key_masked": _mask(ANTHROPIC_API_KEY),
         }), mimetype="application/json")
     body       = _flask_request.get_json(silent=True) or {}
     pin        = body.get("pin", "")
@@ -13425,9 +13549,17 @@ def _web_api_keys():
         return _Response(json.dumps({"ok": False, "error": "key and secret required"}),
                          mimetype="application/json")
     try:
+        _existing = {}
+        try:
+            with open(KEYS_FILE) as _ef:
+                _existing = json.load(_ef)
+        except (OSError, ValueError):
+            pass
+        _existing["kraken_key"]    = new_key
+        _existing["kraken_secret"] = new_secret
         _tmp_keys = KEYS_FILE + ".tmp"
         with open(_tmp_keys, "w") as _kf:
-            json.dump({"kraken_key": new_key, "kraken_secret": new_secret}, _kf)
+            json.dump(_existing, _kf)
         os.replace(_tmp_keys, KEYS_FILE)
     except Exception as _e:
         return _Response(json.dumps({"ok": False, "error": f"disk error: {_e}"}),
@@ -13488,6 +13620,78 @@ def _web_api_keys_test():
     except Exception as _e:
         return _Response(json.dumps({"ok": False, "error": str(_e)}),
                          mimetype="application/json")
+
+@_flask_app.route("/api/claude-key/test", methods=["POST"])
+def _web_claude_key_test():
+    """Verify an Anthropic API key with a minimal 1-token call. Does not save it."""
+    body = _flask_request.get_json(silent=True) or {}
+    pin  = body.get("pin", "")
+    if not DASHBOARD_PIN:
+        return _Response(json.dumps({"ok": False,
+                                     "error": "Set DASHBOARD_PIN in your .env first"}),
+                         mimetype="application/json", status=403)
+    if pin != DASHBOARD_PIN:
+        return _Response(json.dumps({"ok": False, "error": "wrong pin"}),
+                         mimetype="application/json", status=403)
+    test_key = _clean_env(body.get("anthropic_key", ""))
+    if not test_key:
+        return _Response(json.dumps({"ok": False, "error": "key required"}),
+                         mimetype="application/json")
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 1,
+                  "messages": [{"role": "user", "content": "ping"}]},
+            headers={"x-api-key": test_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            timeout=12,
+        )
+        if r.status_code == 200:
+            return _Response(json.dumps({"ok": True}), mimetype="application/json")
+        _err = (r.json().get("error") or {}).get("message", r.text[:120])
+        return _Response(json.dumps({"ok": False, "error": _err}),
+                         mimetype="application/json")
+    except Exception as _e:
+        return _Response(json.dumps({"ok": False, "error": str(_e)}),
+                         mimetype="application/json")
+
+@_flask_app.route("/api/claude-key", methods=["POST"])
+def _web_claude_key_save():
+    """Save an Anthropic API key to api_keys.json and activate it live."""
+    global ANTHROPIC_API_KEY
+    body = _flask_request.get_json(silent=True) or {}
+    pin  = body.get("pin", "")
+    if not DASHBOARD_PIN:
+        return _Response(json.dumps({"ok": False,
+                                     "error": "Set DASHBOARD_PIN in your .env first"}),
+                         mimetype="application/json", status=403)
+    if pin != DASHBOARD_PIN:
+        return _Response(json.dumps({"ok": False, "error": "wrong pin"}),
+                         mimetype="application/json", status=403)
+    new_key = _clean_env(body.get("anthropic_key", ""))
+    if not new_key:
+        return _Response(json.dumps({"ok": False, "error": "key required"}),
+                         mimetype="application/json")
+    try:
+        _existing = {}
+        try:
+            with open(KEYS_FILE) as _ef:
+                _existing = json.load(_ef)
+        except (OSError, ValueError):
+            pass
+        _existing["anthropic_key"] = new_key
+        _tmp = KEYS_FILE + ".tmp"
+        with open(_tmp, "w") as _kf:
+            json.dump(_existing, _kf)
+        os.replace(_tmp, KEYS_FILE)
+    except Exception as _e:
+        return _Response(json.dumps({"ok": False, "error": f"disk error: {_e}"}),
+                         mimetype="application/json")
+    ANTHROPIC_API_KEY = new_key
+    threading.Thread(target=tg, args=(
+        "🤖 *Claude AI key saved* via dashboard\n"
+        "AI-powered news sentiment is now active.",), daemon=True).start()
+    return _Response('{"ok":true}', mimetype="application/json")
 
 @_flask_app.route("/api/live-ready")
 def _web_live_ready():
