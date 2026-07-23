@@ -641,6 +641,11 @@ _STRATEGIES = {
         "min_conf": 0.52,      "min_pillars": 4,   "max_mins": 90,
         "desc": "4+ indicators aligned — broad multi-factor confirmation",
     },
+    "LEARNING_SIGNAL": {
+        "name": "Learning Signal", "emoji": "📚",
+        "min_conf": 0.35,          "min_pillars": 2, "max_mins": 60,
+        "desc": "Paper-mode fallback — 2+ indicators aligned; used to collect training data",
+    },
 }
 
 def _classify_strategy(sig: str, pillars: dict, confidence: float, pair: str) -> tuple:
@@ -666,6 +671,9 @@ def _classify_strategy(sig: str, pillars: dict, confidence: float, pair: str) ->
     # Fallback: any signal with 4+ pillars aligned at decent confidence
     if n_true >= 4 and confidence >= 0.52:
         return "CONFLUENCE", _STRATEGIES["CONFLUENCE"]
+    # Paper-mode training fallback: 2+ pillars at minimum confidence — collect data to tune the real gates
+    if n_true >= 2 and confidence >= MIN_CONFIDENCE:
+        return "LEARNING_SIGNAL", _STRATEGIES["LEARNING_SIGNAL"]
     return None, None
 
 # ── Database ──────────────────────────────────────────────────────────────────
