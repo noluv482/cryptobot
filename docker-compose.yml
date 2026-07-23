@@ -35,4 +35,4 @@ services:
       DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
     depends_on:
       db:
-        condition: service_healthy
+        condition: service_started
