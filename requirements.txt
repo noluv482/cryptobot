@@ -5,3 +5,4 @@ matplotlib
 flask
 pywebpush
 websocket-client
+anthropic>=0.119.0

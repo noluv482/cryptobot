@@ -238,7 +238,8 @@ def _clean_env(val):
 TG_TOKEN        = _clean_env(os.environ.get("TG_TOKEN",        ""))
 TG_CHAT_ID      = _clean_env(os.environ.get("TG_CHAT_ID",      ""))
 TG_URL          = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-DISCORD_WEBHOOK = _clean_env(os.environ.get("DISCORD_WEBHOOK", ""))
+DISCORD_WEBHOOK   = _clean_env(os.environ.get("DISCORD_WEBHOOK",    ""))
+ANTHROPIC_API_KEY = _clean_env(os.environ.get("ANTHROPIC_API_KEY",  ""))
 BASE_URL         = "https://api.kraken.com/0/public"
 BINANCE_BASE_URL = "https://api.binance.com"
 
@@ -4530,54 +4531,174 @@ class SignalEngine:
         return sig, plan, ema, rsi, confidence
 
 # ── News scanner ──────────────────────────────────────────────────────────────
+# Maps Kraken pair → human-readable name for the LLM prompt
+_PAIR_NAMES = {
+    "SOLUSD":   "Solana (SOL)",    "XBTUSD":   "Bitcoin (BTC)",
+    "ETHUSD":   "Ethereum (ETH)",  "XRPUSD":   "XRP (XRP)",
+    "XDGUSD":   "Dogecoin (DOGE)", "ADAUSD":   "Cardano (ADA)",
+    "AVAXUSD":  "Avalanche (AVAX)","LINKUSD":  "Chainlink (LINK)",
+    "DOTUSD":   "Polkadot (DOT)",  "LTCUSD":   "Litecoin (LTC)",
+    "ATOMUSD":  "Cosmos (ATOM)",   "UNIUSD":   "Uniswap (UNI)",
+    "AAVEUSD":  "Aave (AAVE)",     "INJUSD":   "Injective (INJ)",
+    "SUIUSD":   "Sui (SUI)",       "APTUSD":   "Aptos (APT)",
+    "ARBUSD":   "Arbitrum (ARB)",  "NEARUSD":  "Near (NEAR)",
+    "ALGOUSD":  "Algorand (ALGO)", "FILUSD":   "Filecoin (FIL)",
+    "BCHUSD":   "Bitcoin Cash (BCH)", "PEPEUSD": "Pepe (PEPE)",
+    "BONKUSD":  "Bonk (BONK)",     "SHIBUSD":  "Shiba Inu (SHIB)",
+    "WIFUSD":   "dogwifhat (WIF)", "FLOKIUSD": "Floki (FLOKI)",
+}
+
+def _score_headlines_llm(titles: list) -> dict:
+    """
+    Batch-score up to 40 headlines via Claude Haiku.
+    Returns {pair: {"sentiment": "BULLISH"|"BEARISH", "score": 1-5, "headline": str}}
+    Only pairs with clear BULLISH or BEARISH impact are included.
+    """
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        return {}
+
+    coin_list = "\n".join(
+        f"  {pair}: {_PAIR_NAMES.get(pair, pair)}"
+        for pair in COIN_KEYWORDS
+    )
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles[:40]))
+
+    prompt = (
+        "You are a crypto market analyst. Analyze each headline and determine:\n"
+        "- Which tracked cryptocurrency it primarily affects (if any)\n"
+        "- Market sentiment: BULLISH or BEARISH (skip if neutral/unclear)\n"
+        "- Impact score 1-5 (1=minor mention, 3=notable news, 5=major market-moving event)\n\n"
+        "Score 5 examples: ETF approval, exchange hack, major ban, huge institutional buy\n"
+        "Score 3 examples: partnership, upgrade, listing, regulatory clarity\n"
+        "Score 1 examples: price mention, minor analysis piece\n\n"
+        f"Tracked coins (pair_id: name):\n{coin_list}\n\n"
+        f"Headlines:\n{numbered}\n\n"
+        "Return a JSON array. Include only headlines with clear BULLISH or BEARISH impact "
+        "on a specific tracked coin. Skip macro crypto news with no coin-specific impact.\n\n"
+        'Format: [{"idx": 1, "pair": "XBTUSD", "sentiment": "BULLISH", "score": 4}]\n\n'
+        "Return only the JSON array, no other text."
+    )
+
+    try:
+        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        items = json.loads(raw)
+        out = {}
+        for item in items:
+            idx  = int(item.get("idx", 0)) - 1
+            pair = item.get("pair", "")
+            sent = item.get("sentiment", "")
+            if pair not in COIN_KEYWORDS or idx < 0 or idx >= len(titles):
+                continue
+            if sent not in ("BULLISH", "BEARISH"):
+                continue
+            score = max(1, min(5, int(item.get("score", 1))))
+            if score > out.get(pair, {}).get("score", 0):
+                out[pair] = {"sentiment": sent, "score": score, "headline": titles[idx]}
+        log("NEWS", f"LLM scored {len(titles)} headlines → {len(out)} coin signals")
+        return out
+    except Exception as exc:
+        log("NEWS", f"LLM scoring error: {exc}", "WRN")
+        return {}
+
+
+def _score_headlines_keywords(titles: list) -> dict:
+    """Keyword-based fallback scorer. Returns {pair: {"sentiment", "score", "headline"}}."""
+    out = {}
+    for title in titles:
+        t    = title.lower()
+        bull = sum(1 for w in BULLISH_WORDS if w in t)
+        bear = sum(1 for w in BEARISH_WORDS if w in t)
+        if bull == bear:
+            continue
+        sent  = "BULLISH" if bull > bear else "BEARISH"
+        score = abs(bull - bear)
+        for pair, kws in COIN_KEYWORDS.items():
+            if any(k in t for k in kws) and score > out.get(pair, {}).get("score", 0):
+                out[pair] = {"sentiment": sent, "score": score, "headline": title}
+    return out
+
+
 def _news_loop():
     global _seen_headlines
     while True:
         try:
-            new_scores = {p: {"sentiment":"NEUTRAL","headline":"","score":0} for p in COIN_KEYWORDS}
+            # ── 1. Fetch all headlines from every RSS feed ─────────────────
+            all_titles: list = []
             for url in NEWS_FEEDS:
                 try:
-                    r    = requests.get(url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+                    r    = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
                     root = ET.fromstring(r.content[:512_000])
                     for item in root.findall(".//item")[:10]:
-                        title = item.findtext("title","").strip()
-                        if not title: continue
-                        t     = title.lower()
-                        bull  = sum(1 for w in BULLISH_WORDS if w in t)
-                        bear  = sum(1 for w in BEARISH_WORDS if w in t)
-                        if bull == bear: continue
-                        sent  = "BULLISH" if bull > bear else "BEARISH"
-                        score = abs(bull - bear)
-                        for pair, kws in COIN_KEYWORDS.items():
-                            if any(k in t for k in kws) and score > new_scores[pair]["score"]:
-                                new_scores[pair] = {"sentiment":sent,"headline":title[:80],"score":score}
-                                key = title[:60]
-                                if key not in _seen_headlines:
-                                    _seen_headlines.add(key)
-                                    coin_name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"]==pair), pair)
-                                    emoji = "🟢" if sent=="BULLISH" else "🔴"
-                                    tg(f"{emoji} *{sent} NEWS — {coin_name}*\n📰 {title[:120]}\n"
-                                       f"Impact: {'🔥 HIGH' if score>=3 else '⚡ MEDIUM' if score==2 else '📌 LOW'}")
-                                    _news_log.append({
-                                        "ts": time.time(), "coin": coin_name, "pair": pair,
-                                        "sentiment": sent, "headline": title[:120],
-                                        "score": score,
-                                    })
-                                    if len(_news_log) > _NEWS_LOG_MAX:
-                                        _news_log.pop(0)
+                        title = item.findtext("title", "").strip()
+                        if title and title not in all_titles:
+                            all_titles.append(title)
                 except Exception:
                     pass
-            now = time.time()
-            cutoff = now - 86400  # drop readings older than 24h
+
+            # ── 2. Score headlines (LLM when key present, keywords otherwise) ──
+            if ANTHROPIC_API_KEY and all_titles:
+                scored = _score_headlines_llm(all_titles)
+                # Fill any coin the LLM missed with keyword scoring
+                kw_scored = _score_headlines_keywords(all_titles)
+                for pair, data in kw_scored.items():
+                    if pair not in scored:
+                        scored[pair] = data
+            else:
+                scored = _score_headlines_keywords(all_titles)
+
+            # ── 3. Build new_scores and notify on fresh stories ────────────
+            new_scores = {p: {"sentiment": "NEUTRAL", "headline": "", "score": 0}
+                          for p in COIN_KEYWORDS}
+            for pair, data in scored.items():
+                new_scores[pair] = {
+                    "sentiment": data["sentiment"],
+                    "headline":  data["headline"][:80],
+                    "score":     data["score"],
+                }
+                key = data["headline"][:60]
+                if key not in _seen_headlines:
+                    _seen_headlines.add(key)
+                    coin_name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
+                    sent  = data["sentiment"]
+                    score = data["score"]
+                    emoji = "🟢" if sent == "BULLISH" else "🔴"
+                    ai_tag = " 🤖" if ANTHROPIC_API_KEY else ""
+                    tg(f"{emoji} *{sent} NEWS — {coin_name}*{ai_tag}\n"
+                       f"📰 {data['headline'][:120]}\n"
+                       f"Impact: {'🔥 HIGH' if score >= 4 else '⚡ MEDIUM' if score >= 2 else '📌 LOW'}")
+                    _news_log.append({
+                        "ts": time.time(), "coin": coin_name, "pair": pair,
+                        "sentiment": sent, "headline": data["headline"][:120],
+                        "score": score,
+                    })
+                    if len(_news_log) > _NEWS_LOG_MAX:
+                        _news_log.pop(0)
+
+            # ── 4. Commit to global state + history ────────────────────────
+            now    = time.time()
+            cutoff = now - 86400
             for pair in COIN_KEYWORDS:
                 news_sentiment[pair] = new_scores[pair]
                 hist = _sentiment_history.setdefault(pair, [])
                 hist.append((now, new_scores[pair]["sentiment"]))
-                # Trim old entries
                 while hist and hist[0][0] < cutoff:
                     hist.pop(0)
                 if len(hist) > _SENT_HISTORY_MAX:
                     del hist[:-_SENT_HISTORY_MAX]
+
         except Exception as e:
             log("NEWS", str(e), "ERR")
         time.sleep(120)

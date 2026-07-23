@@ -33,6 +33,8 @@ services:
       KRAKEN_KEY: ${KRAKEN_KEY:-}
       KRAKEN_SECRET: ${KRAKEN_SECRET:-}
       DISCORD_WEBHOOK: ${DISCORD_WEBHOOK:-}
+      # Optional — enables AI-powered news sentiment (Claude Haiku); falls back to keywords if blank
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     depends_on:
       db:
         condition: service_started
