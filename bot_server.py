@@ -3913,13 +3913,13 @@ class PaperTrader:
             return
         tg(f"💀 *BOT ELIMINATED — Restarting*\n"
            f"Balance: `${self.balance:.2f}` | Trades: `{len(self.trades)}`\n"
-           f"📚 *Lessons:*\n{lesson_txt}\n🔄 Restarting at `${PAPER_START:.0f}`...")
-        self.balance       = PAPER_START
+           f"📚 *Lessons:*\n{lesson_txt}\n🔄 Restarting at `${self._start_balance:.0f}`...")
+        self.balance       = self._start_balance
         self.positions     = {}
         self.trades        = []
-        self.peak          = PAPER_START
+        self.peak          = self._start_balance
         self.current_rank  = RANKS[0]["name"]
-        self.session_start = PAPER_START
+        self.session_start = self._start_balance
         self._save()
         send_menu(self)
 
@@ -13499,14 +13499,18 @@ def _web_settings():
         if "paper_balance" in body:
             v = float(body["paper_balance"])
             if 10.0 <= v <= 1_000_000:
+                global PAPER_START
                 t = _web_trader_ref[0] if _web_trader_ref else None
                 if t:
                     old_bal = t.balance
-                    t.balance = round(v, 2)
-                    t.peak = max(t.peak, round(v, 2))
-                    t.session_start = round(v, 2)
-                    t._start_balance = round(v, 2)
-                    t.day_start_bal = round(v, 2)
+                    t.balance          = round(v, 2)
+                    t.peak             = max(t.peak, round(v, 2))
+                    t.session_start    = round(v, 2)
+                    t._start_balance   = round(v, 2)
+                    t.day_start_bal    = round(v, 2)
+                    t._weekly_peak     = round(v, 2)
+                    t._weekly_dd_paused = False
+                    PAPER_START        = round(v, 2)
                     threading.Thread(target=tg, args=(
                         f"💰 *Paper balance adjusted* via dashboard\n"
                         f"`${old_bal:.2f}` → `${v:,.2f}`",), daemon=True).start()
