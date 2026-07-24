@@ -8971,8 +8971,12 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     </div>
     <div class="set-section-lbl">Info</div>
     <div class="set-row">
-      <div><div class="set-lbl">Risk Per Trade</div><div class="set-sub">% of balance as margin</div></div>
-      <div class="set-info-val" id="set_risk_val">—</div>
+      <div><div class="set-lbl">Risk Per Trade</div><div class="set-sub">% of balance used as margin per trade</div></div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <button class="set-step-btn" onclick="stepRisk(-1)" title="Lower risk">&#8722;</button>
+        <span id="set_risk_val" style="min-width:52px;text-align:center;font-size:.78rem">—</span>
+        <button class="set-step-btn" onclick="stepRisk(1)" title="Raise risk">+</button>
+      </div>
     </div>
     <div class="set-row">
       <div><div class="set-lbl">Balance Target</div><div class="set-sub">Your trading goal</div></div>
@@ -11202,6 +11206,12 @@ function updateLivePnl(){
 
 /* ── SETTINGS ── */
 let _setMaxPos=2;
+let _setRiskMax=12;
+const _RISK_STEPS=[5,8,10,12,15,20,25];
+function _updateRiskDisplay(){
+  const min=Math.round(_setRiskMax*0.35);
+  const el=$('set_risk_val');if(el)el.textContent=min+'–'+_setRiskMax+'%';
+}
 function renderDiagnostics(d){
   const el=$('diag_panel');if(!el)return;
   const rows=[];
@@ -11326,10 +11336,11 @@ async function openSettings(){
     const d=await(await fetch('/settings')).json();
     _setMaxPos=d.max_positions||2;
     _setDdLimit=d.max_drawdown||0;
+    _setRiskMax=d.risk_max||12;
     $('set_paper').checked=!!d.paper_mode;
     $('set_sim').checked=!!d.sim_enabled;
     $('set_max_pos_val').textContent=_setMaxPos;
-    $('set_risk_val').textContent=(d.risk_pct||'—')+'%';
+    _updateRiskDisplay();
     $('set_target_val').textContent='$'+(d.paper_target||0).toLocaleString();
     $('set_scan_val').textContent=(d.scan_universe||26).toString();
     $('set_exch_val').textContent=d.live_mode?(d.exchange||'live').toUpperCase():'Paper';
@@ -11404,6 +11415,18 @@ async function stepMaxPos(delta){
     await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({max_positions:_setMaxPos})});
   }catch(e){console.warn('stepMaxPos',e);}
+}
+async function stepRisk(delta){
+  let idx=_RISK_STEPS.indexOf(_setRiskMax);
+  if(idx<0)idx=_RISK_STEPS.findIndex(s=>s>=_setRiskMax);
+  if(idx<0)idx=_RISK_STEPS.length-1;
+  idx=Math.max(0,Math.min(_RISK_STEPS.length-1,idx+delta));
+  _setRiskMax=_RISK_STEPS[idx];
+  _updateRiskDisplay();
+  try{
+    await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({risk_max:_setRiskMax})});
+  }catch(e){console.warn('stepRisk',e);}
 }
 
 /* ── BALANCE PICKER MODAL ── */
@@ -13484,7 +13507,7 @@ def _web_bestsetups():
 
 @_flask_app.route("/settings", methods=["GET", "POST"])
 def _web_settings():
-    global _rt_max_positions, _paper_mode, _rt_max_drawdown, _trade_preview_mode, _daily_limits
+    global _rt_max_positions, _paper_mode, _rt_max_drawdown, _trade_preview_mode, _daily_limits, RISK_MIN, RISK_MAX, MAX_TOTAL_RISK
     if _flask_request.method == "POST":
         body = _flask_request.get_json(silent=True) or {}
         if "max_positions" in body:
@@ -13514,6 +13537,12 @@ def _web_settings():
                     threading.Thread(target=tg, args=(
                         f"💰 *Paper balance adjusted* via dashboard\n"
                         f"`${old_bal:.2f}` → `${v:,.2f}`",), daemon=True).start()
+        if "risk_max" in body:
+            v = float(body["risk_max"]) / 100.0
+            if 0.03 <= v <= 0.30:
+                RISK_MAX       = round(v, 3)
+                RISK_MIN       = round(v * 0.35, 3)
+                MAX_TOTAL_RISK = min(0.80, round(v * 2, 2))
         if "daily_limits" in body:
             was = _daily_limits
             _daily_limits = bool(body["daily_limits"])
@@ -13530,6 +13559,7 @@ def _web_settings():
         "max_positions":      _rt_max_positions if _rt_max_positions > 0 else MAX_POSITIONS,
         "max_drawdown":       _rt_max_drawdown,
         "risk_pct":           f"{round(RISK_MIN*100,0):.0f}–{round(RISK_MAX*100,0):.0f}",
+        "risk_max":           round(RISK_MAX * 100, 0),
         "live_mode":          LIVE_MODE,
         "paper_target":       PAPER_TARGET,
         "scan_universe":      len(SCAN_UNIVERSE),
