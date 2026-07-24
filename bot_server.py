@@ -1130,6 +1130,21 @@ def _save_trusted_devices():
     except Exception as e:
         log("AUTH", f"Could not save trusted devices: {e}", "ERR")
 
+def _request_is_authorized(body=None):
+    """Gate for control-plane actions (pause/resume/close/live-toggle).
+    Authorized if the caller is a previously-trusted device_id, OR supplies
+    the correct DASHBOARD_PIN directly. If no DASHBOARD_PIN is configured at
+    all, access is left open (matches the rest of the dashboard's behavior
+    when PIN protection hasn't been set up)."""
+    if not DASHBOARD_PIN:
+        return True
+    body = body if body is not None else (_flask_request.get_json(silent=True) or {})
+    dev_id = body.get("device_id", "") or _flask_request.args.get("device_id", "")
+    if dev_id and dev_id in _trusted_devices:
+        return True
+    pin = body.get("pin", "") or _flask_request.args.get("pin", "")
+    return bool(pin) and pin == DASHBOARD_PIN
+
 
 def _log_gate_summary():
     """Print the top gate blockers to stdout so Railway logs show why the bot is quiet."""
@@ -10493,7 +10508,7 @@ async function togglePause(){
   try{
     const d=await(await fetch('/control',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:'toggle'})})).json();
+      body:JSON.stringify({action:'toggle',device_id:_getDeviceId()})})).json();
     _paused=d.paused;
     const pb=$('pause_btn');
     pb.innerHTML=_paused?'&#9654;':'&#9208;';
@@ -10513,7 +10528,7 @@ async function toggleMode(){
   try{
     const d=await(await fetch('/control',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:'paper'})})).json();
+      body:JSON.stringify({action:'paper',device_id:_getDeviceId()})})).json();
     const live=d.mode==='LIVE';
     $('mode_badge').className='badge '+(live?'badge-live':'badge-paper');
     $('mode_dot').className='dot '+(live?'dot-live':'dot-paper');
@@ -10548,7 +10563,7 @@ async function closePosition(pair,name){
   if(!_pinUnlocked){showToast('🔒 Unlock with PIN first','',2500);return;}
   if(!confirm('Close '+name+' position? This will place a market close order.'))return;
   try{
-    const r=await fetch('/close/'+encodeURIComponent(pair),{method:'POST'});
+    const r=await fetch('/close/'+encodeURIComponent(pair)+'?device_id='+encodeURIComponent(_getDeviceId()),{method:'POST'});
     const d=await r.json();
     if(d.error){alert('Error: '+d.error);}else{setTimeout(fetchStatus,800);}
   }catch(e){alert('Failed to close: '+e);}
@@ -11362,11 +11377,11 @@ async function saveSetting(key){
     if(key==='paper'){
       const live=!$('set_paper').checked;
       await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({action:live?'live':'paper'})});
+        body:JSON.stringify({action:live?'live':'paper',device_id:_getDeviceId()})});
     } else if(key==='sim'){
       const on=$('set_sim').checked;
       await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({action:on?'sim_on':'sim_off'})});
+        body:JSON.stringify({action:on?'sim_on':'sim_off',device_id:_getDeviceId()})});
       fetchSim();
     } else if(key==='preview'){
       const on=$('set_preview').checked;
@@ -11668,7 +11683,7 @@ async function confirmGoLive(){
   closeLiveModal();
   try{
     const d=await(await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:'live'})})).json();
+      body:JSON.stringify({action:'live',device_id:_getDeviceId()})})).json();
     const live=d.mode==='LIVE';
     $('mode_badge').className='badge '+(live?'badge-live':'badge-paper');
     $('mode_dot').className='dot '+(live?'dot-live':'dot-paper');
@@ -11809,7 +11824,7 @@ async function toggleSim(){
   try{
     const d=await(await fetch('/control',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:'toggle_sim'})})).json();
+      body:JSON.stringify({action:'toggle_sim',device_id:_getDeviceId()})})).json();
     const nowOn=d.sim_enabled;
     fetchSim();
     showToast(nowOn?'Sim On ▶':'Sim Off ⏸',
@@ -12288,13 +12303,13 @@ function _updateGoalTracker(dp){
 async function qaTogglePause(){
   const paused=!!_paused;
   await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({action:paused?'resume':'pause'})});
+    body:JSON.stringify({action:paused?'resume':'pause',device_id:_getDeviceId()})});
   await fetchStatus();
 }
 async function qaCloseAll(){
   if(!confirm('Close ALL open positions now?'))return;
   try{
-    const r=await(await fetch('/close_all',{method:'POST'})).json();
+    const r=await(await fetch('/close_all?device_id='+encodeURIComponent(_getDeviceId()),{method:'POST'})).json();
     showToast('Closed '+r.closed+' position'+(r.closed!==1?'s':''),'','win',2200);
     setTimeout(fetchStatus,800);
   }catch(e){showToast('Error closing positions','','loss',2000);}
@@ -13771,7 +13786,10 @@ def _web_control():
         body = _flask_request.get_json(silent=True) or {}
         action = body.get("action", "toggle")
     except Exception:
+        body = {}
         action = "toggle"
+    if not _request_is_authorized(body):
+        return _Response(json.dumps({"error": "unauthorized"}), status=403, mimetype="application/json")
     tg_msg = None
     with _state_lock:
         if action == "pause":
@@ -13936,6 +13954,8 @@ def _web_market():
 
 @_flask_app.route("/close_all", methods=["POST"])
 def _web_close_all():
+    if not _request_is_authorized():
+        return _Response(json.dumps({"error": "unauthorized"}), status=403, mimetype="application/json")
     trader = _web_trader_ref[0] if _web_trader_ref else None
     if not trader:
         return _Response('{"error":"not ready"}', status=503, mimetype="application/json")
@@ -13961,6 +13981,8 @@ def _web_close_all():
 
 @_flask_app.route("/close/<pair>", methods=["POST"])
 def _web_close_position(pair):
+    if not _request_is_authorized():
+        return _Response(json.dumps({"error": "unauthorized"}), status=403, mimetype="application/json")
     trader = _web_trader_ref[0] if _web_trader_ref else None
     if not trader:
         return _Response('{"error":"not ready"}', status=503, mimetype="application/json")
