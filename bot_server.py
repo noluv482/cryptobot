@@ -6685,8 +6685,10 @@ def _poll_loop(trader):
 
 # ── Main trading loop ─────────────────────────────────────────────────────────
 def trading_loop(trader):
-    engine_map   = {}   # pair → SignalEngine
-    last_sigs    = {}   # pair → last signal string
+    engine_map     = {}   # pair → SignalEngine (main bot)
+    sim_engine_map = {}   # pair → SignalEngine (sim bot — independent tick state)
+    last_sigs      = {}   # pair → last signal string
+    sim_last_sigs  = {}   # pair → last sim signal string
     ranked_list  = []   # cached top coins from rank_coins()
     ranked_ts    = 0    # timestamp of last rankings refresh
 
@@ -7064,11 +7066,57 @@ def trading_loop(trader):
                         if _main_open:
                             trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
                                              atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
-                        if _sim_open:
-                            _sim_trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
-                                                  atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
 
                     last_sigs[pair] = sig
+
+                    # ── Sim trader: independent signal evaluation ──────────────
+                    if _sim_open:
+                        try:
+                            if pair not in sim_engine_map:
+                                sim_engine_map[pair] = SignalEngine()
+                            sim_eng = sim_engine_map[pair]
+                            sim_sig, sim_plan, _, _, sim_conf = sim_eng.evaluate(
+                                closes, highs, lows, volumes, price, coin["alert_buffer"],
+                                pair=pair, opens=opens)
+                            sim_signal_ts = time.time()
+
+                            # Pullback filter
+                            if sim_sig in ("BUY", "SELL") and len(closes) >= 2:
+                                try:
+                                    _sreg = detect_regime(closes, highs, lows)
+                                    if _sreg == "TRENDING":
+                                        if sim_sig == "BUY"  and closes[-1] >= closes[-2]: sim_sig = "HOLD"
+                                        elif sim_sig == "SELL" and closes[-1] <= closes[-2]: sim_sig = "HOLD"
+                                except Exception: pass
+
+                            # Momentum filter
+                            if sim_sig in ("BUY", "SELL") and len(closes) >= 16:
+                                try:
+                                    _sm5  = closes[-1] - closes[-6]
+                                    _sm15 = closes[-1] - closes[-16]
+                                    if sim_sig == "BUY"  and _sm5 <= 0 and _sm15 <= 0: sim_sig = "HOLD"
+                                    elif sim_sig == "SELL" and _sm5 >= 0 and _sm15 >= 0: sim_sig = "HOLD"
+                                except Exception: pass
+
+                            _sim_last = sim_last_sigs.get(pair)
+                            if sim_sig != _sim_last and sim_sig in ("BUY", "SELL") and sim_conf >= 0.28:
+                                sim_stop   = sim_plan.get("stop",  price*0.985 if sim_sig=="BUY" else price*1.015)
+                                sim_target = sim_plan.get("exit",  price*1.030 if sim_sig=="BUY" else price*0.970)
+                                sim_fkey    = sim_plan.get("fkey",    "")
+                                sim_pillars = sim_plan.get("pillars", {})
+                                if atr and atr > 0:
+                                    _srr_r = (price - sim_stop)   if sim_sig=="BUY" else (sim_stop - price)
+                                    _srr_w = (sim_target - price) if sim_sig=="BUY" else (price - sim_target)
+                                    if _srr_r <= 0 or _srr_w / max(_srr_r, 1e-12) < MIN_RR_RATIO:
+                                        sim_stop   = round((price - atr*ATR_MULTIPLIER)     if sim_sig=="BUY" else (price + atr*ATR_MULTIPLIER),     8)
+                                        sim_target = round((price + atr*ATR_MULTIPLIER*2.2) if sim_sig=="BUY" else (price - atr*ATR_MULTIPLIER*2.2), 8)
+                                _sim_trader.on_signal(sim_sig, price, sim_stop, sim_target,
+                                                      coin["name"], sim_conf, pair,
+                                                      atr=atr, fkey=sim_fkey,
+                                                      pillars=sim_pillars, signal_ts=sim_signal_ts)
+                            sim_last_sigs[pair] = sim_sig
+                        except Exception as e:
+                            log("TRADE", f"sim scan {pair}: {e}", "ERR")
 
                     # ── Activity log entry ────────────────────────────────
                     _act_pillars = plan.get("pillars", {})
