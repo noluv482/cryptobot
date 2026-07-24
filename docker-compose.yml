@@ -38,3 +38,14 @@ services:
     depends_on:
       db:
         condition: service_started
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    # Quick tunnel (no account needed) — URL printed in logs on startup.
+    # For a permanent URL: create a tunnel at dash.cloudflare.com, copy the
+    # token into .env as CLOUDFLARE_TUNNEL_TOKEN, then change the command to:
+    #   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    command: tunnel --no-autoupdate --url http://bot:8080
+    depends_on:
+      - bot
