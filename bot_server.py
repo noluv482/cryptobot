@@ -2462,6 +2462,12 @@ def detect_macd_divergence(closes, highs, lows, lookback=12):
 # ── Higher timeframe trend filter ─────────────────────────────────────────────
 _htf_cache    = {}
 _htf_cache_ts = {}
+# Separate cache for trading_loop's own (trend, expiry) gate lookups — MUST NOT
+# share a dict with _htf_cache above, which stores plain "BULL"/"BEAR"/"NEUTRAL"
+# strings under the same (pair, interval) keys. Sharing caused an intermittent
+# crash: 'trading_loop' would read a leftover string in place of its own tuple
+# and do `float < str`, e.g. "'<' not supported between instances of 'float' and 'str'".
+_htf_gate_cache = {}
 
 def _htf_trend(pair, interval=60, limit=50):
     """EMA trend for any timeframe. 'BULL', 'BEAR', or 'NEUTRAL'. Cached 5 min."""
@@ -6868,7 +6874,7 @@ def trading_loop(trader):
                     if sig in ("BUY", "SELL"):
                         _now_ts = time.time()
                         _k4 = (pair, 240)
-                        _cached4 = _htf_cache.get(_k4)
+                        _cached4 = _htf_gate_cache.get(_k4)
                         if _cached4 and _now_ts < _cached4[1]:
                             trend_4h = _cached4[0]
                         else:
@@ -6876,7 +6882,7 @@ def trading_loop(trader):
                                 closes_4h, _, _, _, _ = get_klines(pair, interval=240, limit=16)
                                 ema_4h   = calc_ema(closes_4h)
                                 trend_4h = "UP" if closes_4h[-1] > ema_4h else "DOWN"
-                                _htf_cache[_k4] = (trend_4h, _now_ts + _HTF_CACHE_TTL)
+                                _htf_gate_cache[_k4] = (trend_4h, _now_ts + _HTF_CACHE_TTL)
                             except Exception:
                                 trend_4h = _cached4[0] if _cached4 else None
                         if trend_4h:
@@ -6894,7 +6900,7 @@ def trading_loop(trader):
                     if sig in ("BUY", "SELL"):
                         _now_ts = time.time()
                         _k1 = (pair, 60)
-                        _cached1 = _htf_cache.get(_k1)
+                        _cached1 = _htf_gate_cache.get(_k1)
                         if _cached1 and _now_ts < _cached1[1]:
                             trend_1h = _cached1[0]
                         else:
@@ -6902,7 +6908,7 @@ def trading_loop(trader):
                                 closes_1h, _, _, _, _ = get_klines(pair, interval=60, limit=24)
                                 ema_1h   = calc_ema(closes_1h)
                                 trend_1h = "UP" if closes_1h[-1] > ema_1h else "DOWN"
-                                _htf_cache[_k1] = (trend_1h, _now_ts + _HTF_CACHE_TTL)
+                                _htf_gate_cache[_k1] = (trend_1h, _now_ts + _HTF_CACHE_TTL)
                             except Exception:
                                 trend_1h = _cached1[0] if _cached1 else None
                         if trend_1h:
