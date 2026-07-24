@@ -2626,6 +2626,8 @@ class PaperTrader:
         self._ab_winner     = "A"  # set to "B" when B wins; drives permanent policy after resolution
         self._live_orders  = {}   # pair → kraken txid (live mode only)
         self._min_size_warn_ts = {}  # pair → last time "order too small" tg() was sent
+        self._force_risk_min = None  # when set, overrides global RISK_MIN for this trader
+        self._force_risk_max = None  # when set, overrides global RISK_MAX for this trader
         if not force_paper:
             self._load()
         if LIVE_MODE and not force_paper:
@@ -3423,7 +3425,9 @@ class PaperTrader:
         # Kelly Criterion base risk when ≥20 trades available (half-Kelly)
         # Floor at 50% of the linear formula to prevent a jarring drop when Kelly
         # first activates on a marginal strategy (e.g., 55% WR → kelly ≈ 5%).
-        linear = RISK_MIN + (RISK_MAX - RISK_MIN) * confidence
+        _rmin  = self._force_risk_min if self._force_risk_min is not None else RISK_MIN
+        _rmax  = self._force_risk_max if self._force_risk_max is not None else RISK_MAX
+        linear = _rmin + (_rmax - _rmin) * confidence
         kelly  = self._kelly_size(pair=pair)
         if kelly > 0:
             kelly_base = kelly * (0.5 + 0.5 * confidence)
@@ -3460,7 +3464,7 @@ class PaperTrader:
                         * gain_mult
                         * corr_mult
                         * reentry_mult,
-                        RISK_MAX)
+                        _rmax)
         if self._is_live():
             margin = round(self.balance * risk, 4)
             fill   = price
@@ -14428,6 +14432,8 @@ def main():
     # Create the parallel sim trader ($2000 virtual account, always paper)
     global _sim_trader, _btc_benchmark_start
     _sim_trader = PaperTrader(force_paper=True, start_balance=2000.0)
+    _sim_trader._force_risk_min = 0.20   # sim uses fake money — trade bigger to learn faster
+    _sim_trader._force_risk_max = 0.50
     log("BOOT", "Sim trader initialized — $2000 virtual account ready (type 'sim on' to start)")
     try:
         _btc_benchmark_start = get_price("XBTUSD")
