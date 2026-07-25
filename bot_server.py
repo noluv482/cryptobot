@@ -7917,6 +7917,35 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 /* ── SETTINGS SHEET ── */
 .set-sheet{position:fixed;inset:0;z-index:400;display:none}
 .set-sheet.open{display:block}
+.ft-sheet{position:fixed;inset:0;z-index:450;display:none}
+.ft-sheet.open{display:block}
+.ft-panel{position:absolute;bottom:0;left:0;right:0;background:var(--s0);
+  border-radius:20px 20px 0 0;padding:20px 20px calc(20px + var(--sb));
+  border-top:1px solid var(--bd2);max-height:85vh;overflow-y:auto}
+.ft-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.ft-title{font-weight:700;font-size:.95rem}
+.ft-close{background:none;border:none;color:var(--mu);font-size:1.1rem;cursor:pointer;padding:4px}
+.ft-lbl{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);
+  font-weight:700;margin:14px 0 6px}
+.ft-coin-sel{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--bd2);
+  background:var(--s1);color:var(--tx);font-size:.88rem;appearance:none;-webkit-appearance:none}
+.ft-side-row{display:flex;gap:8px;margin-bottom:4px}
+.ft-side-btn{flex:1;padding:11px 0;border-radius:10px;border:1px solid var(--bd2);
+  background:var(--s1);color:var(--mu);font-size:.85rem;font-weight:600;cursor:pointer;transition:.15s}
+.ft-side-btn.active-buy{background:#16a34a;border-color:#16a34a;color:#fff}
+.ft-side-btn.active-sell{background:#dc2626;border-color:#dc2626;color:#fff}
+.ft-conf-row{display:flex;gap:6px;flex-wrap:wrap}
+.ft-conf-btn{flex:1;min-width:56px;padding:8px 4px;border-radius:8px;border:1px solid var(--bd2);
+  background:var(--s1);color:var(--mu);font-size:.78rem;font-weight:600;cursor:pointer;transition:.15s;text-align:center}
+.ft-conf-btn.active{background:var(--ac);border-color:var(--ac);color:#fff}
+.ft-who-row{display:flex;gap:8px}
+.ft-who-btn{flex:1;padding:9px 0;border-radius:10px;border:1px solid var(--bd2);
+  background:var(--s1);color:var(--mu);font-size:.78rem;font-weight:600;cursor:pointer;transition:.15s;text-align:center}
+.ft-who-btn.active{background:var(--ac);border-color:var(--ac);color:#fff}
+.ft-exec-btn{width:100%;margin-top:18px;padding:14px;border-radius:12px;border:none;
+  background:var(--ac);color:#fff;font-size:.92rem;font-weight:700;cursor:pointer;letter-spacing:.02em}
+.ft-exec-btn:disabled{opacity:.45;cursor:not-allowed}
+.ft-status{margin-top:10px;font-size:.78rem;text-align:center;color:var(--mu);min-height:18px}
 .set-overlay{position:absolute;inset:0;background:rgba(0,0,0,.55)}
 .set-panel{position:absolute;bottom:0;left:0;right:0;background:var(--s0);
   border-radius:20px 20px 0 0;padding:20px 20px calc(20px + var(--sb));
@@ -8427,6 +8456,7 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     <button id="install_btn" onclick="installApp()" title="Add to home screen">+ App</button>
     <button id="theme_btn" onclick="toggleTheme()" title="Toggle light/dark theme">&#9788;</button>
     <button id="sound_btn" onclick="toggleSound()" title="Sound alerts">&#128264;</button>
+    <button class="icon-btn" id="ft_btn" onclick="openForceTrade()" title="Force a trade">&#9889;</button>
     <button class="icon-btn" id="settings_btn" onclick="openSettings()" title="Settings">&#9881;</button>
     <button class="icon-btn" id="pause_btn" onclick="togglePause()" title="Pause bot">&#9208;</button>
     <button class="icon-btn" id="notif_btn" onclick="requestNotifs()" title="Notifications">&#128276;</button>
@@ -9173,6 +9203,61 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <button class="cb-modal-ok" id="claude_test_btn" onclick="testClaudeKey()" style="background:rgba(255,152,0,.15);border-color:rgba(255,152,0,.4);color:var(--y);flex:1">Test</button>
       <button class="cb-modal-ok" id="claude_save_btn" onclick="saveClaudeKey()" style="flex:1" disabled>Save &#129302;</button>
     </div>
+  </div>
+</div>
+
+<!-- Force Trade sheet -->
+<div class="ft-sheet" id="ft_sheet">
+  <div class="set-overlay" onclick="closeForceTrade()"></div>
+  <div class="ft-panel">
+    <div class="ft-hdr">
+      <div class="ft-title">&#9889; Force Trade</div>
+      <button class="ft-close" onclick="closeForceTrade()">&#10005;</button>
+    </div>
+    <div class="ft-lbl">Coin</div>
+    <select class="ft-coin-sel" id="ft_pair">
+      <option value="XBTUSD">BTC/USD</option>
+      <option value="ETHUSD">ETH/USD</option>
+      <option value="SOLUSD">SOL/USD</option>
+      <option value="XRPUSD">XRP/USD</option>
+      <option value="XDGUSD">DOGE/USD</option>
+      <option value="ADAUSD">ADA/USD</option>
+      <option value="AVAXUSD">AVAX/USD</option>
+      <option value="LINKUSD">LINK/USD</option>
+      <option value="DOTUSD">DOT/USD</option>
+      <option value="LTCUSD">LTC/USD</option>
+      <option value="ATOMUSD">ATOM/USD</option>
+      <option value="UNIUSD">UNI/USD</option>
+      <option value="AAVEUSD">AAVE/USD</option>
+      <option value="INJUSD">INJ/USD</option>
+      <option value="SUIUSD">SUI/USD</option>
+      <option value="APTUSD">APT/USD</option>
+      <option value="ARBUSD">ARB/USD</option>
+      <option value="NEARUSD">NEAR/USD</option>
+      <option value="ALGOUSD">ALGO/USD</option>
+      <option value="FILUSD">FIL/USD</option>
+      <option value="BCHUSD">BCH/USD</option>
+    </select>
+    <div class="ft-lbl">Direction</div>
+    <div class="ft-side-row">
+      <button class="ft-side-btn active-buy" id="ft_buy" onclick="ftSetSide('LONG')">&#8679; LONG / BUY</button>
+      <button class="ft-side-btn" id="ft_sell" onclick="ftSetSide('SHORT')">&#8681; SHORT / SELL</button>
+    </div>
+    <div class="ft-lbl">Confidence</div>
+    <div class="ft-conf-row">
+      <button class="ft-conf-btn" id="ftc_35" onclick="ftSetConf(35)">35%<br><span style="font-size:.68rem;font-weight:400">Min</span></button>
+      <button class="ft-conf-btn active" id="ftc_55" onclick="ftSetConf(55)">55%<br><span style="font-size:.68rem;font-weight:400">Mid</span></button>
+      <button class="ft-conf-btn" id="ftc_75" onclick="ftSetConf(75)">75%<br><span style="font-size:.68rem;font-weight:400">High</span></button>
+      <button class="ft-conf-btn" id="ftc_95" onclick="ftSetConf(95)">95%<br><span style="font-size:.68rem;font-weight:400">Max</span></button>
+    </div>
+    <div class="ft-lbl">Apply to</div>
+    <div class="ft-who-row">
+      <button class="ft-who-btn active" id="ftw_main" onclick="ftSetWho('main')">Main Bot</button>
+      <button class="ft-who-btn" id="ftw_sim" onclick="ftSetWho('sim')">Sim</button>
+      <button class="ft-who-btn" id="ftw_both" onclick="ftSetWho('both')">Both</button>
+    </div>
+    <button class="ft-exec-btn" id="ft_exec" onclick="executeForceTrade()">&#9889; Execute Trade</button>
+    <div class="ft-status" id="ft_status"></div>
   </div>
 </div>
 
@@ -11450,6 +11535,63 @@ async function openSettings(){
   $('set_sheet').classList.add('open');
 }
 function closeSettings(){$('set_sheet').classList.remove('open');}
+
+/* ── Force Trade sheet ── */
+let _ftSide='LONG', _ftConf=55, _ftWho='main';
+function openForceTrade(){
+  $('ft_sheet').classList.add('open');
+  $('ft_status').textContent='';
+  $('ft_exec').disabled=false;
+}
+function closeForceTrade(){$('ft_sheet').classList.remove('open');}
+function ftSetSide(s){
+  _ftSide=s;
+  $('ft_buy').className='ft-side-btn'+(s==='LONG'?' active-buy':'');
+  $('ft_sell').className='ft-side-btn'+(s==='SHORT'?' active-sell':'');
+}
+function ftSetConf(c){
+  _ftConf=c;
+  [35,55,75,95].forEach(v=>{
+    const el=$('ftc_'+v);
+    if(el)el.classList.toggle('active',v===c);
+  });
+}
+function ftSetWho(w){
+  _ftWho=w;
+  ['main','sim','both'].forEach(v=>{
+    const el=$('ftw_'+v);
+    if(el)el.classList.toggle('active',v===w);
+  });
+}
+async function executeForceTrade(){
+  const pair=$('ft_pair').value;
+  const btn=$('ft_exec');
+  const st=$('ft_status');
+  btn.disabled=true;
+  st.textContent='Sending…';
+  st.style.color='var(--mu)';
+  try{
+    const r=await fetch('/force_trade',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pair,side:_ftSide,confidence:_ftConf/100,who:_ftWho,device_id:_getDeviceId()})});
+    const d=await r.json();
+    if(d.ok){
+      const sym=pair.replace('USD','').replace('XBT','BTC').replace('XDG','DOGE');
+      st.textContent=`✅ ${sym} ${_ftSide} @ $${(d.price||0).toLocaleString()} — sent to ${d.applied.join(', ')}`;
+      st.style.color='var(--g)';
+      setTimeout(closeForceTrade,2200);
+    } else {
+      st.textContent='⚠ '+( d.error||'Trade rejected');
+      st.style.color='var(--r)';
+      btn.disabled=false;
+    }
+  }catch(e){
+    st.textContent='⚠ Network error';
+    st.style.color='var(--r)';
+    btn.disabled=false;
+  }
+}
+
 async function saveSetting(key){
   try{
     if(key==='paper'){
@@ -13939,6 +14081,62 @@ def _web_control():
     return _Response(json.dumps({"paused": now_paused, "paper_mode": now_paper,
                                   "mode": "LIVE" if is_live() else "PAPER",
                                   "sim_enabled": now_sim}),
+                     mimetype="application/json")
+
+@_flask_app.route("/force_trade", methods=["POST"])
+def _web_force_trade():
+    body = _flask_request.get_json(silent=True) or {}
+    if not _request_is_authorized(body):
+        return _Response(json.dumps({"error": "unauthorized"}), status=403, mimetype="application/json")
+    pair       = body.get("pair", "XBTUSD")
+    side       = body.get("side", "LONG")          # "LONG" or "SHORT"
+    confidence = float(body.get("confidence", 0.70))
+    who        = body.get("who", "main")            # "main", "sim", "both"
+    confidence = max(0.28, min(1.0, confidence))
+    if side not in ("LONG", "SHORT"):
+        return _Response(json.dumps({"error": "side must be LONG or SHORT"}), status=400, mimetype="application/json")
+    coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
+    if not coin:
+        return _Response(json.dumps({"error": f"unknown pair {pair}"}), status=400, mimetype="application/json")
+    try:
+        closes, highs, lows, volumes, opens = get_klines(pair)
+        price = get_price(pair)
+        atr   = calc_atr(highs, lows, closes)
+    except Exception as e:
+        return _Response(json.dumps({"error": f"price fetch failed: {e}"}), status=500, mimetype="application/json")
+    stop   = round((price - atr * ATR_MULTIPLIER)       if side == "LONG" else (price + atr * ATR_MULTIPLIER),       8)
+    target = round((price + atr * ATR_MULTIPLIER * 2.2) if side == "LONG" else (price - atr * ATR_MULTIPLIER * 2.2), 8)
+    applied = []
+    t = _web_trader_ref[0] if _web_trader_ref else None
+    if who in ("main", "both") and t:
+        try:
+            if t.can_open_new() and pair not in t.positions:
+                t._open(side, price, coin["name"], target, confidence, pair, atr,
+                        stop=stop, strategy="FORCED")
+                applied.append("main")
+            else:
+                applied.append("main:blocked(position full or open)")
+        except Exception as e:
+            applied.append(f"main:error:{e}")
+    if who in ("sim", "both") and _sim_trader is not None:
+        try:
+            if _sim_trader.can_open_new() and pair not in _sim_trader.positions:
+                _sim_trader._open(side, price, coin["name"], target, confidence, pair, atr,
+                                  stop=stop, strategy="FORCED")
+                applied.append("sim")
+            else:
+                applied.append("sim:blocked(position full or open)")
+        except Exception as e:
+            applied.append(f"sim:error:{e}")
+    direction = "LONG ↑" if side == "LONG" else "SHORT ↓"
+    label     = ", ".join(a for a in applied if not a.endswith(")") and ":error:" not in a)
+    if label:
+        threading.Thread(target=tg, args=(
+            f"🔨 *Force Trade — {coin['name']}* ({direction})\n"
+            f"Entry: `${price:.4f}` | Target: `${target:.4f}` | Stop: `${stop:.4f}`\n"
+            f"Conf: `{int(confidence*100)}%` | Applied to: `{label}`\n"
+            f"_Manually forced via dashboard_",), daemon=True).start()
+    return _Response(json.dumps({"ok": bool(applied), "applied": applied, "price": round(price, 6)}),
                      mimetype="application/json")
 
 @_flask_app.route("/auth", methods=["GET", "POST"])
