@@ -345,6 +345,12 @@ MAX_POSITIONS     = 2          # max 2 simultaneous positions (was 3) — focus 
 MAX_TOTAL_RISK    = 0.25       # total margin ≤ 25% (was 40%) — reduce correlated exposure
 BREAKEVEN_PCT     = 0.020      # lock breakeven at +2% (was 1.2%) — 15-min moves are bigger
 MIN_RR_RATIO      = 1.5        # require 1.5:1 R:R minimum — still asymmetric, more opportunities
+# Round-trip cost as a fraction of price: fee charged on entry AND exit, plus
+# slippage on entry AND exit. A target that clears the R:R ratio can still be
+# a guaranteed net loser if it's smaller than this — e.g. a 0.12% price move
+# nets negative once ~0.72% round-trip costs are subtracted.
+ROUND_TRIP_COST_PCT   = 2 * KRAKEN_FEE + 2 * SLIPPAGE
+MIN_PROFIT_VS_COST_MULT = 3.0  # target must clear round-trip costs by this multiple
 DAILY_GAIN_SOFT   = 0.03
 DAILY_GAIN_HARD   = 0.06
 LIVE_CHART_MINS   = 10
@@ -1093,7 +1099,7 @@ _gate_counters = {
     "adx": 0, "efficiency": 0, "min_conf": 0, "bb_squeeze": 0, "ob_imbalance": 0,
     "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0, "15m_trend": 0,
     "orderbook_wall": 0, "daily_trend": 0, "pair_profit_cap": 0,
-    "ttl_expired": 0, "low_liq_hours": 0, "no_strategy": 0,
+    "ttl_expired": 0, "low_liq_hours": 0, "no_strategy": 0, "cost_floor": 0,
 }
 
 # Trade preview / confirmation state
@@ -7022,6 +7028,15 @@ def trading_loop(trader):
                             _rr_risk   = (price - stop)   if sig == "BUY" else (stop - price)
                         if _rr_risk <= 0 or _rr_reward / _rr_risk < MIN_RR_RATIO:
                             with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
+                            last_sigs[pair] = sig
+                            continue
+
+                        # Cost floor: target must clear round-trip fees+slippage by a
+                        # healthy margin, or "hitting take profit" is a guaranteed net
+                        # loser once real costs are applied (seen live: a 0.013% move
+                        # triggered "take profit" and still lost money after fees).
+                        if _rr_reward / price < ROUND_TRIP_COST_PCT * MIN_PROFIT_VS_COST_MULT:
+                            with _gate_counter_lock: _gate_counters["cost_floor"] += 1
                             last_sigs[pair] = sig
                             continue
 
@@ -13060,7 +13075,8 @@ def _web_status():
         "ws_live":               bool(_prices_cache and (time.time() - _prices_cache_ts) < 60),
         "scan_age":              round(time.time() - _last_scan_ts, 1) if _last_scan_ts else None,
     }
-    return _Response(json.dumps(payload), mimetype="application/json")
+    return _Response(json.dumps(payload), mimetype="application/json",
+                      headers={"Access-Control-Allow-Origin": "*"})
 
 @_flask_app.route("/events")
 def _web_events():
