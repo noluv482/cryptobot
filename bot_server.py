@@ -13561,10 +13561,12 @@ def _web_api_logs():
         return _Response(
             json.dumps({"ok": True, "count": len(lines), "snapshot": snapshot, "logs": lines}),
             mimetype="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
         )
     except Exception as e:
         return _Response(json.dumps({"ok": False, "error": str(e)}),
-                         status=500, mimetype="application/json")
+                         status=500, mimetype="application/json",
+                         headers={"Access-Control-Allow-Origin": "*"})
 
 @_flask_app.route("/bestsetups")
 def _web_bestsetups():
