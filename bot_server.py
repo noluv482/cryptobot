@@ -3370,7 +3370,7 @@ class PaperTrader:
                 return
             self._open(_open_side, price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars, signal_ts=signal_ts, strategy=_strat_key)
 
-    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None, signal_ts=None, strategy=None):
+    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None, signal_ts=None, strategy=None, leverage_override=None):
         # Order TTL: if the signal is older than ORDER_TTL_SECS don't place the order.
         # Gates and API calls between evaluate() and here can add several seconds of lag;
         # acting on a stale signal risks entering at a price the market has already moved past.
@@ -3572,7 +3572,10 @@ class PaperTrader:
                 fee = round(margin * KRAKEN_FEE, 4)
         else:
             # Tiered contracts — leverage and label scale with bot's conviction
-            if confidence >= 0.84:
+            if leverage_override and leverage_override > 0:
+                leverage      = int(leverage_override)
+                contract_tier = f"Manual {leverage}×"
+            elif confidence >= 0.84:
                 leverage      = 5
                 contract_tier = "Max Bet"
             elif confidence >= 0.76:
@@ -9250,6 +9253,15 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <button class="ft-conf-btn" id="ftc_75" onclick="ftSetConf(75)">75%<br><span style="font-size:.68rem;font-weight:400">High</span></button>
       <button class="ft-conf-btn" id="ftc_95" onclick="ftSetConf(95)">95%<br><span style="font-size:.68rem;font-weight:400">Max</span></button>
     </div>
+    <div class="ft-lbl">Leverage</div>
+    <div class="ft-conf-row">
+      <button class="ft-conf-btn active" id="ftl_auto" onclick="ftSetLev(0)">Auto<br><span style="font-size:.68rem;font-weight:400">by conf</span></button>
+      <button class="ft-conf-btn" id="ftl_1" onclick="ftSetLev(1)">1×<br><span style="font-size:.68rem;font-weight:400">Safe</span></button>
+      <button class="ft-conf-btn" id="ftl_2" onclick="ftSetLev(2)">2×</button>
+      <button class="ft-conf-btn" id="ftl_3" onclick="ftSetLev(3)">3×</button>
+      <button class="ft-conf-btn" id="ftl_5" onclick="ftSetLev(5)">5×</button>
+      <button class="ft-conf-btn" id="ftl_10" onclick="ftSetLev(10)">10×</button>
+    </div>
     <div class="ft-lbl">Apply to</div>
     <div class="ft-who-row">
       <button class="ft-who-btn active" id="ftw_main" onclick="ftSetWho('main')">Main Bot</button>
@@ -11537,8 +11549,10 @@ async function openSettings(){
 function closeSettings(){$('set_sheet').classList.remove('open');}
 
 /* ── Force Trade sheet ── */
-let _ftSide='LONG', _ftConf=55, _ftWho='main';
+let _ftSide='LONG', _ftConf=55, _ftWho='main', _ftLev=0;
 function openForceTrade(){
+  _ftSide='LONG'; _ftConf=55; _ftWho='main'; _ftLev=0;
+  ftSetSide('LONG'); ftSetConf(55); ftSetWho('main'); ftSetLev(0);
   $('ft_sheet').classList.add('open');
   $('ft_status').textContent='';
   $('ft_exec').disabled=false;
@@ -11563,6 +11577,13 @@ function ftSetWho(w){
     if(el)el.classList.toggle('active',v===w);
   });
 }
+function ftSetLev(l){
+  _ftLev=l;
+  ['auto',1,2,3,5,10].forEach(v=>{
+    const el=$('ftl_'+v);
+    if(el)el.classList.toggle('active',v===l);
+  });
+}
 async function executeForceTrade(){
   const pair=$('ft_pair').value;
   const btn=$('ft_exec');
@@ -11573,7 +11594,8 @@ async function executeForceTrade(){
   try{
     const r=await fetch('/force_trade',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({pair,side:_ftSide,confidence:_ftConf/100,who:_ftWho,device_id:_getDeviceId()})});
+      body:JSON.stringify({pair,side:_ftSide,confidence:_ftConf/100,who:_ftWho,
+        leverage:_ftLev||null,device_id:_getDeviceId()})});
     const d=await r.json();
     if(d.ok){
       const sym=pair.replace('USD','').replace('XBT','BTC').replace('XDG','DOGE');
@@ -14088,10 +14110,13 @@ def _web_force_trade():
     body = _flask_request.get_json(silent=True) or {}
     if not _request_is_authorized(body):
         return _Response(json.dumps({"error": "unauthorized"}), status=403, mimetype="application/json")
-    pair       = body.get("pair", "XBTUSD")
-    side       = body.get("side", "LONG")          # "LONG" or "SHORT"
-    confidence = float(body.get("confidence", 0.70))
-    who        = body.get("who", "main")            # "main", "sim", "both"
+    pair             = body.get("pair", "XBTUSD")
+    side             = body.get("side", "LONG")      # "LONG" or "SHORT"
+    confidence       = float(body.get("confidence", 0.70))
+    who              = body.get("who", "main")        # "main", "sim", "both"
+    leverage_override = body.get("leverage")          # int or None (None = auto)
+    if leverage_override is not None:
+        leverage_override = max(1, min(25, int(leverage_override)))
     confidence = max(0.28, min(1.0, confidence))
     if side not in ("LONG", "SHORT"):
         return _Response(json.dumps({"error": "side must be LONG or SHORT"}), status=400, mimetype="application/json")
@@ -14112,7 +14137,7 @@ def _web_force_trade():
         try:
             if t.can_open_new() and pair not in t.positions:
                 t._open(side, price, coin["name"], target, confidence, pair, atr,
-                        stop=stop, strategy="FORCED")
+                        stop=stop, strategy="FORCED", leverage_override=leverage_override)
                 applied.append("main")
             else:
                 applied.append("main:blocked(position full or open)")
@@ -14122,7 +14147,7 @@ def _web_force_trade():
         try:
             if _sim_trader.can_open_new() and pair not in _sim_trader.positions:
                 _sim_trader._open(side, price, coin["name"], target, confidence, pair, atr,
-                                  stop=stop, strategy="FORCED")
+                                  stop=stop, strategy="FORCED", leverage_override=leverage_override)
                 applied.append("sim")
             else:
                 applied.append("sim:blocked(position full or open)")
