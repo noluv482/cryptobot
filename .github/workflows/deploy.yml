@@ -18,5 +18,6 @@ jobs:
           git reset --hard origin/claude/bot-scan-1amdiq
           docker compose build bot
           docker compose up -d bot
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) deployed commit $(git rev-parse --short HEAD)" >> ~/deploy.log
           echo "Deploy complete at $(date)"
           docker ps | grep cryptobot-bot
