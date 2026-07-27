@@ -7926,6 +7926,23 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .news-impact.hi{color:var(--r)}
 .news-impact.md{color:var(--y)}
 .news-impact.lo{color:var(--mu)}
+/* ── BOT IQ CARD ── */
+.iq-card{margin:0 16px 14px;background:var(--s0);border:1px solid var(--bd);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden}
+.iq-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,#7c3aed,#a78bfa);border-radius:3px 0 0 3px}
+.iq-top{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.iq-score-ring{width:56px;height:56px;border-radius:50%;background:conic-gradient(var(--iq-c,#7c3aed) var(--iq-pct,0%),var(--bd2) 0);display:flex;align-items:center;justify-content:center;flex-shrink:0;position:relative}
+.iq-score-ring::after{content:'';position:absolute;inset:5px;border-radius:50%;background:var(--s0)}
+.iq-score-val{font-family:var(--fn);font-size:1.05rem;font-weight:800;color:var(--tx);position:relative;z-index:1;line-height:1}
+.iq-info{flex:1;min-width:0}
+.iq-label{font-weight:700;font-size:.88rem;color:var(--tx);line-height:1.2;margin-bottom:3px}
+.iq-sub{font-size:.6rem;color:var(--mu)}
+.iq-comps{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+.iq-comp{flex:1;min-width:60px;background:var(--bg);border-radius:8px;padding:7px 8px;text-align:center}
+.iq-comp-val{font-family:var(--fn);font-size:.82rem;font-weight:700;color:var(--tx)}
+.iq-comp-lbl{font-size:.5rem;color:var(--mu);text-transform:uppercase;letter-spacing:.07em;margin-top:2px}
+.iq-chart-wrap{height:52px;position:relative}
+.iq-chart-canvas{width:100%;height:52px;display:block}
+.iq-chart-empty{font-size:.62rem;color:var(--mu);text-align:center;padding-top:16px}
 /* ── SETTINGS SHEET ── */
 .set-sheet{position:fixed;inset:0;z-index:400;display:none}
 .set-sheet.open{display:block}
@@ -8558,6 +8575,29 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:.57rem;color:var(--mu);font-family:var(--fn)">
         <span id="rank_cur_bal">$100</span>
         <span id="rank_next_info">Next: ⚪ Trader @ $250</span>
+      </div>
+    </div>
+
+    <div class="sh"><span>Bot IQ</span></div>
+    <div class="iq-card" id="iq_card">
+      <div class="iq-top">
+        <div class="iq-score-ring" id="iq_ring" style="--iq-pct:0%;--iq-c:#7c3aed">
+          <span class="iq-score-val" id="iq_score">—</span>
+        </div>
+        <div class="iq-info">
+          <div class="iq-label" id="iq_label">Calculating…</div>
+          <div class="iq-sub" id="iq_sub">How smart is the bot getting?</div>
+        </div>
+      </div>
+      <div class="iq-comps" id="iq_comps">
+        <div class="iq-comp"><div class="iq-comp-val" id="iq_wr">—</div><div class="iq-comp-lbl">Win Rate</div></div>
+        <div class="iq-comp"><div class="iq-comp-val" id="iq_calib">—</div><div class="iq-comp-lbl">Calibration</div></div>
+        <div class="iq-comp"><div class="iq-comp-val" id="iq_rr">—</div><div class="iq-comp-lbl">R:R Quality</div></div>
+        <div class="iq-comp"><div class="iq-comp-val" id="iq_exp">—</div><div class="iq-comp-lbl">Experience</div></div>
+      </div>
+      <div class="iq-chart-wrap">
+        <canvas class="iq-chart-canvas" id="iq_canvas"></canvas>
+        <div class="iq-chart-empty" id="iq_empty" style="display:none">No trades yet — IQ chart will appear here</div>
       </div>
     </div>
 
@@ -9773,6 +9813,83 @@ function renderRank(d){
   if(sp){sp.textContent=bar;}
   if(sb){sb.style.width=Math.min(pct,100)+'%';}
   if(sl){sl.textContent=d.learning?'Learning from trades: ON ✓':'Need more trades to activate learning';}
+}
+
+/* ── BOT IQ CARD ── */
+async function loadIQ(){
+  try{
+    const d=await(await fetch('/iq')).json();
+    const score=d.score||70;
+    const label=d.label||'Finding Its Way';
+    const c=d.components||{};
+    const history=d.history||[];
+    // color by score tier
+    const iqColor=score>=160?'#f59e0b':score>=130?'#a78bfa':score>=110?'#38bdf8':score>=90?'#4ade80':'#7c3aed';
+    // ring: map score 70–200 → 0–100%
+    const pct=Math.min(100,Math.max(0,(score-70)/130*100)).toFixed(1)+'%';
+    const ring=$('iq_ring');
+    if(ring){ring.style.setProperty('--iq-pct',pct);ring.style.setProperty('--iq-c',iqColor);}
+    const sv=$('iq_score');if(sv){sv.textContent=Math.round(score);}
+    const lv=$('iq_label');if(lv){lv.textContent=label;}
+    const sub=$('iq_sub');
+    if(sub){
+      const exp=c.experience||0;
+      sub.textContent=exp<100?`${Math.round(exp)}% experience (${c.trades||0} trades)`:`Fully experienced — ${c.trades||0} trades`;
+    }
+    // component boxes
+    const wre=$('iq_wr');if(wre){wre.textContent=(c.win_rate||0).toFixed(0)+'%';}
+    const cal=$('iq_calib');if(cal){cal.textContent=(c.calibration||0).toFixed(0)+' pts';}
+    const rre=$('iq_rr');if(rre){rre.textContent=(c.rr_quality||0).toFixed(2)+'%';}
+    const exe=$('iq_exp');if(exe){exe.textContent=(c.experience||0).toFixed(0)+'%';}
+    // sparkline chart
+    const canvas=$('iq_canvas');
+    const empty=$('iq_empty');
+    if(!canvas)return;
+    if(history.length<2){
+      canvas.style.display='none';
+      if(empty){empty.style.display='block';}
+      return;
+    }
+    if(empty){empty.style.display='none';}
+    canvas.style.display='block';
+    const dpr=window.devicePixelRatio||1;
+    const W=canvas.offsetWidth||canvas.parentElement.offsetWidth||300;
+    const H=52;
+    canvas.width=W*dpr;canvas.height=H*dpr;
+    canvas.style.width=W+'px';canvas.style.height=H+'px';
+    const ctx=canvas.getContext('2d');
+    ctx.scale(dpr,dpr);
+    const scores=history.map(h=>h.score);
+    const minS=Math.min(...scores,70)-5;
+    const maxS=Math.max(...scores,score)+5;
+    const range=maxS-minS||1;
+    const pad={l:2,r:2,t:4,b:4};
+    const uw=W-pad.l-pad.r;
+    const uh=H-pad.t-pad.b;
+    const xs=i=>pad.l+i/(scores.length-1||1)*uw;
+    const ys=v=>pad.t+uh-(v-minS)/range*uh;
+    // gradient fill
+    const grad=ctx.createLinearGradient(0,pad.t,0,H-pad.b);
+    grad.addColorStop(0,iqColor+'55');
+    grad.addColorStop(1,iqColor+'00');
+    ctx.beginPath();
+    ctx.moveTo(xs(0),ys(scores[0]));
+    for(let i=1;i<scores.length;i++){ctx.lineTo(xs(i),ys(scores[i]));}
+    ctx.lineTo(xs(scores.length-1),H-pad.b);
+    ctx.lineTo(xs(0),H-pad.b);
+    ctx.closePath();
+    ctx.fillStyle=grad;ctx.fill();
+    // line
+    ctx.beginPath();
+    ctx.moveTo(xs(0),ys(scores[0]));
+    for(let i=1;i<scores.length;i++){ctx.lineTo(xs(i),ys(scores[i]));}
+    ctx.strokeStyle=iqColor;ctx.lineWidth=2;ctx.lineJoin='round';ctx.stroke();
+    // endpoint dot
+    const lx=xs(scores.length-1),ly=ys(scores[scores.length-1]);
+    ctx.beginPath();ctx.arc(lx,ly,3.5,0,Math.PI*2);
+    ctx.fillStyle=iqColor;ctx.fill();
+    ctx.strokeStyle='var(--s0)';ctx.lineWidth=1.5;ctx.stroke();
+  }catch(e){console.warn('IQ load failed',e);}
 }
 
 /* ── PATTERN BADGE HELPER ── */
@@ -12804,14 +12921,14 @@ _initSoundBtn();
 _initKeyboard();
 initStripDrag();
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
-fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();
+fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();loadIQ();
 fetchPrices();setInterval(fetchPrices,8000);
-setInterval(fetchStatus,15000);
+setInterval(fetchStatus,15000);setInterval(loadIQ,60000);
 initSSE();initWebPush();
 setInterval(tick,1000);
 setInterval(updateLivePnl,5000);
 setInterval(updateTimers,30000);
-window.addEventListener('resize',()=>{drawEquity();drawCandles();drawDownChart();});
+window.addEventListener('resize',()=>{drawEquity();drawCandles();drawDownChart();loadIQ();});
 if('Notification' in window&&Notification.permission==='granted'){_notif=true;updateNotifBtn();}
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script>
@@ -14171,6 +14288,88 @@ def _web_force_trade():
             f"Conf: `{int(confidence*100)}%` | Applied to: `{label}`\n"
             f"_Manually forced via dashboard_",), daemon=True).start()
     return _Response(json.dumps({"ok": bool(applied), "applied": applied, "price": round(price, 6)}),
+                     mimetype="application/json")
+
+@_flask_app.route("/iq")
+def _web_iq():
+    t = _web_trader_ref[0] if _web_trader_ref else None
+    trades = t.trades if t else []
+    n = len(trades)
+
+    # ── per-trade IQ history ────────────────────────────────────────────────
+    history = []
+    running_wins = 0
+    for i, tr in enumerate(trades):
+        running_wins += 1 if tr["pnl"] > 0 else 0
+        _n = i + 1
+        _wr = running_wins / _n * 100
+        _exp = min(1.0, _n / 30)
+        # win-rate bonus: 0–55 pts (wr=50→0, wr=70→27.5, wr=100→55)
+        _wr_bonus = max(0.0, (_wr - 50) / 50 * 55)
+        # avg R:R so far (exit-entry ratio)
+        _rr_vals = []
+        for _t2 in trades[:_n]:
+            _entry = _t2.get("entry", 0) or 0
+            _exit  = _t2.get("exit",  0) or 0
+            if _entry > 0 and _exit > 0:
+                _ratio = abs(_exit - _entry) / _entry * 100
+                _rr_vals.append(_ratio)
+        _rr_bonus = min(30.0, (sum(_rr_vals) / len(_rr_vals) if _rr_vals else 0) * 5)
+        _score = round((70 + _wr_bonus + _rr_bonus) * _exp + 70 * (1 - _exp), 1)
+        history.append({"n": _n, "score": _score})
+
+    # ── current score ──────────────────────────────────────────────────────
+    if n == 0:
+        score = 70.0
+        wr_val = 0.0
+        rr_val = 0.0
+        calib_val = 0.0
+    else:
+        wr_val = (sum(1 for tr in trades if tr["pnl"] > 0) / n * 100)
+        exp_mult = min(1.0, n / 30)
+        wr_bonus = max(0.0, (wr_val - 50) / 50 * 55)
+        # calibration: how well confidence predicts outcomes
+        conf_pairs = [(tr.get("confidence", 0.5), 1 if tr["pnl"] > 0 else 0) for tr in trades]
+        if len(conf_pairs) >= 5:
+            avg_conf   = sum(c for c, _ in conf_pairs) / len(conf_pairs)
+            avg_outcome = sum(o for _, o in conf_pairs) / len(conf_pairs)
+            calib_err  = abs(avg_conf - avg_outcome)
+            calib_val  = round(max(0.0, 25 * (1 - calib_err * 2)), 1)
+        else:
+            calib_val = 0.0
+        # R:R bonus
+        rr_list = []
+        for tr in trades:
+            _entry = tr.get("entry", 0) or 0
+            _exit  = tr.get("exit",  0) or 0
+            if _entry > 0 and _exit > 0:
+                rr_list.append(abs(_exit - _entry) / _entry * 100)
+        rr_val = round(sum(rr_list) / len(rr_list) if rr_list else 0.0, 2)
+        rr_bonus = min(30.0, rr_val * 5)
+        raw = 70 + wr_bonus + calib_val + rr_bonus
+        score = round(raw * exp_mult + 70 * (1 - exp_mult), 1)
+
+    # label
+    if   score >= 180: label = "Legendary"
+    elif score >= 160: label = "Genius"
+    elif score >= 145: label = "Expert"
+    elif score >= 130: label = "Advanced"
+    elif score >= 120: label = "Analytical"
+    elif score >= 110: label = "Sharp"
+    elif score >= 100: label = "Solid"
+    elif score >=  90: label = "Learning Fast"
+    elif score >=  80: label = "Getting Started"
+    else:              label = "Finding Its Way"
+
+    components = {
+        "win_rate":    round(wr_val, 1),
+        "calibration": round(calib_val, 1),
+        "rr_quality":  round(rr_val, 2),
+        "trades":      n,
+        "experience":  round(min(1.0, n / 30) * 100, 0),
+    }
+    return _Response(json.dumps({"score": score, "label": label,
+                                 "components": components, "history": history}),
                      mimetype="application/json")
 
 @_flask_app.route("/auth", methods=["GET", "POST"])
