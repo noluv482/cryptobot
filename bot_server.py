@@ -1200,6 +1200,14 @@ def tg(msg, plain=False):
         r = requests.post(TG_URL, json=payload, timeout=10)
         if not r.ok:
             log("TG", f"Error {r.status_code}: {r.text[:200]}", "ERR")
+            # Legacy Markdown rejects unbalanced * _ ` (a coin like BTC_USD or an
+            # odd asterisk is enough), and Telegram drops the whole message. Retry
+            # once without parse_mode so it still lands — same fallback tg_buttons uses.
+            if not plain:
+                payload.pop("parse_mode", None)
+                r = requests.post(TG_URL, json=payload, timeout=10)
+                if not r.ok:
+                    log("TG", f"Plain retry failed {r.status_code}: {r.text[:200]}", "ERR")
         return r.ok
     except Exception as e:
         log("TG", f"Send error: {e}", "ERR")
