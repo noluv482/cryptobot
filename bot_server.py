@@ -334,6 +334,7 @@ TRAIL_PCT        = 0.04        # 4% fallback trail on 15-min chart (was 3%)
 ATR_PERIOD       = 14
 ATR_MULTIPLIER   = 2.0         # 2× ATR trail (was 1.5) — gives trade room to breathe
 MAX_TRADE_MINS   = 120         # 2-hour time limit (was 30 min) — trends need time
+POSITION_WATCHDOG_SECS = 60    # how often the watchdog re-checks open positions
 KRAKEN_FEE       = 0.0026
 SLIPPAGE                = 0.001
 ORDER_TTL_SECS          = 45      # max seconds from signal to order placement; older signals are dropped
@@ -14611,6 +14612,37 @@ def _start_web_server(trader):
     log("WEB", f"Dashboard → http://0.0.0.0:{port}")
     _flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
 
+def _position_watchdog(*traders):
+    """Force-close positions that outlive their strategy's max_mins.
+
+    Every exit check lives in on_signal(), which only runs when a fresh signal
+    arrives for that pair. A position on a pair that falls out of the scan
+    rotation is therefore never evaluated at all — one WIF/USD long sat open for
+    512 minutes against a 180-minute cap and became the single largest loss on
+    the book. This enforces only the hard time cap; trailing stops and targets
+    stay in on_signal so the two can't drift apart.
+    """
+    while True:
+        time.sleep(POSITION_WATCHDOG_SECS)
+        for tr in traders:
+            if tr is None:
+                continue
+            for pair, p in list(getattr(tr, "positions", {}).items()):
+                try:
+                    mins_open = (time.time() - p.get("opened_at", time.time())) / 60
+                    cap = _STRATEGIES.get(p.get("strategy", ""), {}).get("max_mins", MAX_TRADE_MINS)
+                    if mins_open < cap:
+                        continue
+                    if pair not in tr.positions:      # closed by on_signal meanwhile
+                        continue
+                    price = get_price(pair)
+                    tr._close(price, p.get("name", pair), "time limit", pair)
+                    log("WATCHDOG",
+                        f"{pair} force-closed at {mins_open:.0f}m (cap {cap}m)", "WRN")
+                except Exception as e:
+                    log("WATCHDOG", f"{pair}: {e}", "ERR")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     global _current_coin
@@ -14685,6 +14717,10 @@ def main():
     _sim_trader._force_risk_min = 0.20   # sim uses fake money — trade bigger to learn faster
     _sim_trader._force_risk_max = 0.50
     log("BOOT", "Sim trader initialized — $2000 virtual account ready (type 'sim on' to start)")
+
+    threading.Thread(target=_position_watchdog, args=(trader, _sim_trader),
+                     daemon=True).start()
+    log("BOOT", f"Position watchdog started — enforcing max-hold every {POSITION_WATCHDOG_SECS}s")
     try:
         _btc_benchmark_start = get_price("XBTUSD")
         log("BOOT", f"BTC benchmark start: ${_btc_benchmark_start:,.2f}")
