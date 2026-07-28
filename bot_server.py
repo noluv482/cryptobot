@@ -770,6 +770,12 @@ class Database:
             # Added after the table shipped — existing deployments need the column
             # backfilled or every per-strategy query silently returns nothing.
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy TEXT")
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS timeframe INTEGER")
+            # Every trade before this column existed was taken on the 15m base, so
+            # backfilling them is a statement of fact, not a guess — and it gives the
+            # 15m-vs-1h comparison a real starting sample. New inserts always set
+            # timeframe, so NULL can only mean "pre-migration".
+            cur.execute("UPDATE trades SET timeframe = 15 WHERE timeframe IS NULL")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
                     id         INT PRIMARY KEY DEFAULT 1,
@@ -856,12 +862,12 @@ class Database:
                     INSERT INTO trades
                       (ts, coin, pair, side, entry, exit_price, pnl, held_mins,
                        reason, confidence, nasdaq_mood, news_sent, balance_after,
-                       strategy)
+                       strategy, timeframe)
                     VALUES
                       (%(ts)s,%(coin)s,%(pair)s,%(side)s,%(entry)s,%(exit_price)s,
                        %(pnl)s,%(held_mins)s,%(reason)s,%(confidence)s,
                        %(nasdaq_mood)s,%(news_sent)s,%(balance_after)s,
-                       %(strategy)s)
+                       %(strategy)s,%(timeframe)s)
                 """, t)
         except Exception as e:
             log("DB", f"Save error: {e}", "ERR")
@@ -3939,6 +3945,7 @@ class PaperTrader:
                 "news_sent": entry_news,
                 "balance_after": self.balance,
                 "strategy": p.get("strategy", "") or "",
+                "timeframe": INTERVAL,
             })
             _push_sse("trade_close", {"name": name, "side": p["side"],
                                        "pnl": pnl, "reason": reason,
