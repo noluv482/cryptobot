@@ -361,6 +361,13 @@ VOLUME_FILTER_MULT= 1.0        # require at least average volume (was 1.2)
 EXTREME_FUNDING   = 0.001
 ECON_BLACKOUT_MINS= 15
 MIN_CONFIDENCE    = 0.35       # confidence floor — lowered to generate more trades for learning
+# Directional balance: entry gates are near-symmetric, but market conditions filter
+# one side far harder than the other (first 50 trades ran 41 LONG / 9 SHORT, with
+# longs losing ~5× more per trade). Rather than loosen a safety gate to force the
+# thin side through, the losing side has to clear a higher confidence bar.
+SIDE_LEARN_MIN       = 15      # trades on a side before it can be penalised
+SIDE_LEARN_MIN_OTHER = 5       # trades needed on the other side to compare against
+SIDE_CONF_MARGIN     = 0.08    # extra confidence the losing side must clear
 ADX_PERIOD        = 14
 ADX_MIN           = 8          # allow mildly trending markets (was 18→14→11→8 for more entries)
 ER_PERIOD         = 10
@@ -975,6 +982,21 @@ class Database:
                         for r in cur.fetchall()}
         except Exception as e:
             log("DB", f"exit_pattern error: {e}", "ERR")
+            return {}
+
+    def side_pattern(self):
+        """Per-direction (LONG/SHORT) trade stats — count and average pnl."""
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT side, COUNT(*) AS n, AVG(pnl) AS avg_pnl
+                    FROM trades GROUP BY side
+                """)
+                return {r[0]: {"n": r[1], "avg_pnl": float(r[2])}
+                        for r in cur.fetchall()}
+        except Exception as e:
+            log("DB", f"side_pattern error: {e}", "ERR")
             return {}
 
     def save_state(self, state: dict):
@@ -2609,6 +2631,8 @@ class PaperTrader:
         # Per-pair exit-quality cache
         self._exit_cache   = {}   # pair → dict
         self._exit_ts      = {}   # pair → float
+        self._side_cache   = {}   # "LONG"/"SHORT" → dict
+        self._side_ts      = 0.0
         # Per-pair re-entry cooldown after a loss
         self._cooldown     = {}   # pair → timestamp when cooldown expires
         # Per-pair win-rate cache for stake sizing
@@ -3012,6 +3036,43 @@ class PaperTrader:
             return 0.60
         return 0.0
 
+    # ── Learning method 5: raise the bar on the losing direction ─────────────
+    def _side_conf_penalty(self, sig):
+        """Confidence floor for a direction that's underperforming the other.
+
+        Entry gates are near-symmetric, but market conditions filter one side much
+        harder — bullish-divergence vetoes blocked 159 SELL signals vs 83 BUY, so
+        the book ran 41 LONG / 9 SHORT while longs lost ~5x more per trade. This
+        makes the losing side earn a higher bar instead of loosening the veto, so
+        the mix self-corrects from realised P&L rather than a hardcoded lean.
+        """
+        if self._no_persist or not db.connected:
+            return 0.0
+        side = "LONG" if sig == "BUY" else "SHORT" if sig == "SELL" else None
+        if side is None:
+            return 0.0
+        now = time.time()
+        if now - self._side_ts > 1800:
+            self._side_ts = now
+            try:
+                self._side_cache = db.side_pattern()
+            except Exception as e:
+                log("PAPER", f"side cache: {e}", "ERR")
+        me    = self._side_cache.get(side)
+        other = self._side_cache.get("SHORT" if side == "LONG" else "LONG")
+        if not me or not other:
+            return 0.0
+        # Need a real sample on the side being penalised, and enough on the other
+        # to be worth comparing against — otherwise a couple of lucky trades on a
+        # thin side would throttle the one actually carrying the book.
+        if me["n"] < SIDE_LEARN_MIN or other["n"] < SIDE_LEARN_MIN_OTHER:
+            return 0.0
+        if me["avg_pnl"] >= other["avg_pnl"]:
+            return 0.0
+        log("PAPER", f"{side} avg {me['avg_pnl']:.3f} < {other['avg_pnl']:.3f} "
+                     f"→ confidence floor +{SIDE_CONF_MARGIN}")
+        return round(MIN_CONFIDENCE + SIDE_CONF_MARGIN, 4)
+
     def _partial_close(self, price, name, pair, stage=1):
         """Scale out in thirds: close 1/3 at 1st target, 1/3 at 2nd, let last 1/3 trail."""
         p = self.positions.get(pair)
@@ -3327,7 +3388,8 @@ class PaperTrader:
             min_conf = max(MIN_CONFIDENCE, _live_floor,
                            self._min_conf_threshold(pair),
                            self._dynamic_conf_gate(),
-                           self._hourly_conf_gate())
+                           self._hourly_conf_gate(),
+                           self._side_conf_penalty(sig))
             # A/B confidence test: B group uses +0.05 threshold; auto-adopt winner at 50 trades each
             if sig in ("BUY", "SELL"):
                 if not self._ab_resolved:
