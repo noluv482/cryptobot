@@ -3,7 +3,6 @@ name: Deploy to Home Server
 on:
   push:
     branches:
-      - claude/bot-scan-1amdiq
       - main
 
 jobs:
@@ -14,8 +13,8 @@ jobs:
         run: |
           cd ~/cryptobot
           git fetch origin
-          git checkout claude/bot-scan-1amdiq
-          git reset --hard origin/claude/bot-scan-1amdiq
+          git checkout main
+          git reset --hard origin/main
           docker compose build bot
           docker compose up -d bot
           echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) deployed commit $(git rev-parse --short HEAD)" >> ~/deploy.log
