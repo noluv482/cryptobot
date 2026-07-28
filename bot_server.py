@@ -314,9 +314,24 @@ _KRAKEN_MIN_VOL = {
 
 EMA_PERIOD    = 14
 RSI_PERIOD    = 14
-CANDLE_LIMIT  = 80             # more history for 15-min chart
-INTERVAL      = 15             # 15-min candles: far less noise than 5-min
-REFRESH_SEC   = 30             # poll every 30s on 15-min chart (was 60)
+CANDLE_LIMIT  = 80             # 80 bars of history for support/resistance detection
+# Base timeframe. Moved 15m → 60m after modelling 16,852 setups against real candle
+# history: on 15m the median distance to nearest resistance was 0.09% while
+# round-trip cost is 0.72%, so targets could not clear fees and ~96% of S/R setups
+# were rejected. At 1h the median target is 0.27% and ~2x as many setups qualify.
+# Everything time-based below derives from _TF_SCALE, so changing INTERVAL back to
+# 15 restores the original tuning in one edit.
+INTERVAL      = 60             # 1-hour candles
+_TF_SCALE     = INTERVAL / 15.0   # multiplier vs the original 15m tuning
+# Higher-timeframe confirmation ladder. These must stay ABOVE the base timeframe —
+# with a 15m base the ladder was 15m/1h/4h/1d, so a naive move to a 1h base would
+# leave the "15m trend" gate checking a LOWER timeframe and veto valid setups on
+# noise. Values snap to Kraken's supported intervals (1,5,15,30,60,240,1440,10080).
+HTF_SAME      = INTERVAL       # same-timeframe trend confirm
+HTF_MID       = 240            # 4x base
+HTF_HIGH      = 1440           # daily
+HTF_MACRO     = 10080          # weekly
+REFRESH_SEC   = 60             # poll every 60s — a 1h bar doesn't need 30s polling
 CONFIRM_TICKS = 1              # fire on first valid signal scan (was 2)
 
 PAPER_START    = 100.0
@@ -333,7 +348,8 @@ PYRAMID_PCT      = 0.05        # pyramid add-on trigger: +5% in-trade move
 TRAIL_PCT        = 0.04        # 4% fallback trail on 15-min chart (was 3%)
 ATR_PERIOD       = 14
 ATR_MULTIPLIER   = 2.0         # 2× ATR trail (was 1.5) — gives trade room to breathe
-MAX_TRADE_MINS   = 120         # 2-hour time limit (was 30 min) — trends need time
+MAX_TRADE_MINS   = int(120 * _TF_SCALE)   # hold cap, scaled to the base timeframe
+STALE_EXIT_MINS  = int(45 * _TF_SCALE)    # "went nowhere" exit, scaled likewise
 POSITION_WATCHDOG_SECS = 60    # how often the watchdog re-checks open positions
 KRAKEN_FEE       = 0.0026
 SLIPPAGE                = 0.001
@@ -637,42 +653,42 @@ BEARISH_WORDS = ["crash","drop","dump","ban","hack","exploit","lawsuit","sec",
 _STRATEGIES = {
     "MULTI_SIGNAL": {
         "name": "Multi-Signal",    "emoji": "✨",
-        "min_conf": 0.65,          "min_pillars": 7,   "max_mins": 180,
+        "min_conf": 0.65,          "min_pillars": 7,   "max_mins": int(180 * _TF_SCALE),
         "desc": "7+ pillars aligned — highest-conviction setup",
     },
     "MOMENTUM_BREAKOUT": {
         "name": "Momentum Breakout", "emoji": "🚀",
-        "min_conf": 0.55,            "required": {"macd_align", "high_volume"}, "max_mins": 90,
+        "min_conf": 0.55,            "required": {"macd_align", "high_volume"}, "max_mins": int(90 * _TF_SCALE),
         "desc": "High-volume breakout with MACD confirmation",
     },
     "TREND_CONTINUATION": {
         "name": "Trend Continuation", "emoji": "📈",
-        "min_conf": 0.50,             "required": {"nasdaq_align", "tick_strength", "vwap_align"}, "max_mins": 180,
+        "min_conf": 0.50,             "required": {"nasdaq_align", "tick_strength", "vwap_align"}, "max_mins": int(180 * _TF_SCALE),
         "desc": "Riding an established trend with macro + VWAP confirmation",
     },
     "RSI_REVERSAL": {
         "name": "RSI Reversal",   "emoji": "🔄",
-        "min_conf": 0.50,         "required": {"rsi_zone", "stoch_rsi"}, "max_mins": 60,
+        "min_conf": 0.50,         "required": {"rsi_zone", "stoch_rsi"}, "max_mins": int(60 * _TF_SCALE),
         "desc": "Oversold/overbought reversal with RSI + Stoch confirmation",
     },
     "NEWS_CATALYST": {
         "name": "News Catalyst",  "emoji": "📰",
-        "min_conf": 0.45,         "required": {"news_align"}, "min_news": 2, "max_mins": 45,
+        "min_conf": 0.45,         "required": {"news_align"}, "min_news": 2, "max_mins": int(45 * _TF_SCALE),
         "desc": "News-driven move with technical confirmation",
     },
     "PATTERN_BREAKOUT": {
         "name": "Pattern Breakout", "emoji": "📐",
-        "min_conf": 0.50,           "required_any": {"chart_struct", "candle_pattern"}, "max_mins": 60,
+        "min_conf": 0.50,           "required_any": {"chart_struct", "candle_pattern"}, "max_mins": int(60 * _TF_SCALE),
         "desc": "Chart or candlestick pattern completion",
     },
     "CONFLUENCE": {
         "name": "Confluence",  "emoji": "🔀",
-        "min_conf": 0.52,      "min_pillars": 4,   "max_mins": 90,
+        "min_conf": 0.52,      "min_pillars": 4,   "max_mins": int(90 * _TF_SCALE),
         "desc": "4+ indicators aligned — broad multi-factor confirmation",
     },
     "LEARNING_SIGNAL": {
         "name": "Learning Signal", "emoji": "📚",
-        "min_conf": 0.35,          "min_pillars": 2, "max_mins": 60,
+        "min_conf": 0.35,          "min_pillars": 2, "max_mins": int(60 * _TF_SCALE),
         "desc": "Paper-mode fallback — 2+ indicators aligned; used to collect training data",
     },
 }
@@ -3443,7 +3459,7 @@ class PaperTrader:
                 self._close(price, name, "trailing stop", pair); closed_this_tick = True
             elif mins_open >= _STRATEGIES.get(p.get("strategy", ""), {}).get("max_mins", MAX_TRADE_MINS):
                 self._close(price, name, "time limit",   pair); closed_this_tick = True
-            elif mins_open >= 45 and abs(move) * p["entry"] < atr_dist:
+            elif mins_open >= STALE_EXIT_MINS and abs(move) * p["entry"] < atr_dist:
                 self._close(price, name, "stale exit",   pair); closed_this_tick = True
             elif side == "LONG"  and price >= p.get("target", float("inf")):
                 self._close(price, name, "take profit",  pair); closed_this_tick = True
@@ -4383,7 +4399,7 @@ class SignalEngine:
         # HTF 1H trend — soft gate: counter-trend penalises confidence instead of hard-blocking.
         # Hard-blocking 1H meant coins on any pullback could never get a BUY entry.
         if sig in ("BUY", "SELL"):
-            _htf = _htf_trend(current_pair)
+            _htf = _htf_trend(current_pair, interval=HTF_MID, limit=50)
             if (_htf == "BEAR" and sig == "BUY") or (_htf == "BULL" and sig == "SELL"):
                 with _gate_counter_lock: _gate_counters["htf"] += 1
                 # Penalty handled below in confidence calculation
@@ -4392,7 +4408,7 @@ class SignalEngine:
         # confidence adjustment for 4H alignment. Double-penalising caused droughts.
         # Telemetry counter preserved for dashboard visibility.
         if sig in ("BUY", "SELL"):
-            _htf4 = _htf_trend(current_pair, interval=240, limit=50)
+            _htf4 = _htf_trend(current_pair, interval=HTF_HIGH, limit=50)
             if (_htf4 == "BEAR" and sig == "BUY") or (_htf4 == "BULL" and sig == "SELL"):
                 with _gate_counter_lock: _gate_counters["4h_trend"] += 1
 
@@ -4400,7 +4416,7 @@ class SignalEngine:
         # doesn't hard-block. 15m EMA(14) is too noisy to veto valid 1h/4h signals.
         _15m_against = False
         if sig in ("BUY", "SELL"):
-            _htf15 = _htf_trend(current_pair, interval=15, limit=50)
+            _htf15 = _htf_trend(current_pair, interval=HTF_SAME, limit=50)
             if _htf15 == "BEAR" and sig == "BUY":
                 _15m_against = True
             elif _htf15 == "BULL" and sig == "SELL":
@@ -4583,14 +4599,14 @@ class SignalEngine:
 
         # 1H HTF soft gate — counter-trend 1H trims confidence (was a hard block)
         if sig in ("BUY", "SELL"):
-            _htf_1h_check = _htf_trend(current_pair)
+            _htf_1h_check = _htf_trend(current_pair, interval=HTF_MID, limit=50)
             if (_htf_1h_check == "BEAR" and sig == "BUY") or (_htf_1h_check == "BULL" and sig == "SELL"):
                 confidence = max(0.0, round(confidence - 0.09, 2))
 
         # Daily EMA soft gate — counter-trend daily trend trims confidence
         if sig in ("BUY", "SELL"):
             try:
-                _htf_daily = _htf_trend(current_pair, interval=1440, limit=30)
+                _htf_daily = _htf_trend(current_pair, interval=HTF_MACRO, limit=30)
                 if (_htf_daily == "BEAR" and sig == "BUY") or (_htf_daily == "BULL" and sig == "SELL"):
                     with _gate_counter_lock: _gate_counters["daily_trend"] += 1
                     confidence = max(0.0, round(confidence - 0.05, 2))
