@@ -368,6 +368,16 @@ MIN_CONFIDENCE    = 0.35       # confidence floor — lowered to generate more t
 SIDE_LEARN_MIN       = 15      # trades on a side before it can be penalised
 SIDE_LEARN_MIN_OTHER = 5       # trades needed on the other side to compare against
 SIDE_CONF_MARGIN     = 0.08    # extra confidence the losing side must clear
+# Per-strategy learning: 8 strategies run concurrently, so a consistently losing
+# one can bleed the book while the aggregate win rate hides it.
+STRAT_LEARN_MIN      = 10      # trades on a strategy before judging it
+STRAT_CONF_MARGIN    = 0.10    # extra confidence a losing strategy must clear
+STRAT_DISABLE_AVG    = -0.15   # avg pnl below which a strategy is benched outright
+# Correlation cap. Sizing already halves stake for a correlated position
+# (corr_mult), but nothing capped how many could stack up — 5 half-size memecoin
+# longs is still one bet held five times over. Uses the existing
+# CORRELATED_GROUPS rather than a second list that could drift out of sync.
+MAX_CORRELATED_POS   = 2       # max simultaneous positions in one correlation group
 ADX_PERIOD        = 14
 ADX_MIN           = 8          # allow mildly trending markets (was 18→14→11→8 for more entries)
 ER_PERIOD         = 10
@@ -737,9 +747,13 @@ class Database:
                     confidence  FLOAT,
                     nasdaq_mood TEXT,
                     news_sent   TEXT,
-                    balance_after FLOAT
+                    balance_after FLOAT,
+                    strategy    TEXT
                 )
             """)
+            # Added after the table shipped — existing deployments need the column
+            # backfilled or every per-strategy query silently returns nothing.
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
                     id         INT PRIMARY KEY DEFAULT 1,
@@ -825,11 +839,13 @@ class Database:
                 cur.execute("""
                     INSERT INTO trades
                       (ts, coin, pair, side, entry, exit_price, pnl, held_mins,
-                       reason, confidence, nasdaq_mood, news_sent, balance_after)
+                       reason, confidence, nasdaq_mood, news_sent, balance_after,
+                       strategy)
                     VALUES
                       (%(ts)s,%(coin)s,%(pair)s,%(side)s,%(entry)s,%(exit_price)s,
                        %(pnl)s,%(held_mins)s,%(reason)s,%(confidence)s,
-                       %(nasdaq_mood)s,%(news_sent)s,%(balance_after)s)
+                       %(nasdaq_mood)s,%(news_sent)s,%(balance_after)s,
+                       %(strategy)s)
                 """, t)
         except Exception as e:
             log("DB", f"Save error: {e}", "ERR")
@@ -984,6 +1000,24 @@ class Database:
             log("DB", f"exit_pattern error: {e}", "ERR")
             return {}
 
+    def strategy_pattern(self):
+        """Per-strategy stats — count, avg pnl, win rate. Skips pre-migration rows."""
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT strategy, COUNT(*) AS n, AVG(pnl) AS avg_pnl,
+                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins
+                    FROM trades
+                    WHERE strategy IS NOT NULL AND strategy <> ''
+                    GROUP BY strategy
+                """)
+                return {r[0]: {"n": r[1], "avg_pnl": float(r[2]), "wins": r[3]}
+                        for r in cur.fetchall()}
+        except Exception as e:
+            log("DB", f"strategy_pattern error: {e}", "ERR")
+            return {}
+
     def side_pattern(self):
         """Per-direction (LONG/SHORT) trade stats — count and average pnl."""
         if not self.conn: return {}
@@ -1124,6 +1158,7 @@ _gate_counters = {
     "stoch_rsi": 0, "htf": 0, "macd_div": 0, "spread": 0, "15m_trend": 0,
     "orderbook_wall": 0, "daily_trend": 0, "pair_profit_cap": 0,
     "ttl_expired": 0, "low_liq_hours": 0, "no_strategy": 0, "cost_floor": 0,
+    "strategy_benched": 0, "strategy_conf": 0, "correlated": 0,
 }
 
 # Trade preview / confirmation state
@@ -2633,6 +2668,8 @@ class PaperTrader:
         self._exit_ts      = {}   # pair → float
         self._side_cache   = {}   # "LONG"/"SHORT" → dict
         self._side_ts      = 0.0
+        self._strat_cache  = {}   # strategy key → dict
+        self._strat_ts     = 0.0
         # Per-pair re-entry cooldown after a loss
         self._cooldown     = {}   # pair → timestamp when cooldown expires
         # Per-pair win-rate cache for stake sizing
@@ -3073,6 +3110,47 @@ class PaperTrader:
                      f"→ confidence floor +{SIDE_CONF_MARGIN}")
         return round(MIN_CONFIDENCE + SIDE_CONF_MARGIN, 4)
 
+    # ── Learning method 6: bench strategies that lose money ──────────────────
+    def _strategy_gate(self, strat):
+        """(extra_confidence, disabled) for a strategy, from its realised P&L.
+
+        Eight strategies run concurrently and the aggregate win rate hides which
+        of them is bleeding — until now nothing recorded per-strategy results at
+        all. A clearly losing strategy is benched outright; a marginal one just
+        has to clear a higher bar.
+        """
+        if self._no_persist or not db.connected or not strat:
+            return 0.0, False
+        now = time.time()
+        if now - self._strat_ts > 1800:
+            self._strat_ts = now
+            try:
+                self._strat_cache = db.strategy_pattern()
+            except Exception as e:
+                log("PAPER", f"strategy cache: {e}", "ERR")
+        s = self._strat_cache.get(strat)
+        if not s or s["n"] < STRAT_LEARN_MIN:
+            return 0.0, False
+        if s["avg_pnl"] <= STRAT_DISABLE_AVG:
+            log("PAPER", f"strategy {strat} avg {s['avg_pnl']:.3f} over {s['n']} "
+                         f"trades → benched")
+            return 0.0, True
+        if s["avg_pnl"] < 0:
+            return round(MIN_CONFIDENCE + STRAT_CONF_MARGIN, 4), False
+        return 0.0, False
+
+    # ── Learning method 7: cap correlated exposure ───────────────────────────
+    def _correlated_open(self, pair):
+        """How many open positions share a correlation group with `pair`.
+
+        Sizing already halves the stake for a correlated entry, but nothing
+        limited how many could accumulate — this caps the count as well.
+        """
+        for grp in CORRELATED_GROUPS:
+            if pair in grp:
+                return sum(1 for p in self.positions if p in grp and p != pair)
+        return 0
+
     def _partial_close(self, price, name, pair, stage=1):
         """Scale out in thirds: close 1/3 at 1st target, 1/3 at 2nd, let last 1/3 trail."""
         p = self.positions.get(pair)
@@ -3409,6 +3487,24 @@ class PaperTrader:
             if _strat_key is None:
                 with _gate_counter_lock: _gate_counters["no_strategy"] += 1
                 log("GATE", f"{name} blocked — no strategy match (conf={confidence:.2f})")
+                return
+            # Per-strategy P&L gate: bench a strategy that loses outright, make a
+            # marginal one clear a higher bar.
+            _strat_conf, _strat_benched = self._strategy_gate(_strat_key)
+            if _strat_benched:
+                with _gate_counter_lock: _gate_counters["strategy_benched"] += 1
+                log("GATE", f"{name} blocked — strategy {_strat_key} benched on P&L")
+                return
+            if _strat_conf and confidence < _strat_conf:
+                with _gate_counter_lock: _gate_counters["strategy_conf"] += 1
+                log("GATE", f"{name} blocked — {_strat_key} needs conf ≥{_strat_conf:.2f} "
+                            f"(got {confidence:.2f})")
+                return
+            # Correlation cap: N positions in one group is one bet N times over.
+            if self._correlated_open(pair) >= MAX_CORRELATED_POS:
+                with _gate_counter_lock: _gate_counters["correlated"] += 1
+                log("GATE", f"{name} blocked — already {MAX_CORRELATED_POS} correlated "
+                            f"positions open")
                 return
             if sig == "BUY" and self.can_open_new():
                 _open_side = "LONG"
@@ -3826,6 +3922,7 @@ class PaperTrader:
                 "nasdaq_mood": entry_nasdaq,
                 "news_sent": entry_news,
                 "balance_after": self.balance,
+                "strategy": p.get("strategy", "") or "",
             })
             _push_sse("trade_close", {"name": name, "side": p["side"],
                                        "pnl": pnl, "reason": reason,
