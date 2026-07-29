@@ -367,6 +367,33 @@ MIN_RR_RATIO      = 1.5        # require 1.5:1 R:R minimum — still asymmetric,
 # slippage on entry AND exit. A target that clears the R:R ratio can still be
 # a guaranteed net loser if it's smaller than this — e.g. a 0.12% price move
 # nets negative once ~0.72% round-trip costs are subtracted.
+def _sr_clusters(highs, lows):
+    """Swing highs/lows, clustered into support/resistance levels.
+
+    Extracted so the chart can draw the SAME levels the trader picks targets and
+    stops from — if these ever diverge the chart would be quietly lying about why
+    a trade was taken. Both the strategy and /candles call this one function.
+    """
+    if len(highs) < 5 or len(lows) < 5:
+        return []
+    price_range = max(highs) - min(lows) or 1
+    tolerance = price_range * 0.005
+    levels = []
+    for i in range(2, len(highs) - 2):
+        if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+            levels.append(highs[i])
+        if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+            levels.append(lows[i])
+    levels.sort()
+    clustered = []
+    for lvl in levels:
+        if clustered and abs(lvl - clustered[-1]) <= tolerance:
+            clustered[-1] = (clustered[-1] + lvl) / 2
+        else:
+            clustered.append(lvl)
+    return clustered
+
+
 ROUND_TRIP_COST_PCT   = 2 * KRAKEN_FEE + 2 * SLIPPAGE
 MIN_PROFIT_VS_COST_MULT = 3.0  # target must clear round-trip costs by this multiple
 DAILY_GAIN_SOFT   = 0.03
@@ -4206,22 +4233,7 @@ class SignalEngine:
         # Volume breakout: current bar has the highest volume of the last 10 bars
         vol_breakout = len(volumes) >= 10 and volumes[-1] == max(volumes[-10:])
 
-        price_range = max(highs) - min(lows) or 1
-        tolerance   = price_range * 0.005
-        levels = []
-        for i in range(2, len(highs)-2):
-            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
-                levels.append(highs[i])
-            if lows[i]  < lows[i-1]  and lows[i]  < lows[i+1]:
-                levels.append(lows[i])
-        levels.sort()
-        clustered = []
-        for lvl in levels:
-            if clustered and abs(lvl-clustered[-1]) <= tolerance:
-                clustered[-1] = (clustered[-1]+lvl)/2
-            else:
-                clustered.append(lvl)
-
+        clustered = _sr_clusters(highs, lows)
         nearest_r = next((l for l in clustered if l > price), None)
         nearest_s = next((l for l in reversed(clustered) if l < price), None)
         above_ema = price > ema
@@ -8993,6 +9005,8 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <button class="iv-btn" data-iv="240" onclick="setCdInterval(240)">4h</button>
     </div>
     <div class="ind-row">
+      <button class="ind-btn active" id="btn_sr" onclick="toggleSR()" title="Support/resistance the bot picks targets and stops from">S/R</button>
+      <button class="ind-btn active" id="btn_cost" onclick="toggleCost()" title="Move needed to clear fees + slippage — targets inside this band cannot profit">COST</button>
       <button class="ind-btn" id="btn_bb" onclick="toggleBB()" title="Bollinger Bands (20,2)">BB</button>
       <button class="ind-btn" id="btn_macd" onclick="toggleMACD()" title="MACD (12,26,9)">MACD</button>
       <span style="font-size:.5rem;color:var(--mu);opacity:.6;margin-left:auto">Hold chip to reorder</span>
@@ -9538,6 +9552,8 @@ const TAB_ORDER=['home','chart','pos','stats','market','journal'];
 let _tab='home',_paused=false,_notif=false;
 let _eqData=[],_cdData=[],_cdHover=-1,_tick=30;
 let _ema20=[],_ema50=[],_cdTrades=[],_cdOpenPos=[],_cdPatSig='NONE',_cdPair='',_cdIv=15;
+let _cdMeta={};                 // S/R levels + cost floor from /candles
+let _showSR=true,_showCost=true; // both on by default — they explain the bot's targets
 let _botPair='',_coinPrices={},_openPairs=new Set();
 let _showBB=false,_showMACD=false;
 let _cdCountdownTimer=null;
@@ -10291,6 +10307,16 @@ function toggleBB(){
   const b=$('btn_bb');if(b)b.classList.toggle('active',_showBB);
   if(_cdData.length)drawCandles();
 }
+function toggleSR(){
+  _showSR=!_showSR;
+  const b=$('btn_sr');if(b)b.classList.toggle('active',_showSR);
+  if(_cdData.length)drawCandles();
+}
+function toggleCost(){
+  _showCost=!_showCost;
+  const b=$('btn_cost');if(b)b.classList.toggle('active',_showCost);
+  if(_cdData.length)drawCandles();
+}
 function toggleMACD(){
   _showMACD=!_showMACD;
   const b=$('btn_macd');if(b)b.classList.toggle('active',_showMACD);
@@ -10360,7 +10386,11 @@ async function fetchCandles(){
   try{
     const pair=_cdPair||_botPair||'';
     const url='/candles?interval='+_cdIv+(pair?'&pair='+pair:'');
-    const data=await(await fetch(url)).json();
+    const raw=await(await fetch(url)).json();
+    // /candles now returns {candles, meta}; tolerate the old bare-array shape so
+    // a cached page mid-deploy still renders instead of blanking the chart.
+    const data=Array.isArray(raw)?raw:(raw&&raw.candles)||[];
+    _cdMeta=Array.isArray(raw)?{}:((raw&&raw.meta)||{});
     if(Array.isArray(data)&&data.length){
       _cdData=data;
       _ema20=_ema(data,20);
@@ -10629,6 +10659,42 @@ function drawCandles(){
     const ts=Math.max(0,n-10);
     ctx.fillStyle=_cdPatSig==='BULLISH'?'rgba(0,204,116,.055)':'rgba(255,51,82,.055)';
     ctx.fillRect(xC(ts)-slotW/2,P.t,(n-ts)*slotW,ch);
+  }
+  // Cost floor band — the move needed to clear fees+slippage by the required
+  // multiple. Anything inside this band cannot be profitable, so a target that
+  // does not escape it is a losing setup no matter how good it looks.
+  if(_showCost&&_cdMeta.cost_floor_pct&&data.length){
+    const px=data[data.length-1].c,fl=_cdMeta.cost_floor_pct/100;
+    const yTop=yP(px*(1+fl)),yBot=yP(px*(1-fl));
+    ctx.fillStyle='rgba(255,51,82,.05)';
+    ctx.fillRect(P.l,Math.max(P.t,yTop),cw,Math.min(P.t+ch,yBot)-Math.max(P.t,yTop));
+    ctx.strokeStyle='rgba(255,51,82,.28)';ctx.lineWidth=.8;ctx.setLineDash([2,3]);
+    [yTop,yBot].forEach(y=>{if(y>P.t&&y<P.t+ch){ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();}});
+    ctx.setLineDash([]);
+    if(yTop>P.t+8){
+      ctx.fillStyle='rgba(255,51,82,.6)';ctx.font='7.5px monospace';ctx.textAlign='left';
+      ctx.fillText('cost floor ±'+_cdMeta.cost_floor_pct+'%',P.l+3,yTop-2);
+    }
+  }
+  // Support / resistance — the exact clustered levels the bot picks targets and
+  // stops from (same _sr_clusters() call), so a target can be judged on sight.
+  if(_showSR&&_cdMeta.levels&&_cdMeta.levels.length){
+    _cdMeta.levels.forEach(lv=>{
+      if(lv<lo||lv>hi)return;
+      const y=yP(lv),isR=_cdMeta.price&&lv>_cdMeta.price;
+      const near=(lv===_cdMeta.nearest_r||lv===_cdMeta.nearest_s);
+      ctx.strokeStyle=isR?(near?'rgba(255,51,82,.55)':'rgba(255,51,82,.2)')
+                         :(near?'rgba(0,204,116,.55)':'rgba(0,204,116,.2)');
+      ctx.lineWidth=near?1.1:.7;ctx.setLineDash(near?[]:[3,4]);
+      ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();
+      ctx.setLineDash([]);
+      if(near){
+        const d=_cdMeta.price?((lv-_cdMeta.price)/_cdMeta.price*100):0;
+        ctx.fillStyle=isR?'rgba(255,51,82,.85)':'rgba(0,204,116,.85)';
+        ctx.font='7.5px monospace';ctx.textAlign='right';
+        ctx.fillText((isR?'R ':'S ')+(d>=0?'+':'')+d.toFixed(2)+'%',W-P.r-2,y-2);
+      }
+    });
   }
   // Grid
   ctx.strokeStyle='rgba(22,37,64,.8)';ctx.lineWidth=.6;
@@ -13597,7 +13663,28 @@ def _web_candles():
         candles = [{"t": int(c[0]), "o": float(c[1]), "h": float(c[2]),
                     "l": float(c[3]), "c": float(c[4]), "v": float(c[6])}
                    for c in raw]
-        return _Response(json.dumps(candles), mimetype="application/json",
+        # Structure the bot actually trades on. Previously the chart showed price
+        # but never the levels driving every target and stop, so a target looked
+        # arbitrary. Same _sr_clusters() the strategy uses, so they cannot drift.
+        try:
+            highs = [c["h"] for c in candles]
+            lows = [c["l"] for c in candles]
+            price = candles[-1]["c"] if candles else 0.0
+            levels = _sr_clusters(highs, lows)
+            meta = {
+                "levels": [round(l, 8) for l in levels],
+                "nearest_r": next((l for l in levels if l > price), None),
+                "nearest_s": next((l for l in reversed(levels) if l < price), None),
+                # Minimum move that clears fees+slippage by the required multiple —
+                # anything inside this band cannot be profitable no matter what.
+                "cost_floor_pct": round(ROUND_TRIP_COST_PCT * MIN_PROFIT_VS_COST_MULT * 100, 3),
+                "round_trip_cost_pct": round(ROUND_TRIP_COST_PCT * 100, 3),
+                "price": price,
+            }
+        except Exception:
+            meta = {}
+        return _Response(json.dumps({"candles": candles, "meta": meta}),
+                         mimetype="application/json",
                          headers={"Cache-Control": "no-store"})
     except Exception as e:
         return _Response(json.dumps({"error": str(e)}), status=503, mimetype="application/json")
