@@ -29,6 +29,14 @@ services:
       DASHBOARD_PIN: ${DASHBOARD_PIN}
       DATABASE_URL: postgresql://cryptobot:${DB_PASSWORD}@db:5432/cryptobot
       DATA_DIR: /data
+      # These are read from .env but MUST be listed here: this service uses an
+      # explicit environment block, not env_file, so unlisted vars never reach
+      # the container. PAPER_LOCK defaults OFF in code, so omitting it made the
+      # safety lock silently inert -- the other two default ON and so appeared
+      # to work by accident.
+      PAPER_LOCK: ${PAPER_LOCK:-0}
+      USE_MAKER_ENTRIES: ${USE_MAKER_ENTRIES:-1}
+      ENTRY_ON_CLOSED_BAR: ${ENTRY_ON_CLOSED_BAR:-1}
       # Optional — leave blank to use dashboard API Keys instead
       KRAKEN_KEY: ${KRAKEN_KEY:-}
       KRAKEN_SECRET: ${KRAKEN_SECRET:-}
