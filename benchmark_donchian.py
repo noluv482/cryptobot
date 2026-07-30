@@ -38,9 +38,15 @@ import sys
 import time
 import urllib.request
 
-KRAKEN_FEE = 0.0026
+TAKER_FEE = 0.0026
+MAKER_FEE = 0.0016
 SLIPPAGE = 0.001
-ROUND_TRIP = 2 * KRAKEN_FEE + 2 * SLIPPAGE      # 0.72%, matches bot_server
+ROUND_TRIP = 2 * TAKER_FEE + 2 * SLIPPAGE       # 0.72%, matches bot_server
+# Posting passively earns the maker fee AND avoids slippage (you name the price),
+# but only fills if price comes back to you. For a breakout that is precisely the
+# adverse-selection case: the trades that never pull back are the ones that ran.
+ROUND_TRIP_MAKER = 2 * MAKER_FEE                # 0.32%
+KRAKEN_FEE = TAKER_FEE                          # back-compat for existing prints
 
 BASE = "https://api.kraken.com/0/public"
 DEFAULT_PAIRS = ["XBTUSD", "ETHUSD", "SOLUSD", "XRPUSD", "ADAUSD", "AVAXUSD",
@@ -74,9 +80,21 @@ def atr(bars, i, period=14):
     return sum(trs) / period
 
 
-def run_pair(bars, lookback, stop_atr, target_atr, max_hold, allow_short=True):
-    """Donchian: close above the prior N-bar high goes long, below the low goes short."""
+def run_pair(bars, lookback, stop_atr, target_atr, max_hold, allow_short=True,
+             fill="taker", maker_wait=2):
+    """Donchian: close above the prior N-bar high goes long, below the low goes short.
+
+    fill="taker": cross the spread, always fills at the signal close plus slippage.
+    fill="maker":  post a limit AT the signal close and wait up to `maker_wait`
+                   bars for price to come back. Cheaper (maker fee, no slippage)
+                   but a runaway breakout never fills — which is the whole point
+                   of testing it rather than assuming the saving is free.
+
+    Missed maker fills are recorded with what they WOULD have made as a taker, so
+    adverse selection can be measured instead of hand-waved.
+    """
     trades = []
+    missed = []
     i = max(lookback, 15)
     while i < len(bars) - 1:
         win = bars[i - lookback:i]                 # prior N bars, excludes bar i
@@ -97,36 +115,62 @@ def run_pair(bars, lookback, stop_atr, target_atr, max_hold, allow_short=True):
             i += 1
             continue
 
-        entry = price
-        if side == "LONG":
-            stop, target = entry - stop_atr * a, entry + target_atr * a
+        taker_entry = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
+
+        if fill == "maker":
+            # Limit rests at the signal close; needs price to trade back to it.
+            start = None
+            for w in range(i + 1, min(i + 1 + maker_wait, len(bars))):
+                if side == "LONG" and bars[w]["l"] <= price:
+                    start = w; break
+                if side == "SHORT" and bars[w]["h"] >= price:
+                    start = w; break
+            if start is None:
+                # No fill. Record what a taker entry WOULD have earned, so the
+                # cost of missing this trade is measured rather than assumed.
+                missed.append(_exit_sim(bars, i, side, taker_entry, stop_atr,
+                                        target_atr, a, max_hold, ROUND_TRIP))
+                i += 1
+                continue
+            trades.append(_exit_sim(bars, start, side, price, stop_atr,
+                                    target_atr, a, max_hold, ROUND_TRIP_MAKER))
         else:
-            stop, target = entry + stop_atr * a, entry - target_atr * a
+            start = i
+            trades.append(_exit_sim(bars, i, side, taker_entry, stop_atr,
+                                    target_atr, a, max_hold, ROUND_TRIP))
 
-        exit_px = reason = None
-        held = 0
-        for j in range(i + 1, min(i + 1 + max_hold, len(bars))):
-            held = j - i
-            hi, lo = bars[j]["h"], bars[j]["l"]
-            if side == "LONG":
-                if lo <= stop:                      # stop first on an ambiguous bar
-                    exit_px, reason = stop, "stop"; break
-                if hi >= target:
-                    exit_px, reason = target, "target"; break
-            else:
-                if hi >= stop:
-                    exit_px, reason = stop, "stop"; break
-                if lo <= target:
-                    exit_px, reason = target, "target"; break
-        if exit_px is None:
-            j = min(i + max_hold, len(bars) - 1)
-            exit_px, reason, held = bars[j]["c"], "timeout", j - i
+        i = start + trades[-1]["bars"] + 1          # no overlapping positions
+    return trades, missed
 
-        gross = ((exit_px - entry) / entry) if side == "LONG" else ((entry - exit_px) / entry)
-        trades.append({"net": (gross - ROUND_TRIP) * 100, "reason": reason,
-                       "bars": held, "side": side})
-        i += held + 1                               # no overlapping positions
-    return trades
+
+def _exit_sim(bars, start, side, entry, stop_atr, target_atr, a, max_hold, cost):
+    """Walk forward from `start` and resolve the position. Shared by both fill models."""
+    if side == "LONG":
+        stop, target = entry - stop_atr * a, entry + target_atr * a
+    else:
+        stop, target = entry + stop_atr * a, entry - target_atr * a
+
+    exit_px = reason = None
+    held = 0
+    for j in range(start + 1, min(start + 1 + max_hold, len(bars))):
+        held = j - start
+        hi, lo = bars[j]["h"], bars[j]["l"]
+        if side == "LONG":
+            if lo <= stop:                          # stop first on an ambiguous bar
+                exit_px, reason = stop, "stop"; break
+            if hi >= target:
+                exit_px, reason = target, "target"; break
+        else:
+            if hi >= stop:
+                exit_px, reason = stop, "stop"; break
+            if lo <= target:
+                exit_px, reason = target, "target"; break
+    if exit_px is None:
+        j = min(start + max_hold, len(bars) - 1)
+        exit_px, reason, held = bars[j]["c"], "timeout", max(1, j - start)
+
+    gross = ((exit_px - entry) / entry) if side == "LONG" else ((entry - exit_px) / entry)
+    return {"net": (gross - cost) * 100, "reason": reason, "bars": held, "side": side}
 
 
 def stats(trades):
@@ -150,6 +194,9 @@ def main():
                     help="candle minutes; 1440 (daily) gives ~2y of history")
     ap.add_argument("--pairs", default="")
     ap.add_argument("--long-only", action="store_true")
+    ap.add_argument("--fill", choices=("taker", "maker"), default="taker")
+    ap.add_argument("--compare-fills", action="store_true",
+                    help="taker vs maker on identical signals, incl. missed fills")
     args = ap.parse_args()
 
     pairs = [p.strip() for p in args.pairs.split(",") if p.strip()] or DEFAULT_PAIRS
@@ -179,6 +226,35 @@ def main():
 
     hold = max(10, int(20 * (1440 / args.interval)) if args.interval < 1440 else 20)
 
+    if args.compare_fills:
+        print(f"TAKER ({ROUND_TRIP*100:.2f}% round trip, always fills) vs "
+              f"MAKER ({ROUND_TRIP_MAKER*100:.2f}%, fills only on a pullback)")
+        print()
+        print(f"  {'combo':>14s} {'taker n':>8s} {'taker avg':>10s} "
+              f"{'maker n':>8s} {'maker avg':>10s} {'missed':>7s} {'missed avg':>11s} {'verdict':>9s}")
+        print("  " + "-" * 88)
+        for lb, st, tg in sweep:
+            tk, mk, ms = [], [], []
+            for pair, bars in data.items():
+                t1, _ = run_pair(bars, lb, st, tg, hold,
+                                 allow_short=not args.long_only, fill="taker")
+                t2, m2 = run_pair(bars, lb, st, tg, hold,
+                                  allow_short=not args.long_only, fill="maker")
+                tk += t1; mk += t2; ms += m2
+            s1, s2 = stats(tk), stats(mk)
+            sm = stats(ms)
+            if not (s1 and s2):
+                continue
+            verdict = "maker" if s2["avg"] > s1["avg"] else "taker"
+            print(f"  {lb:>3d}/{st:.1f}/{tg:.1f}".rjust(16)
+                  + f" {s1['n']:>8d} {s1['avg']:>+9.2f}% {s2['n']:>8d} {s2['avg']:>+9.2f}%"
+                    f" {len(ms):>7d} {(sm['avg'] if sm else 0):>+10.2f}% {verdict:>9s}")
+        print()
+        print("  'missed avg' is what the UNFILLED signals would have returned as a")
+        print("  taker. If that number is strongly positive, posting passively is")
+        print("  skipping the winners and the fee saving is an illusion.")
+        return 0
+
     print(f"max hold {hold} bars | showing ALL {len(sweep)} parameter combinations")
     print()
     print(f"  {'lookback':>8s} {'stop':>5s} {'targ':>5s} {'trades':>7s} {'WR':>7s} "
@@ -189,7 +265,9 @@ def main():
     for lb, st, tg in sweep:
         allt = []
         for pair, bars in data.items():
-            allt += run_pair(bars, lb, st, tg, hold, allow_short=not args.long_only)
+            t, _m = run_pair(bars, lb, st, tg, hold,
+                             allow_short=not args.long_only, fill=args.fill)
+            allt += t
         s = stats(allt)
         if not s:
             print(f"  {lb:>8d} {st:>5.1f} {tg:>5.1f} {'0':>7s}  (no trades)")
