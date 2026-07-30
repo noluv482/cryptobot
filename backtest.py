@@ -125,7 +125,13 @@ def run(candles, pair, name, verbose=True):
             stop   = plan.get("stop",   price * 0.985 if sig == "BUY" else price * 1.015)
             target = plan.get("exit",   price * 1.015 if sig == "BUY" else price * 0.985)
             fkey   = plan.get("fkey",   "")
-            trader.on_signal(sig, price, stop, target, name, conf, pair, atr=atr, fkey=fkey)
+            # pillars are REQUIRED: _classify_strategy() returns (None, None) on an
+            # empty dict, so omitting them makes the strategy gate reject 100% of
+            # signals and the backtest silently reports 0 trades. The live loop
+            # passes plan["pillars"] here (see the scan loop) — mirror it exactly.
+            pillars = plan.get("pillars", {})
+            trader.on_signal(sig, price, stop, target, name, conf, pair,
+                             atr=atr, fkey=fkey, pillars=pillars)
         last_sig = sig
 
         equity.append(trader.balance)
@@ -186,7 +192,7 @@ def summarize(trader, equity, blew_up, candles, name, verbose=True):
         print(line)
 
         # write an equity curve for your dashboard / further analysis
-        out_csv = f"equity_{name}.csv"
+        out_csv = os.path.join(os.environ.get("DATA_DIR", "."), f"equity_{name}.csv")
         try:
             with open(out_csv, "w", newline="") as f:
                 w = csv.writer(f)
