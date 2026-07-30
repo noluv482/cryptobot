@@ -1173,6 +1173,10 @@ funding_rates   = {}   # pair → last funding rate float (from Binance futures)
 trending_boost  = {}   # pair → bonus score from social/trending sources
 _paused         = False
 _paper_mode     = False   # when True: forces paper trading even if live keys are loaded
+# Hard paper lock. Outranks LIVE_MODE and _paper_mode, and unlike them cannot be
+# switched off from the dashboard or Telegram — only by editing .env and
+# restarting. Set while no strategy has a proven edge.
+PAPER_LOCK      = os.environ.get("PAPER_LOCK", "0").strip().lower() not in ("0", "", "false", "no")
 _sim_enabled    = False   # when True: parallel $2000 sim trader runs alongside live/paper
 _sim_trader     = None    # PaperTrader(force_paper=True, start_balance=2000) created in main()
 _daily_limits   = False   # off by default — enable for real-money discipline
@@ -1327,7 +1331,20 @@ def _log_gate_summary():
 
 
 def is_live():
-    """True when real orders should be placed — keys present AND paper override is off."""
+    """True when real orders should be placed — keys present AND paper override is off.
+
+    PAPER_LOCK is a deliberate hard stop that outranks both. It exists because
+    LIVE_MODE flips to True automatically the moment Kraken keys land in
+    api_keys.json (see _load_api_keys_from_file), and _paper_mode defaults to
+    False — so entering keys in the dashboard would start placing real orders
+    with no second confirmation. As of 2026-07-30 no tested strategy has a
+    demonstrable edge (see benchmark_donchian.py / benchmark_xsection.py), so
+    going live by accident is the specific failure worth engineering against.
+    Unlike _paper_mode this cannot be toggled from the dashboard or Telegram:
+    clearing it requires editing .env and restarting, which is the point.
+    """
+    if PAPER_LOCK:
+        return False
     return LIVE_MODE and not _paper_mode
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
