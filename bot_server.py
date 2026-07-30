@@ -355,7 +355,20 @@ ATR_MULTIPLIER   = 2.0         # 2× ATR trail (was 1.5) — gives trade room to
 MAX_TRADE_MINS   = int(120 * _TF_SCALE)   # hold cap, scaled to the base timeframe
 STALE_EXIT_MINS  = int(45 * _TF_SCALE)    # "went nowhere" exit, scaled likewise
 POSITION_WATCHDOG_SECS = 60    # how often the watchdog re-checks open positions
-KRAKEN_FEE       = 0.0026
+KRAKEN_FEE       = 0.0026      # taker: crossing the spread
+KRAKEN_MAKER_FEE = 0.0016      # maker: resting order that provides liquidity
+# Post entries as passive (post-only) limits to earn the maker fee instead of
+# paying taker. Measured 2026-07-29 with benchmark_donchian.py --compare-fills on
+# 16 pairs of daily data: round trip 0.72% -> 0.32%, which improved 8 of 9
+# parameter combinations by 0.1-0.4% per trade and took the best from -0.24% to
+# +0.16%. The trend edge on this universe is roughly the same size as the cost of
+# trading it, so this margin genuinely matters.
+# The cost is fill risk: a passive order only fills if price comes back. That was
+# ~1% of signals on daily bars, but it is NOT free and the paper model below
+# simulates the misses rather than pretending every order fills.
+USE_MAKER_ENTRIES = os.environ.get("USE_MAKER_ENTRIES", "1") not in ("0", "false", "False")
+MAKER_FILL_WAIT_SCANS = int(os.environ.get("MAKER_FILL_WAIT_SCANS", "3"))
+_pending_entries = {}          # pair -> pending passive entry awaiting a fill
 SLIPPAGE                = 0.001
 ORDER_TTL_SECS          = 45      # max seconds from signal to order placement; older signals are dropped
 LIVE_SLIPPAGE_TOLERANCE = 0.003   # 0.3% worst acceptable fill vs signal price on live orders
@@ -723,6 +736,38 @@ _STRATEGIES = {
         "desc": "Paper-mode fallback — 2+ indicators aligned; used to collect training data",
     },
 }
+
+def _resolve_pending_entry(pair, price, trader):
+    """Decide whether a resting passive entry has filled, expired, or still waits.
+
+    Returns "filled", "expired", "waiting", or None if there is no pending order.
+
+    This exists so maker entries are not free money in paper trading. A passive
+    limit only fills when price trades back to it; skipping that simulation would
+    make the paper bot look better than the live one could ever be, which is the
+    exact way a backtest lies. Measured miss rate was ~1% on daily bars, but on
+    faster timeframes it will be higher — so it is modelled, not assumed.
+    """
+    p = _pending_entries.get(pair)
+    if not p:
+        return None
+    p["scans"] = p.get("scans", 0) + 1
+    side, limit = p["side"], p["limit"]
+    touched = (price <= limit) if side == "BUY" else (price >= limit)
+    if touched:
+        _pending_entries.pop(pair, None)
+        log("ORDER", f"{pair} passive entry filled at {limit:.6f} "
+                     f"(maker, waited {p['scans']} scans)")
+        return "filled"
+    if p["scans"] >= MAKER_FILL_WAIT_SCANS:
+        _pending_entries.pop(pair, None)
+        with _gate_counter_lock:
+            _gate_counters["maker_no_fill"] = _gate_counters.get("maker_no_fill", 0) + 1
+        log("ORDER", f"{pair} passive entry expired unfilled after "
+                     f"{p['scans']} scans (price never returned to {limit:.6f})")
+        return "expired"
+    return "waiting"
+
 
 def _classify_strategy(sig: str, pillars: dict, confidence: float, pair: str) -> tuple:
     """Return (strategy_key, strategy_dict) for the best matching named strategy, or (None, None)."""
@@ -1489,7 +1534,8 @@ def _kraken_get_usd_balance():
         tg(f"⚠️ Kraken balance error: `{e}`")
         return 0.0
 
-def _kraken_place_order(pair, side, volume, validate=False, leverage=None, price_limit=None):
+def _kraken_place_order(pair, side, volume, validate=False, leverage=None,
+                        price_limit=None, post_only=False):
     """
     Place a Kraken spot or margin order.
     side: 'buy' or 'sell'
@@ -1511,6 +1557,12 @@ def _kraken_place_order(pair, side, volume, validate=False, leverage=None, price
     }
     if price_limit:
         params["price"] = f"{price_limit:.4f}"
+        if post_only:
+            # oflags=post makes Kraken CANCEL the order rather than let it cross
+            # the spread. That guarantees the maker fee: without it a limit placed
+            # at or through the market fills as a taker and the saving evaporates
+            # silently — you would still see a fill and never know you paid 0.26%.
+            params["oflags"] = "post"
     if leverage and leverage >= 2:
         params["leverage"] = str(leverage)
     if validate:
@@ -3808,11 +3860,20 @@ class PaperTrader:
             else:
                 leverage      = 1
                 contract_tier = "Cautious"
-            fill      = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
+            # A passive entry fills AT the limit price with no slippage — that is
+            # the point of resting the order. Crossing the spread costs slippage
+            # plus the taker fee. The fill-or-miss decision happens before _open
+            # is ever called (see _pending_entries in the scan loop), so reaching
+            # here already means the order filled.
+            if USE_MAKER_ENTRIES and not (USE_BINANCE or USE_FUTURES):
+                fill = price
+            else:
+                fill = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
             margin    = round(self.balance * risk, 4)
             contracts = round((margin * leverage) / fill, 6)
             _sim_fee  = (BINANCE_FEE if USE_BINANCE else
                          KRAKEN_FUTURES_FEE if USE_FUTURES else
+                         KRAKEN_MAKER_FEE if USE_MAKER_ENTRIES else
                          KRAKEN_FEE)
             fee       = round(margin * _sim_fee, 4)
             self.balance = round(self.balance - fee, 4)
@@ -7065,6 +7126,25 @@ def trading_loop(trader):
                 # the one whose favourable excursion averaged LESS than its adverse
                 # excursion. Exits are unaffected: they run in the position-management
                 # loop above and still check every cycle.
+                # A resting passive entry is checked EVERY scan, before the
+                # closed-bar gate — the whole point is to catch price coming back
+                # to the limit, which can happen at any moment within the bar.
+                if USE_MAKER_ENTRIES and pair in _pending_entries:
+                    try:
+                        _pp = _pending_entries[pair]
+                        _outcome = _resolve_pending_entry(pair, get_price(pair), trader)
+                        if _outcome == "filled":
+                            trader.on_signal(_pp["sig"], _pp["limit"], _pp["stop"],
+                                             _pp["target"], _pp["name"], _pp["conf"],
+                                             pair, atr=_pp.get("atr"),
+                                             fkey=_pp.get("fkey", ""),
+                                             pillars=_pp.get("pillars") or {})
+                        if _outcome in ("filled", "waiting"):
+                            continue      # do not also evaluate a fresh entry
+                    except Exception as e:
+                        log("ORDER", f"pending entry {pair}: {e}", "ERR")
+                        _pending_entries.pop(pair, None)
+
                 if ENTRY_ON_CLOSED_BAR:
                     _bar_id = int(time.time() // (INTERVAL * 60))
                     if _entry_bar_seen.get(pair) == _bar_id:
@@ -7312,8 +7392,25 @@ def trading_loop(trader):
                            f"R:R: `{_rr_str}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*{_pat_note}")
                         if _main_open:
-                            trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
-                                             atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
+                            if USE_MAKER_ENTRIES and not (USE_BINANCE or USE_FUTURES):
+                                # Rest the order at the signal price instead of
+                                # crossing the spread. It becomes a position only
+                                # when price trades back to it (see
+                                # _resolve_pending_entry), which is what earns the
+                                # maker fee — and what can miss the trade entirely.
+                                _pending_entries[pair] = {
+                                    "sig": sig, "limit": price, "stop": stop,
+                                    "target": target, "name": coin["name"],
+                                    "conf": conf, "atr": atr, "fkey": fkey,
+                                    "pillars": pillars, "scans": 0,
+                                    "placed_ts": time.time(),
+                                }
+                                log("ORDER", f"{coin['name']} passive {sig} limit resting at "
+                                             f"{price:.6f} (maker; expires in "
+                                             f"{MAKER_FILL_WAIT_SCANS} scans)")
+                            else:
+                                trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
+                                                 atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
 
                     last_sigs[pair] = sig
 
