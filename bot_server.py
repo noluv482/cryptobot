@@ -8589,6 +8589,84 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 .tab.active{color:var(--b)}
 .tab.active .tab-ico{filter:drop-shadow(0 0 6px rgba(41,121,255,0.6))}
 
+/* ══ DESKTOP ═══════════════════════════════════════════════════════════════
+   The whole UI was mobile-only: no width cap anywhere, so on a 1920px monitor
+   the phone layout stretched edge to edge with a full-width bottom tab bar.
+   Above 900px the bottom bar becomes a left sidebar (the desktop convention,
+   and it uses the horizontal space that was being wasted) and content is
+   width-capped and centred. Pure CSS — the pages stay absolutely positioned
+   and the tab JS is untouched, so mobile behaviour cannot regress.        */
+@media(min-width:900px){
+  body{flex-direction:row-reverse}          /* pages left, nav right in DOM order */
+  .tabbar{
+    height:100vh;width:196px;flex-direction:column;
+    padding:14px 0 0;border-top:none;border-right:1px solid var(--bd);
+    order:-1;                                /* visually first */
+  }
+  .tab{
+    flex:0 0 auto;flex-direction:row;justify-content:flex-start;
+    gap:12px;padding:0 18px;height:46px;min-height:46px;
+    border-radius:10px;margin:0 10px 4px;
+  }
+  .tab:hover{background:var(--glass,rgba(255,255,255,.04));color:var(--tx)}
+  .tab.active{background:rgba(41,121,255,.12)}
+  .tab-ico{font-size:1.05rem}
+  .tab-lbl{font-size:.72rem;letter-spacing:.02em}
+  /* Header and pages become a column beside the sidebar. */
+  .hdr{position:fixed;top:0;left:196px;right:0;z-index:20;
+       height:var(--hdr-h);align-items:center;padding-top:0}
+  .pages{margin-top:var(--hdr-h)}
+  .page{padding-bottom:24px}
+  /* Readable measure: long lines are the main thing that looks wrong when a
+     phone layout is stretched across a widescreen. */
+  .page > *{max-width:1080px;margin-left:auto;margin-right:auto}
+  .chart-wrap,.pc,.sh,.coin-strip,.iv-row,.ind-row,.chart-info-row{
+    max-width:1080px;margin-left:auto;margin-right:auto}
+}
+@media(min-width:1500px){
+  .page > *{max-width:1240px}
+  .chart-wrap,.pc,.sh,.coin-strip,.iv-row,.ind-row,.chart-info-row{max-width:1240px}
+}
+
+/* ══ VALUE-CHANGE FLASH ════════════════════════════════════════════════════
+   A price silently becoming a different number is the main reason this read as
+   static. Applied by a MutationObserver (see JS) rather than by editing every
+   assignment site, so it catches updates from any code path and cannot drift
+   out of sync when new fields are added.                                  */
+@keyframes flashUp{
+  0%{background:rgba(0,230,118,.28);box-shadow:0 0 12px rgba(0,230,118,.35)}
+  100%{background:transparent;box-shadow:none}
+}
+@keyframes flashDown{
+  0%{background:rgba(255,51,102,.28);box-shadow:0 0 12px rgba(255,51,102,.3)}
+  100%{background:transparent;box-shadow:none}
+}
+.flash-up{animation:flashUp .85s ease-out;border-radius:5px}
+.flash-down{animation:flashDown .85s ease-out;border-radius:5px}
+
+/* ══ SKELETON LOADING ══════════════════════════════════════════════════════
+   Values used to sit as "—" until data landed, which reads as broken rather
+   than loading.                                                           */
+@keyframes shimmer{100%{background-position:-200% 0}}
+.skel{
+  color:transparent!important;border-radius:5px;
+  background:linear-gradient(90deg,
+    rgba(255,255,255,.04) 0%,rgba(255,255,255,.10) 50%,rgba(255,255,255,.04) 100%);
+  background-size:200% 100%;animation:shimmer 1.3s linear infinite;
+}
+.skel *{visibility:hidden}
+
+/* Respect the existing reduced-motion contract: no flashing, no shimmer. */
+@media(prefers-reduced-motion:reduce){
+  .flash-up,.flash-down{animation:none}
+  .skel{animation:none;background:rgba(255,255,255,.06)}
+}
+
+/* ══ COIN-STRIP SPARKLINES ════════════════════════════════════════════════ */
+.coin-chip{position:relative;overflow:hidden}
+.chip-spark{position:absolute;left:0;right:0;bottom:0;height:16px;
+            opacity:.5;pointer-events:none}
+
 /* ── Hero balance — gradient text ── */
 .hero{
   background:linear-gradient(160deg,rgba(15,28,55,0.6) 0%,transparent 70%);
@@ -9733,6 +9811,88 @@ const msign=n=>(n>=0?'+$':'\u2212$')+fmt(Math.abs(n));
 const pc=n=>n>0?'c-g':n<0?'c-r':'c-mu';
 
 /* ── TAB NAVIGATION ── */
+/* ── VALUE-CHANGE FLASH ──────────────────────────────────────────────────
+   Watches the key numeric readouts and flashes green/red when they change.
+   A MutationObserver is used deliberately instead of wrapping every
+   assignment: values are written from many code paths (poll loops, socket
+   updates, tab handlers), so observing the DOM catches all of them and keeps
+   working when new fields are added. Comparing parsed numbers rather than
+   strings means formatting changes ("$1,000" -> "$1000") do not false-flash. */
+/* Verified against the markup — a guessed id would silently never flash, which
+   is the worst kind of bug because the feature just quietly does nothing. */
+const _FLASH_IDS=['hdr_price','ci_price','ci_chg','ci_pnl_badge',
+                  'bal_int','bal_dec','live_pnl_tick','s_pnl',
+                  'sim_bal','sim_pnl','rank_cur_bal'];
+const _flashPrev=new Map();
+function _numOf(s){
+  const m=String(s||'').replace(/[, ]/g,'').match(/-?\d+(\.\d+)?/);
+  return m?parseFloat(m[0]):null;
+}
+function _flashEl(el){
+  const now=_numOf(el.textContent);
+  if(now===null)return;
+  const was=_flashPrev.get(el);
+  _flashPrev.set(el,now);
+  if(was===undefined||now===was)return;
+  const cls=now>was?'flash-up':'flash-down';
+  el.classList.remove('flash-up','flash-down');
+  void el.offsetWidth;               // restart the animation
+  el.classList.add(cls);
+  setTimeout(()=>el.classList.remove(cls),900);
+}
+function initValueFlash(){
+  if(!window.MutationObserver)return;
+  const obs=new MutationObserver(muts=>{
+    const seen=new Set();
+    muts.forEach(m=>{
+      const el=m.target.nodeType===1?m.target:m.target.parentElement;
+      if(el&&!seen.has(el)){seen.add(el);_flashEl(el);}
+    });
+  });
+  _FLASH_IDS.forEach(id=>{
+    const el=$(id);
+    if(el){_flashPrev.set(el,_numOf(el.textContent));
+           obs.observe(el,{childList:true,characterData:true,subtree:true});}
+  });
+}
+
+/* ── SKELETON LOADING ────────────────────────────────────────────────────
+   Marks value elements as loading until real data arrives, so the first paint
+   reads as "loading" rather than "broken". Cleared by clearSkeletons() on the
+   first successful poll. */
+function markSkeletons(){
+  _FLASH_IDS.forEach(id=>{const el=$(id);
+    if(el&&(!el.textContent.trim()||el.textContent.trim()==='—'))el.classList.add('skel');});
+}
+function clearSkeletons(){
+  document.querySelectorAll('.skel').forEach(el=>el.classList.remove('skel'));
+}
+
+/* ── COIN-STRIP SPARKLINES ───────────────────────────────────────────────
+   A 24-point trail per coin, kept client-side from prices already polled — no
+   extra requests. Drawn as inline SVG so it costs no canvas contexts. */
+const _sparkHist={};
+function _pushSpark(pair,price){
+  if(!price)return;
+  const a=_sparkHist[pair]||(_sparkHist[pair]=[]);
+  if(a.length&&a[a.length-1]===price)return;
+  a.push(price);
+  if(a.length>24)a.shift();
+}
+function _sparkSvg(pair,up){
+  const a=_sparkHist[pair];
+  if(!a||a.length<3)return '';
+  const lo=Math.min(...a),hi=Math.max(...a),rng=(hi-lo)||1;
+  const pts=a.map((v,i)=>{
+    const x=(i/(a.length-1))*100;
+    const y=16-((v-lo)/rng)*14-1;
+    return x.toFixed(1)+','+y.toFixed(1);
+  }).join(' ');
+  const col=up?'#00e676':'#ff3366';
+  return '<svg class="chip-spark" viewBox="0 0 100 16" preserveAspectRatio="none">'+
+         '<polyline points="'+pts+'" fill="none" stroke="'+col+'" stroke-width="1.2"/></svg>';
+}
+
 function goTab(t){
   if(_tab===t)return;
   const pg=$('pg-'+t),tb=$('tab-'+t);
@@ -9807,6 +9967,7 @@ async function fetchStatus(){
   try{
     const d=await(await fetch('/status')).json();
     if(d.error) return;
+    clearSkeletons();          // real data has landed — stop shimmering
     const live=d.mode==='LIVE';
     $('mode_badge').className='badge '+(live?'badge-live':'badge-paper');
     $('mode_dot').className='dot '+(live?'dot-live':'dot-paper');
@@ -10591,12 +10752,14 @@ function renderCoinStrip(){
     const col=_COIN_COLORS[c.pair]||'#888';
     const badge=isTrading?'<div class="coin-ico-badge">&#36;</div>':(isBot?'<div class="coin-ico-badge" style="background:#ffd54f;font-size:.45rem">&#128270;</div>':'');
     const cls='coin-chip'+(isView?' viewing':'')+(isTrading?' trading':'');
+    _pushSpark(c.pair,cp.price);
     return '<div class="'+cls+'" data-pair="'+c.pair+'" data-sym="'+c.sym+'" onclick="selectCoin(this.dataset.pair,this.dataset.sym)">'+
       '<div class="coin-ico" style="background:'+col+'">'+c.sym+badge+'</div>'+
       '<div class="coin-chip-sym">'+c.sym+'</div>'+
       '<div class="coin-chip-price">'+_fmtPrice(cp.price)+'</div>'+
       '<div class="coin-chip-pct '+(pct>0?'c-g':pct<0?'c-r':'c-mu')+'">'+
         (cp.price?((pct>=0?'+':'')+pct.toFixed(2)+'%'):'')+'</div>'+
+      _sparkSvg(c.pair,pct>=0)+
       '</div>';
   }).join('');
   const viewing_chip=el.querySelector('.coin-chip.viewing');
@@ -13305,6 +13468,8 @@ applyTheme(_theme);
 _initSoundBtn();
 _initKeyboard();
 initStripDrag();
+markSkeletons();      // shimmer the value readouts until the first poll lands
+initValueFlash();     // must run BEFORE the first fetch so it captures baselines
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
 fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();loadIQ();
 fetchPrices();setInterval(fetchPrices,8000);
