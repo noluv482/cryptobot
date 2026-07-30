@@ -78,8 +78,16 @@ def load_csv(path):
     return out
 
 
-def run(candles, pair, name, verbose=True):
-    """Run a single backtest pass. Returns summary dict."""
+def run(candles, pair, name, verbose=True, intrabar_polls=1):
+    """Run a single backtest pass. Returns summary dict.
+
+    intrabar_polls simulates the live bot's polling. The scan loop runs every
+    REFRESH_SEC while a bar takes INTERVAL minutes to close, so live the same
+    unfinished bar is evaluated many times. intrabar_polls=1 is the closed-bar
+    behaviour (ENTRY_ON_CLOSED_BAR=1); a higher value replays each bar N times
+    with the price walked from open toward close, which reproduces the
+    noise-triggered entries the live bot was taking.
+    """
     n = len(candles)
     warmup = bs.CANDLE_LIMIT
     if n <= warmup + 5:
@@ -103,36 +111,58 @@ def run(candles, pair, name, verbose=True):
         highs  = [c["h"] for c in window]
         lows   = [c["l"] for c in window]
         vols   = [c["v"] for c in window]
-        price  = closes[-1]
 
-        try:
-            atr = bs.calc_atr(highs, lows, closes)
-        except Exception:
-            atr = None
+        # Prices this bar is evaluated at. One poll = decide on the closed bar.
+        # Many polls = replay the forming bar, walking open->close, which is what
+        # the live loop effectively did before ENTRY_ON_CLOSED_BAR.
+        bar = candles[i]
+        if intrabar_polls <= 1:
+            poll_prices = [closes[-1]]
+        else:
+            # A linear open->close walk is too smooth to reproduce anything: signals
+            # never wobble, so polling looks harmless. Real intrabar movement is
+            # jagged, so traverse open -> high -> low -> close (the standard
+            # pessimistic reconstruction) and interpolate along those legs. This is
+            # the movement that can flip a signal back and forth within one bar.
+            o, h, l, c = bar["o"], bar["h"], bar["l"], bar["c"]
+            legs = [(o, h), (h, l), (l, c)]
+            per = max(1, intrabar_polls // 3)
+            poll_prices = []
+            for a_, b_ in legs:
+                for k in range(per):
+                    poll_prices.append(a_ + (b_ - a_) * (k + 1) / per)
+            poll_prices.append(c)
 
-        # 1) manage any open position at this candle's price
-        trader.on_signal("HOLD", price, 0, 0, name, 0.0, pair, atr=atr)
+        for price in poll_prices:
+            pw = closes[:-1] + [price]      # forming bar's running close
+            try:
+                atr = bs.calc_atr(highs, lows, pw)
+            except Exception:
+                atr = None
 
-        # 2) evaluate a fresh signal on the current window
-        try:
-            sig, plan, ema, rsi, conf = engine.evaluate(
-                closes, highs, lows, vols, price, [], pair=pair)
-        except Exception:
-            sig, plan = "HOLD", {}
+            # 1) manage any open position at this price
+            trader.on_signal("HOLD", price, 0, 0, name, 0.0, pair, atr=atr)
 
-        # 3) act only on a signal change (mirrors the live loop)
-        if sig in ("BUY", "SELL") and sig != last_sig:
-            stop   = plan.get("stop",   price * 0.985 if sig == "BUY" else price * 1.015)
-            target = plan.get("exit",   price * 1.015 if sig == "BUY" else price * 0.985)
-            fkey   = plan.get("fkey",   "")
-            # pillars are REQUIRED: _classify_strategy() returns (None, None) on an
-            # empty dict, so omitting them makes the strategy gate reject 100% of
-            # signals and the backtest silently reports 0 trades. The live loop
-            # passes plan["pillars"] here (see the scan loop) — mirror it exactly.
-            pillars = plan.get("pillars", {})
-            trader.on_signal(sig, price, stop, target, name, conf, pair,
-                             atr=atr, fkey=fkey, pillars=pillars)
-        last_sig = sig
+            # 2) evaluate a fresh signal
+            try:
+                sig, plan, ema, rsi, conf = engine.evaluate(
+                    pw, highs, lows, vols, price, [], pair=pair)
+            except Exception:
+                sig, plan = "HOLD", {}
+
+            # 3) act only on a signal change (mirrors the live loop)
+            if sig in ("BUY", "SELL") and sig != last_sig:
+                stop   = plan.get("stop",   price * 0.985 if sig == "BUY" else price * 1.015)
+                target = plan.get("exit",   price * 1.015 if sig == "BUY" else price * 0.985)
+                fkey   = plan.get("fkey",   "")
+                # pillars are REQUIRED: _classify_strategy() returns (None, None) on
+                # an empty dict, so omitting them makes the strategy gate reject 100%
+                # of signals and the backtest silently reports 0 trades. The live
+                # loop passes plan["pillars"] here — mirror it exactly.
+                pillars = plan.get("pillars", {})
+                trader.on_signal(sig, price, stop, target, name, conf, pair,
+                                 atr=atr, fkey=fkey, pillars=pillars)
+            last_sig = sig
 
         equity.append(trader.balance)
 
@@ -238,7 +268,7 @@ def walk_forward(candles, pair, interval_mins, window_days=30, step_days=15):
         t0 = _dt.utcfromtimestamp(window[0]["t"]).strftime("%Y-%m-%d")
         t1 = _dt.utcfromtimestamp(window[-1]["t"]).strftime("%Y-%m-%d")
         label = f"{t0} → {t1}"
-        res = run(window, pair, label, verbose=False)
+        res = run(window, pair, label, verbose=False, intrabar_polls=1)
         sign = "+" if res["return_pct"] >= 0 else ""
         flag = " ✗" if res["blew_up"] else (" ✓" if res["return_pct"] >= 0 else "")
         print(f"  {label:26s}  {sign}{res['return_pct']:>6.1f}%  {res['win_rate']:>5.1f}%"
@@ -279,6 +309,12 @@ def main():
                     help="Walk-forward window size in days (default 30)")
     ap.add_argument("--wf-step",   type=int, default=15,
                     help="Walk-forward step size in days (default 15)")
+    ap.add_argument("--polls", type=int, default=1,
+                    help="Intrabar evaluations per bar. 1 = closed-bar entries "
+                         "(ENTRY_ON_CLOSED_BAR=1). 60 reproduces the old live "
+                         "behaviour of polling a 1h bar every 60s.")
+    ap.add_argument("--compare", action="store_true",
+                    help="Run closed-bar vs polled side by side on the same data")
     args = ap.parse_args()
 
     if args.csv:
@@ -303,7 +339,22 @@ def main():
                      window_days=args.wf_window, step_days=args.wf_step)
         return   # walk-forward already ran a full-dataset summary internally
 
-    run(candles, args.pair, name, verbose=True)
+    if args.compare:
+        polls = max(2, (args.interval * 60) // 60)
+        print(f"\nSame data, two entry policies ({args.pair}, {args.interval}m):\n")
+        a = run(candles, args.pair, name + "_closedbar", verbose=False, intrabar_polls=1)
+        b = run(candles, args.pair, name + "_polled", verbose=False, intrabar_polls=polls)
+        print(f"  {'policy':22s} {'trades':>7s} {'WR':>7s} {'return':>9s} {'PF':>6s} {'maxDD':>7s}")
+        print("  " + "-" * 62)
+        for lbl, r in (("closed bar (1 eval)", a), (f"polled ({polls} evals/bar)", b)):
+            print(f"  {lbl:22s} {r['trades']:>7d} {r['win_rate']:>6.1f}% "
+                  f"{r['return_pct']:>+8.2f}% {r['profit_factor']:>6.2f} {r['max_dd']:>6.1f}%")
+        print()
+        if b["trades"] and a["trades"]:
+            print(f"  polling inflated trade count {b['trades']/max(a['trades'],1):.1f}x")
+        return
+
+    run(candles, args.pair, name, verbose=True, intrabar_polls=args.polls)
 
 
 if __name__ == "__main__":

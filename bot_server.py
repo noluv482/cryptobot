@@ -333,6 +333,10 @@ HTF_HIGH      = 1440           # daily
 HTF_MACRO     = 10080          # weekly
 REFRESH_SEC   = 60             # poll every 60s — a 1h bar doesn't need 30s polling
 CONFIRM_TICKS = 1              # fire on first valid signal scan (was 2)
+# Evaluate entries once per CLOSED candle instead of on every 60s poll. Set false
+# to restore the old behaviour for comparison. See the gate in the scan loop.
+ENTRY_ON_CLOSED_BAR = os.environ.get("ENTRY_ON_CLOSED_BAR", "1") not in ("0", "false", "False")
+_entry_bar_seen = {}           # pair -> bar id of the last bar an entry was considered on
 
 PAPER_START    = 100.0
 PAPER_TARGET   = 50000.0
@@ -7049,6 +7053,24 @@ def trading_loop(trader):
 
                 coin = next((c for c in SCAN_UNIVERSE if c["pair"] == pair), None)
                 if not coin: continue
+
+                # Closed-bar entry gate. The scan loop runs every REFRESH_SEC (60s)
+                # but a bar only closes every INTERVAL minutes, so without this the
+                # SAME unfinished candle is evaluated ~INTERVAL times. last_sigs only
+                # blocks an identical CONSECUTIVE signal, so a HOLD->BUY->HOLD->BUY
+                # wobble re-fires and the bot ends up trading intrabar noise rather
+                # than its own signal. Measured 2026-07-29: live took ~16 trades per
+                # pair per month where the backtester (one decision per closed bar)
+                # took ~1.3 — a 12x inflation, and that extra population is exactly
+                # the one whose favourable excursion averaged LESS than its adverse
+                # excursion. Exits are unaffected: they run in the position-management
+                # loop above and still check every cycle.
+                if ENTRY_ON_CLOSED_BAR:
+                    _bar_id = int(time.time() // (INTERVAL * 60))
+                    if _entry_bar_seen.get(pair) == _bar_id:
+                        continue
+                    _entry_bar_seen[pair] = _bar_id
+
                 try:
                     closes, highs, lows, volumes, opens = get_klines(pair)
                     price = get_price(pair)
