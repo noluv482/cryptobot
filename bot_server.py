@@ -3195,6 +3195,22 @@ class PaperTrader:
         return False
 
     # ── Learning method 4: require higher confidence on bad-entry pairs ───────
+    def effective_min_conf(self, pair, sig, live_floor=None):
+        """The confidence floor an entry must clear, combining every adaptive gate.
+
+        Extracted so the scan loop can apply the SAME floor before resting a
+        passive limit that on_signal applies at fill time. Previously only
+        on_signal knew it, so a doomed signal still rested an order and burned
+        the pair's slot for up to 20 scans before being silently dropped.
+        """
+        if live_floor is None:
+            live_floor = 0.50 if self._is_live() else 0.0
+        return max(MIN_CONFIDENCE, live_floor,
+                   self._min_conf_threshold(pair),
+                   self._dynamic_conf_gate(),
+                   self._hourly_conf_gate(),
+                   self._side_conf_penalty(sig))
+
     def _min_conf_threshold(self, pair):
         """Returns 0.60 confidence floor when early-stop rate ≥40% of total exits."""
         if self._no_persist or not db.connected:
@@ -3601,11 +3617,7 @@ class PaperTrader:
                 with _gate_counter_lock: _gate_counters["daily_gain"] += 1
                 return
             _live_floor = 0.50 if self._is_live() else 0.0
-            min_conf = max(MIN_CONFIDENCE, _live_floor,
-                           self._min_conf_threshold(pair),
-                           self._dynamic_conf_gate(),
-                           self._hourly_conf_gate(),
-                           self._side_conf_penalty(sig))
+            min_conf = self.effective_min_conf(pair, sig, _live_floor)
             # A/B confidence test: B group uses +0.05 threshold; auto-adopt winner at 50 trades each
             if sig in ("BUY", "SELL"):
                 if not self._ab_resolved:
@@ -3619,6 +3631,12 @@ class PaperTrader:
                     confidence = min(1.0, round(confidence + 0.05, 2))
             if sig in ("BUY", "SELL") and confidence < min_conf:
                 with _gate_counter_lock: _gate_counters["min_conf"] += 1
+                # Log it: this used to return silently, so a rejected entry left
+                # no trace at all. With maker entries that meant an order could
+                # rest, wait, fill, and then vanish with nothing in the log —
+                # which is exactly how a 45-hour no-trade stretch went undiagnosed.
+                log("GATE", f"{name} blocked — confidence {confidence:.0%} below "
+                            f"floor {min_conf:.0%} (adaptive: raises after losses)")
                 return
             # Strategy gate: require a named setup before any entry
             _strat_key, _strat = _classify_strategy(sig, pillars or {}, confidence, pair)
@@ -7440,6 +7458,19 @@ def trading_loop(trader):
                            f"R:R: `{_rr_str}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*{_pat_note}")
                         if _main_open:
+                            # Check the confidence floor BEFORE resting an order.
+                            # on_signal applies it at fill time, so without this a
+                            # doomed signal would rest, wait up to 20 scans, fill,
+                            # and only then be discarded — burning the pair's slot
+                            # and producing a "filled" log with no position.
+                            _floor = trader.effective_min_conf(pair, sig)
+                            if conf < _floor:
+                                with _gate_counter_lock: _gate_counters["min_conf"] += 1
+                                log("GATE", f"{coin['name']} skipped — confidence "
+                                            f"{conf:.0%} below floor {_floor:.0%}")
+                                last_sigs[pair] = sig
+                                continue
+
                             if USE_MAKER_ENTRIES and not (USE_BINANCE or USE_FUTURES):
                                 # Rest the order at the signal price instead of
                                 # crossing the spread. It becomes a position only
