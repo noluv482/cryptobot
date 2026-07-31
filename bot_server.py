@@ -758,8 +758,18 @@ def _resolve_pending_entry(pair, price, trader):
     if not p:
         return None
     p["scans"] = p.get("scans", 0) + 1
-    side, limit = p["side"], p["limit"]
-    touched = (price <= limit) if side == "BUY" else (price >= limit)
+    # The scan loop stores the direction as "sig" (BUY/SELL). An earlier version
+    # of this function read p["side"], which does not exist — every order raised
+    # KeyError, was swallowed by the caller's except, and silently discarded.
+    # That is why 21 orders rested with 0 filled and 0 expired. Accept either key
+    # so a future rename cannot resurrect the same silent failure.
+    side = p.get("sig") or p.get("side")
+    limit = p["limit"]
+    if not side or not limit:
+        _pending_entries.pop(pair, None)
+        log("ORDER", f"{pair} pending entry malformed ({sorted(p)}) — dropped", "ERR")
+        return "expired"
+    touched = (price <= limit) if side in ("BUY", "LONG") else (price >= limit)
     if touched:
         _pending_entries.pop(pair, None)
         log("ORDER", f"{pair} passive entry filled at {limit:.6f} "
