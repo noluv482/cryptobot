@@ -367,7 +367,13 @@ KRAKEN_MAKER_FEE = 0.0016      # maker: resting order that provides liquidity
 # ~1% of signals on daily bars, but it is NOT free and the paper model below
 # simulates the misses rather than pretending every order fills.
 USE_MAKER_ENTRIES = os.environ.get("USE_MAKER_ENTRIES", "1") not in ("0", "false", "False")
-MAKER_FILL_WAIT_SCANS = int(os.environ.get("MAKER_FILL_WAIT_SCANS", "3"))
+# How long a passive limit rests before being cancelled, in scan cycles. Must be
+# scaled to the BAR, not a fixed count: the first version used 3 scans = 3
+# minutes on a 1h bar, so essentially nothing could ever fill. The backtest that
+# justified maker entries allowed 2 bars. A third of a bar is the compromise —
+# long enough for a realistic pullback, short enough that the signal is not stale.
+MAKER_FILL_WAIT_SCANS = int(os.environ.get(
+    "MAKER_FILL_WAIT_SCANS", max(3, int(INTERVAL * 60 / max(REFRESH_SEC, 1) / 3))))
 _pending_entries = {}          # pair -> pending passive entry awaiting a fill
 SLIPPAGE                = 0.001
 ORDER_TTL_SECS          = 45      # max seconds from signal to order placement; older signals are dropped
@@ -7019,6 +7025,34 @@ def trading_loop(trader):
             except Exception:
                 pass
 
+            # ── Resolve resting passive entries every tick ─────────────────
+            # MUST iterate _pending_entries itself, NOT the ranked list. The
+            # first version checked pending orders inside the `ranked_list[:8]`
+            # loop, so as soon as a pair fell out of the top 8 its order was
+            # never looked at again: it could not fill, could not expire, and
+            # permanently blocked that pair from signalling. That stopped
+            # trading dead for 25 hours (21 orders rested, 0 filled, 0 expired).
+            # Same shape as the position-management loop below, and for the same
+            # reason: order lifecycle cannot depend on current ranking.
+            if USE_MAKER_ENTRIES:
+                for _pp_pair in list(_pending_entries.keys()):
+                    _pp = _pending_entries.get(_pp_pair)
+                    if not _pp:
+                        continue
+                    try:
+                        _px = get_price(_pp_pair)
+                        if not _px:
+                            continue
+                        if _resolve_pending_entry(_pp_pair, _px, trader) == "filled":
+                            trader.on_signal(_pp["sig"], _pp["limit"], _pp["stop"],
+                                             _pp["target"], _pp["name"], _pp["conf"],
+                                             _pp_pair, atr=_pp.get("atr"),
+                                             fkey=_pp.get("fkey", ""),
+                                             pillars=_pp.get("pillars") or {})
+                    except Exception as e:
+                        log("ORDER", f"pending {_pp_pair}: {e}", "ERR")
+                        _pending_entries.pop(_pp_pair, None)
+
             # ── Manage every open position every tick ──────────────────────
             for pair in list(trader.positions.keys()):
                 p = trader.positions.get(pair)
@@ -7143,24 +7177,11 @@ def trading_loop(trader):
                 # the one whose favourable excursion averaged LESS than its adverse
                 # excursion. Exits are unaffected: they run in the position-management
                 # loop above and still check every cycle.
-                # A resting passive entry is checked EVERY scan, before the
-                # closed-bar gate — the whole point is to catch price coming back
-                # to the limit, which can happen at any moment within the bar.
+                # Pending orders are resolved in their own loop above (which runs
+                # regardless of ranking). Here we only need to avoid stacking a
+                # second signal on a pair that already has one resting.
                 if USE_MAKER_ENTRIES and pair in _pending_entries:
-                    try:
-                        _pp = _pending_entries[pair]
-                        _outcome = _resolve_pending_entry(pair, get_price(pair), trader)
-                        if _outcome == "filled":
-                            trader.on_signal(_pp["sig"], _pp["limit"], _pp["stop"],
-                                             _pp["target"], _pp["name"], _pp["conf"],
-                                             pair, atr=_pp.get("atr"),
-                                             fkey=_pp.get("fkey", ""),
-                                             pillars=_pp.get("pillars") or {})
-                        if _outcome in ("filled", "waiting"):
-                            continue      # do not also evaluate a fresh entry
-                    except Exception as e:
-                        log("ORDER", f"pending entry {pair}: {e}", "ERR")
-                        _pending_entries.pop(pair, None)
+                    continue
 
                 if ENTRY_ON_CLOSED_BAR:
                     _bar_id = int(time.time() // (INTERVAL * 60))
