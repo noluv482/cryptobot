@@ -4476,7 +4476,20 @@ class SignalEngine:
         # Volume gate — very low volume is a hard block; average volume is allowed.
         # vol_pts pillar already penalises confidence for below-average volume.
         # Only hard-block when volume is extremely thin (< 40% of average).
-        _very_low_vol = (volumes[-1] < (sum(volumes) / len(volumes)) * 0.40) if volumes else False
+        # Judge the last CLOSED bar, not the forming one. Kraken's OHLC includes
+        # the in-progress candle as the final element, so volumes[-1] is a bar
+        # that may be seconds old — and ENTRY_ON_CLOSED_BAR makes the bot
+        # evaluate right after a bar opens, i.e. at the exact moment that value
+        # is smallest. Measured 2026-08-01: LINK forming 927 vs closed 1830,
+        # SOL forming 177 vs closed 1927 — the forming bar reads 5-10x lower
+        # purely because it has not finished. The average excludes it for the
+        # same reason.
+        if volumes and len(volumes) >= 3:
+            _closed_vols = volumes[:-1]
+            _avg_vol = sum(_closed_vols) / len(_closed_vols)
+            _very_low_vol = _closed_vols[-1] < _avg_vol * 0.40
+        else:
+            _very_low_vol = False
         if sig in ("BUY", "SELL") and _very_low_vol:
             with _gate_counter_lock: _gate_counters["volume"] += 1
             sig = "HOLD"
