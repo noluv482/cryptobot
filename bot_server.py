@@ -73,7 +73,37 @@ _TAG_COLOUR = {
     "WARN":    _C.YELLOW,
 }
 
+# Telegram bot token shape. NO leading \b: the token appears in URLs as
+# ".../bot8382017140:AA..." and there is no word boundary between "bot" and the
+# digits, so \b made this silently never match.
+_SECRET_RE = re.compile(r"\d{8,12}:AA[\w-]{20,}")
+
+
+def _redact(msg: str) -> str:
+    """Strip credentials out of anything headed for the log.
+
+    requests puts the full request URL into its exception messages, so a
+    Telegram network error logged as str(e) printed the entire bot token in
+    plaintext — observed in the wild on 2026-08-03:
+        ERR POLL ... url: /bot8382017140:AAH-Zs0dBTAk47vwn...
+    Redacting inside log() rather than at each call site means every current
+    and future logging path is covered, including ones added later.
+    """
+    s = str(msg)
+    # globals().get, not direct names: log() is defined near the top of the file
+    # and can fire during startup before these are assigned further down. A
+    # NameError inside the logger would be a miserable failure mode.
+    g = globals()
+    for name in ("TG_TOKEN", "KRAKEN_API_KEY", "KRAKEN_API_SECRET",
+                 "ANTHROPIC_API_KEY", "DB_PASSWORD", "DASHBOARD_PIN"):
+        v = g.get(name)
+        if isinstance(v, str) and len(v) > 8 and v in s:
+            s = s.replace(v, f"<{name}>")
+    return _SECRET_RE.sub("<TG_TOKEN>", s)
+
+
 def log(tag: str, msg: str, level: str = "INFO"):
+    msg  = _redact(msg)
     ts   = datetime.now().strftime("%H:%M:%S")
     tcol = _TAG_COLOUR.get(tag, _C.WHITE)
     if level == "ERR":
