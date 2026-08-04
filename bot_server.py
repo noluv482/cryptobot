@@ -8783,6 +8783,22 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 }
 .skel *{visibility:hidden}
 
+/* ══ iPHONE / TOUCH FIXES ═════════════════════════════════════════════════
+   iOS Safari zooms the whole page when you focus an input whose font-size is
+   under 16px — jarring, and you have to pinch back out afterwards. Seven inputs
+   across this app were between 10.6px and 15.2px. Fixed globally for touch
+   devices only, so the compact monospace look is kept on desktop where the
+   behaviour does not exist. NOT fixed with maximum-scale=1, which would also
+   block deliberate pinch-zoom and is an accessibility regression.            */
+@media (pointer: coarse){
+  input,textarea,select{font-size:16px!important}
+  /* Apple HIG minimum touch target is 44px. These were 30-34px. */
+  .mt-lev,.mt-quick,.zoom-btn,.ind-btn,.iv-btn{min-height:44px}
+  .zoom-btn{min-width:44px}
+  /* Keep the arrows comfortably tappable without covering more of the strip. */
+  .strip-arrow{width:40px}
+}
+
 /* Respect the existing reduced-motion contract: no flashing, no shimmer. */
 @media(prefers-reduced-motion:reduce){
   .flash-up,.flash-down{animation:none}
