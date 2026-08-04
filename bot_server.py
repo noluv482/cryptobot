@@ -10007,7 +10007,7 @@ function mtSetSize(frac){
 }
 async function fetchManual(){
   try{
-    const d=await(await fetch('/manual/status')).json();
+    const d=await(await fetch('/manual/status?device_id='+encodeURIComponent(_getDeviceId()))).json();
     if(d.error)return;
     _mtBook=d;
     const pair=_cdPair||_botPair;
@@ -10042,7 +10042,7 @@ async function mtOpen(side){
   try{
     const r=await fetch('/manual/open',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({pair:pair,side:side,size:size})});
+      body:JSON.stringify({pair:pair,side:side,size:size,device_id:_getDeviceId()})});
     const d=await r.json();
     if(d.error){_mtMsg(d.error,'err');return;}
     _mtMsg((side==='BUY'?'LONG':'SHORT')+' opened @ '+_fmtPrice(d.entry),'ok');
@@ -10054,7 +10054,7 @@ async function mtClose(){
   try{
     const r=await fetch('/manual/close',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({pair:pair})});
+      body:JSON.stringify({pair:pair,device_id:_getDeviceId()})});
     const d=await r.json();
     if(d.error){_mtMsg(d.error,'err');return;}
     _mtMsg('closed  '+(d.pnl>=0?'+':'')+d.pnl.toFixed(2),d.pnl>=0?'ok':'err');
