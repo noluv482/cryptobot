@@ -8807,6 +8807,10 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 .mt-quick{background:rgba(255,255,255,.05);border:1px solid var(--bd2);color:var(--mu);
   border-radius:7px;font-family:var(--fn);font-size:.52rem;padding:7px 8px;cursor:pointer}
 .mt-quick:active{background:rgba(255,255,255,.12);color:var(--tx)}
+.zoom-btn{font-size:.95rem!important;font-weight:700;line-height:1;
+  min-width:32px;padding:4px 0!important}
+.zoom-lbl{font-family:var(--fn);font-size:.52rem;color:var(--mu);
+  min-width:26px;text-align:center;font-variant-numeric:tabular-nums}
 .mt-sltp-row{display:flex;align-items:center;gap:5px;margin-bottom:8px}
 .mt-sltp{flex:1;min-width:0;background:rgba(0,0,0,.3);border:1px solid var(--bd2);
   border-radius:7px;color:var(--tx);font-family:var(--fn);font-size:.66rem;
@@ -9393,8 +9397,11 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <button class="ind-btn active" id="btn_cost" onclick="toggleCost()" title="Move needed to clear fees + slippage — targets inside this band cannot profit">COST</button>
       <button class="ind-btn" id="btn_bb" onclick="toggleBB()" title="Bollinger Bands (20,2)">BB</button>
       <button class="ind-btn" id="btn_macd" onclick="toggleMACD()" title="MACD (12,26,9)">MACD</button>
-      <button class="ind-btn" id="btn_reset_view" onclick="cdResetView()" title="Reset pan/zoom (or double-click the chart)">RESET</button>
-      <span style="font-size:.5rem;color:var(--mu);opacity:.6;margin-left:auto">Drag to pan · pinch/scroll to zoom</span>
+      <button class="ind-btn zoom-btn" onclick="cdZoom(1)"  title="Zoom out (show more bars)">&minus;</button>
+      <span class="zoom-lbl" id="zoom_lbl">80</span>
+      <button class="ind-btn zoom-btn" onclick="cdZoom(-1)" title="Zoom in (show fewer bars)">+</button>
+      <button class="ind-btn" id="btn_reset_view" onclick="cdResetView()" title="Reset pan and zoom">RESET</button>
+      <span style="font-size:.48rem;color:var(--mu);opacity:.6;margin-left:auto">drag to pan</span>
     </div>
     <div class="chart-wrap">
       <canvas id="cd_cv" style="display:block;width:100%" height="376"></canvas>
@@ -10007,7 +10014,23 @@ function _cdVisible(){
   const end=all.length-off;
   return {rows:all.slice(end-n,end),start:end-n,n:n,off:off};
 }
-function cdResetView(){_cdView={n:80,off:0};drawCandles();}
+function cdResetView(){_cdView={n:80,off:0};drawCandles();_cdUpdZoomLbl();}
+// dir: -1 zooms in (fewer bars), +1 zooms out (more bars). Steps through fixed
+// levels rather than a multiplier so repeated taps feel predictable.
+const _CD_ZOOM_STEPS=[20,30,40,60,80,120,160,220,300];
+function cdZoom(dir){
+  const cur=_cdVisible().n;
+  let i=0,best=1e9;
+  _CD_ZOOM_STEPS.forEach((v,k)=>{const d=Math.abs(v-cur);if(d<best){best=d;i=k;}});
+  let ni=Math.max(0,Math.min(_CD_ZOOM_STEPS.length-1,i+dir));
+  let n=Math.min(_CD_ZOOM_STEPS[ni],_cdData.length||_CD_ZOOM_STEPS[ni]);
+  _cdView.n=n;
+  _cdView.off=Math.max(0,Math.min(_cdView.off,(_cdData.length||n)-n));
+  drawCandles();_cdUpdZoomLbl();
+}
+function _cdUpdZoomLbl(){
+  const el=$('zoom_lbl');if(el)el.textContent=_cdVisible().n;
+}
 let _showSR=true,_showCost=true; // both on by default — they explain the bot's targets
 let _botPair='',_coinPrices={},_openPairs=new Set();
 let _showBB=false,_showMACD=false;
@@ -11055,6 +11078,7 @@ async function fetchCandles(){
     _cdMeta=Array.isArray(raw)?{}:((raw&&raw.meta)||{});
     if(Array.isArray(data)&&data.length){
       _cdData=data;
+      _cdUpdZoomLbl();
       _ema20=_ema(data,20);
       _ema50=_ema(data,50);
       const last=data[data.length-1],first=data[0];
@@ -11678,7 +11702,7 @@ function initCandleHover(){
     const grew=n-vw.n;
     _cdView.n=n;
     _cdView.off=Math.max(0,Math.min(_cdData.length-n, vw.off+Math.round(grew*(1-(anchor||0.5)))));
-    drawCandles();
+    drawCandles();_cdUpdZoomLbl();
   };
 
   cv.addEventListener('mousedown',e=>{dragging=true;moved=0;dragX=e.clientX;dragOff=_cdVisible().off;});
@@ -11716,7 +11740,7 @@ function initCandleHover(){
         const n=Math.max(20,Math.min(_cdData.length,Math.round(pinchN*(pinchDist/d))));
         _cdView.n=n;
         _cdView.off=Math.min(_cdView.off,Math.max(0,_cdData.length-n));
-        drawCandles();
+        drawCandles();_cdUpdZoomLbl();
       }
       return;
     }
