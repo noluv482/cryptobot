@@ -2107,6 +2107,114 @@ def calc_bb_squeeze(closes, period=20, std_dev=2.0):
     avg      = sum(lookback) / len(lookback)
     return avg > 0 and current < avg * 0.55  # current < 55% of recent average = squeeze
 
+# ── Order flow: the trade tape ────────────────────────────────────────────
+# The bot already reads the order BOOK (resting orders) via _get_ob_imbalance
+# and _orderbook_wall. This is the other half: actual executions and which side
+# crossed the spread to get filled.
+#
+# Kraken's public /Trades returns [price, volume, time, side, ordertype, ...]
+# where side is 'b' (a buyer lifted the ask) or 's' (a seller hit the bid). That
+# is the aggressor — the party who wanted it badly enough to pay the spread —
+# and it is information a candle chart cannot show. Verified live 2026-08-04:
+# SOL had 566 buy trades vs 434 sell trades but delta -220 by VOLUME, i.e. many
+# small buyers being sold into by fewer, larger sellers.
+_flow_cache: dict = {}          # pair -> {"ts": float, "data": dict}
+_FLOW_TTL = 45.0                # seconds; /Trades is rate-limited like any endpoint
+
+
+def _fetch_trade_tape(pair, since=None):
+    """Recent executions with aggressor side. Returns list of (ts, price, vol, side)."""
+    try:
+        params = {"pair": pair}
+        if since:
+            params["since"] = since
+        r = requests.get(f"{BASE_URL}/Trades", params=params, timeout=8)
+        if not r.ok:
+            return []
+        res = r.json().get("result", {})
+        key = next((k for k in res if k != "last"), None)
+        if not key:
+            return []
+        out = []
+        for t in res[key]:
+            try:
+                out.append((float(t[2]), float(t[0]), float(t[1]), t[3]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def get_order_flow(pair, bucket_secs=300, buckets=24):
+    """Cumulative volume delta and its recent shape.
+
+    delta        = buy volume - sell volume over the whole tape
+    cvd          = running cumulative delta, one point per bucket
+    divergence   = price made a higher high while CVD made a lower high (or the
+                   mirror). That is the classic order-flow read: the move is
+                   being faded by the side that actually has size.
+
+    Volume-weighted throughout, never trade counts. Counting trades treats a
+    0.01 SOL buy the same as a 500 SOL sell, which inverts the answer — the
+    live sample above is exactly that case.
+    """
+    cached = _flow_cache.get(pair)
+    if cached and time.time() - cached["ts"] < _FLOW_TTL:
+        return cached["data"]
+
+    tape = _fetch_trade_tape(pair)
+    if len(tape) < 20:
+        return None
+
+    buy_v = sum(v for _, _, v, s in tape if s == "b")
+    sell_v = sum(v for _, _, v, s in tape if s == "s")
+    total_v = buy_v + sell_v
+    if total_v <= 0:
+        return None
+
+    t_end = tape[-1][0]
+    t_start = t_end - bucket_secs * buckets
+    series, run = [], 0.0
+    for i in range(buckets):
+        lo = t_start + i * bucket_secs
+        hi = lo + bucket_secs
+        rows = [r for r in tape if lo <= r[0] < hi]
+        if not rows:
+            series.append({"t": hi, "cvd": run, "delta": 0.0, "px": None})
+            continue
+        d = sum(v if s == "b" else -v for _, _, v, s in rows)
+        run += d
+        series.append({"t": hi, "cvd": run, "delta": d,
+                       "px": rows[-1][1]})
+
+    # Divergence over the recent half, comparing price highs to CVD highs.
+    div = None
+    pts = [p for p in series if p["px"] is not None]
+    if len(pts) >= 6:
+        half = len(pts) // 2
+        a, b = pts[:half], pts[half:]
+        pa, pb = max(x["px"] for x in a), max(x["px"] for x in b)
+        ca, cb = max(x["cvd"] for x in a), max(x["cvd"] for x in b)
+        if pb > pa and cb < ca:
+            div = "BEARISH"        # higher price high, lower CVD high
+        elif pb < pa and cb > ca:
+            div = "BULLISH"        # lower price low, higher CVD — absorption
+    data = {
+        "delta": round(buy_v - sell_v, 4),
+        "buy_vol": round(buy_v, 4),
+        "sell_vol": round(sell_v, 4),
+        "buy_pct": round(buy_v / total_v * 100, 1),
+        "trades": len(tape),
+        "cvd": series,
+        "divergence": div,
+        "pressure": ("BUY" if buy_v > sell_v * 1.15 else
+                     "SELL" if sell_v > buy_v * 1.15 else "BALANCED"),
+    }
+    _flow_cache[pair] = {"ts": time.time(), "data": data}
+    return data
+
+
 def _get_ob_imbalance(pair):
     """Return bid_vol / ask_vol ratio. Checks real-time WS cache first (updated every
     ticker message), falls back to REST top-10 depth. Ratio >1 = bid pressure; <1 = ask."""
@@ -8815,6 +8923,21 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   .skel{animation:none;background:rgba(255,255,255,.06)}
 }
 
+/* ══ ORDER FLOW PANEL ═════════════════════════════════════════════════════
+   Sits under the chart: the tape answers "who is paying the spread", which is
+   only meaningful next to the price it produced.                            */
+.of-panel{margin:8px 12px 0;padding:10px 12px;border-radius:12px;
+  background:var(--glass,rgba(255,255,255,.03));border:1px solid var(--bd)}
+.of-row{display:flex;align-items:baseline;gap:8px}
+.of-title{font-family:var(--fn);font-size:.5rem;letter-spacing:.12em;color:var(--mu)}
+.of-pressure{font-family:var(--fn);font-size:.62rem;font-weight:700;letter-spacing:.05em}
+.of-delta{margin-left:auto;font-family:var(--fn);font-size:.72rem;font-weight:700;
+  font-variant-numeric:tabular-nums}
+.of-bar{height:6px;border-radius:99px;background:var(--r);overflow:hidden;margin:7px 0 5px}
+.of-bar-buy{height:100%;background:var(--g);transition:width .4s ease}
+.of-sub{font-family:var(--fn);font-size:.52rem;color:var(--mu)}
+.of-div{margin-left:auto;font-weight:700}
+
 /* ══ MANUAL PAPER TRADING PANEL ═══════════════════════════════════════════
    Lives under the chart so a decision and the action are in one place — the
    chart tab was previously read-only, which is what made it feel inert.     */
@@ -9450,6 +9573,20 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     <div class="chart-wrap">
       <canvas id="cd_cv" style="display:block;width:100%" height="376"></canvas>
       <div class="cv-tip" id="cv_tip"></div>
+    </div>
+
+    <!-- Order flow: who is actually crossing the spread -->
+    <div class="of-panel" id="of_panel" style="display:none">
+      <div class="of-row">
+        <span class="of-title">ORDER FLOW</span>
+        <span class="of-pressure" id="of_pressure">—</span>
+        <span class="of-delta" id="of_delta">—</span>
+      </div>
+      <div class="of-bar"><div class="of-bar-buy" id="of_bar_buy"></div></div>
+      <div class="of-row of-sub">
+        <span id="of_split">—</span>
+        <span class="of-div" id="of_div"></span>
+      </div>
     </div>
 
     <!-- Manual paper trading: your own book, separate from the bot's -->
@@ -10119,6 +10256,40 @@ const msign=n=>(n>=0?'+$':'\u2212$')+fmt(Math.abs(n));
 const pc=n=>n>0?'c-g':n<0?'c-r':'c-mu';
 
 /* ── TAB NAVIGATION ── */
+/* ── ORDER FLOW ──────────────────────────────────────────────────────────
+   Reads the trade tape: who crossed the spread, and by how much VOLUME (never
+   trade count — a 0.01 buy and a 500 sell are not one-all). */
+async function fetchOrderFlow(){
+  const pair=_cdPair||_botPair; if(!pair)return;
+  const panel=$('of_panel'); if(!panel)return;
+  try{
+    const d=await(await fetch('/orderflow?pair='+encodeURIComponent(pair))).json();
+    if(d.error){panel.style.display='none';return;}
+    panel.style.display='';
+    const pr=$('of_pressure');
+    pr.textContent=d.pressure;
+    pr.style.color=d.pressure==='BUY'?'var(--g)':d.pressure==='SELL'?'var(--r)':'var(--mu)';
+    const dl=$('of_delta');
+    dl.textContent=(d.delta>=0?'+':'')+_fmtVolShort(d.delta);
+    dl.style.color=d.delta>0?'var(--g)':d.delta<0?'var(--r)':'var(--mu)';
+    $('of_bar_buy').style.width=d.buy_pct+'%';
+    $('of_split').textContent=d.buy_pct.toFixed(0)+'% bought  ·  '
+      +(100-d.buy_pct).toFixed(0)+'% sold  ·  '+d.trades+' trades';
+    const dv=$('of_div');
+    if(d.divergence){
+      // Divergence is the actual signal: price and the tape disagreeing.
+      dv.textContent=d.divergence==='BEARISH'?'⚠ bearish divergence':'⚠ bullish divergence';
+      dv.style.color=d.divergence==='BEARISH'?'var(--r)':'var(--g)';
+    }else{dv.textContent='';}
+  }catch(e){panel.style.display='none';}
+}
+function _fmtVolShort(v){
+  const a=Math.abs(v);
+  if(a>=1e6)return (v/1e6).toFixed(2)+'M';
+  if(a>=1e3)return (v/1e3).toFixed(1)+'K';
+  return a>=100?v.toFixed(0):v.toFixed(2);
+}
+
 /* ── MANUAL PAPER TRADING ────────────────────────────────────────────────
    Your own book, entirely separate from the bot's. Same fees and slippage are
    applied server-side so the comparison against the bot is honest. */
@@ -10338,7 +10509,7 @@ function goTab(t){
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   pg.classList.add('active');
   tb.classList.add('active');
-  if(t==='chart'){drawCandles();fetchManual();}
+  if(t==='chart'){drawCandles();fetchManual();fetchOrderFlow();}
   if(t==='home'){drawEquity();}
   if(t==='market'){fetchMarket();fetchForecast();loadQuiz();}
   if(t==='stats'){drawDownChart();fetchCalibration();}
@@ -11344,6 +11515,7 @@ function selectCoin(pair,sym){
   _cdPair=pair;
   _cdOpenPos=(_openPairs.has(pair)?[]:[]); // will update on next status
   fetchManual();          // the panel is per-coin, so refresh on switch
+  fetchOrderFlow();
   _cdTrades=[];
   const name=sym?sym+'/USD':pair;
   $('ci_name').textContent=name;
@@ -14039,6 +14211,7 @@ initStripDrag();
 initStripArrows();
 markSkeletons();      // shimmer the value readouts until the first poll lands
 fetchManual();setInterval(fetchManual,6000);   // manual paper book
+fetchOrderFlow();setInterval(fetchOrderFlow,45000);  // tape TTL is 45s server-side
 initValueFlash();     // must run BEFORE the first fetch so it captures baselines
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
 fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();loadIQ();
@@ -15853,6 +16026,23 @@ def _manual_unrealised(book, prices=None):
             move = -move
         out += move * p["size"]
     return out
+
+
+@_flask_app.route("/orderflow")
+def _web_orderflow():
+    """Trade-tape order flow for the charted pair. Read-only, so no auth gate —
+    matches /candles and /prices."""
+    pair = _flask_request.args.get("pair") or _current_coin.get("pair") or ""
+    if not pair:
+        return _Response('{"error":"no pair"}', status=400, mimetype="application/json")
+    try:
+        d = get_order_flow(pair)
+    except Exception as e:
+        return _Response(json.dumps({"error": str(e)}), status=503, mimetype="application/json")
+    if not d:
+        return _Response('{"error":"no tape data"}', status=503, mimetype="application/json")
+    return _Response(json.dumps(d), mimetype="application/json",
+                     headers={"Cache-Control": "no-store"})
 
 
 @_flask_app.route("/manual/status")
