@@ -7857,11 +7857,17 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .dot-live{background:var(--g);animation:blink 2s ease-in-out infinite}
 .dot-paper{background:var(--mu)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
-.hdr-mid{flex:1;display:flex;flex-direction:column;align-items:center;min-width:0}
+.hdr-mid{flex:1;display:flex;flex-direction:column;align-items:center;min-width:0;
+         overflow:hidden}
+/* A long price (ADA prints 8 significant digits) plus the P&L chip could grow
+   past the centre column and slide under the action buttons. Clamp the row and
+   let the price shrink rather than overlap. */
+.hdr-mid>div{max-width:100%;min-width:0}
+.hdr-price{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hdr-coin{font-size:.58rem;color:var(--mu);letter-spacing:.06em;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px}
 .hdr-price{font-family:var(--fn);font-size:.98rem;font-weight:700;
             font-variant-numeric:tabular-nums;line-height:1.3}
-.hdr-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.hdr-actions{display:flex;align-items:center;gap:6px;flex-shrink:0;margin-left:8px}
 .icon-btn{width:38px;height:38px;display:flex;align-items:center;justify-content:center;
            border-radius:10px;border:1px solid var(--bd);background:transparent;
            color:var(--mu);font-size:1rem;cursor:pointer;touch-action:manipulation;
@@ -13824,7 +13830,10 @@ function updateLivePnlTicker(positions){
   const el=$('live_pnl_tick');if(!el)return;
   if(!positions||!positions.length){el.className='';el.style.display='none';return;}
   const total=positions.reduce((s,p)=>s+(p.unrealized_pnl||0),0);
-  el.textContent=(total>=0?'+':'')+msign(total);
+  // Hide when it rounds to nothing: '+$0' beside a long price just crowds the
+  // header on a phone without telling you anything.
+  if(Math.abs(total)<0.005){el.className='';el.style.display='none';return;}
+  el.textContent=msign(total);   // msign() already prefixes + or − ; adding another produced '++$0'
   el.style.color=total>0?'var(--g)':total<0?'var(--r)':'var(--mu)';
   el.className='show';
 }
