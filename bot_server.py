@@ -7100,7 +7100,7 @@ def trading_loop(trader):
             # Must run here rather than in the dashboard poll: a 10x position
             # has to be liquidated whether or not a browser happens to be open.
             try:
-                _manual_check_liquidations()
+                _manual_check_exits()
             except Exception as e:
                 log("MANUAL", f"liquidation check: {e}", "ERR")
 
@@ -8807,6 +8807,12 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 .mt-quick{background:rgba(255,255,255,.05);border:1px solid var(--bd2);color:var(--mu);
   border-radius:7px;font-family:var(--fn);font-size:.52rem;padding:7px 8px;cursor:pointer}
 .mt-quick:active{background:rgba(255,255,255,.12);color:var(--tx)}
+.mt-sltp-row{display:flex;align-items:center;gap:5px;margin-bottom:8px}
+.mt-sltp{flex:1;min-width:0;background:rgba(0,0,0,.3);border:1px solid var(--bd2);
+  border-radius:7px;color:var(--tx);font-family:var(--fn);font-size:.66rem;
+  padding:6px 8px;-moz-appearance:textfield}
+.mt-sltp::-webkit-outer-spin-button,.mt-sltp::-webkit-inner-spin-button{
+  -webkit-appearance:none;margin:0}
 .mt-btn-row{display:flex;gap:8px}
 .mt-btn{flex:1;border:none;border-radius:9px;padding:12px 8px;cursor:pointer;
   font-family:var(--fn);font-size:.64rem;font-weight:700;letter-spacing:.06em;
@@ -9387,7 +9393,8 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       <button class="ind-btn active" id="btn_cost" onclick="toggleCost()" title="Move needed to clear fees + slippage — targets inside this band cannot profit">COST</button>
       <button class="ind-btn" id="btn_bb" onclick="toggleBB()" title="Bollinger Bands (20,2)">BB</button>
       <button class="ind-btn" id="btn_macd" onclick="toggleMACD()" title="MACD (12,26,9)">MACD</button>
-      <span style="font-size:.5rem;color:var(--mu);opacity:.6;margin-left:auto">Hold chip to reorder</span>
+      <button class="ind-btn" id="btn_reset_view" onclick="cdResetView()" title="Reset pan/zoom (or double-click the chart)">RESET</button>
+      <span style="font-size:.5rem;color:var(--mu);opacity:.6;margin-left:auto">Drag to pan · pinch/scroll to zoom</span>
     </div>
     <div class="chart-wrap">
       <canvas id="cd_cv" style="display:block;width:100%" height="376"></canvas>
@@ -9409,6 +9416,13 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
           <span class="mt-upnl" id="mt_upnl">—</span>
         </div>
         <div class="mt-liqrow" id="mt_liqrow"></div>
+        <div class="mt-sltp-row">
+          <span class="mt-lbl">STOP</span>
+          <input class="mt-sltp" id="mt_sl_live" type="number" inputmode="decimal" placeholder="none" step="any">
+          <span class="mt-lbl">TARGET</span>
+          <input class="mt-sltp" id="mt_tp_live" type="number" inputmode="decimal" placeholder="none" step="any">
+          <button class="mt-quick" onclick="mtSaveSltp()">SET</button>
+        </div>
         <button class="mt-btn mt-close" onclick="mtClose()">CLOSE POSITION</button>
       </div>
 
@@ -9429,6 +9443,12 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
           <button class="mt-quick" onclick="mtSetSize(0.25)">25%</button>
           <button class="mt-quick" onclick="mtSetSize(0.5)">50%</button>
           <button class="mt-quick" onclick="mtSetSize(1)">MAX</button>
+        </div>
+        <div class="mt-sltp-row">
+          <span class="mt-lbl">STOP</span>
+          <input class="mt-sltp" id="mt_sl" type="number" inputmode="decimal" placeholder="optional" step="any">
+          <span class="mt-lbl">TARGET</span>
+          <input class="mt-sltp" id="mt_tp" type="number" inputmode="decimal" placeholder="optional" step="any">
         </div>
         <div class="mt-btn-row">
           <button class="mt-btn mt-buy"  onclick="mtOpen('BUY')">BUY / LONG</button>
@@ -9977,6 +9997,17 @@ let _tab='home',_paused=false,_notif=false;
 let _eqData=[],_cdData=[],_cdHover=-1,_tick=30;
 let _ema20=[],_ema50=[],_cdTrades=[],_cdOpenPos=[],_cdPatSig='NONE',_cdPair='',_cdIv=15;
 let _cdMeta={};                 // S/R levels + cost floor from /candles
+// Pan/zoom view over the candle buffer. _cdView.n = bars visible, _cdView.off =
+// bars scrolled back from the newest. Kept as an offset rather than refetching
+// so dragging never waits on the network.
+let _cdView={n:80,off:0};
+function _cdVisible(){
+  const all=_cdData, n=Math.max(20,Math.min(_cdView.n,all.length));
+  const off=Math.max(0,Math.min(_cdView.off,all.length-n));
+  const end=all.length-off;
+  return {rows:all.slice(end-n,end),start:end-n,n:n,off:off};
+}
+function cdResetView(){_cdView={n:80,off:0};drawCandles();}
 let _showSR=true,_showCost=true; // both on by default — they explain the bot's targets
 let _botPair='',_coinPrices={},_openPairs=new Set();
 let _showBB=false,_showMACD=false;
@@ -10026,6 +10057,7 @@ const pc=n=>n>0?'c-g':n<0?'c-r':'c-mu';
    applied server-side so the comparison against the bot is honest. */
 let _mtBook={balance:0,positions:[],count:0,win_rate:0,realised:0};
 let _mtLev=1;
+let _mtPos=null;   // your open position on the charted pair, for overlay lines
 
 function mtSetLev(l){
   _mtLev=l;
@@ -10076,6 +10108,10 @@ async function fetchManual(){
       const u=$('mt_upnl');
       u.textContent=(p.pnl>=0?'+':'')+p.pnl.toFixed(2)+'  ('+(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(2)+'%)';
       u.className='mt-upnl '+(p.pnl>0?'c-g':p.pnl<0?'c-r':'c-mu');
+      _mtPos=p;                        // chart draws entry/stop/target from this
+      const sli=$('mt_sl_live'),tpi=$('mt_tp_live');
+      if(sli&&document.activeElement!==sli)sli.value=p.stop_loss||'';
+      if(tpi&&document.activeElement!==tpi)tpi.value=p.take_profit||'';
       const lr=$('mt_liqrow');
       if(p.liq_price){
         // Flag when liquidation is close enough to matter.
@@ -10086,6 +10122,7 @@ async function fetchManual(){
         lr.className='mt-liqrow'+(near?' near':'');
       }else{ lr.textContent='spot — cannot be liquidated'; lr.className='mt-liqrow'; }
     }else{
+      _mtPos=null;
       $('mt_open').style.display='none';
       $('mt_form').style.display='';
     }
@@ -10099,13 +10136,31 @@ async function mtOpen(side){
   try{
     const r=await fetch('/manual/open',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({pair:pair,side:side,size:size,leverage:_mtLev,device_id:_getDeviceId()})});
+      body:JSON.stringify({pair:pair,side:side,size:size,leverage:_mtLev,
+        stop_loss:parseFloat($('mt_sl').value)||null,
+        take_profit:parseFloat($('mt_tp').value)||null,
+        device_id:_getDeviceId()})});
     const d=await r.json();
     if(d.error){_mtMsg(d.error,'err');return;}
     _mtMsg((side==='BUY'?'LONG':'SHORT')+(d.leverage>1?' '+d.leverage+'x':'')
       +' opened @ '+_fmtPrice(d.entry)
       +(d.liq_price?'  liq '+_fmtPrice(d.liq_price):''),'ok');
     fetchManual();
+  }catch(e){_mtMsg('failed: '+e,'err');}
+}
+async function mtSaveSltp(){
+  const pair=_cdPair||_botPair;
+  try{
+    const r=await fetch('/manual/sltp',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pair:pair,
+        stop_loss:parseFloat($('mt_sl_live').value)||null,
+        take_profit:parseFloat($('mt_tp_live').value)||null,
+        device_id:_getDeviceId()})});
+    const d=await r.json();
+    if(d.error){_mtMsg(d.error,'err');return;}
+    _mtMsg('levels set','ok');
+    fetchManual();drawCandles();
   }catch(e){_mtMsg('failed: '+e,'err');}
 }
 async function mtClose(){
@@ -11245,7 +11300,9 @@ function drawCandles(){
   const RSI_H=50,MACD_H=_showMACD?55:0,H=320+RSI_H+6+(MACD_H?MACD_H+6:0),PR=devicePixelRatio||1;
   cv.width=W*PR;cv.height=H*PR;cv.style.width=W+'px';cv.style.height=H+'px';
   const ctx=cv.getContext('2d');ctx.scale(PR,PR);
-  const data=_cdData;if(!data.length)return;
+  if(!_cdData.length)return;
+  const _vw=_cdVisible();
+  const data=_vw.rows;if(!data.length)return;
   const P={t:10,r:10,b:22,l:56};
   const VH=40,cw=W-P.l-P.r,ch=320-P.t-P.b-VH-6;
   const n=data.length;
@@ -11253,10 +11310,14 @@ function drawCandles(){
   const prices=data.flatMap(c=>[c.h,c.l]);
   let lo=Math.min(...prices),hi=Math.max(...prices);
   _cdOpenPos.forEach(p=>{lo=Math.min(lo,p.entry);hi=Math.max(hi,p.entry);});
-  _ema20.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
-  _ema50.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
+  // EMAs are computed over the whole buffer; only range on the visible slice,
+  // otherwise scrolling back rescales the axis to bars you cannot see.
+  const _e20v=_ema20.slice(_vw.start,_vw.start+_vw.n);
+  const _e50v=_ema50.slice(_vw.start,_vw.start+_vw.n);
+  _e20v.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
+  _e50v.forEach(v=>{if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);}});
   // Expand range for Bollinger Bands (compute once, reused in drawing block below)
-  const _bb=_showBB?_calcBB(data):null;
+  const _bb=_showBB?(()=>{const b=_calcBB(_cdData);return{upper:b.upper.slice(_vw.start,_vw.start+_vw.n),lower:b.lower.slice(_vw.start,_vw.start+_vw.n),mid:(b.mid||[]).slice(_vw.start,_vw.start+_vw.n)};})():null;
   if(_bb){_bb.upper.forEach(v=>{if(v!==null)hi=Math.max(hi,v);});_bb.lower.forEach(v=>{if(v!==null)lo=Math.min(lo,v);});}
   const rng=(hi-lo)*0.04;lo-=rng;hi+=rng;
   if(hi===lo){hi*=1.001;lo*=0.999;}
@@ -11306,6 +11367,23 @@ function drawCandles(){
       }
     });
   }
+  // Your manual position: entry, stop, target and liquidation drawn on the
+  // chart so the levels are judged against structure, not read as bare numbers.
+  if(_mtPos&&_mtPos.pair===(_cdPair||_botPair)){
+    const line=(price,col,label,dash)=>{
+      if(!price||price<lo||price>hi)return;
+      const y=yP(price);
+      ctx.strokeStyle=col;ctx.lineWidth=1;ctx.setLineDash(dash||[]);
+      ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle=col;ctx.font='7.5px monospace';ctx.textAlign='left';
+      ctx.fillText(label,P.l+3,y-2);
+    };
+    line(_mtPos.entry,'rgba(255,255,255,.55)','entry',[4,3]);
+    line(_mtPos.stop_loss,'rgba(255,51,102,.9)','stop',[]);
+    line(_mtPos.take_profit,'rgba(0,230,118,.9)','target',[]);
+    line(_mtPos.liq_price,'rgba(255,179,0,.85)','LIQ',[2,2]);
+  }
   // Grid
   ctx.strokeStyle='rgba(22,37,64,.8)';ctx.lineWidth=.6;
   for(let i=0;i<=4;i++){
@@ -11346,8 +11424,8 @@ function drawCandles(){
     });
     if(started)ctx.stroke();
   };
-  drawEmaLine(_ema20,'#58a6ff');
-  drawEmaLine(_ema50,'#f0883e');
+  drawEmaLine(_e20v,'#58a6ff');   // visible slice — xC() is window-relative
+  drawEmaLine(_e50v,'#f0883e');
   ctx.restore();
   // EMA legend
   ctx.font='7.5px monospace';ctx.textAlign='left';
@@ -11461,7 +11539,9 @@ function drawCandles(){
     ctx.restore();
   }
   // ── RSI Panel ──
-  const rsiArr=_calcRSI(data);
+  // Compute on the FULL buffer then slice: RSI has a warmup, so computing it
+  // on only the visible 80 bars would make the values shift as you pan.
+  const rsiArr=_calcRSI(_cdData).slice(_vw.start,_vw.start+_vw.n);
   const RP={t:320+8,h:RSI_H-10};
   // divider
   ctx.strokeStyle='rgba(22,37,64,.8)';ctx.lineWidth=.5;
@@ -11505,7 +11585,10 @@ function drawCandles(){
   if(_showMACD&&MACD_H>0){
     const macdTop=320+RSI_H+6+6;
     const macdH=MACD_H-10;
-    const {macdLine,signal,hist}=_calcMACD(data);
+    const _m=_calcMACD(_cdData);
+    const macdLine=_m.macdLine.slice(_vw.start,_vw.start+_vw.n);
+    const signal=_m.signal.slice(_vw.start,_vw.start+_vw.n);
+    const hist=_m.hist.slice(_vw.start,_vw.start+_vw.n);
     // Panel divider
     ctx.strokeStyle='rgba(22,37,64,.8)';ctx.lineWidth=.5;
     ctx.beginPath();ctx.moveTo(P.l,macdTop-3);ctx.lineTo(W-P.r,macdTop-3);ctx.stroke();
@@ -11551,18 +11634,19 @@ function drawCandles(){
 function initCandleHover(){
   const cv=$('cd_cv'),tip=$('cv_tip');
   const idx=cx=>{
-    const b=cv.getBoundingClientRect(),n=_cdData.length;
+    const b=cv.getBoundingClientRect(),n=_cdVisible().n;
     return n?Math.min(n-1,Math.max(0,Math.floor((cx-b.left)/b.width*n))):-1;
   };
   const show=i=>{
-    if(i<0||!_cdData[i]){tip.style.display='none';_cdHover=-1;drawCandles();return;}
+    if(i<0||!_cdVisible().rows[i]){tip.style.display='none';_cdHover=-1;drawCandles();return;}
     _cdHover=i;drawCandles();
-    const c=_cdData[i],bull=c.c>=c.o;
+    const c=_cdVisible().rows[i],bull=c.c>=c.o;
     const ts=new Date(c.t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
     const f6=v=>v>=100?v.toFixed(2):v.toPrecision(6);
     const _fmtVol=v=>{if(v>=1e9)return (v/1e9).toFixed(2)+'B';if(v>=1e6)return (v/1e6).toFixed(2)+'M';if(v>=1e3)return (v/1e3).toFixed(1)+'K';return v.toFixed(0);};
-    const e20=_ema20[i],e50=_ema50[i];
-    const _rsiTip=_calcRSI(_cdData)[i];const _rsiTipCol=_rsiTip!==null&&_rsiTip>=70?'var(--r)':_rsiTip!==null&&_rsiTip<=30?'var(--g)':'#58a6ff';
+    const _bi=_cdVisible().start+i;      // buffer index for the hovered bar
+    const e20=_ema20[_bi],e50=_ema50[_bi];
+    const _rsiTip=_calcRSI(_cdData)[_bi];const _rsiTipCol=_rsiTip!==null&&_rsiTip>=70?'var(--r)':_rsiTip!==null&&_rsiTip<=30?'var(--g)':'#58a6ff';
     tip.innerHTML='<b>'+ts+'</b>&nbsp; O&nbsp;'+f6(c.o)+
       '&nbsp; H&nbsp;<span style="color:var(--g)">'+f6(c.h)+'</span>'+
       '&nbsp; L&nbsp;<span style="color:var(--r)">'+f6(c.l)+'</span>'+
@@ -11573,11 +11657,79 @@ function initCandleHover(){
       (c.v?'&nbsp;<span style="color:var(--mu)">Vol '+_fmtVol(c.v)+'</span>':'');
     tip.style.display='block';
   };
-  cv.addEventListener('mousemove',e=>show(idx(e.clientX)));
+  // ── Pan / zoom ──────────────────────────────────────────────────────────
+  // Drag scrolls through history, wheel/pinch zooms. A drag must NOT also move
+  // the crosshair, so a movement threshold decides between the two: under it the
+  // gesture is a tap (crosshair), over it a pan.
+  const DRAG_PX=6;
+  let dragging=false,dragX=0,dragOff=0,moved=0,pinchDist=0,pinchN=0;
+
+  const panBy=dx=>{
+    const vw=_cdVisible();
+    const barW=cv.clientWidth/Math.max(vw.n,1);
+    _cdView.n=vw.n;
+    _cdView.off=Math.max(0,Math.min(_cdData.length-vw.n, dragOff+Math.round(dx/barW)));
+    drawCandles();
+  };
+  const zoomBy=(factor,anchor)=>{
+    const vw=_cdVisible();
+    const n=Math.max(20,Math.min(_cdData.length,Math.round(vw.n*factor)));
+    // Keep the bar under the cursor roughly put while zooming.
+    const grew=n-vw.n;
+    _cdView.n=n;
+    _cdView.off=Math.max(0,Math.min(_cdData.length-n, vw.off+Math.round(grew*(1-(anchor||0.5)))));
+    drawCandles();
+  };
+
+  cv.addEventListener('mousedown',e=>{dragging=true;moved=0;dragX=e.clientX;dragOff=_cdVisible().off;});
+  window.addEventListener('mouseup',()=>{dragging=false;});
+  cv.addEventListener('mousemove',e=>{
+    if(dragging){
+      moved=Math.abs(e.clientX-dragX);
+      if(moved>DRAG_PX){tip.style.display='none';_cdHover=-1;panBy(e.clientX-dragX);return;}
+    }
+    show(idx(e.clientX));
+  });
   cv.addEventListener('mouseleave',()=>{_cdHover=-1;tip.style.display='none';drawCandles();});
-  cv.addEventListener('touchstart',e=>{e.preventDefault();show(idx(e.touches[0].clientX));},{passive:false});
-  cv.addEventListener('touchmove',e=>{e.preventDefault();show(idx(e.touches[0].clientX));},{passive:false});
-  cv.addEventListener('touchend',()=>{_cdHover=-1;tip.style.display='none';drawCandles();});
+  cv.addEventListener('wheel',e=>{
+    e.preventDefault();
+    const b=cv.getBoundingClientRect();
+    zoomBy(e.deltaY>0?1.15:0.87,(e.clientX-b.left)/b.width);
+  },{passive:false});
+  cv.addEventListener('dblclick',()=>cdResetView());
+
+  cv.addEventListener('touchstart',e=>{
+    if(e.touches.length===2){
+      pinchN=_cdVisible().n;
+      pinchDist=Math.abs(e.touches[0].clientX-e.touches[1].clientX);
+      dragging=false;
+    }else{
+      dragging=true;moved=0;dragX=e.touches[0].clientX;dragOff=_cdVisible().off;
+    }
+    e.preventDefault();
+  },{passive:false});
+  cv.addEventListener('touchmove',e=>{
+    e.preventDefault();
+    if(e.touches.length===2&&pinchDist){
+      const d=Math.abs(e.touches[0].clientX-e.touches[1].clientX);
+      if(d>4){
+        const n=Math.max(20,Math.min(_cdData.length,Math.round(pinchN*(pinchDist/d))));
+        _cdView.n=n;
+        _cdView.off=Math.min(_cdView.off,Math.max(0,_cdData.length-n));
+        drawCandles();
+      }
+      return;
+    }
+    if(dragging){
+      moved=Math.abs(e.touches[0].clientX-dragX);
+      if(moved>DRAG_PX){tip.style.display='none';_cdHover=-1;panBy(e.touches[0].clientX-dragX);return;}
+    }
+    show(idx(e.touches[0].clientX));
+  },{passive:false});
+  cv.addEventListener('touchend',e=>{
+    dragging=false;pinchDist=0;
+    if(!e.touches.length){_cdHover=-1;tip.style.display='none';drawCandles();}
+  });
 }
 
 /* ── TOAST ── */
@@ -14272,7 +14424,10 @@ def _web_candles():
         if payload.get("error"):
             raise ValueError(str(payload["error"]))
         rkey = next(k for k in payload["result"] if k != "last")
-        raw = payload["result"][rkey][-80:]
+        # 300 bars, not 80: the chart is pannable now, so it needs history to
+        # scroll back into. The visible window is still ~80 — the frontend keeps
+        # a view offset over this buffer rather than refetching while you drag.
+        raw = payload["result"][rkey][-300:]
         candles = [{"t": int(c[0]), "o": float(c[1]), "h": float(c[2]),
                     "l": float(c[3]), "c": float(c[4]), "v": float(c[6])}
                    for c in raw]
@@ -15428,47 +15583,134 @@ def _manual_liq_price(side, entry, leverage):
     return entry * (1 - frac) if side == "BUY" else entry * (1 + frac)
 
 
-def _manual_check_liquidations(prices=None):
-    """Close out any manual position whose liquidation price has been hit.
+def _manual_validate_sltp(side, entry, liq, sl_raw, tp_raw):
+    """Validate stop-loss / take-profit against the side. Returns (sl, tp, error).
 
-    Runs from the bot's scan loop, NOT from the dashboard poll: a leveraged
-    position has to be liquidated whether or not a browser happens to be open.
+    Rejecting a stop on the wrong side of entry matters: a 'stop' above entry on
+    a long would trigger instantly on the next tick and close the trade at what
+    looks like a stop-out, which is baffling rather than educational.
+    """
+    def num(v):
+        if v in (None, "", 0):
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0 else None
+
+    sl, tp = num(sl_raw), num(tp_raw)
+    is_buy = side == "BUY"
+    if sl is not None:
+        if is_buy and sl >= entry:
+            return None, None, "stop loss must be BELOW entry for a long"
+        if not is_buy and sl <= entry:
+            return None, None, "stop loss must be ABOVE entry for a short"
+        # A stop beyond the liquidation price can never fire — the position is
+        # gone first. Silently accepting it would give a false sense of safety.
+        if liq:
+            if is_buy and sl <= liq:
+                return None, None, f"stop loss is past liquidation ({liq:.6f}) — it could never fire"
+            if not is_buy and sl >= liq:
+                return None, None, f"stop loss is past liquidation ({liq:.6f}) — it could never fire"
+    if tp is not None:
+        if is_buy and tp <= entry:
+            return None, None, "take profit must be ABOVE entry for a long"
+        if not is_buy and tp >= entry:
+            return None, None, "take profit must be BELOW entry for a short"
+    return sl, tp, None
+
+
+@_flask_app.route("/manual/sltp", methods=["POST"])
+def _manual_set_sltp():
+    """Set or clear stop-loss / take-profit on an already-open position."""
+    if not _request_is_authorized():
+        return _Response('{"error":"unauthorized"}', status=403, mimetype="application/json")
+    d = _flask_request.get_json(force=True, silent=True) or {}
+    pair = (d.get("pair") or "").strip()
+    with _manual_lock:
+        book = _manual_load()
+        p = book["positions"].get(pair)
+        if not p:
+            return _Response('{"error":"no position"}', status=404, mimetype="application/json")
+        sl, tp, why = _manual_validate_sltp(p["side"], p["entry"], p.get("liq_price"),
+                                            d.get("stop_loss"), d.get("take_profit"))
+        if why:
+            return _Response(json.dumps({"error": why}), status=400, mimetype="application/json")
+        p["stop_loss"], p["take_profit"] = sl, tp
+        _manual_save(book)
+    log("MANUAL", f"{pair} stop={sl} target={tp}")
+    return _Response(json.dumps({"ok": True, "stop_loss": sl, "take_profit": tp}),
+                     mimetype="application/json")
+
+
+def _manual_check_exits(prices=None):
+    """Close manual positions that hit liquidation, stop-loss or take-profit.
+
+    Runs from the bot's scan loop, NOT the dashboard poll: a stop has to fire
+    whether or not a browser happens to be open — a stop that only works while
+    you are watching is not a stop.
+
+    Liquidation is checked FIRST. If price gapped past both the stop and the
+    liquidation level, the liquidation is what actually happened on the way
+    through; reporting the friendlier stop-loss would understate the loss.
     """
     with _manual_lock:
         book = _manual_load()
         hits = []
         for pair, p in list(book.get("positions", {}).items()):
-            liq = p.get("liq_price")
-            if not liq:
-                continue
             px = (prices or {}).get(pair) or get_price(pair)
             if not px:
                 continue
-            gone = (px <= liq) if p["side"] == "BUY" else (px >= liq)
-            if gone:
-                hits.append((pair, p, liq))
-        for pair, p, liq in hits:
-            # Liquidation means the whole margin is lost — nothing is returned.
-            loss = -p["size"]
-            book["balance"] = round(book["balance"] + loss, 4)
+            is_buy = p["side"] == "BUY"
+            liq, sl, tp = p.get("liq_price"), p.get("stop_loss"), p.get("take_profit")
+            if liq and ((px <= liq) if is_buy else (px >= liq)):
+                hits.append((pair, p, liq, "liquidated"))
+            elif sl and ((px <= sl) if is_buy else (px >= sl)):
+                hits.append((pair, p, sl, "stop loss"))
+            elif tp and ((px >= tp) if is_buy else (px <= tp)):
+                hits.append((pair, p, tp, "take profit"))
+
+        for pair, p, exit_px, reason in hits:
+            lev = p.get("leverage", 1)
+            notional = p.get("notional", p["size"] * lev)
+            if reason == "liquidated":
+                pnl = round(-p["size"], 4)        # whole margin gone
+                pct = -100.0
+            else:
+                move = (exit_px - p["entry"]) / p["entry"]
+                if not p["side"] == "BUY":
+                    move = -move
+                pnl = round(move * notional - notional * KRAKEN_FEE, 4)
+                pnl = max(pnl, round(-p["size"], 4))   # cannot lose more than margin
+                pct = round(move * 100 * lev, 3)
+            book["balance"] = round(book["balance"] + pnl, 4)
             book["trades"].append({
-                "pair": pair, "side": p["side"], "entry": p["entry"], "exit": liq,
-                "size": p["size"], "leverage": p.get("leverage", 1),
-                "pnl": round(loss, 4), "pct": -100.0, "liquidated": True,
+                "pair": pair, "side": p["side"], "entry": p["entry"], "exit": exit_px,
+                "size": p["size"], "leverage": lev, "notional": round(notional, 2),
+                "pnl": pnl, "pct": pct, "reason": reason,
+                "liquidated": reason == "liquidated",
                 "held_mins": round((time.time() - p["opened_at"]) / 60, 1),
                 "ts": time.time(),
             })
             del book["positions"][pair]
-            log("MANUAL", f"LIQUIDATED {pair} {p['side']} {p.get('leverage',1)}x "
-                          f"@ {liq:.6f} — margin ${p['size']:.2f} lost", "WARN")
+            lvl = "WARN" if reason == "liquidated" else "INFO"
+            log("MANUAL", f"{reason.upper()} {pair} {p['side']} {lev}x @ {exit_px:.6f} "
+                          f"pnl {pnl:+.2f}", lvl)
             try:
-                tg(f"*LIQUIDATED* — your manual {p.get('leverage',1)}x "
-                   f"{p['side']} on {pair}\nMargin lost: `${p['size']:.2f}`")
+                icon = "*LIQUIDATED*" if reason == "liquidated" else (
+                    "*Take profit*" if reason == "take profit" else "*Stop loss*")
+                tg(f"{icon} — your manual {lev}x {p['side']} on {pair}\n"
+                   f"P&L: `{pnl:+.2f}`")
             except Exception:
                 pass
         if hits:
             _manual_save(book)
         return len(hits)
+
+
+# Kept so any older reference keeps working.
+_manual_check_liquidations = _manual_check_exits
 
 
 def _manual_load():
@@ -15587,10 +15829,16 @@ def _manual_open():
         fee = notional * KRAKEN_FEE
         book["balance"] = round(book["balance"] - fee, 4)
         liq = _manual_liq_price(side, fill, lev)
+        sl, tp, why = _manual_validate_sltp(side, fill, liq, d.get("stop_loss"),
+                                            d.get("take_profit"))
+        if why:
+            return _Response(json.dumps({"error": why}), status=400,
+                             mimetype="application/json")
         book["positions"][pair] = {
             "side": side, "entry": fill, "size": size,
             "leverage": lev, "tier": MANUAL_LEVERAGE.get(lev, f"{lev}x"),
             "notional": notional, "liq_price": liq,
+            "stop_loss": sl, "take_profit": tp,
             "opened_at": time.time(), "fee_paid": fee,
             "name": pair.replace("USD", "/USD"),
         }
