@@ -8767,6 +8767,45 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   .skel{animation:none;background:rgba(255,255,255,.06)}
 }
 
+/* ══ MANUAL PAPER TRADING PANEL ═══════════════════════════════════════════
+   Lives under the chart so a decision and the action are in one place — the
+   chart tab was previously read-only, which is what made it feel inert.     */
+.mt-panel{margin:10px 12px 18px;padding:12px;border-radius:12px;
+  background:var(--glass,rgba(255,255,255,.03));border:1px solid var(--bd)}
+.mt-head{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+.mt-title{font-family:var(--fn);font-size:.52rem;letter-spacing:.12em;color:var(--mu)}
+.mt-bal{font-family:var(--fn);font-size:.95rem;font-weight:700;color:var(--tx);
+  font-variant-numeric:tabular-nums;margin-left:auto}
+.mt-pl{font-family:var(--fn);font-size:.7rem;font-variant-numeric:tabular-nums}
+.mt-size-row{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+.mt-lbl{font-family:var(--fn);font-size:.5rem;letter-spacing:.1em;color:var(--mu)}
+.mt-size{flex:1;min-width:0;background:rgba(0,0,0,.3);border:1px solid var(--bd2);
+  border-radius:7px;color:var(--tx);font-family:var(--fn);font-size:.8rem;
+  padding:7px 9px;-moz-appearance:textfield}
+.mt-size::-webkit-outer-spin-button,.mt-size::-webkit-inner-spin-button{
+  -webkit-appearance:none;margin:0}
+.mt-quick{background:rgba(255,255,255,.05);border:1px solid var(--bd2);color:var(--mu);
+  border-radius:7px;font-family:var(--fn);font-size:.52rem;padding:7px 8px;cursor:pointer}
+.mt-quick:active{background:rgba(255,255,255,.12);color:var(--tx)}
+.mt-btn-row{display:flex;gap:8px}
+.mt-btn{flex:1;border:none;border-radius:9px;padding:12px 8px;cursor:pointer;
+  font-family:var(--fn);font-size:.64rem;font-weight:700;letter-spacing:.06em;
+  color:#04121f;min-height:44px;transition:filter .12s}
+.mt-btn:active{filter:brightness(1.25)}
+.mt-buy{background:var(--g)}
+.mt-sell{background:var(--r);color:#fff}
+.mt-close{width:100%;background:var(--y);margin-top:8px}
+.mt-open-row{display:flex;align-items:center;gap:10px;
+  font-family:var(--fn);font-size:.72rem;font-variant-numeric:tabular-nums}
+.mt-side{font-weight:700;letter-spacing:.06em}
+.mt-entry{color:var(--mu);font-size:.62rem}
+.mt-upnl{margin-left:auto;font-weight:700}
+.mt-stats{margin-top:9px;font-family:var(--fn);font-size:.54rem;color:var(--mu);
+  letter-spacing:.03em}
+.mt-msg{margin-top:6px;font-family:var(--fn);font-size:.56rem;min-height:.8rem}
+.mt-msg.err{color:var(--r)}
+.mt-msg.ok{color:var(--g)}
+
 /* ══ COIN-STRIP SPARKLINES ════════════════════════════════════════════════ */
 .coin-chip{position:relative;overflow:hidden}
 .chip-spark{position:absolute;left:0;right:0;bottom:0;height:16px;
@@ -9333,6 +9372,42 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     <div class="chart-wrap">
       <canvas id="cd_cv" style="display:block;width:100%" height="376"></canvas>
       <div class="cv-tip" id="cv_tip"></div>
+    </div>
+
+    <!-- Manual paper trading: your own book, separate from the bot's -->
+    <div class="mt-panel" id="mt_panel">
+      <div class="mt-head">
+        <span class="mt-title">YOUR PAPER BOOK</span>
+        <span class="mt-bal" id="mt_bal">—</span>
+        <span class="mt-pl" id="mt_pl"></span>
+      </div>
+
+      <div class="mt-open" id="mt_open" style="display:none">
+        <div class="mt-open-row">
+          <span class="mt-side" id="mt_side">—</span>
+          <span class="mt-entry" id="mt_entry">—</span>
+          <span class="mt-upnl" id="mt_upnl">—</span>
+        </div>
+        <button class="mt-btn mt-close" onclick="mtClose()">CLOSE POSITION</button>
+      </div>
+
+      <div class="mt-entryform" id="mt_form">
+        <div class="mt-size-row">
+          <span class="mt-lbl">SIZE $</span>
+          <input class="mt-size" id="mt_size" type="number" inputmode="decimal"
+                 value="100" min="1" step="10">
+          <button class="mt-quick" onclick="mtSetSize(0.25)">25%</button>
+          <button class="mt-quick" onclick="mtSetSize(0.5)">50%</button>
+          <button class="mt-quick" onclick="mtSetSize(1)">MAX</button>
+        </div>
+        <div class="mt-btn-row">
+          <button class="mt-btn mt-buy"  onclick="mtOpen('BUY')">BUY / LONG</button>
+          <button class="mt-btn mt-sell" onclick="mtOpen('SELL')">SELL / SHORT</button>
+        </div>
+      </div>
+
+      <div class="mt-stats" id="mt_stats">—</div>
+      <div class="mt-msg" id="mt_msg"></div>
     </div>
   </div>
 
@@ -9916,6 +9991,77 @@ const msign=n=>(n>=0?'+$':'\u2212$')+fmt(Math.abs(n));
 const pc=n=>n>0?'c-g':n<0?'c-r':'c-mu';
 
 /* ── TAB NAVIGATION ── */
+/* ── MANUAL PAPER TRADING ────────────────────────────────────────────────
+   Your own book, entirely separate from the bot's. Same fees and slippage are
+   applied server-side so the comparison against the bot is honest. */
+let _mtBook={balance:0,positions:[],count:0,win_rate:0,realised:0};
+
+function _mtMsg(text,cls){
+  const el=$('mt_msg'); if(!el)return;
+  el.textContent=text||''; el.className='mt-msg'+(cls?' '+cls:'');
+  if(text)setTimeout(()=>{if(el.textContent===text){el.textContent='';el.className='mt-msg';}},4000);
+}
+function mtSetSize(frac){
+  const el=$('mt_size'); if(!el)return;
+  el.value=Math.max(1,Math.floor(_mtBook.balance*frac));
+}
+async function fetchManual(){
+  try{
+    const d=await(await fetch('/manual/status')).json();
+    if(d.error)return;
+    _mtBook=d;
+    const pair=_cdPair||_botPair;
+    $('mt_bal').textContent='$'+d.balance.toFixed(2);
+    const pl=$('mt_pl');
+    pl.textContent=(d.realised>=0?'+':'')+d.realised.toFixed(2);
+    pl.className='mt-pl '+(d.realised>0?'c-g':d.realised<0?'c-r':'c-mu');
+    $('mt_stats').textContent=d.count+' trades · '+d.win_rate+'% win · vs bot: see Stats';
+    // Only show a position if it is for the coin currently on screen —
+    // otherwise the Close button would act on a pair you cannot see.
+    const p=(d.positions||[]).find(x=>x.pair===pair);
+    if(p){
+      $('mt_open').style.display='';
+      $('mt_form').style.display='none';
+      $('mt_side').textContent=p.side==='BUY'?'LONG':'SHORT';
+      $('mt_side').className='mt-side '+(p.side==='BUY'?'c-g':'c-r');
+      $('mt_entry').textContent='@ '+_fmtPrice(p.entry)+'  ·  $'+p.size.toFixed(0);
+      const u=$('mt_upnl');
+      u.textContent=(p.pnl>=0?'+':'')+p.pnl.toFixed(2)+'  ('+(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(2)+'%)';
+      u.className='mt-upnl '+(p.pnl>0?'c-g':p.pnl<0?'c-r':'c-mu');
+    }else{
+      $('mt_open').style.display='none';
+      $('mt_form').style.display='';
+    }
+  }catch(e){}
+}
+async function mtOpen(side){
+  const pair=_cdPair||_botPair;
+  if(!pair){_mtMsg('pick a coin first','err');return;}
+  const size=parseFloat($('mt_size').value||'0');
+  if(!(size>0)){_mtMsg('enter a size','err');return;}
+  try{
+    const r=await fetch('/manual/open',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pair:pair,side:side,size:size})});
+    const d=await r.json();
+    if(d.error){_mtMsg(d.error,'err');return;}
+    _mtMsg((side==='BUY'?'LONG':'SHORT')+' opened @ '+_fmtPrice(d.entry),'ok');
+    fetchManual();
+  }catch(e){_mtMsg('failed: '+e,'err');}
+}
+async function mtClose(){
+  const pair=_cdPair||_botPair;
+  try{
+    const r=await fetch('/manual/close',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pair:pair})});
+    const d=await r.json();
+    if(d.error){_mtMsg(d.error,'err');return;}
+    _mtMsg('closed  '+(d.pnl>=0?'+':'')+d.pnl.toFixed(2),d.pnl>=0?'ok':'err');
+    fetchManual();
+  }catch(e){_mtMsg('failed: '+e,'err');}
+}
+
 /* ── VALUE-CHANGE FLASH ──────────────────────────────────────────────────
    Watches the key numeric readouts and flashes green/red when they change.
    A MutationObserver is used deliberately instead of wrapping every
@@ -10007,7 +10153,7 @@ function goTab(t){
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   pg.classList.add('active');
   tb.classList.add('active');
-  if(t==='chart'){drawCandles();}
+  if(t==='chart'){drawCandles();fetchManual();}
   if(t==='home'){drawEquity();}
   if(t==='market'){fetchMarket();fetchForecast();loadQuiz();}
   if(t==='stats'){drawDownChart();fetchCalibration();}
@@ -10981,6 +11127,7 @@ function renderLivePrices(){
 function selectCoin(pair,sym){
   _cdPair=pair;
   _cdOpenPos=(_openPairs.has(pair)?[]:[]); // will update on next status
+  fetchManual();          // the panel is per-coin, so refresh on switch
   _cdTrades=[];
   const name=sym?sym+'/USD':pair;
   $('ci_name').textContent=name;
@@ -13574,6 +13721,7 @@ _initSoundBtn();
 _initKeyboard();
 initStripDrag();
 markSkeletons();      // shimmer the value readouts until the first poll lands
+fetchManual();setInterval(fetchManual,6000);   // manual paper book
 initValueFlash();     // must run BEFORE the first fetch so it captures baselines
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
 fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();loadIQ();
@@ -15189,6 +15337,173 @@ def _web_close_all():
             f"🛑 *Close All — {closed} position{'s' if closed != 1 else ''} closed via dashboard*\n"
             f"{coins}",), daemon=True).start()
     return _Response(json.dumps({"ok": True, "closed": closed}), mimetype="application/json")
+
+# ── Manual paper trading ──────────────────────────────────────────────────
+# A completely separate book so Noluv can trade the same signals by hand and
+# compare against the bot. Deliberately NOT a PaperTrader: that class carries
+# Kelly sizing, rank progression, confidence gates and strategy classification,
+# none of which apply to a human clicking Buy — and sharing it would let manual
+# trades corrupt the bot's own statistics, which are the thing being measured.
+#
+# Costs mirror the bot exactly (fees + slippage both ways) so the comparison is
+# honest: a manual book with free entries would always look better.
+MANUAL_FILE = os.path.join(_DATA_DIR, "manual_book.json")
+MANUAL_START = 1000.0
+_manual_lock = threading.Lock()
+
+
+def _manual_load():
+    try:
+        with open(MANUAL_FILE) as f:
+            d = json.load(f)
+        d.setdefault("balance", MANUAL_START)
+        d.setdefault("positions", {})
+        d.setdefault("trades", [])
+        return d
+    except (OSError, ValueError):
+        return {"balance": MANUAL_START, "positions": {}, "trades": []}
+
+
+def _manual_save(book):
+    try:
+        tmp = MANUAL_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(book, f)
+        os.replace(tmp, MANUAL_FILE)          # atomic; never a half-written book
+    except OSError as e:
+        log("MANUAL", f"could not save book: {e}", "ERR")
+
+
+def _manual_unrealised(book, prices=None):
+    """Mark open positions to market. prices lets the caller avoid refetching."""
+    out = 0.0
+    for pair, p in book.get("positions", {}).items():
+        px = (prices or {}).get(pair) or get_price(pair)
+        if not px:
+            continue
+        move = (px - p["entry"]) / p["entry"]
+        if p["side"] == "SELL":
+            move = -move
+        out += move * p["size"]
+    return out
+
+
+@_flask_app.route("/manual/status")
+def _manual_status():
+    if not _request_is_authorized():
+        return _Response('{"error":"unauthorized"}', status=403, mimetype="application/json")
+    with _manual_lock:
+        book = _manual_load()
+    pos = []
+    for pair, p in book["positions"].items():
+        px = get_price(pair) or p["entry"]
+        move = (px - p["entry"]) / p["entry"]
+        if p["side"] == "SELL":
+            move = -move
+        pos.append({**p, "pair": pair, "price": px,
+                    "pnl": round(move * p["size"], 4),
+                    "pnl_pct": round(move * 100, 3)})
+    closed = book["trades"][-40:]
+    wins = sum(1 for t in book["trades"] if t["pnl"] > 0)
+    n = len(book["trades"])
+    return _Response(json.dumps({
+        "balance": round(book["balance"], 2),
+        "start": MANUAL_START,
+        "positions": pos,
+        "trades": list(reversed(closed)),
+        "count": n,
+        "win_rate": round(wins / n * 100, 1) if n else 0.0,
+        "realised": round(book["balance"] - MANUAL_START, 2),
+    }), mimetype="application/json", headers={"Cache-Control": "no-store"})
+
+
+@_flask_app.route("/manual/open", methods=["POST"])
+def _manual_open():
+    if not _request_is_authorized():
+        return _Response('{"error":"unauthorized"}', status=403, mimetype="application/json")
+    d = _flask_request.get_json(force=True, silent=True) or {}
+    pair = (d.get("pair") or "").strip()
+    side = (d.get("side") or "").upper()
+    try:
+        size = float(d.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0.0
+    if side not in ("BUY", "SELL"):
+        return _Response('{"error":"side must be BUY or SELL"}', status=400, mimetype="application/json")
+    if not pair:
+        return _Response('{"error":"no pair"}', status=400, mimetype="application/json")
+    with _manual_lock:
+        book = _manual_load()
+        if pair in book["positions"]:
+            return _Response('{"error":"already have a position in that pair"}',
+                             status=409, mimetype="application/json")
+        if size <= 0 or size > book["balance"]:
+            return _Response(json.dumps({"error": f"size must be between 0 and {book['balance']:.2f}"}),
+                             status=400, mimetype="application/json")
+        price = get_price(pair)
+        if not price:
+            return _Response('{"error":"no price for that pair"}', status=503, mimetype="application/json")
+        # Slippage on entry, same as the bot's paper fills.
+        fill = price * (1 + SLIPPAGE) if side == "BUY" else price * (1 - SLIPPAGE)
+        fee = size * KRAKEN_FEE
+        book["balance"] = round(book["balance"] - fee, 4)
+        book["positions"][pair] = {
+            "side": side, "entry": fill, "size": size,
+            "opened_at": time.time(), "fee_paid": fee,
+            "name": pair.replace("USD", "/USD"),
+        }
+        _manual_save(book)
+    log("MANUAL", f"opened {side} {pair} ${size:.2f} @ {fill:.6f}")
+    return _Response(json.dumps({"ok": True, "entry": fill, "fee": round(fee, 4)}),
+                     mimetype="application/json")
+
+
+@_flask_app.route("/manual/close", methods=["POST"])
+def _manual_close():
+    if not _request_is_authorized():
+        return _Response('{"error":"unauthorized"}', status=403, mimetype="application/json")
+    d = _flask_request.get_json(force=True, silent=True) or {}
+    pair = (d.get("pair") or "").strip()
+    with _manual_lock:
+        book = _manual_load()
+        p = book["positions"].get(pair)
+        if not p:
+            return _Response('{"error":"no position"}', status=404, mimetype="application/json")
+        price = get_price(pair)
+        if not price:
+            return _Response('{"error":"no price"}', status=503, mimetype="application/json")
+        exit_fill = price * (1 - SLIPPAGE) if p["side"] == "BUY" else price * (1 + SLIPPAGE)
+        move = (exit_fill - p["entry"]) / p["entry"]
+        if p["side"] == "SELL":
+            move = -move
+        gross = move * p["size"]
+        exit_fee = p["size"] * KRAKEN_FEE
+        pnl = round(gross - exit_fee, 4)          # entry fee was deducted on open
+        # `size` is notional exposure, not capital locked up, so only the P&L
+        # moves the balance. Opening does not debit the size, which is why the
+        # open handler caps size at the current balance (effectively 1x).
+        book["balance"] = round(book["balance"] + pnl, 4)
+        book["trades"].append({
+            "pair": pair, "side": p["side"], "entry": p["entry"], "exit": exit_fill,
+            "size": p["size"], "pnl": pnl, "pct": round(move * 100, 3),
+            "held_mins": round((time.time() - p["opened_at"]) / 60, 1),
+            "ts": time.time(),
+        })
+        del book["positions"][pair]
+        _manual_save(book)
+    log("MANUAL", f"closed {pair} pnl {pnl:+.4f}")
+    return _Response(json.dumps({"ok": True, "pnl": pnl}), mimetype="application/json")
+
+
+@_flask_app.route("/manual/reset", methods=["POST"])
+def _manual_reset():
+    if not _request_is_authorized():
+        return _Response('{"error":"unauthorized"}', status=403, mimetype="application/json")
+    with _manual_lock:
+        _manual_save({"balance": MANUAL_START, "positions": {}, "trades": []})
+    log("MANUAL", "book reset")
+    return _Response('{"ok":true}', mimetype="application/json")
+
 
 @_flask_app.route("/close/<pair>", methods=["POST"])
 def _web_close_position(pair):
