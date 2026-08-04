@@ -8760,16 +8760,20 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
    static. Applied by a MutationObserver (see JS) rather than by editing every
    assignment site, so it catches updates from any code path and cannot drift
    out of sync when new fields are added.                                  */
+/* Tint the digits rather than painting a background box. These elements are
+   block-level inside flex rows, so a background filled the whole element box —
+   a coloured rectangle far wider than the number, which looked wrong in the
+   header. Colouring the text has no layout footprint at all. */
 @keyframes flashUp{
-  0%{background:rgba(0,230,118,.28);box-shadow:0 0 12px rgba(0,230,118,.35)}
-  100%{background:transparent;box-shadow:none}
+  0%,35%{color:#00e676;text-shadow:0 0 9px rgba(0,230,118,.55)}
+  100%{text-shadow:none}
 }
 @keyframes flashDown{
-  0%{background:rgba(255,51,102,.28);box-shadow:0 0 12px rgba(255,51,102,.3)}
-  100%{background:transparent;box-shadow:none}
+  0%,35%{color:#ff3366;text-shadow:0 0 9px rgba(255,51,102,.5)}
+  100%{text-shadow:none}
 }
-.flash-up{animation:flashUp .85s ease-out;border-radius:5px}
-.flash-down{animation:flashDown .85s ease-out;border-radius:5px}
+.flash-up{animation:flashUp .9s ease-out}
+.flash-down{animation:flashDown .9s ease-out}
 
 /* ══ SKELETON LOADING ══════════════════════════════════════════════════════
    Values used to sit as "—" until data landed, which reads as broken rather
@@ -10285,6 +10289,10 @@ function initValueFlash(){
 function markSkeletons(){
   _FLASH_IDS.forEach(id=>{const el=$(id);
     if(el&&(!el.textContent.trim()||el.textContent.trim()==='—'))el.classList.add('skel');});
+  // Safety net: if /status never succeeds (offline, API down) the shimmer would
+  // sit there forever and read as broken rather than loading. Give up after 8s
+  // and show whatever placeholder is underneath.
+  setTimeout(clearSkeletons,8000);
 }
 function clearSkeletons(){
   document.querySelectorAll('.skel').forEach(el=>el.classList.remove('skel'));
