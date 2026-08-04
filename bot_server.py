@@ -74,7 +74,7 @@ _TAG_COLOUR = {
 }
 
 # Telegram bot token shape. NO leading \b: the token appears in URLs as
-# ".../bot8382017140:AA..." and there is no word boundary between "bot" and the
+# ".../bot1234567890:AA..." and there is no word boundary between "bot" and the
 # digits, so \b made this silently never match.
 _SECRET_RE = re.compile(r"\d{8,12}:AA[\w-]{20,}")
 
@@ -84,8 +84,8 @@ def _redact(msg: str) -> str:
 
     requests puts the full request URL into its exception messages, so a
     Telegram network error logged as str(e) printed the entire bot token in
-    plaintext — observed in the wild on 2026-08-03:
-        ERR POLL ... url: /bot8382017140:AAH-Zs0dBTAk47vwn...
+    plaintext — observed in the wild on 2026-08-03, in the shape:
+        ERR POLL ... url: /bot1234567890:AAExampleTokenValue.../getUpdates
     Redacting inside log() rather than at each call site means every current
     and future logging path is covered, including ones added later.
     """
