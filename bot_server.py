@@ -7096,6 +7096,14 @@ def trading_loop(trader):
             except Exception:
                 pass
 
+            # ── Liquidate manual leveraged positions ───────────────────────
+            # Must run here rather than in the dashboard poll: a 10x position
+            # has to be liquidated whether or not a browser happens to be open.
+            try:
+                _manual_check_liquidations()
+            except Exception as e:
+                log("MANUAL", f"liquidation check: {e}", "ERR")
+
             # ── Resolve resting passive entries every tick ─────────────────
             # MUST iterate _pending_entries itself, NOT the ranked list. The
             # first version checked pending orders inside the `ranked_list[:8]`
@@ -8777,6 +8785,18 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 .mt-bal{font-family:var(--fn);font-size:.95rem;font-weight:700;color:var(--tx);
   font-variant-numeric:tabular-nums;margin-left:auto}
 .mt-pl{font-family:var(--fn);font-size:.7rem;font-variant-numeric:tabular-nums}
+.mt-lev-row{display:flex;align-items:center;gap:5px;margin-bottom:7px}
+.mt-lev{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--bd2);
+  color:var(--mu);border-radius:7px;font-family:var(--fn);font-size:.56rem;
+  font-weight:700;padding:7px 0;cursor:pointer;min-height:34px}
+.mt-lev.active{background:rgba(41,121,255,.18);border-color:var(--b);color:var(--tx)}
+.mt-lev[data-lev="10"].active,.mt-lev[data-lev="20"].active{
+  background:rgba(255,51,102,.18);border-color:var(--r)}
+.mt-liqwarn{font-family:var(--fn);font-size:.52rem;color:var(--y);
+  margin-bottom:7px;min-height:.7rem;letter-spacing:.02em}
+.mt-liqrow{font-family:var(--fn);font-size:.54rem;color:var(--mu);margin-top:5px;
+  font-variant-numeric:tabular-nums}
+.mt-liqrow.near{color:var(--r);font-weight:700}
 .mt-size-row{display:flex;align-items:center;gap:6px;margin-bottom:8px}
 .mt-lbl{font-family:var(--fn);font-size:.5rem;letter-spacing:.1em;color:var(--mu)}
 .mt-size{flex:1;min-width:0;background:rgba(0,0,0,.3);border:1px solid var(--bd2);
@@ -9388,10 +9408,20 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
           <span class="mt-entry" id="mt_entry">—</span>
           <span class="mt-upnl" id="mt_upnl">—</span>
         </div>
+        <div class="mt-liqrow" id="mt_liqrow"></div>
         <button class="mt-btn mt-close" onclick="mtClose()">CLOSE POSITION</button>
       </div>
 
       <div class="mt-entryform" id="mt_form">
+        <div class="mt-lev-row">
+          <span class="mt-lbl">LEVERAGE</span>
+          <button class="mt-lev active" data-lev="1"  onclick="mtSetLev(1)">1x</button>
+          <button class="mt-lev" data-lev="2"  onclick="mtSetLev(2)">2x</button>
+          <button class="mt-lev" data-lev="5"  onclick="mtSetLev(5)">5x</button>
+          <button class="mt-lev" data-lev="10" onclick="mtSetLev(10)">10x</button>
+          <button class="mt-lev" data-lev="20" onclick="mtSetLev(20)">20x</button>
+        </div>
+        <div class="mt-liqwarn" id="mt_liqwarn"></div>
         <div class="mt-size-row">
           <span class="mt-lbl">SIZE $</span>
           <input class="mt-size" id="mt_size" type="number" inputmode="decimal"
@@ -9995,6 +10025,21 @@ const pc=n=>n>0?'c-g':n<0?'c-r':'c-mu';
    Your own book, entirely separate from the bot's. Same fees and slippage are
    applied server-side so the comparison against the bot is honest. */
 let _mtBook={balance:0,positions:[],count:0,win_rate:0,realised:0};
+let _mtLev=1;
+
+function mtSetLev(l){
+  _mtLev=l;
+  document.querySelectorAll('.mt-lev').forEach(b=>
+    b.classList.toggle('active', parseInt(b.dataset.lev,10)===l));
+  const w=$('mt_liqwarn');
+  if(!w)return;
+  if(l<=1){ w.textContent=''; return; }
+  // The move that wipes out the margin. Showing it up front is the whole point:
+  // 20x sounds like 20x the profit until you see it dies on a 4.5% move.
+  const pct=((1/l)-0.005)*100;
+  w.textContent='liquidated by a '+pct.toFixed(1)+'% move against you  ·  fees x'+l;
+  w.style.color = l>=10 ? 'var(--r)' : 'var(--y)';
+}
 
 function _mtMsg(text,cls){
   const el=$('mt_msg'); if(!el)return;
@@ -10015,7 +10060,8 @@ async function fetchManual(){
     const pl=$('mt_pl');
     pl.textContent=(d.realised>=0?'+':'')+d.realised.toFixed(2);
     pl.className='mt-pl '+(d.realised>0?'c-g':d.realised<0?'c-r':'c-mu');
-    $('mt_stats').textContent=d.count+' trades · '+d.win_rate+'% win · vs bot: see Stats';
+    $('mt_stats').textContent=d.count+' trades · '+d.win_rate+'% win'
+      +(d.liquidated?'  ·  '+d.liquidated+' liquidated':'');
     // Only show a position if it is for the coin currently on screen —
     // otherwise the Close button would act on a pair you cannot see.
     const p=(d.positions||[]).find(x=>x.pair===pair);
@@ -10024,10 +10070,21 @@ async function fetchManual(){
       $('mt_form').style.display='none';
       $('mt_side').textContent=p.side==='BUY'?'LONG':'SHORT';
       $('mt_side').className='mt-side '+(p.side==='BUY'?'c-g':'c-r');
-      $('mt_entry').textContent='@ '+_fmtPrice(p.entry)+'  ·  $'+p.size.toFixed(0);
+      const lev=p.leverage||1;
+      $('mt_entry').textContent='@ '+_fmtPrice(p.entry)+'  ·  $'+p.size.toFixed(0)
+        +(lev>1?'  ·  '+lev+'x':'');
       const u=$('mt_upnl');
       u.textContent=(p.pnl>=0?'+':'')+p.pnl.toFixed(2)+'  ('+(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(2)+'%)';
       u.className='mt-upnl '+(p.pnl>0?'c-g':p.pnl<0?'c-r':'c-mu');
+      const lr=$('mt_liqrow');
+      if(p.liq_price){
+        // Flag when liquidation is close enough to matter.
+        const near=(p.liq_dist_pct!==null&&p.liq_dist_pct<2);
+        lr.textContent='liq '+_fmtPrice(p.liq_price)
+          +(p.liq_dist_pct!==null?'  ('+p.liq_dist_pct.toFixed(2)+'% away)':'')
+          +'  ·  price '+(p.price_move_pct>=0?'+':'')+p.price_move_pct.toFixed(2)+'%';
+        lr.className='mt-liqrow'+(near?' near':'');
+      }else{ lr.textContent='spot — cannot be liquidated'; lr.className='mt-liqrow'; }
     }else{
       $('mt_open').style.display='none';
       $('mt_form').style.display='';
@@ -10042,10 +10099,12 @@ async function mtOpen(side){
   try{
     const r=await fetch('/manual/open',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({pair:pair,side:side,size:size,device_id:_getDeviceId()})});
+      body:JSON.stringify({pair:pair,side:side,size:size,leverage:_mtLev,device_id:_getDeviceId()})});
     const d=await r.json();
     if(d.error){_mtMsg(d.error,'err');return;}
-    _mtMsg((side==='BUY'?'LONG':'SHORT')+' opened @ '+_fmtPrice(d.entry),'ok');
+    _mtMsg((side==='BUY'?'LONG':'SHORT')+(d.leverage>1?' '+d.leverage+'x':'')
+      +' opened @ '+_fmtPrice(d.entry)
+      +(d.liq_price?'  liq '+_fmtPrice(d.liq_price):''),'ok');
     fetchManual();
   }catch(e){_mtMsg('failed: '+e,'err');}
 }
@@ -15351,6 +15410,66 @@ MANUAL_FILE = os.path.join(_DATA_DIR, "manual_book.json")
 MANUAL_START = 1000.0
 _manual_lock = threading.Lock()
 
+# Leverage tiers match the bot's own (Cautious/Moderate/Confident/Max Bet) so the
+# two books stay comparable.
+MANUAL_LEVERAGE = {1: "Spot", 2: "Cautious", 5: "Moderate", 10: "Confident", 20: "Max Bet"}
+# Maintenance margin: the equity fraction below which the position is closed out.
+# Without this, leverage is a free P&L multiplier and the book teaches exactly the
+# wrong lesson — on a real exchange a 10x long is liquidated by a ~9.5% move.
+MANUAL_MAINT_MARGIN = 0.005
+
+
+def _manual_liq_price(side, entry, leverage):
+    """Price at which the margin is exhausted. None for spot (cannot be liquidated)."""
+    if leverage <= 1:
+        return None
+    frac = (1.0 / leverage) - MANUAL_MAINT_MARGIN
+    frac = max(frac, 0.001)
+    return entry * (1 - frac) if side == "BUY" else entry * (1 + frac)
+
+
+def _manual_check_liquidations(prices=None):
+    """Close out any manual position whose liquidation price has been hit.
+
+    Runs from the bot's scan loop, NOT from the dashboard poll: a leveraged
+    position has to be liquidated whether or not a browser happens to be open.
+    """
+    with _manual_lock:
+        book = _manual_load()
+        hits = []
+        for pair, p in list(book.get("positions", {}).items()):
+            liq = p.get("liq_price")
+            if not liq:
+                continue
+            px = (prices or {}).get(pair) or get_price(pair)
+            if not px:
+                continue
+            gone = (px <= liq) if p["side"] == "BUY" else (px >= liq)
+            if gone:
+                hits.append((pair, p, liq))
+        for pair, p, liq in hits:
+            # Liquidation means the whole margin is lost — nothing is returned.
+            loss = -p["size"]
+            book["balance"] = round(book["balance"] + loss, 4)
+            book["trades"].append({
+                "pair": pair, "side": p["side"], "entry": p["entry"], "exit": liq,
+                "size": p["size"], "leverage": p.get("leverage", 1),
+                "pnl": round(loss, 4), "pct": -100.0, "liquidated": True,
+                "held_mins": round((time.time() - p["opened_at"]) / 60, 1),
+                "ts": time.time(),
+            })
+            del book["positions"][pair]
+            log("MANUAL", f"LIQUIDATED {pair} {p['side']} {p.get('leverage',1)}x "
+                          f"@ {liq:.6f} — margin ${p['size']:.2f} lost", "WARN")
+            try:
+                tg(f"*LIQUIDATED* — your manual {p.get('leverage',1)}x "
+                   f"{p['side']} on {pair}\nMargin lost: `${p['size']:.2f}`")
+            except Exception:
+                pass
+        if hits:
+            _manual_save(book)
+        return len(hits)
+
 
 def _manual_load():
     try:
@@ -15400,9 +15519,17 @@ def _manual_status():
         move = (px - p["entry"]) / p["entry"]
         if p["side"] == "SELL":
             move = -move
+        lev = p.get("leverage", 1)
+        notional = p.get("notional", p["size"] * lev)
+        liq = p.get("liq_price")
+        # Distance to liquidation as a % of current price — the number that
+        # actually matters when holding leverage.
+        liq_dist = round(abs(px - liq) / px * 100, 2) if liq else None
         pos.append({**p, "pair": pair, "price": px,
-                    "pnl": round(move * p["size"], 4),
-                    "pnl_pct": round(move * 100, 3)})
+                    "pnl": round(move * notional, 4),
+                    "pnl_pct": round(move * 100 * lev, 3),   # return on margin
+                    "price_move_pct": round(move * 100, 3),
+                    "liq_dist_pct": liq_dist})
     closed = book["trades"][-40:]
     wins = sum(1 for t in book["trades"] if t["pnl"] > 0)
     n = len(book["trades"])
@@ -15414,6 +15541,8 @@ def _manual_status():
         "count": n,
         "win_rate": round(wins / n * 100, 1) if n else 0.0,
         "realised": round(book["balance"] - MANUAL_START, 2),
+        "leverage_tiers": {str(k): v for k, v in sorted(MANUAL_LEVERAGE.items())},
+        "liquidated": sum(1 for t in book["trades"] if t.get("liquidated")),
     }), mimetype="application/json", headers={"Cache-Control": "no-store"})
 
 
@@ -15428,10 +15557,17 @@ def _manual_open():
         size = float(d.get("size") or 0)
     except (TypeError, ValueError):
         size = 0.0
+    try:
+        lev = int(d.get("leverage") or 1)
+    except (TypeError, ValueError):
+        lev = 1
     if side not in ("BUY", "SELL"):
         return _Response('{"error":"side must be BUY or SELL"}', status=400, mimetype="application/json")
     if not pair:
         return _Response('{"error":"no pair"}', status=400, mimetype="application/json")
+    if lev not in MANUAL_LEVERAGE:
+        return _Response(json.dumps({"error": f"leverage must be one of {sorted(MANUAL_LEVERAGE)}"}),
+                         status=400, mimetype="application/json")
     with _manual_lock:
         book = _manual_load()
         if pair in book["positions"]:
@@ -15445,16 +15581,26 @@ def _manual_open():
             return _Response('{"error":"no price for that pair"}', status=503, mimetype="application/json")
         # Slippage on entry, same as the bot's paper fills.
         fill = price * (1 + SLIPPAGE) if side == "BUY" else price * (1 - SLIPPAGE)
-        fee = size * KRAKEN_FEE
+        # Fees are charged on NOTIONAL, as exchanges do — so 10x costs 10x the
+        # fee. Leverage amplifies the cost of being wrong, not just the upside.
+        notional = size * lev
+        fee = notional * KRAKEN_FEE
         book["balance"] = round(book["balance"] - fee, 4)
+        liq = _manual_liq_price(side, fill, lev)
         book["positions"][pair] = {
             "side": side, "entry": fill, "size": size,
+            "leverage": lev, "tier": MANUAL_LEVERAGE.get(lev, f"{lev}x"),
+            "notional": notional, "liq_price": liq,
             "opened_at": time.time(), "fee_paid": fee,
             "name": pair.replace("USD", "/USD"),
         }
         _manual_save(book)
-    log("MANUAL", f"opened {side} {pair} ${size:.2f} @ {fill:.6f}")
-    return _Response(json.dumps({"ok": True, "entry": fill, "fee": round(fee, 4)}),
+    log("MANUAL", f"opened {side} {pair} ${size:.2f} @ {lev}x "
+                  f"(notional ${notional:.2f}) @ {fill:.6f}"
+                  + (f" liq {liq:.6f}" if liq else ""))
+    return _Response(json.dumps({"ok": True, "entry": fill, "fee": round(fee, 4),
+                                 "leverage": lev, "notional": round(notional, 2),
+                                 "liq_price": liq}),
                      mimetype="application/json")
 
 
@@ -15476,16 +15622,24 @@ def _manual_close():
         move = (exit_fill - p["entry"]) / p["entry"]
         if p["side"] == "SELL":
             move = -move
-        gross = move * p["size"]
-        exit_fee = p["size"] * KRAKEN_FEE
+        lev = p.get("leverage", 1)
+        notional = p.get("notional", p["size"] * lev)
+        gross = move * notional                   # leverage multiplies the move
+        exit_fee = notional * KRAKEN_FEE
         pnl = round(gross - exit_fee, 4)          # entry fee was deducted on open
+        # A leveraged loss can never exceed the margin posted — that is what
+        # liquidation enforces. Clamp defensively in case a gap slipped past
+        # the liquidation check between polls.
+        if pnl < -p["size"]:
+            pnl = round(-p["size"], 4)
         # `size` is notional exposure, not capital locked up, so only the P&L
         # moves the balance. Opening does not debit the size, which is why the
         # open handler caps size at the current balance (effectively 1x).
         book["balance"] = round(book["balance"] + pnl, 4)
         book["trades"].append({
             "pair": pair, "side": p["side"], "entry": p["entry"], "exit": exit_fill,
-            "size": p["size"], "pnl": pnl, "pct": round(move * 100, 3),
+            "size": p["size"], "leverage": lev, "notional": round(notional, 2),
+            "pnl": pnl, "pct": round(move * 100 * lev, 3),
             "held_mins": round((time.time() - p["opened_at"]) / 60, 1),
             "ts": time.time(),
         })
