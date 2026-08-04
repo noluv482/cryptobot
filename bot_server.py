@@ -7966,8 +7966,22 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .iv-btn.active{background:var(--b);color:#000;border-color:var(--b)}
 
 /* ── COIN STRIP ── */
+.strip-wrap{position:relative}
+.strip-arrow{position:absolute;top:0;bottom:4px;width:34px;z-index:4;
+  border:none;cursor:pointer;color:var(--tx);font-size:1.4rem;line-height:1;
+  padding:0;display:flex;align-items:center;justify-content:center;
+  transition:opacity .15s}
+.strip-arrow.left{left:0;
+  background:linear-gradient(90deg,var(--bg) 45%,transparent 100%)}
+.strip-arrow.right{right:0;
+  background:linear-gradient(270deg,var(--bg) 45%,transparent 100%)}
+.strip-arrow:active{color:var(--b)}
+/* Hidden rather than greyed at the ends: a dead button you can still press is
+   more annoying than one that gets out of the way. */
+.strip-arrow.hide{opacity:0;pointer-events:none}
 .coin-strip{display:flex;gap:8px;padding:10px 12px 4px;overflow-x:auto;
-            scrollbar-width:none;-webkit-overflow-scrolling:touch}
+            scrollbar-width:none;-webkit-overflow-scrolling:touch;
+            scroll-behavior:smooth}
 .coin-strip::-webkit-scrollbar{display:none}
 .coin-chip{display:flex;flex-direction:column;align-items:center;gap:3px;
            cursor:pointer;min-width:62px;padding:5px 4px 6px;border-radius:12px;
@@ -9354,7 +9368,11 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   <!-- CHART -->
   <div class="page" id="pg-chart">
     <div class="ptr" id="ptr-chart">&#8635; Refreshing…</div>
-    <div class="coin-strip" id="coin_strip"></div>
+    <div class="strip-wrap">
+      <button class="strip-arrow left"  id="strip_l" onclick="stripScroll(-1)" aria-label="Scroll coins left">&#8249;</button>
+      <div class="coin-strip" id="coin_strip"></div>
+      <button class="strip-arrow right" id="strip_r" onclick="stripScroll(1)"  aria-label="Scroll coins right">&#8250;</button>
+    </div>
     <div class="chart-info-row">
       <div>
         <div class="ci-name" id="ci_name">—</div>
@@ -11129,6 +11147,33 @@ function _updateStripChip(pair,cp){
     pc2.className='coin-chip-pct '+(pct>0?'c-g':pct<0?'c-r':'c-mu');
   }
 }
+/* ── COIN-STRIP ARROWS ────────────────────────────────────────────────────
+   Scrolls by roughly a screenful of chips, minus one so the coin at the edge
+   stays visible as an anchor rather than jumping past it. */
+function stripScroll(dir){
+  const el=$('coin_strip'); if(!el)return;
+  const chip=el.querySelector('.coin-chip');
+  const step=chip?(chip.getBoundingClientRect().width+8):70;
+  const perScreen=Math.max(1,Math.floor(el.clientWidth/step)-1);
+  el.scrollBy({left:dir*step*perScreen,behavior:'smooth'});
+  setTimeout(_stripArrows,320);
+}
+function _stripArrows(){
+  const el=$('coin_strip'),L=$('strip_l'),R=$('strip_r');
+  if(!el||!L||!R)return;
+  const max=el.scrollWidth-el.clientWidth;
+  // No overflow at all (wide desktop) -> hide both, they would do nothing.
+  if(max<=4){L.classList.add('hide');R.classList.add('hide');return;}
+  L.classList.toggle('hide',el.scrollLeft<=2);
+  R.classList.toggle('hide',el.scrollLeft>=max-2);
+}
+function initStripArrows(){
+  const el=$('coin_strip'); if(!el)return;
+  el.addEventListener('scroll',_stripArrows,{passive:true});
+  window.addEventListener('resize',_stripArrows);
+  _stripArrows();
+}
+
 function renderCoinStrip(){
   const el=$('coin_strip');if(!el)return;
   const viewing=_cdPair||_botPair;
@@ -11151,6 +11196,7 @@ function renderCoinStrip(){
       _sparkSvg(c.pair,pct>=0)+
       '</div>';
   }).join('');
+  _stripArrows();            // chips changed, so the ends may have moved
   const viewing_chip=el.querySelector('.coin-chip.viewing');
   if(viewing_chip&&el.scrollWidth>el.clientWidth){
     const stripRect=el.getBoundingClientRect();
@@ -11170,7 +11216,7 @@ function initStripDrag(){
     strip.querySelectorAll('.coin-chip').forEach(c=>c.classList.remove('dragging','drop-before'));
     isDragging=false;dropIdx=-1;pressChip=null;
     // Small delay before clearing so the swipe handler sees the flag on touchend
-    setTimeout(()=>{_stripDragActive=false;},80);
+    setTimeout(()=>{_stripDragActive=false;_stripArrows();},80);
   };
   strip.addEventListener('pointerdown',e=>{
     const chip=e.target.closest('.coin-chip');if(!chip)return;
@@ -11178,6 +11224,8 @@ function initStripDrag(){
     pressTimer=setTimeout(()=>{
       isDragging=true;
       _stripDragActive=true; // block swipe-to-change-tab while dragging
+      // Arrows overlay the strip edges; hide them so a chip can be dropped there.
+      document.querySelectorAll('.strip-arrow').forEach(a=>a.classList.add('hide'));
       chip.classList.add('dragging');
       ghost=chip.cloneNode(true);
       const r=chip.getBoundingClientRect();
@@ -13955,6 +14003,7 @@ applyTheme(_theme);
 _initSoundBtn();
 _initKeyboard();
 initStripDrag();
+initStripArrows();
 markSkeletons();      // shimmer the value readouts until the first poll lands
 fetchManual();setInterval(fetchManual,6000);   // manual paper book
 initValueFlash();     // must run BEFORE the first fetch so it captures baselines
