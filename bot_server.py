@@ -4217,7 +4217,14 @@ class PaperTrader:
         # Bot writes its own journal note. After the append so the note can quote
         # history, and wrapped inside _auto_note_record so a note can never take
         # down a close.
-        _auto_note_record(self, p, trade_rec)
+        #
+        # _no_persist gate: the sim trader and any backtest run through this same
+        # close(), but the dashboard's trade rows come from the real trader alone.
+        # Without this their notes would land in the journal as cards with no
+        # trade behind them, and would poison the "this pattern went 3W-32L"
+        # counts with trades that were never taken.
+        if not self._no_persist:
+            _auto_note_record(self, p, trade_rec)
         if not self._force_paper:
             db.log_feature(fkey, pair, pnl > 0)
             db.log_pillars(p.get("pillars", {}), pnl > 0)
