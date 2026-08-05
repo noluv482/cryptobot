@@ -4214,6 +4214,10 @@ class PaperTrader:
                      "fkey": p.get("fkey", ""), "hour": datetime.utcnow().hour,
                      "pillars": p.get("pillars", {})}
         self.trades.append(trade_rec)
+        # Bot writes its own journal note. After the append so the note can quote
+        # history, and wrapped inside _auto_note_record so a note can never take
+        # down a close.
+        _auto_note_record(self, p, trade_rec)
         if not self._force_paper:
             db.log_feature(fkey, pair, pnl > 0)
             db.log_pillars(p.get("pillars", {}), pnl > 0)
@@ -5638,6 +5642,276 @@ def _post_loss_analysis(position, pnl, reason, held_mins):
     tg(f"📚 *Loss note — {name}*\n"
        f"`{side}` | PnL `{pnl:+.2f}$` | Held `{held_mins:.0f}` min\n"
        + "\n".join(lines))
+
+# ── Bot-written trade notes ───────────────────────────────────────────────────
+# The Journal's note cards stayed empty until Noluv wrote something by hand,
+# which meant the one moment worth recording — right as a trade closes, while
+# the setup that produced it is still known — passed with nothing kept. The bot
+# already holds every fact such a note needs (what fired the entry, which
+# pillars were on, how it exited, how the same pattern has done before), so it
+# now writes one for every close.
+#
+# These are deliberately NOT model-generated. A note has to be free, instant,
+# work offline and say the same thing every time; every sentence below is either
+# a field from the trade record or a count over trade history. Nothing here is
+# inferred, and nothing is encouraging for its own sake — a note that flatters a
+# bad trade is worse than no note.
+#
+# Auto notes live server-side (localStorage is per-browser and the bot cannot
+# reach it) but are keyed EXACTLY like the dashboard's own note keys, so one
+# card can carry both and the bot can never overwrite what Noluv wrote.
+AUTO_NOTES_FILE = os.path.join(_DATA_DIR, "auto_notes.json")
+AUTO_NOTES_KEEP = 300
+_auto_notes_lock = threading.Lock()
+
+# Pillar → phrase for the note body. Kept neutral about direction: "VWAP aligned"
+# is true for a long above VWAP and a short below it, "above VWAP" is not.
+_PILLAR_WORDS = {
+    "rsi_zone":       "RSI in range",
+    "news_align":     "news aligned",
+    "nasdaq_align":   "NASDAQ aligned",
+    "tick_strength":  "tick strength",
+    "macd_align":     "MACD aligned",
+    "high_volume":    "high volume",
+    "candle_pattern": "candle pattern",
+    "vwap_align":     "VWAP aligned",
+    "obv_trend":      "OBV trend",
+    "chart_struct":   "chart structure",
+    "stoch_rsi":      "Stoch RSI",
+}
+
+
+def _note_price(x):
+    """Price with enough decimals to be meaningful at any magnitude."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "?"
+    if x >= 1000:  return f"${x:,.2f}"
+    if x >= 1:     return f"${x:,.4f}"
+    return f"${x:.6f}"
+
+
+def _auto_note_key(ts, pair):
+    """The exact key the dashboard builds for a trade row: '<epoch_ms>|<pair>'."""
+    return f"{int(float(ts) * 1000)}|{pair}"
+
+
+def _auto_note_ms(key):
+    try:
+        return int(key.split("|")[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _auto_notes_load():
+    try:
+        with open(AUTO_NOTES_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _auto_notes_save(notes):
+    try:
+        tmp = AUTO_NOTES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(notes, f)
+        os.replace(tmp, AUTO_NOTES_FILE)      # atomic; never a half-written file
+    except OSError as e:
+        log("NOTES", f"could not save auto notes: {e}", "ERR")
+
+
+def _note_history(trades, field, value):
+    """(wins, losses) for earlier trades sharing `field`. Excludes the newest one."""
+    w = l = 0
+    for t in trades[:-1]:
+        if value and t.get(field) == value:
+            if t.get("pnl", 0) > 0: w += 1
+            else:                   l += 1
+    return w, l
+
+
+def _auto_note_tags(t, conf, pillars_on, held, won):
+    """Reuse the dashboard's four journal tags so its filter chips keep working.
+
+    'Good setup' is tagged on the SETUP, not the result — a high-conviction trade
+    that lost was still a good setup, and tagging on outcome would just relabel
+    luck as skill and make the filter useless for finding what actually works.
+    """
+    tags = []
+    if conf >= 0.60 and pillars_on >= 5:
+        tags.append("Good setup")
+    if not won and conf < 0.45 and held < 5:
+        tags.append("FOMO")
+    fkey = t.get("fkey", "") or ""
+    if "nB" in fkey or "nR" in fkey or (t.get("pillars") or {}).get("news_align"):
+        tags.append("News spike")
+    return tags
+
+
+def _build_auto_note(trader, position, t):
+    """Compose the bot's note for one closed trade. Pure function of the record."""
+    side    = t.get("side", "")
+    coin    = t.get("coin", "") or "?"
+    entry   = float(t.get("entry", 0) or 0)
+    exitp   = float(t.get("exit", 0) or 0)
+    pnl     = float(t.get("pnl", 0) or 0)
+    conf    = float(t.get("confidence", 0) or 0)
+    fkey    = t.get("fkey", "") or ""
+    held    = float(t.get("held_mins", 0) or 0)
+    reason  = (t.get("reason", "") or "exit").replace("_", " ")
+    pillars = t.get("pillars", {}) or {}
+    on      = [k for k, v in pillars.items() if v]
+    lev     = int(position.get("leverage", 1) or 1)
+    won     = pnl > 0
+
+    move = ((exitp - entry) / entry * 100) if entry else 0.0
+    if side == "SHORT":
+        move = -move
+
+    lines = []
+    head = (f"{side} {coin} · {_note_price(entry)} → {_note_price(exitp)} "
+            f"({move:+.2f}%) · {'+' if pnl >= 0 else '-'}${abs(pnl):.2f}")
+    if lev > 1:
+        head += f" at {lev}x"
+    lines.append(head)
+
+    # Why it went in.
+    why = []
+    if conf:
+        why.append(f"{conf:.0%} confidence")
+    if on:
+        named = ", ".join(_PILLAR_WORDS.get(k, k.replace("_", " ")) for k in on[:4])
+        why.append(f"{len(on)}/{len(pillars)} pillars ({named}"
+                   + (", …" if len(on) > 4 else "") + ")")
+    else:
+        # The fkey decode only earns its place when there are no pillars to
+        # read — on a normal trade it just restates "MACD aligned, high volume"
+        # in different words, and a note nobody finishes reading is no note.
+        decoded = _decode_fkey(fkey)
+        if decoded:
+            why.append(decoded)
+    if why:
+        lines.append("Entry: " + " · ".join(why))
+
+    # How it came out.
+    lines.append(f"Exit: {reason} after {held:.0f} min")
+
+    # Only observations the record actually supports. Silence beats filler.
+    obs = []
+    if not won and held < 3:
+        obs.append("Held under 3 min — the move reversed almost immediately, "
+                   "which usually means the breakout was never real.")
+    if not won and conf and conf < 0.40:
+        obs.append(f"Entered at only {conf:.0%} confidence; this pattern gets "
+                   f"de-weighted for next time.")
+    if won and held > 120:
+        obs.append(f"Ran {held/60:.1f}h — the winners on this book are the ones "
+                   f"that get left alone.")
+    if reason == "trailing stop" and not won:
+        obs.append("Trailing stop took it out at a loss — the trail may be too "
+                   "tight for how much this pair moves.")
+
+    fw, fl = _note_history(trader.trades, "fkey", fkey)
+    if fkey and fw + fl >= 3:
+        obs.append(f"Pattern `{fkey}` before this: {fw}W-{fl}L "
+                   f"({fw/(fw+fl)*100:.0f}% win).")
+    cw, cl = _note_history(trader.trades, "coin", t.get("coin", ""))
+    if cw + cl >= 3:
+        obs.append(f"{coin} before this: {cw}W-{cl}L.")
+
+    streak = trader.consecutive_losses
+    if not won and streak >= 3:
+        obs.append(f"{streak} losses in a row now — position size is being cut "
+                   f"automatically until it turns.")
+
+    if obs:
+        lines.append("")
+        lines.extend("• " + o for o in obs)
+
+    return {
+        "text": "\n".join(lines),
+        "tags": _auto_note_tags(t, conf, len(on), held, won),
+        "auto": True,
+        "ts":   int(float(t.get("ts", time.time())) * 1000),
+        "coin": coin,
+        "pnl":  round(pnl, 2),
+        "win":  won,
+    }
+
+
+def _auto_note_record(trader, position, trade_rec):
+    """Write the bot's note for a just-closed trade. Must never break a close."""
+    try:
+        note = _build_auto_note(trader, position, trade_rec)
+        key  = _auto_note_key(trade_rec.get("ts", time.time()),
+                              trade_rec.get("pair", ""))
+        with _auto_notes_lock:
+            notes = _auto_notes_load()
+            notes[key] = note
+            if len(notes) > AUTO_NOTES_KEEP:
+                keep  = sorted(notes, key=_auto_note_ms, reverse=True)[:AUTO_NOTES_KEEP]
+                notes = {k: notes[k] for k in keep}
+            _auto_notes_save(notes)
+    except Exception as e:
+        log("NOTES", f"auto note failed: {e}", "ERR")
+
+
+def _auto_notes_backfill(trader, limit=60):
+    """Write notes for trades that closed before this feature existed.
+
+    Without this the Journal reads 'no notes yet' until the next close, which
+    makes a working feature look broken. Only fills gaps — an existing note is
+    never rewritten, so this is safe to run on every boot.
+    """
+    try:
+        with _auto_notes_lock:
+            notes   = _auto_notes_load()
+            written = 0
+            for i, t in enumerate(trader.trades[-limit:], start=len(trader.trades) - min(limit, len(trader.trades))):
+                key = _auto_note_key(t.get("ts", 0), t.get("pair", ""))
+                if not t.get("ts") or key in notes:
+                    continue
+                # History stats must only see trades BEFORE this one, exactly as
+                # they would have at the moment it closed.
+                notes[key] = _build_auto_note_at(trader, t, i)
+                written += 1
+            if written:
+                if len(notes) > AUTO_NOTES_KEEP:
+                    keep  = sorted(notes, key=_auto_note_ms, reverse=True)[:AUTO_NOTES_KEEP]
+                    notes = {k: notes[k] for k in keep}
+                _auto_notes_save(notes)
+        if written:
+            log("NOTES", f"wrote {written} note{'s' if written != 1 else ''} for past trades")
+    except Exception as e:
+        log("NOTES", f"backfill failed: {e}", "ERR")
+
+
+class _TradesUpTo:
+    """A trader view whose .trades stops at index i, so a backfilled note quotes
+    the same history the live note would have quoted at that moment.
+
+    consecutive_losses counts the closing trade itself, matching PaperTrader's
+    property — at close() time the record is already appended, so "3 losses in a
+    row" means this one and the two before it in both paths.
+    """
+    def __init__(self, trader, i):
+        self.trades = trader.trades[:i + 1]
+
+    @property
+    def consecutive_losses(self):
+        n = 0
+        for t in reversed(self.trades):
+            if t.get("pnl", 0) <= 0: n += 1
+            else: break
+        return n
+
+
+def _build_auto_note_at(trader, t, i):
+    return _build_auto_note(_TradesUpTo(trader, i), {}, t)
+
 
 def _compute_sharpe_sortino(trades):
     """Annualised Sharpe and Sortino ratios from trade PnL as % of PAPER_START.
@@ -8748,11 +9022,28 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .jnl-note-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}
 .jnl-note-coin{font-size:.75rem;font-weight:700;color:var(--tx)}
 .jnl-note-date{font-size:.6rem;color:var(--mu);font-family:var(--fn)}
-.jnl-note-txt{font-size:.78rem;color:var(--mu);line-height:1.45;overflow:hidden;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 .jnl-note-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:7px}
 .jnl-tag{font-size:.55rem;padding:2px 7px;border-radius:99px;font-weight:700;
   background:rgba(74,143,255,.12);color:var(--b);border:1px solid rgba(74,143,255,.25)}
+/* ── BOT-WRITTEN NOTE ──────────────────────────────────────────────────────
+   Visibly not the user's own writing. A journal is only worth keeping if you
+   can tell at a glance which line you wrote and which the machine did. */
+/* Both clamped on the card — a bot note runs to ~8 lines and an unclamped feed
+   of them is unscannable. The full text is one tap away in the modal. */
+.jnl-note-auto{font-size:.7rem;color:var(--mu);line-height:1.5;
+  border-left:2px solid rgba(124,58,237,.45);padding-left:8px;margin-top:6px;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical}
+.jnl-note-mine{font-size:.78rem;color:var(--tx);line-height:1.45;margin-top:6px;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.jnl-bot-badge{font-size:.5rem;letter-spacing:.06em;text-transform:uppercase;
+  font-weight:800;color:#a78bfa;background:rgba(124,58,237,.14);
+  border:1px solid rgba(124,58,237,.3);border-radius:99px;padding:1px 6px;margin-left:6px}
+.tnote-auto{background:var(--bg);border:1px solid var(--bd2);border-left:2px solid rgba(124,58,237,.5);
+  border-radius:9px;padding:10px 12px;margin-bottom:12px;max-height:34vh;overflow-y:auto}
+.tnote-auto-hdr{font-size:.52rem;letter-spacing:.08em;text-transform:uppercase;
+  font-weight:800;color:#a78bfa;margin-bottom:6px}
+.tnote-auto-txt{font-size:.7rem;color:var(--mu);line-height:1.55}
+.tnote-btn.has-auto{border-color:rgba(124,58,237,.4);color:#a78bfa}
 /* ── NOTE TAG CHIPS ── */
 .tnote-tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
 .tag-chip{padding:5px 11px;border-radius:99px;border:1px solid var(--bd2);
@@ -10513,7 +10804,7 @@ function goTab(t){
   if(t==='home'){drawEquity();}
   if(t==='market'){fetchMarket();fetchForecast();loadQuiz();}
   if(t==='stats'){drawDownChart();fetchCalibration();}
-  if(t==='journal'){fetchDailyPnl();renderJournal();}
+  if(t==='journal'){fetchDailyPnl();fetchAutoNotes().then(renderJournal);}
 }
 
 /* ── SWIPE ── */
@@ -10545,7 +10836,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();renderJournal();}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAutoNotes().then(renderJournal);}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -10765,6 +11056,7 @@ function renderPositions(ps){
 /* ── RECENT TRADES ── */
 function renderTrades(recent){
   _allTrades=recent||[];
+  _migrateNoteKeys();          // needs _allTrades; self-guarded, runs once
   renderDOW(_allTrades);
   if(_tradeFilter!=='all'){renderFilteredTrades();return;}
   const box=$('trades_box');
@@ -10773,9 +11065,10 @@ function renderTrades(recent){
   box.innerHTML=recent.map(t=>{
     const w=t.pnl>0;
     const ts=t.ts?new Date(t.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
-    const key=((t.ts||'')+'|'+(t.pair||t.coin||'')).replace(/'/g,'');
+    const key=_tradeNoteKey(t);
     const entry=_noteGetEntry(notes,key);
     const hasNote=!!(entry.text||entry.tags.length);
+    const hasAuto=!!_autoNote(key);
     const noteLabel=((t.coin||'')+'@'+ts).replace(/'/g,'');
     return '<div class="tr">'+
       '<div class="tr-icon '+(w?'w':'l')+'">'+(w?'\u2713':'\u2717')+'</div>'+
@@ -10787,10 +11080,11 @@ function renderTrades(recent){
         '<div class="tr-pnl '+(w?'c-g':'c-r')+'">'+msign(t.pnl)+'</div>'+
         '<div style="display:flex;align-items:center;gap:5px">'+
           '<div class="tr-time">'+ts+'</div>'+
-          '<button class="tnote-btn'+(hasNote?' has-note':'')+'" '+
+          '<button class="tnote-btn'+(hasNote?' has-note':hasAuto?' has-auto':'')+'" '+
             'data-key="'+key+'" data-label="'+noteLabel+'" '+
             'onclick="openNote(this.dataset.key,this.dataset.label)" '+
-            'title="'+(hasNote?'Edit note':'Add note')+'">'+(hasNote?'📝':'📄')+'</button>'+
+            'title="'+(hasNote?'Edit note':hasAuto?'Read the bot’s note':'Add note')+'">'+
+            (hasNote?'📝':hasAuto?'🤖':'📄')+'</button>'+
         '</div>'+
       '</div></div>';
   }).join('');
@@ -12619,17 +12913,21 @@ function renderFilteredTrades(){
   else if(_tradeFilter==='short') trades=trades.filter(t=>t.side==='SHORT');
   if(!trades.length){box.innerHTML='<div class="no-data">No trades match filter</div>';return;}
   box.innerHTML=trades.slice().reverse().slice(0,30).map(t=>{
-    const dt=new Date((t.ts||0)*1000);
+    // t.ts arrives from /status already in MILLISECONDS. This used to multiply
+    // by 1000 again and dated every filtered trade tens of thousands of years
+    // out; the main list next to it was right, which is why it went unnoticed.
+    const dt=new Date(t.ts||0);
     const dtStr=dt.toLocaleDateString('en-US',{month:'short',day:'numeric'})+
       ' '+dt.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
     const pnlCls=t.pnl>0?'c-g':'c-r';
     const sideCls=t.side==='LONG'?'c-g':'c-r';
     const notes=_noteKeys();
-    const nkey=(t.coin||'')+'_'+(t.side||'')+'_'+(Math.round(t.ts||0));
+    const nkey=_tradeNoteKey(t);
     const noteEntry=_noteGetEntry(notes,nkey);
     const hasNote=!!(noteEntry.text||noteEntry.tags.length);
-    const noteBtnCls='tnote-btn'+(hasNote?' has-note':'');
-    const noteBtnTxt=hasNote?'&#128203;&#10003;':'&#128203;';
+    const hasAuto=!!_autoNote(nkey);
+    const noteBtnCls='tnote-btn'+(hasNote?' has-note':hasAuto?' has-auto':'');
+    const noteBtnTxt=hasNote?'&#128203;&#10003;':hasAuto?'&#129302;':'&#128203;';
     return '<div class="trade-row">'+
       '<div style="flex:1;min-width:0">'+
         '<span class="'+sideCls+'" style="font-weight:700;font-size:.72rem">'+t.side+'</span>'+
@@ -13734,10 +14032,51 @@ function _renderCalibChart(buckets){
   });
 }
 
-/* ── TRADE NOTES ── */
-let _noteCurrentKey='',_noteCurrentLabel='',_noteTags=[];
+/* ── TRADE NOTES ──────────────────────────────────────────────────────────
+   Two sources land on one card. The BOT writes a note for every close and
+   serves it from /notes; NOLUV writes his own and they stay in this browser's
+   localStorage. Both use the same key ('<epoch_ms>|<pair>') so a card can show
+   the bot's read of the trade and his own reaction to it side by side — and the
+   bot physically cannot overwrite what he typed, since it never writes here. */
+let _noteCurrentKey='',_noteCurrentLabel='',_noteTags=[],_autoNotes={};
+async function fetchAutoNotes(){
+  try{
+    const d=await(await fetch('/notes')).json();
+    _autoNotes=d.notes||{};
+  }catch(e){/* journal still renders from local notes alone */}
+}
+function _autoNote(key){return _autoNotes[key]||null;}
+/* The single definition of a trade's note key. Both trade lists and the server
+   must agree on it — when they didn't, a note written in one view simply did
+   not exist in the other. */
+function _tradeNoteKey(t){
+  return ((t.ts||'')+'|'+(t.pair||t.coin||'')).replace(/'/g,'');
+}
 function _noteKeys(){
   try{return JSON.parse(localStorage.getItem('cb_notes')||'{}');}catch(e){return {};}
+}
+/* One-time key repair. The filtered trade list used to key notes as
+   'coin_side_ms' while the main list used 'ms|pair', so a note written in one
+   view was invisible in the other. Rewrite the old keys onto the canonical one
+   where the trade is still known; anything too old to match is left alone
+   rather than dropped, and _keyToMeta still renders it. */
+let _notesMigrated=false;
+function _migrateNoteKeys(){
+  if(_notesMigrated)return;
+  _notesMigrated=true;
+  const notes=_noteKeys();
+  let changed=false;
+  Object.keys(notes).forEach(k=>{
+    if(k.includes('|'))return;
+    const p=k.split('_'); if(p.length<3)return;
+    const ms=parseFloat(p[2]); if(!ms)return;
+    const t=_allTrades.find(x=>Math.round(x.ts||0)===Math.round(ms));
+    if(!t||!t.pair)return;
+    const nk=ms+'|'+t.pair;
+    if(!notes[nk])notes[nk]=notes[k];
+    delete notes[k];changed=true;
+  });
+  if(changed)localStorage.setItem('cb_notes',JSON.stringify(notes));
 }
 function _noteGetEntry(notes,key){
   const val=notes[key];
@@ -13750,6 +14089,17 @@ function openNote(key,label){
   const notes=_noteKeys();
   const entry=_noteGetEntry(notes,key);
   $('tnote_title').textContent='Note: '+label;
+  // The bot's note sits above the box, read-only. The point of a journal entry
+  // is to react to what happened, so the facts should be in front of you while
+  // you write rather than something you have to go and look up.
+  const box=$('tnote_auto'),auto=_autoNote(key);
+  if(box){
+    if(auto&&auto.text){
+      box.innerHTML='<div class="tnote-auto-hdr">&#129302; Bot’s note</div>'+
+        '<div class="tnote-auto-txt">'+auto.text.replace(/</g,'&lt;').replace(/\n/g,'<br>')+'</div>';
+      box.style.display='';
+    }else{box.style.display='none';}
+  }
   $('tnote_ta').value=entry.text;
   _noteTags=[...entry.tags];
   document.querySelectorAll('.tag-chip').forEach(c=>{
@@ -14139,17 +14489,28 @@ function setJournalFilter(f){
 }
 function renderJournal(){
   const el=$('jnl_notes_list');if(!el)return;
-  const notes=_noteKeys();
-  const entries=Object.entries(notes);
-  if(!entries.length){
-    el.innerHTML='<div class="no-data" style="padding:20px 16px">No notes yet — tap &#128203; on any trade to add one</div>';
+  const mine=_noteKeys();
+  // Union of both sources. The bot's note carries its own coin/pnl/ts, so a
+  // closed trade shows up in the journal even after it has scrolled out of the
+  // 20-trade window the dashboard keeps in memory.
+  const keys=[...new Set([...Object.keys(mine),...Object.keys(_autoNotes)])];
+  if(!keys.length){
+    el.innerHTML='<div class="no-data" style="padding:20px 16px">No notes yet — the bot writes one for every trade it closes</div>';
     return;
   }
-  // Sort newest first, filter by tag
-  const parsed=entries.map(([key,val])=>{
-    const obj=typeof val==='object'&&val!==null?val:{text:val,tags:[]};
+  const parsed=keys.map(key=>{
+    const val=mine[key];
+    const obj=typeof val==='object'&&val!==null?val:{text:val||'',tags:[]};
+    const auto=_autoNote(key);
     const d=_keyToMeta(key);
-    return {key,text:obj.text||'',tags:obj.tags||[],coin:d.coin,date:d.date,ts:d.ts,pnl:d.pnl};
+    return {key,
+      text:obj.text||'',
+      autoText:auto?(auto.text||''):'',
+      tags:[...new Set([...(obj.tags||[]),...(auto?auto.tags||[]:[])])],
+      coin:(auto&&auto.coin)||d.coin,
+      date:d.date,
+      ts:(auto&&auto.ts)||d.ts,
+      pnl:auto&&auto.pnl!=null?auto.pnl:d.pnl};
   }).filter(n=>{
     if(_journalFilter==='all')return true;
     return n.tags.includes(_journalFilter);
@@ -14161,12 +14522,15 @@ function renderJournal(){
     const tagHtml=n.tags.length?'<div class="jnl-note-tags">'+n.tags.map(t=>'<span class="jnl-tag">'+t+'</span>').join('')+'</div>':'';
     const pnlStr=n.pnl!=null?(n.pnl>=0?'+$':'-$')+Math.abs(n.pnl).toFixed(2):'';
     const pnlCol=n.pnl>0?'color:var(--g)':n.pnl<0?'color:var(--r)':'';
+    const esc=s=>s.replace(/</g,'&lt;').replace(/\n/g,'<br>');
     return '<div class="jnl-note-card" data-key="'+n.key+'" data-coin="'+n.coin+'" onclick="openNote(this.dataset.key,this.dataset.coin)">'+
       '<div class="jnl-note-hdr">'+
-        '<div class="jnl-note-coin">'+n.coin+(pnlStr?' <span style="'+pnlCol+'">'+pnlStr+'</span>':'')+'</div>'+
+        '<div class="jnl-note-coin">'+n.coin+(pnlStr?' <span style="'+pnlCol+'">'+pnlStr+'</span>':'')+
+          (n.autoText?'<span class="jnl-bot-badge">bot</span>':'')+'</div>'+
         '<div class="jnl-note-date">'+n.date+'</div>'+
       '</div>'+
-      (n.text?'<div class="jnl-note-txt">'+n.text.replace(/</g,'&lt;')+'</div>':'')+
+      (n.text?'<div class="jnl-note-mine">'+esc(n.text)+'</div>':'')+
+      (n.autoText?'<div class="jnl-note-auto">'+esc(n.autoText)+'</div>':'')+
       tagHtml+
     '</div>';
   }).join('');
@@ -14212,6 +14576,9 @@ initStripArrows();
 markSkeletons();      // shimmer the value readouts until the first poll lands
 fetchManual();setInterval(fetchManual,6000);   // manual paper book
 fetchOrderFlow();setInterval(fetchOrderFlow,45000);  // tape TTL is 45s server-side
+// Loaded at start, not only on the Journal tab, so the 🤖 marker on a trade row
+// is right the moment the row appears. Only grows when a trade closes.
+fetchAutoNotes().then(renderJournal);setInterval(fetchAutoNotes,60000);
 initValueFlash();     // must run BEFORE the first fetch so it captures baselines
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
 fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();loadIQ();
@@ -14233,6 +14600,7 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch
   <div class="tnote-overlay" onclick="closeNote()"></div>
   <div class="tnote-panel">
     <div class="tnote-title" id="tnote_title">Trade Note</div>
+    <div class="tnote-auto" id="tnote_auto" style="display:none"></div>
     <div class="tnote-tags" id="tnote_tags">
       <span class="tag-chip" onclick="toggleTag(this)" data-tag="FOMO">FOMO</span>
       <span class="tag-chip" onclick="toggleTag(this)" data-tag="Good setup">Good setup</span>
@@ -14241,7 +14609,7 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch
       <span class="tag-chip" onclick="toggleTag(this)" data-tag="Revenge trade">Revenge</span>
       <span class="tag-chip" onclick="toggleTag(this)" data-tag="Patient wait">Patient</span>
     </div>
-    <textarea class="tnote-ta" id="tnote_ta" placeholder="What happened in this trade? What would you do differently?" rows="3"></textarea>
+    <textarea class="tnote-ta" id="tnote_ta" placeholder="Your take — what would you do differently?" rows="3"></textarea>
     <div class="tnote-row">
       <button class="tnote-save" onclick="saveNote()">Save Note</button>
       <button class="tnote-del" onclick="deleteNote()">Delete</button>
@@ -16028,6 +16396,16 @@ def _manual_unrealised(book, prices=None):
     return out
 
 
+@_flask_app.route("/notes")
+def _web_notes():
+    """The notes the bot wrote itself. Read-only — Noluv's own notes never come
+    through here, they stay in the browser's localStorage."""
+    with _auto_notes_lock:
+        notes = _auto_notes_load()
+    return _Response(json.dumps({"notes": notes}), mimetype="application/json",
+                     headers={"Cache-Control": "no-store"})
+
+
 @_flask_app.route("/orderflow")
 def _web_orderflow():
     """Trade-tape order flow for the charted pair. Read-only, so no auth gate —
@@ -16604,6 +16982,8 @@ def main():
     _sim_trader._force_risk_min = 0.20   # sim uses fake money — trade bigger to learn faster
     _sim_trader._force_risk_max = 0.50
     log("BOOT", "Sim trader initialized — $2000 virtual account ready (type 'sim on' to start)")
+
+    _auto_notes_backfill(trader)
 
     threading.Thread(target=_position_watchdog, args=(trader, _sim_trader),
                      daemon=True).start()
