@@ -382,8 +382,37 @@ PYRAMID_PCT      = 0.05        # pyramid add-on trigger: +5% in-trade move
 TRAIL_PCT        = 0.04        # 4% fallback trail on 15-min chart (was 3%)
 ATR_PERIOD       = 14
 ATR_MULTIPLIER   = 2.0         # 2× ATR trail (was 1.5) — gives trade room to breathe
-MAX_TRADE_MINS   = int(120 * _TF_SCALE)   # hold cap, scaled to the base timeframe
-STALE_EXIT_MINS  = int(45 * _TF_SCALE)    # "went nowhere" exit, scaled likewise
+# Hold horizon. Measured 2026-08-05 across the whole 26-pair universe, as the
+# median favourable move a pair actually travels in N bars:
+#
+#     3 bars  0.47%   ->  0 of 26 pairs can reach a target that pays for itself
+#     8 bars  0.81%   ->  3 of 26
+#    24 bars  1.54%   -> 12 of 26
+#    48 bars  2.38%   -> 20 of 26      (round trip 0.52%, cost floor 1.56%)
+#
+# The old 8h cap with a 3h stale window meant the target was out of reach on
+# every pair in the universe, so a trade could only ever end at the stop, the
+# stale exit or the clock -- which is exactly the exit mix the book showed:
+# 84 stale exits, 41 trailing stops, 0 genuine take-profits out of 136 trades.
+# The strategy was not losing to the market so much as to its own clock.
+#
+# Noluv chose the 48h horizon on 2026-08-05. HOLD_SCALE is the single dial:
+# everything below is expressed relative to the original 15m tuning, so raising
+# or lowering it moves the cap, the stale window and every per-strategy hold
+# together and keeps their proportions.
+HOLD_SCALE       = float(os.environ.get("HOLD_SCALE", "6.0"))
+MAX_TRADE_MINS   = int(120 * _TF_SCALE * HOLD_SCALE)   # 48h at 1h candles
+STALE_EXIT_MINS  = int(45  * _TF_SCALE * HOLD_SCALE)   # 18h — still 3/8 of the cap
+
+
+def _hold(mins_at_15m):
+    """Per-strategy max hold, scaled to the timeframe and the hold horizon.
+
+    Capped at MAX_TRADE_MINS because the per-strategy value OVERRIDES the global
+    cap in the exit check, so without the clamp a long-hold strategy would
+    quietly outlive the limit that is supposed to bound every trade.
+    """
+    return min(int(mins_at_15m * _TF_SCALE * HOLD_SCALE), MAX_TRADE_MINS)
 POSITION_WATCHDOG_SECS = 60    # how often the watchdog re-checks open positions
 KRAKEN_FEE       = 0.0026      # taker: crossing the spread
 KRAKEN_MAKER_FEE = 0.0016      # maker: resting order that provides liquidity
@@ -462,6 +491,45 @@ _ENTRY_COST_PCT = (KRAKEN_MAKER_FEE if USE_MAKER_ENTRIES and not (USE_BINANCE or
 _EXIT_COST_PCT  = (BINANCE_FEE if USE_BINANCE else
                    KRAKEN_FUTURES_FEE if USE_FUTURES else KRAKEN_FEE) + SLIPPAGE
 ROUND_TRIP_COST_PCT   = _ENTRY_COST_PCT + _EXIT_COST_PCT
+
+
+def _reachable_dist(highs, lows, closes, bars, side, samples=120):
+    """How far this pair actually travels the favourable way in `bars` bars.
+
+    Returns the MEDIAN favourable excursion as a fraction of price, or None if
+    there is not enough history to say. Median means: half the time the pair
+    gets at least this far, which is the weakest claim worth acting on.
+
+    This exists because a target the market does not reach is not a target, it
+    is decoration -- and an R:R built on one is arithmetic about money that was
+    never available. Measured on the real book: only 15% of 136 trades ever saw
+    the 2.30% favourable move their target implied, and the median best case
+    over eight hours was 0.758%. Whole pairs are worse than that: XBTUSD
+    contains a 2.30% move in 4% of its 8h windows, XRPUSD and LTCUSD in 8%.
+    With targets that far out of reach a trade can only end at the stop, the
+    stale exit or the clock -- which is exactly the exit mix the book shows
+    (84 stale, 41 trailing, 0 genuine take-profits).
+
+    Non-parametric on purpose: no fitted constant to overfit, just what this
+    pair has been doing lately.
+    """
+    n = min(len(closes), len(highs), len(lows))
+    if n < bars + 12:
+        return None
+    ex = []
+    for i in range(max(0, n - samples - bars - 1), n - bars - 1):
+        c = closes[i]
+        if not c:
+            continue
+        window = slice(i + 1, i + 1 + bars)
+        if side in ("SELL", "SHORT"):
+            ex.append((c - min(lows[window])) / c)
+        else:
+            ex.append((max(highs[window]) - c) / c)
+    if len(ex) < 10:
+        return None
+    ex.sort()
+    return ex[len(ex) // 2]
 MIN_PROFIT_VS_COST_MULT = 3.0  # target must clear round-trip costs by this multiple
 # A stop closer to entry than one full round trip cannot produce a winning trade
 # even when the direction call is right: the move it allows is smaller than the
@@ -751,42 +819,42 @@ BEARISH_WORDS = ["crash","drop","dump","ban","hack","exploit","lawsuit","sec",
 _STRATEGIES = {
     "MULTI_SIGNAL": {
         "name": "Multi-Signal",    "emoji": "✨",
-        "min_conf": 0.65,          "min_pillars": 7,   "max_mins": int(180 * _TF_SCALE),
+        "min_conf": 0.65,          "min_pillars": 7,   "max_mins": _hold(180),
         "desc": "7+ pillars aligned — highest-conviction setup",
     },
     "MOMENTUM_BREAKOUT": {
         "name": "Momentum Breakout", "emoji": "🚀",
-        "min_conf": 0.55,            "required": {"macd_align", "high_volume"}, "max_mins": int(90 * _TF_SCALE),
+        "min_conf": 0.55,            "required": {"macd_align", "high_volume"}, "max_mins": _hold(90),
         "desc": "High-volume breakout with MACD confirmation",
     },
     "TREND_CONTINUATION": {
         "name": "Trend Continuation", "emoji": "📈",
-        "min_conf": 0.50,             "required": {"nasdaq_align", "tick_strength", "vwap_align"}, "max_mins": int(180 * _TF_SCALE),
+        "min_conf": 0.50,             "required": {"nasdaq_align", "tick_strength", "vwap_align"}, "max_mins": _hold(180),
         "desc": "Riding an established trend with macro + VWAP confirmation",
     },
     "RSI_REVERSAL": {
         "name": "RSI Reversal",   "emoji": "🔄",
-        "min_conf": 0.50,         "required": {"rsi_zone", "stoch_rsi"}, "max_mins": int(60 * _TF_SCALE),
+        "min_conf": 0.50,         "required": {"rsi_zone", "stoch_rsi"}, "max_mins": _hold(60),
         "desc": "Oversold/overbought reversal with RSI + Stoch confirmation",
     },
     "NEWS_CATALYST": {
         "name": "News Catalyst",  "emoji": "📰",
-        "min_conf": 0.45,         "required": {"news_align"}, "min_news": 2, "max_mins": int(45 * _TF_SCALE),
+        "min_conf": 0.45,         "required": {"news_align"}, "min_news": 2, "max_mins": _hold(45),
         "desc": "News-driven move with technical confirmation",
     },
     "PATTERN_BREAKOUT": {
         "name": "Pattern Breakout", "emoji": "📐",
-        "min_conf": 0.50,           "required_any": {"chart_struct", "candle_pattern"}, "max_mins": int(60 * _TF_SCALE),
+        "min_conf": 0.50,           "required_any": {"chart_struct", "candle_pattern"}, "max_mins": _hold(60),
         "desc": "Chart or candlestick pattern completion",
     },
     "CONFLUENCE": {
         "name": "Confluence",  "emoji": "🔀",
-        "min_conf": 0.52,      "min_pillars": 4,   "max_mins": int(90 * _TF_SCALE),
+        "min_conf": 0.52,      "min_pillars": 4,   "max_mins": _hold(90),
         "desc": "4+ indicators aligned — broad multi-factor confirmation",
     },
     "LEARNING_SIGNAL": {
         "name": "Learning Signal", "emoji": "📚",
-        "min_conf": 0.35,          "min_pillars": 2, "max_mins": int(60 * _TF_SCALE),
+        "min_conf": 0.35,          "min_pillars": 2, "max_mins": _hold(60),
         "desc": "Paper-mode fallback — 2+ indicators aligned; used to collect training data",
     },
 }
@@ -3769,7 +3837,21 @@ class PaperTrader:
                 self._close(price, name, "trailing stop", pair); closed_this_tick = True
             elif mins_open >= _STRATEGIES.get(p.get("strategy", ""), {}).get("max_mins", MAX_TRADE_MINS):
                 self._close(price, name, "time limit",   pair); closed_this_tick = True
-            elif mins_open >= STALE_EXIT_MINS and abs(move) * p["entry"] < atr_dist:
+            elif mins_open >= STALE_EXIT_MINS and \
+                 abs(move) * p["entry"] < p.get("vol_dist", atr_dist):
+                # Measured and left alone deliberately. After STALE_EXIT_MINS of
+                # no movement the position has no edge left in either direction:
+                # forward returns from the exit point are 41-57% positive at every
+                # horizon out to 24h, and a trade that was UP when killed carried
+                # on 52% of the time versus 59% for one that was DOWN — the same
+                # coin flip. It is also the cheapest exit the bot has, at
+                # -0.070$/trade against -0.149$ for the trailing stop, so
+                # loosening it just moves money into a worse exit.
+                #
+                # It fires on 61% of trades because the TARGET was unreachable,
+                # not because the timer is wrong. That is fixed at entry, above.
+                # Judged on vol_dist, not atr_dist, so a cost-widened stop does
+                # not change what counts as "went nowhere".
                 self._close(price, name, "stale exit",   pair); closed_this_tick = True
             elif ((side == "LONG"  and price >= p.get("target", float("inf"))) or
                   (side == "SHORT" and price <= p.get("target", 0))):
@@ -4162,6 +4244,14 @@ class PaperTrader:
         # against what the trade costs. A stop nearer than one round trip cannot
         # produce a winner even when the direction is right, because the move it
         # allows is smaller than the fee to have taken the position.
+        # Keep the volatility-derived distance before the cost floor touches it.
+        # Two different questions share this number and must not: "where does the
+        # stop go" is risk management and is floored by what trading costs, while
+        # "has this trade gone anywhere" is a question about the pair's normal
+        # movement. Without the split, widening a stop for cost reasons silently
+        # raises the bar the stale exit applies, on a pair whose behaviour has not
+        # changed at all.
+        vol_dist = atr_dist
         _min_stop_dist = fill * ROUND_TRIP_COST_PCT * MIN_STOP_VS_COST_MULT
         if atr_dist < _min_stop_dist:
             log("PAPER", f"{name} stop widened {atr_dist/fill*100:.2f}% → "
@@ -4196,7 +4286,7 @@ class PaperTrader:
                                 "contract_tier": contract_tier,
                                 "pair": pair, "name": name,
                                 "trail_stop": trail_stop, "trail_peak": fill,
-                                "atr_dist": atr_dist, "fkey": fkey,
+                                "atr_dist": atr_dist, "vol_dist": vol_dist, "fkey": fkey,
                                 "r1_price": r1_price, "r2_price": r2_price,
                                 "entry_nasdaq": market_mood["nasdaq"],
                                 "entry_news": news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"),
@@ -7936,6 +8026,30 @@ def trading_loop(trader):
                             target = round(_atr_target, 8)
                             _rr_reward = (target - price) if sig == "BUY" else (price - target)
                             _rr_risk   = (price - stop)   if sig == "BUY" else (stop - price)
+                        # Reachability. Clamp the target to what this pair actually
+                        # travels in the time the trade is allowed, BEFORE any gate
+                        # reads it — otherwise every gate below is doing arithmetic
+                        # on a reward that was never on the table.
+                        #
+                        # Deliberately a clamp and not another rejection rule: make
+                        # the number honest and the cost floor and R:R gate already
+                        # know what to do with it. A pair that cannot travel far
+                        # enough to pay its own fees now fails the cost floor on its
+                        # own, which is the correct reason to skip it.
+                        _max_bars = max(1, int(MAX_TRADE_MINS / max(INTERVAL, 1)))
+                        _reach = _reachable_dist(highs, lows, closes, _max_bars, sig)
+                        if _reach:
+                            _reach_px = price * _reach
+                            _want     = (target - price) if sig == "BUY" else (price - target)
+                            if _want > _reach_px:
+                                target = round(price + _reach_px if sig == "BUY"
+                                               else price - _reach_px, 8)
+                                _rr_reward = (target - price) if sig == "BUY" else (price - target)
+                                log("GATE", f"{coin['name']} target pulled in to "
+                                            f"{_reach*100:.2f}% — this pair reaches that in "
+                                            f"{_max_bars} bars only half the time "
+                                            f"(asked for {_want/price*100:.2f}%)")
+
                         # R:R must be measured NET OF COSTS, not gross. Costs do not
                         # cancel out of the ratio — they shrink the reward and grow
                         # the loss, so they push it down twice:
