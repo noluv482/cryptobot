@@ -447,8 +447,26 @@ def _sr_clusters(highs, lows):
     return clustered
 
 
-ROUND_TRIP_COST_PCT   = 2 * KRAKEN_FEE + 2 * SLIPPAGE
+# Round-trip cost of one trade, as a fraction of price. Entry and exit are NOT
+# symmetric and modelling them as if they were is how a stop ends up sitting
+# inside the cost band:
+#   entry — a resting maker limit fills AT its price (see _open): maker fee, and
+#           NO slippage, because nothing crossed the spread. A taker entry pays
+#           the taker fee plus slippage.
+#   exit  — always a market close: taker fee plus slippage.
+# The old value hard-coded the taker-both-ways case (0.72%), overstating the real
+# cost by ~38% whenever maker entries are on, which is the default.
+_ENTRY_COST_PCT = (KRAKEN_MAKER_FEE if USE_MAKER_ENTRIES and not (USE_BINANCE or USE_FUTURES)
+                   else (BINANCE_FEE if USE_BINANCE else
+                         KRAKEN_FUTURES_FEE if USE_FUTURES else KRAKEN_FEE) + SLIPPAGE)
+_EXIT_COST_PCT  = (BINANCE_FEE if USE_BINANCE else
+                   KRAKEN_FUTURES_FEE if USE_FUTURES else KRAKEN_FEE) + SLIPPAGE
+ROUND_TRIP_COST_PCT   = _ENTRY_COST_PCT + _EXIT_COST_PCT
 MIN_PROFIT_VS_COST_MULT = 3.0  # target must clear round-trip costs by this multiple
+# A stop closer to entry than one full round trip cannot produce a winning trade
+# even when the direction call is right: the move it allows is smaller than the
+# cost of having taken the position at all. Enforced as a floor in _open().
+MIN_STOP_VS_COST_MULT = 1.0
 DAILY_GAIN_SOFT   = 0.03
 DAILY_GAIN_HARD   = 0.06
 LIVE_CHART_MINS   = 10
@@ -3669,8 +3687,13 @@ class PaperTrader:
             if closed_this_tick:
                 return   # position gone — skip trailing / lock-in blocks below
 
-            # Update trailing stop using stored ATR distance (or fixed % fallback)
+            # Update trailing stop using stored ATR distance (or fixed % fallback).
+            # The floor is re-applied here, not just at open: the parabolic and
+            # divergence tighteners write p["atr_dist"] directly mid-trade and can
+            # push it under one round trip, which turns the trail into a guaranteed
+            # loss the moment it is touched.
             atr_dist = p.get("atr_dist", price * TRAIL_PCT)
+            atr_dist = max(atr_dist, p["entry"] * ROUND_TRIP_COST_PCT * MIN_STOP_VS_COST_MULT)
             if side == "LONG":
                 if price > p.get("trail_peak", p["entry"]):
                     p["trail_peak"] = price
@@ -3680,16 +3703,27 @@ class PaperTrader:
                     p["trail_peak"] = price
                     p["trail_stop"] = round(price + atr_dist, 6)
 
-            # Breakeven stop: once up BREAKEVEN_PCT, push stop to entry so we never lose
+            # Breakeven stop: once up BREAKEVEN_PCT, push the stop to the price
+            # where the trade actually nets zero — which is NOT the entry price.
+            # Exiting at entry still pays the full round trip, so the old version
+            # promised "we never lose" while guaranteeing a small loss, and
+            # tightened the stop to make it more likely to be collected.
+            # (With leverage > 1 this overshoots slightly, because the fee model
+            # charges fees on margin while P&L scales with leverage. Erring on the
+            # profitable side of breakeven is the right direction to be wrong.)
+            _be = round(p["entry"] * (1 + ROUND_TRIP_COST_PCT) if side == "LONG"
+                        else p["entry"] * (1 - ROUND_TRIP_COST_PCT), 6)
             if not p.get("breakeven_set") and move >= BREAKEVEN_PCT:
                 if side == "LONG":
-                    if p["trail_stop"] < p["entry"]:
-                        p["trail_stop"] = round(p["entry"], 6)
-                        tg(f"🔒 *Breakeven — {name}*\nStop moved to entry `${p['entry']:.4f}` (up {move*100:.1f}%)")
+                    if p["trail_stop"] < _be:
+                        p["trail_stop"] = _be
+                        tg(f"🔒 *Breakeven — {name}*\nStop moved to `${_be:.4f}` "
+                           f"(entry + {ROUND_TRIP_COST_PCT*100:.2f}% costs, up {move*100:.1f}%)")
                 else:
-                    if p["trail_stop"] > p["entry"]:
-                        p["trail_stop"] = round(p["entry"], 6)
-                        tg(f"🔒 *Breakeven — {name}*\nStop moved to entry `${p['entry']:.4f}` (up {move*100:.1f}%)")
+                    if p["trail_stop"] > _be:
+                        p["trail_stop"] = _be
+                        tg(f"🔒 *Breakeven — {name}*\nStop moved to `${_be:.4f}` "
+                           f"(entry − {ROUND_TRIP_COST_PCT*100:.2f}% costs, up {move*100:.1f}%)")
                 p["breakeven_set"] = True
 
             # Tier-2 trailing stop: at +10% move lock in ≥7% profit (3% trail from peak)
@@ -3737,10 +3771,26 @@ class PaperTrader:
                 self._close(price, name, "time limit",   pair); closed_this_tick = True
             elif mins_open >= STALE_EXIT_MINS and abs(move) * p["entry"] < atr_dist:
                 self._close(price, name, "stale exit",   pair); closed_this_tick = True
-            elif side == "LONG"  and price >= p.get("target", float("inf")):
-                self._close(price, name, "take profit",  pair); closed_this_tick = True
-            elif side == "SHORT" and price <= p.get("target", 0):
-                self._close(price, name, "take profit",  pair); closed_this_tick = True
+            elif ((side == "LONG"  and price >= p.get("target", float("inf"))) or
+                  (side == "SHORT" and price <= p.get("target", 0))):
+                # A "take profit" that books a loss is not a take profit. Four
+                # trades on 2026-08-05 closed this way at -0.00% to -0.10%, which
+                # needs a target sitting on top of entry. _open now clamps that,
+                # so this should be unreachable — but the clamp only protects
+                # positions that went through _open, and being wrong here costs
+                # real money. If it does fire, the trade is left to the trail
+                # instead of booking the loss, and the state is logged once so
+                # the source can be found rather than inferred.
+                if move > ROUND_TRIP_COST_PCT:
+                    self._close(price, name, "take profit",  pair); closed_this_tick = True
+                elif not p.get("_bad_target_logged"):
+                    p["_bad_target_logged"] = True
+                    log("PAPER", f"{name} take-profit SUPPRESSED — target "
+                                 f"{p.get('target')} reached at {price:.6f} but the "
+                                 f"move is {move*100:+.3f}%, under the "
+                                 f"{ROUND_TRIP_COST_PCT*100:.2f}% round trip. "
+                                 f"entry={p['entry']:.6f} side={side}. Target did not "
+                                 f"come through _open's clamp — find that caller.", "ERR")
             elif (side == "LONG" and sig == "SELL") or (side == "SHORT" and sig == "BUY"):
                 self._close(price, name, "signal flip",  pair); closed_this_tick = True
 
@@ -3800,6 +3850,25 @@ class PaperTrader:
                 log("GATE", f"{name} blocked — already {MAX_CORRELATED_POS} correlated "
                             f"positions open")
                 return
+            # Net-of-cost R:R, enforced HERE and not only in the scan loop.
+            # The scan loop's gate is invisible to two callers that matter: the
+            # resting-maker fill path, which re-enters at a price the gate never
+            # saw, and backtest.py, which calls on_signal directly — so the
+            # backtester has been measuring a more permissive bot than the one
+            # that actually runs, and could never have caught this.
+            if stop and target and math.isfinite(stop) and math.isfinite(target):
+                _rew = (target - price) if sig == "BUY" else (price - target)
+                _rsk = (price - stop)   if sig == "BUY" else (stop - price)
+                _cst = price * ROUND_TRIP_COST_PCT
+                if _rsk > 0 and ((_rew - _cst) <= 0 or
+                                 (_rew - _cst) / (_rsk + _cst) < MIN_RR_RATIO):
+                    with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
+                    log("GATE", f"{name} blocked — net R:R "
+                                f"{(_rew - _cst) / (_rsk + _cst):.2f}:1 after "
+                                f"{ROUND_TRIP_COST_PCT*100:.2f}% costs "
+                                f"(gross {_rew/_rsk:.2f}:1) below {MIN_RR_RATIO}")
+                    return
+
             if sig == "BUY" and self.can_open_new():
                 _open_side = "LONG"
             elif sig == "SELL" and self.can_open_new():
@@ -4088,10 +4157,36 @@ class PaperTrader:
                     stop_label = "structure"
         if atr is None:
             stop_label = "fixed"
+        # Stop floor. Everything above can SHRINK atr_dist — a tight structure stop,
+        # a parabolic tighten, a divergence tighten — and nothing checked the result
+        # against what the trade costs. A stop nearer than one round trip cannot
+        # produce a winner even when the direction is right, because the move it
+        # allows is smaller than the fee to have taken the position.
+        _min_stop_dist = fill * ROUND_TRIP_COST_PCT * MIN_STOP_VS_COST_MULT
+        if atr_dist < _min_stop_dist:
+            log("PAPER", f"{name} stop widened {atr_dist/fill*100:.2f}% → "
+                         f"{_min_stop_dist/fill*100:.2f}% (below one round-trip cost)")
+            atr_dist   = round(_min_stop_dist, 8)
+            stop_label = "cost floor"
         trail_stop = round(fill - atr_dist if side == "LONG" else fill + atr_dist, 6)
         # R-multiple partial take levels: 1R and 2R from entry based on ATR distance
         r1_price = round(fill + atr_dist      if side == "LONG" else fill - atr_dist,      6)
         r2_price = round(fill + atr_dist * 2  if side == "LONG" else fill - atr_dist * 2,  6)
+        # Target sanity. Callers are supposed to hand over a gated target, but not
+        # all of them do — /force computes its own from ATR with no cost check, and
+        # four live trades on 2026-08-05 closed as "take profit" at a LOSS, which
+        # requires a target sitting essentially at entry. Rather than trust every
+        # present and future caller, clamp here: a target the trade cannot profit
+        # from is not a target. Logged at ERR so the bad caller is identifiable
+        # instead of the symptom being silently absorbed.
+        _min_tgt_dist = fill * ROUND_TRIP_COST_PCT * MIN_PROFIT_VS_COST_MULT
+        if target is not None and math.isfinite(target):
+            _tgt_dist = (target - fill) if side == "LONG" else (fill - target)
+            if _tgt_dist < _min_tgt_dist:
+                log("PAPER", f"{name} target {target:.6f} is only {_tgt_dist/fill*100:+.3f}% "
+                             f"from entry {fill:.6f} — below the {_min_tgt_dist/fill*100:.2f}% "
+                             f"cost floor. Clamping. Caller passed an ungated target.", "ERR")
+                target = round(fill + _min_tgt_dist if side == "LONG" else fill - _min_tgt_dist, 8)
         effective_target = float("inf") if (side == "LONG"  and self._trail_only(pair)) else \
                            0.0          if (side == "SHORT" and self._trail_only(pair)) else target
         self.positions[pair] = {"side": side, "entry": fill,
@@ -7841,15 +7936,29 @@ def trading_loop(trader):
                             target = round(_atr_target, 8)
                             _rr_reward = (target - price) if sig == "BUY" else (price - target)
                             _rr_risk   = (price - stop)   if sig == "BUY" else (stop - price)
-                        if _rr_risk <= 0 or _rr_reward / _rr_risk < MIN_RR_RATIO:
+                        # R:R must be measured NET OF COSTS, not gross. Costs do not
+                        # cancel out of the ratio — they shrink the reward and grow
+                        # the loss, so they push it down twice:
+                        #
+                        #   LINK 2026-08-05: target +2.30%, stop -1.05%.
+                        #   Gross 2.20:1 — comfortably past a 1.5 floor.
+                        #   Net   (2.30-0.52) : (1.05+0.52) = 1.14:1.
+                        #
+                        # Every open position on the book had this shape, and the
+                        # book was 11W-49L. A gross ratio is not a measure of
+                        # anything you can actually collect.
+                        _cost       = price * ROUND_TRIP_COST_PCT
+                        _net_reward = _rr_reward - _cost
+                        _net_risk   = _rr_risk   + _cost
+                        if _rr_risk <= 0 or _net_reward <= 0 or _net_reward / _net_risk < MIN_RR_RATIO:
                             with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
                             last_sigs[pair] = sig
                             continue
 
-                        # Cost floor: target must clear round-trip fees+slippage by a
-                        # healthy margin, or "hitting take profit" is a guaranteed net
-                        # loser once real costs are applied (seen live: a 0.013% move
-                        # triggered "take profit" and still lost money after fees).
+                        # Cost floor: the target on its own must also clear round-trip
+                        # costs by a healthy margin, or "hitting take profit" is a
+                        # guaranteed net loser once real costs are applied (seen live:
+                        # a 0.013% move triggered "take profit" and still lost money).
                         if _rr_reward / price < ROUND_TRIP_COST_PCT * MIN_PROFIT_VS_COST_MULT:
                             with _gate_counter_lock: _gate_counters["cost_floor"] += 1
                             last_sigs[pair] = sig
