@@ -9260,10 +9260,11 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
    can tell at a glance which line you wrote and which the machine did. */
 /* Both clamped on the card — a bot note runs to ~8 lines and an unclamped feed
    of them is unscannable. The full text is one tap away in the modal. */
-.jnl-note-auto{font-size:.7rem;color:var(--mu);line-height:1.5;
+.jnl-note-auto{font-size:.7rem;color:var(--mu);line-height:1.5;white-space:pre-wrap;
   border-left:2px solid rgba(124,58,237,.45);padding-left:8px;margin-top:6px;
   overflow:hidden;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical}
 .jnl-note-mine{font-size:.78rem;color:var(--tx);line-height:1.45;margin-top:6px;
+  white-space:pre-wrap;
   overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 .jnl-bot-badge{font-size:.5rem;letter-spacing:.06em;text-transform:uppercase;
   font-weight:800;color:#a78bfa;background:rgba(124,58,237,.14);
@@ -9272,7 +9273,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   border-radius:9px;padding:10px 12px;margin-bottom:12px;max-height:34vh;overflow-y:auto}
 .tnote-auto-hdr{font-size:.52rem;letter-spacing:.08em;text-transform:uppercase;
   font-weight:800;color:#a78bfa;margin-bottom:6px}
-.tnote-auto-txt{font-size:.7rem;color:var(--mu);line-height:1.55}
+.tnote-auto-txt{font-size:.7rem;color:var(--mu);line-height:1.55;white-space:pre-wrap}
 .tnote-btn.has-auto{border-color:rgba(124,58,237,.4);color:#a78bfa}
 /* ── NOTE TAG CHIPS ── */
 .tnote-tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
@@ -14325,8 +14326,15 @@ function openNote(key,label){
   const box=$('tnote_auto'),auto=_autoNote(key);
   if(box){
     if(auto&&auto.text){
+      // Newlines are handled by white-space:pre-wrap in CSS, NOT by replacing
+      // them here. This whole page lives in a non-raw Python string, so a
+      // backslash-n written anywhere in it — regex, string, even a comment like
+      // this one — is consumed by Python and reaches the browser as a REAL line
+      // break. Inside a regex literal that means an unterminated regex, and one
+      // parse error kills the ENTIRE script element, so every function on the
+      // page disappears at once. Keep backslash escapes out of this string.
       box.innerHTML='<div class="tnote-auto-hdr">&#129302; Bot’s note</div>'+
-        '<div class="tnote-auto-txt">'+auto.text.replace(/</g,'&lt;').replace(/\n/g,'<br>')+'</div>';
+        '<div class="tnote-auto-txt">'+auto.text.replace(/</g,'&lt;')+'</div>';
       box.style.display='';
     }else{box.style.display='none';}
   }
@@ -14752,7 +14760,8 @@ function renderJournal(){
     const tagHtml=n.tags.length?'<div class="jnl-note-tags">'+n.tags.map(t=>'<span class="jnl-tag">'+t+'</span>').join('')+'</div>':'';
     const pnlStr=n.pnl!=null?(n.pnl>=0?'+$':'-$')+Math.abs(n.pnl).toFixed(2):'';
     const pnlCol=n.pnl>0?'color:var(--g)':n.pnl<0?'color:var(--r)':'';
-    const esc=s=>s.replace(/</g,'&lt;').replace(/\n/g,'<br>');
+    // Escape only. Newlines are CSS's job (white-space:pre-wrap) — see openNote.
+    const esc=s=>s.replace(/</g,'&lt;');
     return '<div class="jnl-note-card" data-key="'+n.key+'" data-coin="'+n.coin+'" onclick="openNote(this.dataset.key,this.dataset.coin)">'+
       '<div class="jnl-note-hdr">'+
         '<div class="jnl-note-coin">'+n.coin+(pnlStr?' <span style="'+pnlCol+'">'+pnlStr+'</span>':'')+
