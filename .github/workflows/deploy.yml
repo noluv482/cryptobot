@@ -20,3 +20,21 @@ jobs:
           echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) deployed commit $(git rev-parse --short HEAD)" >> ~/deploy.log
           echo "Deploy complete at $(date)"
           docker ps | grep cryptobot-bot
+
+      # Every deploy rebuilds the image and leaves a new set of cache layers
+      # behind, and nothing ever removed them: 259 entries / 14.3GB had built up,
+      # 13.2GB of it reclaimable, growing with each push. Capping it here keeps
+      # recent layers so incremental rebuilds stay fast while the total stops
+      # growing without bound.
+      #
+      # BUILD CACHE ONLY. Not `system prune`, which would also delete unused
+      # images — including the previous bot image that a rollback needs. `|| true`
+      # because a failed cleanup must never fail a deploy that already succeeded,
+      # and the flag was renamed across Docker versions (--keep-storage ->
+      # --reserved-space) so both spellings are tried.
+      - name: Cap Docker build cache
+        run: |
+          docker builder prune -f --keep-storage 3GB \
+            || docker builder prune -f --reserved-space 3GB \
+            || true
+          docker system df | sed -n '1p;5p'

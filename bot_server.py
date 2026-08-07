@@ -3539,7 +3539,22 @@ class PaperTrader:
         if p["side"] == "SHORT": move = -move
         # Stage 1 closes 1/3 of original; stage 2 closes half of the remaining 2/3 (= 1/3 original)
         frac = 1/3 if stage == 1 else 0.5
-        pnl = round(move * (p["margin"] * frac) * p.get("leverage", LEVERAGE_MIN), 4)
+        # A partial exit is a real market sell and costs a real taker fee and
+        # slippage. This booked the gain with NEITHER, which made scaling out
+        # look free: two partials plus the final close is three exits, and the
+        # book was paying for one. Both partials sit in profit by construction
+        # (PARTIAL_TAKE_PCT / _2X are +8% / +16%), so the missing cost never
+        # showed up as an obvious loss — it just quietly inflated every winner
+        # that scaled out.
+        _lev  = p.get("leverage", LEVERAGE_MIN)
+        _exit = price * (1 - SLIPPAGE) if p["side"] == "LONG" else price * (1 + SLIPPAGE)
+        _mv   = (_exit - p["entry"]) / p["entry"]
+        if p["side"] == "SHORT": _mv = -_mv
+        _sim_fee = (BINANCE_FEE if USE_BINANCE else
+                    KRAKEN_FUTURES_FEE if USE_FUTURES else
+                    KRAKEN_FEE)
+        _part_margin = p["margin"] * frac
+        pnl = round(_mv * _part_margin * _lev - _part_margin * _lev * _sim_fee, 4)
         self.balance      = round(self.balance + pnl, 4)
         p["contracts"]    = round(p["contracts"] * (1 - frac), 6)
         p["margin"]       = round(p["margin"]    * (1 - frac), 4)
@@ -4113,7 +4128,8 @@ class PaperTrader:
                     return
                 if real_usd > 0:
                     self.balance = real_usd
-                fee = round(margin * KRAKEN_FUTURES_FEE, 4)
+                # notional, not margin — see the note in the paper branch below
+                fee = round(margin * leverage * KRAKEN_FUTURES_FEE, 4)
             elif LIVE_EXCHANGE == "binance":
                 leverage      = 1
                 contract_tier = "Spot"
@@ -4127,7 +4143,8 @@ class PaperTrader:
                     return
                 if real_usd > 0:
                     self.balance = real_usd
-                fee = round(margin * BINANCE_FEE, 4)
+                # notional, not margin — see the note in the paper branch below
+                fee = round(margin * leverage * BINANCE_FEE, 4)
             else:
                 if KRAKEN_MARGIN:
                     leverage      = KRAKEN_LEVERAGE
@@ -4182,7 +4199,8 @@ class PaperTrader:
                     return
                 if real_usd > 0:
                     self.balance = real_usd
-                fee = round(margin * KRAKEN_FEE, 4)
+                # notional, not margin — see the note in the paper branch below
+                fee = round(margin * leverage * KRAKEN_FEE, 4)
         else:
             # Tiered contracts — leverage and label scale with bot's conviction
             if leverage_override and leverage_override > 0:
@@ -4215,7 +4233,22 @@ class PaperTrader:
                          KRAKEN_FUTURES_FEE if USE_FUTURES else
                          KRAKEN_MAKER_FEE if USE_MAKER_ENTRIES else
                          KRAKEN_FEE)
-            fee       = round(margin * _sim_fee, 4)
+            # Fees are charged on NOTIONAL (margin x leverage), which is what an
+            # exchange actually bills — you are trading that much, whatever you
+            # posted as margin. Charging on margin alone while P&L scales with
+            # leverage made the break-even move rate/leverage instead of rate, so
+            # a 5x trade appeared to need a 5x smaller move to pay for itself and
+            # every leveraged trade in the book was flattered.
+            #
+            # It also broke the one comparison the manual book exists for: that
+            # book charges notional * KRAKEN_FEE, so the two ledgers were using
+            # different fee maths and could not be read against each other.
+            #
+            # Currently every trade is 1x (the tiers need confidence >= 0.68 and
+            # it never gets there), so this changes nothing today — it changes
+            # what happens the first time conviction rises, or the day this runs
+            # with real money.
+            fee       = round(margin * leverage * _sim_fee, 4)
             self.balance = round(self.balance - fee, 4)
 
         self.day_trades += 1
@@ -4371,7 +4404,10 @@ class PaperTrader:
             _live_fee = (KRAKEN_FUTURES_FEE if LIVE_EXCHANGE == "kraken_futures" else
                          BINANCE_FEE        if LIVE_EXCHANGE == "binance" else
                          KRAKEN_FEE)
-            fee = round(p.get("margin", 0) * _live_fee, 4)
+            # notional, matching _open. Live balance is read back from the
+            # exchange so this is the reported figure rather than the ledger,
+            # but a fee shown 5x too small on a 5x trade is still wrong.
+            fee = round(p.get("margin", 0) * p.get("leverage", LEVERAGE_MIN) * _live_fee, 4)
         else:
             fill = price * (1 - SLIPPAGE) if p["side"] == "LONG" else price * (1 + SLIPPAGE)
             move = (fill - p["entry"]) / p["entry"]
@@ -4379,8 +4415,14 @@ class PaperTrader:
             _sim_fee = (BINANCE_FEE if USE_BINANCE else
                         KRAKEN_FUTURES_FEE if USE_FUTURES else
                         KRAKEN_FEE)
-            fee  = round(p["margin"] * _sim_fee, 4)
-            pnl  = round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN) - fee, 4)
+            # Notional, matching _open — see the note there. With both sides
+            # correct, pnl = margin * lev * (move - fee_rate), so break-even is a
+            # move of fee_rate regardless of leverage. That is what the entry
+            # gates already assume when they compare a target against
+            # ROUND_TRIP_COST_PCT, so the accounting and the gates now agree.
+            _lev = p.get("leverage", LEVERAGE_MIN)
+            fee  = round(p["margin"] * _lev * _sim_fee, 4)
+            pnl  = round(move * p["margin"] * _lev - fee, 4)
             self.balance = round(self.balance + pnl, 4)
 
         self.peak         = max(self.peak, self.balance)
