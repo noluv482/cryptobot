@@ -13,6 +13,7 @@ import json
 import sys
 import re
 import math
+import statistics
 import io
 import hashlib
 import hmac
@@ -4915,10 +4916,18 @@ class SignalEngine:
         # SOL forming 177 vs closed 1927 — the forming bar reads 5-10x lower
         # purely because it has not finished. The average excludes it for the
         # same reason.
+        # Compared against the MEDIAN, not the mean. Volume is heavily
+        # right-skewed — a handful of spike bars drag the mean well above a
+        # typical bar, so "40% of average" quietly becomes a much higher bar
+        # than the 40% suggests. Measured 2026-08-08 on live candles: mean/median
+        # ran 1.5x–2.6x across pairs, and the mean rule rejected 21–24 of the
+        # last 40 closed bars (52–60%) where the median rule rejects 13–16
+        # (32–40%). This gate is meant to skip unusually dead bars, not most of
+        # them, and it was the single biggest blocker in the book by 3x.
         if volumes and len(volumes) >= 3:
             _closed_vols = volumes[:-1]
-            _avg_vol = sum(_closed_vols) / len(_closed_vols)
-            _very_low_vol = _closed_vols[-1] < _avg_vol * 0.40
+            _typ_vol = statistics.median(_closed_vols)
+            _very_low_vol = _closed_vols[-1] < _typ_vol * 0.40
         else:
             _very_low_vol = False
         if sig in ("BUY", "SELL") and _very_low_vol:
