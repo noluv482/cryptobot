@@ -76,6 +76,27 @@ def main():
     else:
         P("  insufficient history -> None (ok)")
 
+    # REGRESSION: the live bot fetches CANDLE_LIMIT (80) candles, and the hold
+    # horizon is 48 bars. The original guard (n < bars + 12) passed that, leaving
+    # 31 heavily-overlapping windows -- under two independent observations -- and
+    # returned a confident 0.70% where 720 candles say 3.70%. The cost floor then
+    # rejected everything and the bot did not trade for 54 hours. A measurement
+    # this thin must return None so the caller leaves the target alone.
+    bars_live = int(bs.MAX_TRADE_MINS / bs.INTERVAL)
+    thin = bs._reachable_dist(h[:bs.CANDLE_LIMIT], l[:bs.CANDLE_LIMIT],
+                              c[:bs.CANDLE_LIMIT], bars_live, "BUY")
+    P(f"  {bs.CANDLE_LIMIT} candles with a {bars_live}-bar lookahead -> {thin}")
+    if thin is not None:
+        fails.append(f"measured {thin*100:.2f}% from only {bs.CANDLE_LIMIT} candles "
+                     f"with a {bars_live}-bar lookahead — this halted trading for 54h")
+    else:
+        P("  refuses to measure from the scan's short window (ok)")
+
+    # And the guard must not be so strict that a full history is refused.
+    full = bs._reachable_dist(h, l, c, bars_live, "BUY") if len(c) > bars_live * 4 else None
+    if len(c) > bars_live * 4 and full is None:
+        fails.append("refused to measure even with ample history — too strict")
+
     # Both sides must be measured, and on symmetric noise be similar.
     rs = bs._reachable_dist(h, l, c, 8, "SELL")
     P(f"  BUY {r8*100:.3f}%  vs  SELL {rs*100:.3f}%")

@@ -493,6 +493,56 @@ _EXIT_COST_PCT  = (BINANCE_FEE if USE_BINANCE else
 ROUND_TRIP_COST_PCT   = _ENTRY_COST_PCT + _EXIT_COST_PCT
 
 
+_reach_cache: dict = {}          # pair -> {(bars, side): dist}, expiry
+REACH_CANDLES = 720              # Kraken's public OHLC maximum
+REACH_TTL     = 6 * 3600         # a volatility regime does not turn over in an hour
+
+
+def _pair_reachable(pair, bars, side):
+    """Reachable distance for `pair`, measured on a LONG history.
+
+    Deliberately does NOT reuse the scan's candles. CANDLE_LIMIT is 80, and
+    measuring a 48-bar excursion from 80 candles leaves 31 heavily-overlapping
+    windows -- under two independent observations. That is not a measurement,
+    and it read 0.70% on NEAR where 720 candles read 3.70%. Because the cost
+    floor then rejects anything under 1.56%, that under-reading silently halted
+    ALL trading for 54 hours.
+
+    It also must not widen the scan's own candle window: S/R clustering and the
+    volume average are tuned to CANDLE_LIMIT bars, so feeding them 720 would
+    quietly change entry behaviour everywhere. Hence a separate fetch and a
+    separate cache, 6h TTL -- this number moves slowly and does not deserve a
+    request per scan.
+
+    Returns None when it cannot measure properly. Callers must treat None as
+    "no opinion" and leave the target alone: a failed measurement must never be
+    able to stop the bot trading.
+    """
+    now = time.time()
+    ent = _reach_cache.get(pair)
+    if ent and ent[1] > now and (bars, side) in ent[0]:
+        return ent[0][(bars, side)]
+    try:
+        r = requests.get(f"{BASE_URL}/OHLC",
+                         params={"pair": pair, "interval": INTERVAL}, timeout=12)
+        payload = r.json()
+        if payload.get("error"):
+            return None
+        rkey = next(k for k in payload["result"] if k != "last")
+        data = payload["result"][rkey][-REACH_CANDLES:]
+        highs  = [float(c[2]) for c in data]
+        lows   = [float(c[3]) for c in data]
+        closes = [float(c[4]) for c in data]
+    except Exception as e:
+        log("GATE", f"reachability fetch failed for {pair}: {e} — not clamping", "WRN")
+        return None
+    dist = _reachable_dist(highs, lows, closes, bars, side)
+    store = (ent[0] if ent and ent[1] > now else {})
+    store[(bars, side)] = dist
+    _reach_cache[pair] = (store, now + REACH_TTL)
+    return dist
+
+
 def _reachable_dist(highs, lows, closes, bars, side, samples=120):
     """How far this pair actually travels the favourable way in `bars` bars.
 
@@ -514,7 +564,12 @@ def _reachable_dist(highs, lows, closes, bars, side, samples=120):
     pair has been doing lately.
     """
     n = min(len(closes), len(highs), len(lows))
-    if n < bars + 12:
+    # The old guard was `n < bars + 12`, which passes with 80 candles and a
+    # 48-bar lookahead: 31 overlapping windows spanning 1.7 independent periods.
+    # It returned a confident-looking number from almost no data. Require the
+    # history to be several times the lookahead AND enough windows to have a
+    # meaningful median, and return None rather than guess.
+    if n < bars * 4 or (n - bars - 1) < 60:
         return None
     ex = []
     for i in range(max(0, n - samples - bars - 1), n - bars - 1):
@@ -8079,7 +8134,10 @@ def trading_loop(trader):
                         # enough to pay its own fees now fails the cost floor on its
                         # own, which is the correct reason to skip it.
                         _max_bars = max(1, int(MAX_TRADE_MINS / max(INTERVAL, 1)))
-                        _reach = _reachable_dist(highs, lows, closes, _max_bars, sig)
+                        # Measured on its own long history, NOT the 80 candles in
+                        # `highs/lows/closes` here — see _pair_reachable. None
+                        # means "could not measure", and the target is left alone.
+                        _reach = _pair_reachable(pair, _max_bars, sig)
                         if _reach:
                             _reach_px = price * _reach
                             _want     = (target - price) if sig == "BUY" else (price - target)
