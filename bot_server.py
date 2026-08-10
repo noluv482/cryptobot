@@ -5301,7 +5301,21 @@ class SignalEngine:
             "rsi_zone":      40 <= rsi <= 60,
             "news_align":    news_pts >= 1.0,
             "nasdaq_align":  nasdaq_pts >= 1.0,
-            "tick_strength": ticks > 0,
+            # `ticks > 0` could never be false. above_ticks/below_ticks are
+            # incremented immediately before this, so whichever side the signal
+            # is on already has a count of at least 1 — the pillar was a
+            # tautology. Its own data proves it: 165 samples active, 0 inactive.
+            #
+            # That mattered in three places. It handed every signal one free
+            # pillar toward min_pillars (7 for MULTI_SIGNAL, 4 for CONFLUENCE),
+            # and TREND_CONTINUATION listed it as REQUIRED — a requirement that
+            # was always already satisfied.
+            #
+            # The threshold is not invented: tick_pts is min(ticks/2, 1.0), so
+            # the score already treats 2 as "full strength". The pillar now
+            # means the same thing the score means. Measured over 3,548 signals:
+            # true on 80.6%, so 19.4% lose exactly one pillar.
+            "tick_strength": ticks >= 2,
             "macd_align":    macd_pts >= 1.0,
             "high_volume":   high_volume,
             "candle_pattern":candle_pts >= 1.0,
