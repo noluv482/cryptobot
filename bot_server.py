@@ -591,6 +591,16 @@ MIN_PROFIT_VS_COST_MULT = 3.0  # target must clear round-trip costs by this mult
 # even when the direction call is right: the move it allows is smaller than the
 # cost of having taken the position at all. Enforced as a floor in _open().
 MIN_STOP_VS_COST_MULT = 1.0
+# Paper-mode economics. The 1.5x net R:R and 3x cost floor are LIVE-money bars,
+# and in a quiet market they can be unreachable for days: 2026-08-11 to -15,
+# 7,554 signals reached the gates and every one died at net R:R — zero trades,
+# zero data, while PAPER_LOCK meant there was no money to protect. Paper's job
+# is to produce the track record and the learning data, so on paper a trade
+# must merely be POSITIVE after costs (1.0x) and its target must clear one
+# round trip (1.0x). The strict bars snap back the moment the trader is live —
+# these constants are read only through the _is_live() checks at the gate sites.
+PAPER_MIN_RR            = float(os.environ.get("PAPER_MIN_RR", "1.0"))
+PAPER_PROFIT_VS_COST_MULT = float(os.environ.get("PAPER_PROFIT_VS_COST_MULT", "1.0"))
 DAILY_GAIN_SOFT   = 0.03
 DAILY_GAIN_HARD   = 0.06
 LIVE_CHART_MINS   = 10
@@ -4013,13 +4023,14 @@ class PaperTrader:
                 _rew = (target - price) if sig == "BUY" else (price - target)
                 _rsk = (price - stop)   if sig == "BUY" else (stop - price)
                 _cst = price * ROUND_TRIP_COST_PCT
+                _rr_floor = MIN_RR_RATIO if self._is_live() else PAPER_MIN_RR
                 if _rsk > 0 and ((_rew - _cst) <= 0 or
-                                 (_rew - _cst) / (_rsk + _cst) < MIN_RR_RATIO):
+                                 (_rew - _cst) / (_rsk + _cst) < _rr_floor):
                     with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
                     log("GATE", f"{name} blocked — net R:R "
                                 f"{(_rew - _cst) / (_rsk + _cst):.2f}:1 after "
                                 f"{ROUND_TRIP_COST_PCT*100:.2f}% costs "
-                                f"(gross {_rew/_rsk:.2f}:1) below {MIN_RR_RATIO}")
+                                f"(gross {_rew/_rsk:.2f}:1) below {_rr_floor}")
                     return
 
             if sig == "BUY" and self.can_open_new():
@@ -4358,7 +4369,8 @@ class PaperTrader:
         # present and future caller, clamp here: a target the trade cannot profit
         # from is not a target. Logged at ERR so the bad caller is identifiable
         # instead of the symptom being silently absorbed.
-        _min_tgt_dist = fill * ROUND_TRIP_COST_PCT * MIN_PROFIT_VS_COST_MULT
+        _min_tgt_dist = fill * ROUND_TRIP_COST_PCT * (
+            MIN_PROFIT_VS_COST_MULT if self._is_live() else PAPER_PROFIT_VS_COST_MULT)
         if target is not None and math.isfinite(target):
             _tgt_dist = (target - fill) if side == "LONG" else (fill - target)
             if _tgt_dist < _min_tgt_dist:
@@ -8187,7 +8199,8 @@ def trading_loop(trader):
                         _cost       = price * ROUND_TRIP_COST_PCT
                         _net_reward = _rr_reward - _cost
                         _net_risk   = _rr_risk   + _cost
-                        if _rr_risk <= 0 or _net_reward <= 0 or _net_reward / _net_risk < MIN_RR_RATIO:
+                        _rr_floor = MIN_RR_RATIO if trader._is_live() else PAPER_MIN_RR
+                        if _rr_risk <= 0 or _net_reward <= 0 or _net_reward / _net_risk < _rr_floor:
                             with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
                             last_sigs[pair] = sig
                             continue
@@ -8196,7 +8209,8 @@ def trading_loop(trader):
                         # costs by a healthy margin, or "hitting take profit" is a
                         # guaranteed net loser once real costs are applied (seen live:
                         # a 0.013% move triggered "take profit" and still lost money).
-                        if _rr_reward / price < ROUND_TRIP_COST_PCT * MIN_PROFIT_VS_COST_MULT:
+                        _cf_mult = MIN_PROFIT_VS_COST_MULT if trader._is_live() else PAPER_PROFIT_VS_COST_MULT
+                        if _rr_reward / price < ROUND_TRIP_COST_PCT * _cf_mult:
                             with _gate_counter_lock: _gate_counters["cost_floor"] += 1
                             last_sigs[pair] = sig
                             continue
