@@ -1077,6 +1077,35 @@ class Database:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS pi_pillar ON pillar_outcomes(pillar, active)")
+            # Learning lab (2026-08-13). shadow_signals: EVERY signal that
+            # reaches the entry gates, taken or not, with its raw feature
+            # values — the bot used to learn only from ~1 taken trade a day
+            # and threw away the thousands it evaluated. exit_lab: for every
+            # closed trade, what fixed-horizon exits would have paid, filled
+            # in later once the future has happened. Raw numbers, not pillar
+            # booleans, so future signal ideas can be mined offline.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS shadow_signals (
+                    id SERIAL PRIMARY KEY, ts FLOAT, pair TEXT, sig TEXT,
+                    price FLOAT, conf FLOAT, rsi FLOAT, atr_pct FLOAT,
+                    reach_pct FLOAT, stop_pct FLOAT, tgt_pct FLOAT,
+                    rr_gross FLOAT, rr_net FLOAT, vol_ratio FLOAT,
+                    funding FLOAT, regime TEXT, hour INT, dow INT,
+                    pillars TEXT, fkey TEXT,
+                    taken INT DEFAULT 0, rejected_by TEXT DEFAULT '',
+                    fwd6 FLOAT, fwd24 FLOAT, fwd48 FLOAT, fwd_done INT DEFAULT 0
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS ss_done ON shadow_signals(fwd_done, ts)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS exit_lab (
+                    id SERIAL PRIMARY KEY, ts_entry FLOAT, ts_exit FLOAT,
+                    pair TEXT, side TEXT, entry FLOAT, exitp FLOAT,
+                    reason TEXT, act_gross FLOAT, cost_pct FLOAT,
+                    f24 FLOAT, f48 FLOAT, done INT DEFAULT 0
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS el_done ON exit_lab(done, ts_entry)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS candles (
                     pair        TEXT    NOT NULL,
@@ -1260,6 +1289,94 @@ class Database:
                         (pillar, bool(active), won, time.time()))
         except Exception as e:
             log("DB", f"log_pillars error: {e}", "ERR")
+
+    # ── Learning lab ─────────────────────────────────────────────────────
+    def log_shadow(self, r):
+        """One signal that reached the entry gates. Returns row id or None.
+        Must never raise into the scan loop."""
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""INSERT INTO shadow_signals
+                    (ts,pair,sig,price,conf,rsi,atr_pct,reach_pct,stop_pct,tgt_pct,
+                     rr_gross,rr_net,vol_ratio,funding,regime,hour,dow,pillars,fkey)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id""",
+                    (r.get("ts"), r.get("pair"), r.get("sig"), r.get("price"),
+                     r.get("conf"), r.get("rsi"), r.get("atr_pct"), r.get("reach_pct"),
+                     r.get("stop_pct"), r.get("tgt_pct"), r.get("rr_gross"),
+                     r.get("rr_net"), r.get("vol_ratio"), r.get("funding"),
+                     r.get("regime"), r.get("hour"), r.get("dow"),
+                     r.get("pillars"), r.get("fkey")))
+                return cur.fetchone()[0]
+        except Exception as e:
+            log("DB", f"log_shadow: {e}", "ERR"); return None
+
+    def mark_shadow(self, sid, taken=None, rejected=None):
+        if not self.conn or sid is None: return
+        try:
+            with self.conn.cursor() as cur:
+                if taken is not None:
+                    cur.execute("UPDATE shadow_signals SET taken=%s WHERE id=%s",
+                                (1 if taken else 0, sid))
+                if rejected is not None:
+                    cur.execute("UPDATE shadow_signals SET rejected_by=%s WHERE id=%s",
+                                (rejected, sid))
+        except Exception as e:
+            log("DB", f"mark_shadow: {e}", "ERR")
+
+    def shadow_pending(self, older_than_s, limit=400):
+        if not self.conn: return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT id,ts,pair FROM shadow_signals
+                               WHERE fwd_done=0 AND ts < %s ORDER BY ts LIMIT %s""",
+                            (older_than_s, limit))
+                return cur.fetchall()
+        except Exception as e:
+            log("DB", f"shadow_pending: {e}", "ERR"); return []
+
+    def fill_shadow(self, sid, f6, f24, f48):
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""UPDATE shadow_signals
+                               SET fwd6=%s, fwd24=%s, fwd48=%s, fwd_done=1
+                               WHERE id=%s""", (f6, f24, f48, sid))
+        except Exception as e:
+            log("DB", f"fill_shadow: {e}", "ERR")
+
+    def log_exit_lab(self, r):
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""INSERT INTO exit_lab
+                    (ts_entry,ts_exit,pair,side,entry,exitp,reason,act_gross,cost_pct)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (r["ts_entry"], r["ts_exit"], r["pair"], r["side"], r["entry"],
+                     r["exitp"], r["reason"], r["act_gross"], r["cost_pct"]))
+        except Exception as e:
+            log("DB", f"log_exit_lab: {e}", "ERR")
+
+    def exit_pending(self, older_than_s, limit=200):
+        if not self.conn: return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT id,ts_entry,pair,side,entry FROM exit_lab
+                               WHERE done=0 AND ts_entry < %s ORDER BY ts_entry LIMIT %s""",
+                            (older_than_s, limit))
+                return cur.fetchall()
+        except Exception as e:
+            log("DB", f"exit_pending: {e}", "ERR"); return []
+
+    def fill_exit(self, eid, f24, f48):
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("UPDATE exit_lab SET f24=%s, f48=%s, done=1 WHERE id=%s",
+                            (f24, f48, eid))
+        except Exception as e:
+            log("DB", f"fill_exit: {e}", "ERR")
 
     def pillar_win_rates(self):
         """Per-pillar win rate when that pillar was ACTIVE. Min 10 samples."""
@@ -4520,6 +4637,22 @@ class PaperTrader:
         # counts with trades that were never taken.
         if not self._no_persist:
             _auto_note_record(self, p, trade_rec)
+            # Exit lab: record the trade so the filler can later compare the
+            # exit that HAPPENED against fixed 24h/48h holds from the same
+            # entry. The counterfactuals need the future, so f24/f48 stay
+            # NULL until _learning_filler_loop fills them.
+            try:
+                _mv = (fill - p["entry"]) / p["entry"] if p.get("entry") else 0.0
+                if p.get("side") == "SHORT": _mv = -_mv
+                db.log_exit_lab({
+                    "ts_entry": p.get("opened_at", time.time()),
+                    "ts_exit": time.time(), "pair": pair,
+                    "side": p.get("side", ""), "entry": p.get("entry", 0.0),
+                    "exitp": fill, "reason": reason, "act_gross": _mv,
+                    "cost_pct": ROUND_TRIP_COST_PCT,
+                })
+            except Exception as _ee:
+                log("DB", f"exit_lab hook: {_ee}", "ERR")
         if not self._force_paper:
             db.log_feature(fkey, pair, pnl > 0)
             db.log_pillars(p.get("pillars", {}), pnl > 0)
@@ -8200,8 +8333,39 @@ def trading_loop(trader):
                         _net_reward = _rr_reward - _cost
                         _net_risk   = _rr_risk   + _cost
                         _rr_floor = MIN_RR_RATIO if trader._is_live() else PAPER_MIN_RR
+                        # Learning lab: snapshot EVERY signal that gets this far,
+                        # with raw feature values — before the economics gates
+                        # decide its fate. The gates then stamp the outcome, so
+                        # later analysis can ask "what did each gate reject, and
+                        # was it right to?" using forward returns filled in by
+                        # _learning_filler_loop. conf here is pre-orderbook
+                        # adjustment. Never allowed to break the scan: log_shadow
+                        # swallows its own errors and returns None when no DB.
+                        _sid = None
+                        try:
+                            _cv = volumes[:-1] if volumes and len(volumes) > 3 else []
+                            _sid = db.log_shadow({
+                                "ts": time.time(), "pair": pair, "sig": sig,
+                                "price": price, "conf": conf, "rsi": rsi,
+                                "atr_pct": (atr / price) if (atr and price) else None,
+                                "reach_pct": _reach,
+                                "stop_pct": (_rr_risk / price) if price else None,
+                                "tgt_pct": (_rr_reward / price) if price else None,
+                                "rr_gross": (_rr_reward / _rr_risk) if _rr_risk > 0 else None,
+                                "rr_net": (_net_reward / _net_risk) if _net_risk > 0 else None,
+                                "vol_ratio": (_cv[-1] / statistics.median(_cv)) if _cv and statistics.median(_cv) > 0 else None,
+                                "funding": funding_rates.get(pair),
+                                "regime": (detect_regime(closes, highs, lows) if len(closes) > 25 else None),
+                                "hour": datetime.utcnow().hour,
+                                "dow": datetime.utcnow().weekday(),
+                                "pillars": json.dumps(pillars or {}),
+                                "fkey": fkey,
+                            })
+                        except Exception:
+                            pass
                         if _rr_risk <= 0 or _net_reward <= 0 or _net_reward / _net_risk < _rr_floor:
                             with _gate_counter_lock: _gate_counters["rr_ratio"] += 1
+                            db.mark_shadow(_sid, rejected="net_rr")
                             last_sigs[pair] = sig
                             continue
 
@@ -8212,6 +8376,7 @@ def trading_loop(trader):
                         _cf_mult = MIN_PROFIT_VS_COST_MULT if trader._is_live() else PAPER_PROFIT_VS_COST_MULT
                         if _rr_reward / price < ROUND_TRIP_COST_PCT * _cf_mult:
                             with _gate_counter_lock: _gate_counters["cost_floor"] += 1
+                            db.mark_shadow(_sid, rejected="cost_floor")
                             last_sigs[pair] = sig
                             continue
 
@@ -8268,6 +8433,7 @@ def trading_loop(trader):
                                 with _gate_counter_lock: _gate_counters["min_conf"] += 1
                                 log("GATE", f"{coin['name']} skipped — confidence "
                                             f"{conf:.0%} below floor {_floor:.0%}")
+                                db.mark_shadow(_sid, rejected="min_conf")
                                 last_sigs[pair] = sig
                                 continue
 
@@ -8277,6 +8443,7 @@ def trading_loop(trader):
                                 # when price trades back to it (see
                                 # _resolve_pending_entry), which is what earns the
                                 # maker fee — and what can miss the trade entirely.
+                                db.mark_shadow(_sid, taken=True, rejected="")
                                 _pending_entries[pair] = {
                                     "sig": sig, "limit": price, "stop": stop,
                                     "target": target, "name": coin["name"],
@@ -8288,6 +8455,7 @@ def trading_loop(trader):
                                              f"{price:.6f} (maker; expires in "
                                              f"{MAKER_FILL_WAIT_SCANS} scans)")
                             else:
+                                db.mark_shadow(_sid, taken=True, rejected="")
                                 trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
                                                  atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
 
@@ -17284,6 +17452,102 @@ def _position_watchdog(*traders):
                     log("WATCHDOG", f"{pair}: {e}", "ERR")
 
 
+# ── Learning lab filler ───────────────────────────────────────────────────────
+def _learning_filler_loop():
+    """Fill forward returns for shadow signals and exit-lab counterfactuals.
+
+    A shadow row records a signal the moment it reached the gates; only the
+    future can say whether the gates judged it well. This wakes every 30 min,
+    finds rows whose 48h horizon has fully elapsed, and computes returns from
+    public OHLC (one fetch per pair per pass, includes timestamps — the scan's
+    get_klines cache does not carry them).
+
+    Returns are stored LONG-signed from the recorded price; analysis flips by
+    the stored side. Rows too old for the 720-bar window are closed out with
+    NULLs rather than left to poll forever.
+    """
+    def ohlc(pair):
+        r = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair, "interval": 60},
+                         timeout=12)
+        d = r.json()
+        if d.get("error"):
+            return []
+        key = next(k for k in d["result"] if k != "last")
+        return [(int(c[0]), float(c[4])) for c in d["result"][key]]
+
+    def close_at(bars, when):
+        for t, c in bars:
+            if t >= when:
+                return c
+        return None
+
+    log("LAB", "learning filler loop started (30 min cadence)")
+    while True:
+        time.sleep(1800)
+        try:
+            cutoff = time.time() - 49 * 3600
+            srows = db.shadow_pending(cutoff)
+            erows = db.exit_pending(cutoff)
+            if not srows and not erows:
+                continue
+            pairs = {r[2] for r in srows} | {r[2] for r in erows}
+            books = {}
+            for pr in pairs:
+                try:
+                    books[pr] = ohlc(pr)
+                except Exception:
+                    books[pr] = []
+                time.sleep(1.1)
+            filled = 0
+            for sid, ts, pr in srows:
+                bars = books.get(pr) or []
+                if not bars:
+                    continue
+                if bars and ts + 6 * 3600 < bars[0][0]:
+                    db.fill_shadow(sid, None, None, None)   # predates the window
+                    continue
+                with_c = [close_at(bars, ts + h * 3600) for h in (6, 24, 48)]
+                if with_c[2] is None:
+                    continue                                 # 48h not elapsed in data yet
+                base = None
+                # price at signal time was recorded; read it back for the base
+                try:
+                    with db.conn.cursor() as cur:
+                        cur.execute("SELECT price FROM shadow_signals WHERE id=%s", (sid,))
+                        row = cur.fetchone()
+                        base = row[0] if row else None
+                except Exception:
+                    base = None
+                if not base:
+                    db.fill_shadow(sid, None, None, None)
+                    continue
+                f6, f24, f48 = [((c - base) / base) if c else None for c in with_c]
+                db.fill_shadow(sid, f6, f24, f48)
+                filled += 1
+            for eid, ts_e, pr, side, entry in erows:
+                bars = books.get(pr) or []
+                if not bars or not entry:
+                    continue
+                if ts_e + 24 * 3600 < bars[0][0]:
+                    db.fill_exit(eid, None, None)
+                    continue
+                c24 = close_at(bars, ts_e + 24 * 3600)
+                c48 = close_at(bars, ts_e + 48 * 3600)
+                if c48 is None:
+                    continue
+                f24 = (c24 - entry) / entry if c24 else None
+                f48 = (c48 - entry) / entry
+                if side == "SHORT":
+                    f24 = -f24 if f24 is not None else None
+                    f48 = -f48
+                db.fill_exit(eid, f24, f48)
+                filled += 1
+            if filled:
+                log("LAB", f"filled forward returns for {filled} row(s)")
+        except Exception as e:
+            log("LAB", f"filler error: {e}", "ERR")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     global _current_coin
@@ -17405,6 +17669,7 @@ def main():
         ("Fear & Greed",      _fear_greed_loop,     ()),
         ("BTC Dominance",     _btc_dominance_loop,  ()),
         ("Funding rates",     _funding_loop,        ()),
+        ("Learning filler",   _learning_filler_loop, ()),
         ("Trending scanner",  _trending_loop,       ()),
         ("Coin switcher",     _switcher_loop,       (trader,)),
         ("Telegram poll",     _poll_loop,           (trader,)),
