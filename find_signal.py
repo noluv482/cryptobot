@@ -29,6 +29,7 @@ Usage:
 """
 import argparse
 import math
+import os
 import statistics
 import sys
 import time
@@ -36,6 +37,41 @@ import time
 import bot_server as bs
 
 bs.log = lambda *a, **k: None
+
+HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "data", "history")
+
+
+def load_history(pair, since_year=None):
+    """(closes, highs, lows, vols) from data/history/{pair}_60.csv, or None.
+
+    Multi-year Coinbase data fetched by fetch_history.py. Kraken's API only
+    serves 720 candles; these files are what make a REAL out-of-sample split
+    possible — 2022's crash and 2024's chop instead of two halves of one
+    quiet month.
+    """
+    path = os.path.join(HISTORY_DIR, f"{pair}_60.csv")
+    if not os.path.exists(path):
+        return None
+    cutoff = 0
+    if since_year:
+        import calendar
+        cutoff = calendar.timegm((since_year, 1, 1, 0, 0, 0))
+    c, h, l, v = [], [], [], []
+    with open(path, encoding="utf-8") as f:
+        next(f, None)                              # header
+        for line in f:
+            bits = line.rstrip("\n").split(",")
+            if len(bits) < 6 or not bits[0].isdigit():
+                continue
+            if int(bits[0]) < cutoff:
+                continue
+            try:
+                c.append(float(bits[4])); h.append(float(bits[2]))
+                l.append(float(bits[3])); v.append(float(bits[5]))
+            except ValueError:
+                continue
+    return (c, h, l, v) if len(c) > 500 else None
 
 
 # ── candidate signals ────────────────────────────────────────────────────────
@@ -226,11 +262,16 @@ def fwd(c, i, n, side):
 
 
 def evaluate(fn, series, horizon, lo, hi, warmup=80):
-    """Run one candidate over [lo, hi). Returns (buys, sells, baseline)."""
+    """Run one candidate over a window. Returns (buys, sells, baseline).
+
+    lo/hi are FRACTIONS of each pair's own length (0.0–1.0). Pairs list on
+    different dates, and an absolute split at the shortest pair's midpoint
+    would throw away most of a 9-year BTC file to match a 3-year SUI file.
+    """
     buys, sells, base = [], [], []
     for c, h, l, v in series:
-        a = max(warmup, lo)
-        b = min(hi, len(c) - horizon - 1)
+        a = max(warmup, int(len(c) * lo))
+        b = min(int(len(c) * hi), len(c) - horizon - 1)
         for i in range(a, b):
             f = fwd(c, i, horizon, "BUY")
             if f is not None:
@@ -263,29 +304,44 @@ def main():
     ap.add_argument("--pairs", default="")
     ap.add_argument("--interval", type=int, default=60)
     ap.add_argument("--horizons", default="6,24")
+    ap.add_argument("--history", action="store_true",
+                    help="use data/history CSVs (multi-year) instead of the live API")
+    ap.add_argument("--since", type=int, default=None,
+                    help="with --history: trim to candles from this year on")
     args = ap.parse_args()
 
     pairs = ([p.strip() for p in args.pairs.split(",") if p.strip()]
              or [c["pair"] for c in bs.SCAN_UNIVERSE])
     horizons = [int(x) for x in args.horizons.split(",")]
 
-    print(f"fetching {len(pairs)} pairs at {args.interval}m ...")
     series = []
-    for p in pairs:
-        try:
-            c, h, l, v, o = bs.get_klines(p, interval=args.interval, limit=720)
-        except Exception:
-            continue
-        if len(c) >= 300:
-            series.append((c, h, l, v))
-        time.sleep(1.1)
-    if not series:
-        print("no data")
-        return 1
-    n_bars = min(len(c) for c, _, _, _ in series)
-    mid = n_bars // 2
-    print(f"{len(series)} pairs, {n_bars} bars each")
-    print(f"IN-SAMPLE  bars 80..{mid}   OUT-OF-SAMPLE bars {mid}..{n_bars}")
+    if args.history:
+        print(f"loading {len(pairs)} pairs from {HISTORY_DIR}"
+              + (f" (since {args.since})" if args.since else "") + " ...")
+        for p in pairs:
+            got = load_history(p, args.since)
+            if got:
+                series.append(got)
+        if not series:
+            print("no history files — run fetch_history.py first")
+            return 1
+        spans = [len(c) for c, _, _, _ in series]
+        print(f"{len(series)} pairs, {min(spans):,}–{max(spans):,} bars "
+              f"({max(spans)/8760:.1f} years at the longest)")
+    else:
+        print(f"fetching {len(pairs)} pairs at {args.interval}m ...")
+        for p in pairs:
+            try:
+                c, h, l, v, o = bs.get_klines(p, interval=args.interval, limit=720)
+            except Exception:
+                continue
+            if len(c) >= 300:
+                series.append((c, h, l, v))
+            time.sleep(1.1)
+        if not series:
+            print("no data")
+            return 1
+    print("split: first half of EACH pair ranks, second half judges")
     print("candidates are RANKED in-sample and JUDGED out-of-sample\n")
 
     results = []
@@ -297,9 +353,9 @@ def main():
               f"{'OOS n':>6s} {'OOS edge':>9s} {'OOS t':>7s}")
         print("  " + "-" * 72)
         for name, fn in CANDIDATES.items():
-            bi, si, base_i = evaluate(fn, series, hz, 80, mid)
+            bi, si, base_i = evaluate(fn, series, hz, 0.0, 0.5)
             n_i, e_i, t_i = score(bi, si, base_i)
-            bo, so, base_o = evaluate(fn, series, hz, mid, n_bars)
+            bo, so, base_o = evaluate(fn, series, hz, 0.5, 1.0)
             n_o, e_o, t_o = score(bo, so, base_o)
             f = lambda e, t: (f"{e*100:>+8.3f}% {t:>+7.2f}" if e is not None
                               else f"{'—':>9s} {'—':>7s}")
