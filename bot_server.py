@@ -9680,11 +9680,16 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
    width-capped and centred. Pure CSS — the pages stay absolutely positioned
    and the tab JS is untouched, so mobile behaviour cannot regress.        */
 @media(min-width:900px){
-  body{flex-direction:row-reverse}          /* pages left, nav right in DOM order */
+  /* LEFT sidebar (per this block's own header note). Must be `row`, not
+     `row-reverse`: with tabbar order:-1 (visually first) + row, the sidebar
+     lands on the LEFT — which is where .hdr{left:196px} and .pages expect it.
+     row-reverse put it on the RIGHT, so the header overlapped the sidebar and
+     left a 196px dead strip on the left. */
+  body{flex-direction:row}
   .tabbar{
     height:100vh;width:196px;flex-direction:column;
     padding:14px 0 0;border-top:none;border-right:1px solid var(--bd);
-    order:-1;                                /* visually first */
+    order:-1;                                /* visually first → leftmost */
   }
   .tab{
     flex:0 0 auto;flex-direction:row;justify-content:flex-start;
