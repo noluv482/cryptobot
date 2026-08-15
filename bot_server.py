@@ -9706,10 +9706,15 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   .pages{margin-top:var(--hdr-h)}
   .page{padding-bottom:24px}
   /* Readable measure: long lines are the main thing that looks wrong when a
-     phone layout is stretched across a widescreen. */
-  .page > *{max-width:1080px;margin-left:auto;margin-right:auto}
+     phone layout is stretched across a widescreen.
+     margin auto is !important because several cards carry an INLINE
+     margin:0 16px (e.g. #rank_card) — inline styles beat a normal selector, so
+     without !important those cards left-align at the page edge while their
+     centered siblings sit ~200px in. That mismatch is the "not lined up" look.
+     Only left/right are forced; the inline top/bottom spacing is preserved. */
+  .page > *{max-width:1080px;margin-left:auto!important;margin-right:auto!important}
   .chart-wrap,.pc,.sh,.coin-strip,.iv-row,.ind-row,.chart-info-row{
-    max-width:1080px;margin-left:auto;margin-right:auto}
+    max-width:1080px;margin-left:auto!important;margin-right:auto!important}
 }
 @media(min-width:1500px){
   .page > *{max-width:1240px}
