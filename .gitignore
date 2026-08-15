@@ -20,3 +20,5 @@ run_sol_tracker.bat
 solusd_log.csv
 paper_state.json
 notes.json
+data/history/
+ohlc_cache/
