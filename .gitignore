@@ -7,3 +7,16 @@ api_keys.json
 .env
 data/
 pgdata/
+
+# Loose local experiments — never for the PUBLIC repo. auto_trojan.py embeds
+# live Telethon API credentials and a personal phone number; one `git add -A`
+# away from publishing them without these lines.
+auto_trojan.py
+sol_trader.py
+pico_trader.py
+crypto_chart.py
+news_scanner.py
+run_sol_tracker.bat
+solusd_log.csv
+paper_state.json
+notes.json
