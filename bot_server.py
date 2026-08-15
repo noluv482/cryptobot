@@ -658,6 +658,21 @@ def _load_api_keys_from_file():
 _load_api_keys_from_file()
 
 SCAN_UNIVERSE = [
+    # Added 2026-08-15 from a live volume ranking of every Kraken USD
+    # pair not already here (top by 24h USD volume, minus stables,
+    # tokenized gold, and unknown micro-caps). The cost/reachability
+    # gates decide per-cycle whether each is worth trading, so a quiet
+    # coin costs a scan slot, never money. XMR/HYPE/TRX have no US
+    # research-history source (not on Coinbase; Binance.US thin) — the
+    # bot trades them on live Kraken candles like everything else.
+    {"name": "HYPE/USD",  "pair": "HYPEUSD",  "alert_buffer": 0.2818},
+    {"name": "ZEC/USD",  "pair": "ZECUSD",  "alert_buffer": 2.46},
+    {"name": "XMR/USD",  "pair": "XMRUSD",  "alert_buffer": 2.033},
+    {"name": "TAO/USD",  "pair": "TAOUSD",  "alert_buffer": 0.9935},
+    {"name": "PUMP/USD",  "pair": "PUMPUSD",  "alert_buffer": 1.381e-05},
+    {"name": "CRV/USD",  "pair": "CRVUSD",  "alert_buffer": 0.001206},
+    {"name": "XLM/USD",  "pair": "XLMUSD",  "alert_buffer": 0.0007955},
+    {"name": "TRX/USD",  "pair": "TRXUSD",  "alert_buffer": 0.001663},
     {"name": "SOL/USD",   "pair": "SOLUSD",   "alert_buffer": 0.10},
     {"name": "BTC/USD",   "pair": "XBTUSD",   "alert_buffer": 50.0},
     {"name": "ETH/USD",   "pair": "ETHUSD",   "alert_buffer": 2.0},
