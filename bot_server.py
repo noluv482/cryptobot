@@ -10008,6 +10008,36 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 .upnl-banner{border-radius:16px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
 .upnl-banner:not(.neg){box-shadow:0 0 20px rgba(0,230,118,0.08)}
 .upnl-banner.neg{box-shadow:0 0 20px rgba(255,51,102,0.08)}
+
+/* ── DESKTOP / FULLSCREEN ─────────────────────────────────────────────────
+   The dashboard is a phone app: one column, bottom sheets, fixed toasts.
+   With no desktop rules it stretched edge-to-edge on a monitor — cards a
+   thousand pixels wide, sheets spanning the whole screen. Rather than invent
+   a second layout for 4,000 lines of phone-first JS (chart sizing, strip
+   drag, swipe nav all assume one narrow column), the app keeps its phone
+   geometry and is framed as a centered column, the way Telegram Web or
+   WhatsApp Web present a phone UI on a desktop.
+
+   Everything position:fixed anchors to the VIEWPORT, not to body — so each
+   fixed element (bottom-sheet panels, toasts, keyboard hint) is constrained
+   to the same 520px column explicitly, or it would still span the monitor.
+   Backdrop overlays deliberately stay full-viewport: dimming the whole
+   screen behind a centered sheet is correct.
+   Width guard is 800px so tablets and phone-landscape keep the native look. */
+@media (min-width: 800px){
+  html{background:#050508}
+  body{
+    max-width:520px;margin:0 auto;position:relative;
+    box-shadow:0 0 0 1px var(--bd), 0 0 80px rgba(0,0,0,.6);
+  }
+  .alert-panel,.ft-panel,.set-panel,.cb-modal-panel,.tnote-panel,.cd-panel{
+    /* width must be explicit: with right:auto the absolute panel would
+       otherwise shrink-wrap its content instead of filling the column */
+    width:100%;max-width:520px;left:50%;right:auto;transform:translateX(-50%);
+  }
+  .kbd-hint{right:calc(50% - 260px + 14px)}
+  /* toast-stack is already centered with its own max-width — nothing to do */
+}
 </style>
 </head>
 <body>
