@@ -1678,6 +1678,23 @@ def is_live():
     return LIVE_MODE and not _paper_mode
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
+def _md_balanced(text):
+    """True if legacy-Markdown entities (* _ `) are balanced.
+
+    Telegram's legacy Markdown rejects the WHOLE message with a 400
+    "can't parse entities" if any of * _ ` appears an odd number of times —
+    one stray underscore from a coin pair or a reason string is enough. This
+    lets tg() skip Markdown for those messages instead of firing a doomed
+    request, logging an error, and only then retrying plain. Backslash-escaped
+    occurrences don't count. Characters inside `code spans` can still fool it,
+    but the plain-text fallback in tg() catches that rare case.
+    """
+    for ch in ("*", "_", "`"):
+        if len(re.findall(r"(?<!\\)" + re.escape(ch), text)) % 2:
+            return False
+    return True
+
+
 def tg(msg, plain=False):
     global _tg_log
     # Keep a rolling log of the last 15 messages for the dashboard panel
@@ -1698,19 +1715,23 @@ def tg(msg, plain=False):
         return False
     try:
         payload = {"chat_id": TG_CHAT_ID, "text": msg}
-        if not plain:
+        # Only ask for Markdown when the entities actually balance. An unbalanced
+        # message would be rejected outright, so sending it plain is not a
+        # downgrade — Telegram would have dropped the formatting anyway. This is
+        # why the midnight "can't parse entities" 400s stopped: no doomed request,
+        # no error line, message still lands.
+        use_md = not plain and _md_balanced(msg)
+        if use_md:
             payload["parse_mode"] = "Markdown"
         r = requests.post(TG_URL, json=payload, timeout=10)
+        if not r.ok and use_md:
+            # Balanced but still rejected (a nested/edge case the checker missed).
+            # Drop formatting and resend — not worth an ERR unless plain fails too.
+            payload.pop("parse_mode", None)
+            r = requests.post(TG_URL, json=payload, timeout=10)
         if not r.ok:
-            log("TG", f"Error {r.status_code}: {r.text[:200]}", "ERR")
-            # Legacy Markdown rejects unbalanced * _ ` (a coin like BTC_USD or an
-            # odd asterisk is enough), and Telegram drops the whole message. Retry
-            # once without parse_mode so it still lands — same fallback tg_buttons uses.
-            if not plain:
-                payload.pop("parse_mode", None)
-                r = requests.post(TG_URL, json=payload, timeout=10)
-                if not r.ok:
-                    log("TG", f"Plain retry failed {r.status_code}: {r.text[:200]}", "ERR")
+            # Only a genuine failure now: the message did NOT get through.
+            log("TG", f"Send failed {r.status_code}: {r.text[:200]}", "ERR")
         return r.ok
     except Exception as e:
         log("TG", f"Send error: {e}", "ERR")
@@ -1721,12 +1742,16 @@ def tg_photo(buf, caption=""):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-            data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "Markdown"},
-            files={"photo": ("chart.png", buf, "image/png")},
-            timeout=20,
-        )
+        data = {"chat_id": TG_CHAT_ID, "caption": caption}
+        if _md_balanced(caption):                 # same guard as tg(): no doomed 400
+            data["parse_mode"] = "Markdown"
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+        r = requests.post(url, data=data, files={"photo": ("chart.png", buf, "image/png")},
+                          timeout=20)
+        if not r.ok and "parse_mode" in data:
+            data.pop("parse_mode", None)
+            r = requests.post(url, data=data, files={"photo": ("chart.png", buf, "image/png")},
+                              timeout=20)
         if not r.ok:
             log("TG", f"sendPhoto {r.status_code}: {r.text[:200]}", "ERR")
     except Exception as e:
