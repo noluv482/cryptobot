@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 paper_state.json
+autopilot_state.json
 trusted_devices.json
 api_keys.json
 .env

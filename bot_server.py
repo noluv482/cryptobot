@@ -1514,6 +1514,7 @@ _paper_mode     = False   # when True: forces paper trading even if live keys ar
 PAPER_LOCK      = os.environ.get("PAPER_LOCK", "0").strip().lower() not in ("0", "", "false", "no")
 _sim_enabled    = False   # when True: parallel $2000 sim trader runs alongside live/paper
 _sim_trader     = None    # PaperTrader(force_paper=True, start_balance=2000) created in main()
+_autopilot      = None    # autopilot.Autopilot() created in main() when AUTOPILOT=1 (paper-only allocator)
 _daily_limits   = False   # off by default — enable for real-money discipline
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
@@ -4735,9 +4736,13 @@ class PaperTrader:
             self._pair_day_date[pair] = now_date_str
         self._pair_day_pnl[pair] = round(self._pair_day_pnl.get(pair, 0.0) + pnl, 4)
         if self._pair_day_pnl[pair] < -(self.balance * 0.05):
-            _disabled_pairs.add(pair)
-            tg(f"⚠️ *{name} auto-disabled for the day* — pair lost `${abs(self._pair_day_pnl[pair]):.2f}` today (>5% of balance)")
-            log("PAPER", f"{name} per-pair DD limit hit — disabled for today", "WARN")
+            # force_paper guard: a sandbox challenger's losing close must NOT reach
+            # into the GLOBAL _disabled_pairs and disable that pair for the live/real
+            # book. Only a real (non-force_paper) trader may disable a pair.
+            if not self._force_paper:
+                _disabled_pairs.add(pair)
+                tg(f"⚠️ *{name} auto-disabled for the day* — pair lost `${abs(self._pair_day_pnl[pair]):.2f}` today (>5% of balance)")
+                log("PAPER", f"{name} per-pair DD limit hit — disabled for today", "WARN")
 
         # A/B test result tracking — compare win rates; auto-adopt winner at 50 trades each
         if not self._ab_resolved:
@@ -8113,6 +8118,13 @@ def trading_loop(trader):
                     except Exception as e:
                         log("TRADE", f"sim manage {pair}: {e}", "ERR")
 
+            # ── Manage autopilot challenger positions (paper-only) ─────────
+            if _autopilot is not None:
+                try:
+                    _autopilot.manage_positions()
+                except Exception as e:
+                    log("TRADE", f"autopilot manage: {e}", "ERR")
+
             # ── Scan top-ranked coins for new entry signals ────────────────
             for coin_score in ranked_list[:8]:
                 pair = coin_score["pair"]
@@ -8468,6 +8480,15 @@ def trading_loop(trader):
                            f"R:R: `{_rr_str}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*{_pat_note}")
                         if _main_open:
+                            # ── Autopilot allocation seam (paper-only) ──────────
+                            # Honest default is FLAT: place the REAL paper entry only
+                            # when the champion is the config this book represents.
+                            # Otherwise stay flat — the shadow row above already
+                            # recorded the signal. No-op when AUTOPILOT is off.
+                            if _autopilot is not None and not _autopilot.allows(pair, "base"):
+                                db.mark_shadow(_sid, taken=False, rejected="autopilot_flat")
+                                last_sigs[pair] = sig
+                                continue
                             # Check the confidence floor BEFORE resting an order.
                             # on_signal applies it at fill time, so without this a
                             # doomed signal would rest, wait up to 20 scans, fill,
@@ -8555,6 +8576,17 @@ def trading_loop(trader):
                         except Exception as e:
                             log("TRADE", f"sim scan {pair}: {e}", "ERR")
 
+                    # ── Autopilot: drive challengers for this pair (paper-only) ──
+                    # Runs regardless of sim state; each challenger keeps its own
+                    # positions/engines and accumulates its own .trades.
+                    if _autopilot is not None:
+                        try:
+                            _autopilot.scan(pair, coin, closes, highs, lows,
+                                            volumes, opens, price, atr,
+                                            signal_ts=_signal_ts)
+                        except Exception as e:
+                            log("TRADE", f"autopilot scan {pair}: {e}", "ERR")
+
                     # ── Activity log entry ────────────────────────────────
                     _act_pillars = plan.get("pillars", {})
                     _act_entry = {
@@ -8580,6 +8612,12 @@ def trading_loop(trader):
         except Exception as e:
             log("TRADE", str(e), "ERR")
         _log_gate_summary()
+        # ── Autopilot: refresh champion/allocation once per tick (cheap) ──────
+        if _autopilot is not None:
+            try:
+                _autopilot.decide()
+            except Exception as e:
+                log("TRADE", f"autopilot decide: {e}", "ERR")
         global _last_scan_ts
         _last_scan_ts = time.time()
         time.sleep(REFRESH_SEC)
@@ -10396,6 +10434,34 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       </div>
     </div>
 
+    <div class="sh"><span>Autopilot</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">paper champion/challenger allocator</span></div>
+    <div class="sim-card" id="ap_card">
+      <div class="sim-top">
+        <div style="flex:1">
+          <div class="sim-bal-lbl">Allocation</div>
+          <div class="sim-bal" id="ap_alloc" style="font-size:1.1rem">—</div>
+        </div>
+        <button class="sim-toggle" id="ap_toggle_btn" onclick="toggleAutopilot()">OFF</button>
+      </div>
+      <div class="sim-off-msg" id="ap_off_msg">Autopilot is OFF — tap to enable</div>
+      <div id="ap_stats_wrap" style="display:none">
+        <div class="sim-grid">
+          <div>
+            <div class="sim-stat-lbl">Champion</div>
+            <div class="sim-stat-val" id="ap_champ">—</div>
+          </div>
+          <div>
+            <div class="sim-stat-lbl">Cost Gate</div>
+            <div class="sim-stat-val" id="ap_gate">—</div>
+          </div>
+          <div>
+            <div class="sim-stat-lbl">Challengers</div>
+            <div class="sim-stat-val" id="ap_nch">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="sh"><span>Bot Activity</span><span style="font-size:.58rem;color:var(--mu);font-weight:400">live scan feed</span></div>
     <div id="activity_feed" style="padding:0 12px 4px">
       <div class="no-data" style="padding:16px 0">Waiting for first scan…</div>
@@ -11436,7 +11502,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAutoNotes().then(renderJournal);}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchAutopilot();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAutoNotes().then(renderJournal);}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -12950,6 +13016,10 @@ function initSSE(){
     const d=JSON.parse(e.data);
     renderBacktestResult(d);
   });
+  es.addEventListener('autopilot',e=>{
+    try{renderAutopilot(JSON.parse(e.data));}catch(_){}
+    fetchAutopilot();
+  });
   es.onerror=()=>{
     const d=$('conn_dot');if(d)d.className='conn-dot';
     clearTimeout(_sseTimer);
@@ -13410,7 +13480,7 @@ function renderExitReasons(trades){
 /* ── TICK ── */
 function tick(){
   if(--_tick<=0){
-    fetchStatus();fetchCandles();fetchHistory();fetchSim();
+    fetchStatus();fetchCandles();fetchHistory();fetchSim();fetchAutopilot();
     if(_tab==='market'){fetchMarket();fetchForecast();}
     if(_tab==='stats'){fetchHourly();drawDownChart();}
     _tick=30;
@@ -14394,6 +14464,43 @@ async function toggleSim(){
       nowOn?'$2,000 sim trader running':'Sim trader paused',
       nowOn?'open':'loss',2500);
   }catch(e){console.warn('toggleSim',e);}
+}
+
+/* ── AUTOPILOT (paper champion/challenger allocator) ── */
+let _apEnabled=false;
+async function fetchAutopilot(){
+  try{
+    const d=await(await fetch('/autopilot')).json();
+    renderAutopilot(d);
+  }catch(e){console.warn('autopilot',e);}
+}
+function renderAutopilot(d){
+  _apEnabled=!!(d&&d.enabled);
+  const btn=$('ap_toggle_btn'),off=$('ap_off_msg'),wrap=$('ap_stats_wrap');
+  if(btn){btn.textContent=_apEnabled?'ON':'OFF';btn.className='sim-toggle'+(_apEnabled?' on':'');}
+  if(off)off.style.display=_apEnabled?'none':'';
+  if(wrap)wrap.style.display=_apEnabled?'':'none';
+  if(!_apEnabled)return;
+  const alloc=d.allocation||'FLAT';
+  const aEl=$('ap_alloc');
+  if(aEl){aEl.textContent=alloc;aEl.style.color=(alloc&&alloc!=='FLAT')?'var(--g)':'var(--mu)';}
+  if($('ap_champ'))$('ap_champ').textContent=d.champion||'FLAT';
+  if($('ap_gate'))$('ap_gate').textContent=(d.cost_gate_pct!=null?d.cost_gate_pct+'%':'—');
+  if($('ap_nch'))$('ap_nch').textContent=(d.challengers?d.challengers.length:0).toString();
+}
+async function toggleAutopilot(){
+  if(!_pinUnlocked){showToast('🔒 Unlock with PIN first','',2500);return;}
+  const turnOn=!_apEnabled;
+  try{
+    const r=await fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:turnOn?'autopilot_on':'autopilot_off',device_id:_getDeviceId()})});
+    const d=await r.json();
+    if(d.error){showToast('Autopilot',d.error,'loss',3500);return;}
+    fetchAutopilot();
+    showToast(turnOn?'Autopilot On ▶':'Autopilot Off ⏸',
+      turnOn?'Paper allocator running (no real orders)':'Allocator stopped',
+      turnOn?'open':'loss',2500);
+  }catch(e){console.warn('toggleAutopilot',e);}
 }
 
 /* ── NEWS FORECAST ── */
@@ -15634,6 +15741,19 @@ def _web_status():
         "ws_live":               bool(_prices_cache and (time.time() - _prices_cache_ts) < 60),
         "scan_age":              round(time.time() - _last_scan_ts, 1) if _last_scan_ts else None,
     }
+    # Autopilot block — always present so the dashboard/HUD can render ON/OFF.
+    if _autopilot is not None:
+        try:
+            payload["autopilot"] = _autopilot.status()
+        except Exception as e:
+            payload["autopilot"] = {"enabled": True, "error": str(e)}
+    else:
+        try:
+            import autopilot as _autopilot_mod
+            payload["autopilot"] = {"enabled": False,
+                                    "persisted_enabled": _autopilot_mod.autopilot_persisted_enabled()}
+        except Exception:
+            payload["autopilot"] = {"enabled": False}
     return _Response(json.dumps(payload), mimetype="application/json",
                       headers={"Access-Control-Allow-Origin": "*"})
 
@@ -15750,13 +15870,32 @@ def _web_healthz():
     trader = _web_trader_ref[0] if _web_trader_ref else None
     scan_age = round(time.time() - _last_scan_ts, 1) if _last_scan_ts else None
     ws_live  = bool(_prices_cache and (time.time() - _prices_cache_ts) < 60)
-    return _Response(json.dumps({
+    _hz = {
         "ok":       True,
         "scan_age": scan_age,
         "db":       db.connected,
         "ws_live":  ws_live,
         "balance":  round(trader.balance, 2) if trader else None,
-    }), mimetype="application/json")
+    }
+    # Autopilot summary — always report enabled state so the Noluv HUD can show it.
+    if _autopilot is not None:
+        try:
+            _hz["autopilot"] = {
+                "enabled":     True,
+                "champion":    _autopilot.champion_id,
+                "allocation":  _autopilot.allocation,
+                "last_switch": _autopilot.last_switch,
+            }
+        except Exception:
+            pass
+    else:
+        try:
+            import autopilot as _autopilot_mod
+            _hz["autopilot"] = {"enabled": False,
+                                "persisted_enabled": _autopilot_mod.autopilot_persisted_enabled()}
+        except Exception:
+            pass
+    return _Response(json.dumps(_hz), mimetype="application/json")
 
 @_flask_app.route("/history")
 def _web_history():
@@ -15906,6 +16045,18 @@ def _web_sim():
         "win_rate":   round(wins / max(n, 1) * 100, 1),
         "positions":  open_pos,
     }), mimetype="application/json")
+
+@_flask_app.route("/autopilot")
+def _web_autopilot():
+    # No-op when AUTOPILOT is off: report disabled instead of erroring.
+    if _autopilot is None:
+        return _Response(json.dumps({"enabled": False}), mimetype="application/json")
+    try:
+        return _Response(json.dumps(_autopilot.status()), mimetype="application/json",
+                         headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        return _Response(json.dumps({"enabled": True, "error": str(e)}),
+                         mimetype="application/json")
 
 @_flask_app.route("/export/trades.csv")
 def _web_export_csv():
@@ -16468,7 +16619,7 @@ def _web_live_ready():
 
 @_flask_app.route("/control", methods=["POST"])
 def _web_control():
-    global _paused, _paper_mode, _sim_enabled, _daily_limits
+    global _paused, _paper_mode, _sim_enabled, _daily_limits, _autopilot
     try:
         body = _flask_request.get_json(silent=True) or {}
         action = body.get("action", "toggle")
@@ -16477,6 +16628,39 @@ def _web_control():
         action = "toggle"
     if not _request_is_authorized(body):
         return _Response(json.dumps({"error": "unauthorized"}), status=403, mimetype="application/json")
+
+    # ── Autopilot runtime toggle (paper-only allocator) ───────────────────────
+    # Handled before the _state_lock block: these touch only the _autopilot global,
+    # not _paused/_paper_mode/_sim_enabled. Both refuse while is_live() is True — a
+    # paper allocator must never be enabled when real orders are possible. The ON
+    # state is persisted to the data volume + DB so it survives a redeploy.
+    if action in ("autopilot_on", "autopilot_off"):
+        if is_live():
+            return _Response(json.dumps({"error": "refused: is_live() is True — autopilot is paper-only"}),
+                             status=409, mimetype="application/json")
+        try:
+            import autopilot as _autopilot_mod
+            if action == "autopilot_on":
+                _autopilot_mod.autopilot_set_persisted_enabled(True)
+                if _autopilot is None:
+                    _autopilot = _autopilot_mod.Autopilot()   # same construction as main()
+                ap_state = _autopilot.status()
+            else:  # autopilot_off
+                _autopilot_mod.autopilot_set_persisted_enabled(False)
+                _autopilot = None                             # trading loop reverts next tick
+                ap_state = {"enabled": False}
+        except Exception as e:
+            log("CONTROL", f"autopilot {action} failed: {e}", "ERR")
+            return _Response(json.dumps({"error": f"autopilot {action} failed: {e}"}),
+                             status=500, mimetype="application/json")
+        _push_sse("autopilot", ap_state)
+        threading.Thread(target=tg, args=(
+            ("🤖 *Autopilot ENABLED* via dashboard\nPaper champion/challenger allocator running (no real orders)."
+             if action == "autopilot_on" else
+             "🤖 *Autopilot DISABLED* via dashboard\nAllocator stopped; bot reverts to normal behavior."),),
+            daemon=True).start()
+        return _Response(json.dumps({"autopilot": ap_state}), mimetype="application/json")
+
     tg_msg = None
     with _state_lock:
         if action == "pause":
@@ -17637,6 +17821,7 @@ def main():
 
     log("BOOT", f"Chat ID: {_c(_C.CYAN, TG_CHAT_ID)}")
     log("BOOT", f"Mode: {_c(_C.RED + _C.BOLD, 'LIVE TRADING') if LIVE_MODE else _c(_C.GREY, 'paper')}")
+    log("BOOT", f"Cost model: taker {KRAKEN_FEE*100:.2f}%  ·  maker {KRAKEN_MAKER_FEE*100:.2f}%  ·  round-trip {ROUND_TRIP_COST_PCT*100:.2f}%")
 
     # Remove any webhook so long-polling (getUpdates) works
     try:
@@ -17686,6 +17871,35 @@ def main():
     _sim_trader._force_risk_min = 0.20   # sim uses fake money — trade bigger to learn faster
     _sim_trader._force_risk_max = 0.50
     log("BOOT", "Sim trader initialized — $2000 virtual account ready (type 'sim on' to start)")
+
+    # ── Autopilot (paper-only champion/challenger allocator) ──────────────────
+    # OFF by default: nothing changes unless the owner sets AUTOPILOT=1. When off,
+    # _autopilot stays None and every hook below is a no-op. All challengers are
+    # force_paper=True and can never place a real order (see autopilot.py invariants).
+    global _autopilot
+    # Env AUTOPILOT is the FIRST-BOOT default only. Explicit truthy set (inverted from
+    # an allow/deny list) so a typo like AUTOPILOT=off can never accidentally enable.
+    _ap_env = os.environ.get("AUTOPILOT", "0").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        import autopilot as _autopilot_mod
+        # An EXPLICIT persisted choice (dashboard button, or a running instance's
+        # periodic save) is authoritative and survives a redeploy — the flag lives in
+        # the data volume + DB (id=2), untouched by a git reset --hard + rebuild that
+        # only changes the code tree. Env is consulted ONLY when no choice was ever
+        # recorded. So ON stays ON across updates, and a deliberate OFF stays OFF too.
+        # Fresh install with neither = OFF (unchanged honest default).
+        _ap_state  = _autopilot_mod.autopilot_persisted_state()   # True / False / None
+        _ap_enable = _ap_env if _ap_state is None else _ap_state
+        if _ap_enable:
+            _autopilot = _autopilot_mod.Autopilot()
+            _ap_src = "env default" if _ap_state is None else "persisted button"
+            log("BOOT", f"Autopilot ENABLED — {_autopilot.n_configs()} paper challengers, "
+                        f"champion={_autopilot.champion_id or 'FLAT'} (via {_ap_src})")
+        else:
+            log("BOOT", f"Autopilot OFF (via {'persisted button' if _ap_state is not None else 'default'})")
+    except Exception as _ap_e:
+        log("BOOT", f"Autopilot init FAILED — staying disabled: {_ap_e}", "ERR")
+        _autopilot = None
 
     _auto_notes_backfill(trader)
 
