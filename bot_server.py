@@ -415,8 +415,13 @@ def _hold(mins_at_15m):
     """
     return min(int(mins_at_15m * _TF_SCALE * HOLD_SCALE), MAX_TRADE_MINS)
 POSITION_WATCHDOG_SECS = 60    # how often the watchdog re-checks open positions
-KRAKEN_FEE       = 0.0026      # taker: crossing the spread
-KRAKEN_MAKER_FEE = 0.0016      # maker: resting order that provides liquidity
+KRAKEN_FEE       = float(os.environ.get('KRAKEN_FEE', '0.008'))   # taker: crossing the spread (base tier since 2026-07-09)
+KRAKEN_MAKER_FEE = float(os.environ.get('KRAKEN_MAKER_FEE', '0.004')) # maker: resting order that provides liquidity
+# NOTE: the base-tier rates above make the LIVE round-trip cost ~1.30% with maker
+# entries (~1.80% taker both ways) — the true figure is recomputed into
+# ROUND_TRIP_COST_PCT below and printed at boot (see the "Cost model" log line).
+# Older "0.72%"/"0.32%" figures in the comments below are historical benchmark
+# results measured before the 2026-07-09 fee rise; kept as a record, not current.
 # Post entries as passive (post-only) limits to earn the maker fee instead of
 # paying taker. Measured 2026-07-29 with benchmark_donchian.py --compare-fills on
 # 16 pairs of daily data: round trip 0.72% -> 0.32%, which improved 8 of 9
