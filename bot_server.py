@@ -1515,6 +1515,7 @@ PAPER_LOCK      = os.environ.get("PAPER_LOCK", "0").strip().lower() not in ("0",
 _sim_enabled    = False   # when True: parallel $2000 sim trader runs alongside live/paper
 _sim_trader     = None    # PaperTrader(force_paper=True, start_balance=2000) created in main()
 _autopilot      = None    # autopilot.Autopilot() created in main() when AUTOPILOT=1 (paper-only allocator)
+_autopilot_boot_error = None  # last autopilot init failure (str), surfaced on /autopilot for diagnosis
 _daily_limits   = False   # off by default — enable for real-money discipline
 _current_coin   = SCAN_UNIVERSE[0]
 _last_update_id = 0
@@ -16050,7 +16051,11 @@ def _web_sim():
 def _web_autopilot():
     # No-op when AUTOPILOT is off: report disabled instead of erroring.
     if _autopilot is None:
-        return _Response(json.dumps({"enabled": False}), mimetype="application/json")
+        return _Response(json.dumps({
+            "enabled": False,
+            "boot_error": _autopilot_boot_error,
+            "env_autopilot": os.environ.get("AUTOPILOT"),
+        }), mimetype="application/json")
     try:
         return _Response(json.dumps(_autopilot.status()), mimetype="application/json",
                          headers={"Cache-Control": "no-store"})
@@ -17876,7 +17881,7 @@ def main():
     # OFF by default: nothing changes unless the owner sets AUTOPILOT=1. When off,
     # _autopilot stays None and every hook below is a no-op. All challengers are
     # force_paper=True and can never place a real order (see autopilot.py invariants).
-    global _autopilot
+    global _autopilot, _autopilot_boot_error
     # Env AUTOPILOT is the FIRST-BOOT default only. Explicit truthy set (inverted from
     # an allow/deny list) so a typo like AUTOPILOT=off can never accidentally enable.
     _ap_env = os.environ.get("AUTOPILOT", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -17898,7 +17903,9 @@ def main():
         else:
             log("BOOT", f"Autopilot OFF (via {'persisted button' if _ap_state is not None else 'default'})")
     except Exception as _ap_e:
-        log("BOOT", f"Autopilot init FAILED — staying disabled: {_ap_e}", "ERR")
+        import traceback as _ap_tb
+        _autopilot_boot_error = f"{type(_ap_e).__name__}: {_ap_e}"
+        log("BOOT", f"Autopilot init FAILED — staying disabled: {_ap_e}\n{_ap_tb.format_exc()}", "ERR")
         _autopilot = None
 
     _auto_notes_backfill(trader)
