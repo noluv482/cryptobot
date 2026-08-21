@@ -35,11 +35,13 @@ services:
       # safety lock silently inert -- the other two default ON and so appeared
       # to work by accident.
       PAPER_LOCK: ${PAPER_LOCK:-0}
-      # Paper champion/challenger allocator. Defaults ON for testing — it can NEVER
+      # Paper champion/challenger allocator. Pinned ON for testing — it can NEVER
       # place a real order (every challenger is force_paper=True and it refuses to
-      # run while is_live()). This is only the FIRST-BOOT default: once you use the
-      # dashboard ON/OFF button, that choice is authoritative and survives redeploys.
-      AUTOPILOT: ${AUTOPILOT:-1}
+      # run while is_live()). Literal "1" (not ${AUTOPILOT:-1}) so the value always
+      # reaches the container regardless of host .env resolution. This is only the
+      # FIRST-BOOT default: once you use the dashboard ON/OFF button, that choice is
+      # authoritative and survives redeploys (set this to "0" to change the default).
+      AUTOPILOT: "1"
       USE_MAKER_ENTRIES: ${USE_MAKER_ENTRIES:-1}
       ENTRY_ON_CLOSED_BAR: ${ENTRY_ON_CLOSED_BAR:-1}
       # Optional — leave blank to use dashboard API Keys instead
