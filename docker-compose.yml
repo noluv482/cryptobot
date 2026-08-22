@@ -42,6 +42,14 @@ services:
       # FIRST-BOOT default: once you use the dashboard ON/OFF button, that choice is
       # authoritative and survives redeploys (set this to "0" to change the default).
       AUTOPILOT: "1"
+      # Nightly research lab. Paper-only: it backtests lever sweeps on cached
+      # history and writes reports + challenger nominations — it can NEVER touch
+      # a live order. Literal "1" for the same reason as AUTOPILOT above: the
+      # value must reach the container regardless of host .env resolution.
+      RESEARCH_LAB: "1"
+      # Optional lab tuning — uncomment to override the in-code defaults:
+      #   RESEARCH_HOUR_UTC: "4"      # UTC hour the nightly cycle fires
+      #   RESEARCH_BUDGET_MINS: "45"  # wall-clock cap per cycle before it checkpoints
       USE_MAKER_ENTRIES: ${USE_MAKER_ENTRIES:-1}
       ENTRY_ON_CLOSED_BAR: ${ENTRY_ON_CLOSED_BAR:-1}
       # Optional — leave blank to use dashboard API Keys instead

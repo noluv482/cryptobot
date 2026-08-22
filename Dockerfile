@@ -15,6 +15,15 @@ COPY learning_report.py .
 # to the repo but, like learning_report.py above, it MUST be copied in explicitly
 # or `import autopilot` raises ModuleNotFoundError and autopilot silently disables.
 COPY autopilot.py .
+# Nightly research lab (paper-only sweeps): bot_server spawns it as a subprocess,
+# so a missing file fails the cycle at spawn time — same footgun, new victim.
+COPY research_lab.py .
+# Imported by research_lab.py for signal evaluation — omit it and the lab dies on
+# ModuleNotFoundError just like autopilot.py did before it was copied in above.
+COPY find_signal.py .
+# Imported by research_lab.py to top up {DATA_DIR}/history CSVs — same story:
+# committed to the repo is not the same as present in the image.
+COPY fetch_history.py .
 
 RUN useradd -r -u 1001 -s /bin/false bot && mkdir -p /data && chown bot:bot /data
 

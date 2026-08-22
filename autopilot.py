@@ -39,11 +39,32 @@ clears the cost gate, the real book stays FLAT rather than being silently
 re-parametrised to an unproven-in-production lever set — the conservative choice for
 a real-money-capable (though paper-locked) bot. Champion promotion among challengers
 is allowed (paper only), gated by hysteresis, and logged.
+
+LAB INTAKE (research_lab.py nominations)
+----------------------------------------
+Overnight, research_lab.py sweeps the SAME Tier-A levers over historical CSVs and
+nominates up to 3 candidate configs into {DATA_DIR}/lab_challengers.json. This
+module is the ONLY reader of that file, and it trusts NOTHING in it: every entry
+is re-sanitized on intake (keys whitelisted; id forced to ^lab_[a-z0-9_]{1,24}$ so
+it can never shadow a built-in; entry_conf_floor clamped to [0.28,0.90] and dropped
+outright if it isn't a confidence fraction at all; min_rr None or clamped to
+[0.5,5.0]; risk_min/risk_max None or clamped to [0.01,0.50] with min<=max;
+allowed_strategies None or a subset of the bot's 8 _classify_strategy keys,
+normalized list->set; hard cap 3). Bad entries are dropped with a log line, never
+raised on. Survivors become ORDINARY challengers — the same
+PaperTrader(force_paper=True, no_persist=True) sandbox, the same OOS scoring, the
+same cost gate — appended after the 6 built-ins. decide() hot-swaps the lab slots
+at most every 10 minutes on file mtime change: new ids join with a fresh paper
+bankroll, removed ids retire (a retired champion falls back to FLAT explicitly,
+never lingers), and no other challenger's in-memory trades are touched. The lab
+file therefore cannot mutate globals, touch the real book, or bypass a gate:
+a nomination still has to EARN allocation in live paper, out-of-sample.
 """
 
 import json
 import math
 import os
+import re
 import statistics
 import time
 
@@ -120,6 +141,146 @@ CHALLENGER_CONFIGS = [
 ]
 
 MAIN_BOOK_CONFIG_ID = "base"   # the config identity the REAL paper book represents
+
+
+# ── Lab intake (nominations from research_lab.py) ─────────────────────────────
+# The lab file is DATA, not code: it crosses a process boundary from the overnight
+# research job, so every field is re-validated here as if it were hostile. Ids are
+# forced into the lab_ namespace by regex, so a nomination can never collide with
+# (or shadow) a built-in config id like "base".
+LAB_MAX_SLOTS    = 3                                  # hard cap on lab challengers
+LAB_REFRESH_SECS = 600.0                              # decide() re-stats the file at most this often
+_LAB_ID_RE       = re.compile(r"^lab_[a-z0-9_]{1,24}\Z")  # \Z not $: $ admits a trailing \n, which would allow "lab_x" vs "lab_x\n" lookalike ids
+_LAB_CONF_CLAMP  = (0.28, 0.90)                       # entry_conf_floor bounds (>= ATTEMPT_CONF_MIN)
+_LAB_RR_CLAMP    = (0.5, 5.0)                         # min_rr bounds
+_LAB_RISK_CLAMP  = (0.01, 0.50)                       # risk_min/risk_max bounds
+# The 8 strategy keys _classify_strategy can emit (MULTI_SIGNAL, MOMENTUM_BREAKOUT,
+# TREND_CONTINUATION, RSI_REVERSAL, NEWS_CATALYST, PATTERN_BREAKOUT, CONFLUENCE,
+# LEARNING_SIGNAL) — derived from the source dict so the two can never drift apart.
+_LAB_STRATEGY_KEYS = frozenset(bs._STRATEGIES)
+# Levers whose change means a lab config is a NEW experiment (its trader must be
+# rebuilt fresh so its score history is earned under exactly one lever set).
+_LAB_LEVER_KEYS = ("entry_conf_floor", "min_rr", "allowed_strategies",
+                   "risk_min", "risk_max")
+
+
+def _lab_path():
+    """The nomination handoff file — written ONLY by research_lab.py, read ONLY here."""
+    return os.path.join(bs._DATA_DIR, "lab_challengers.json")
+
+
+def _num(v):
+    """Finite float or None. Rejects bools (json true/false are not numbers here)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    return v if math.isfinite(v) else None
+
+
+def sanitize_lab_configs(raw):
+    """Validate raw lab-file content into at most LAB_MAX_SLOTS config dicts.
+
+    NEVER raises — a malformed file yields [], a malformed entry is dropped with a
+    log line (the allocator must boot no matter what the research job wrote).
+    Accepts the parsed file dict ({"configs": [...]}) or a bare list. Each survivor
+    carries exactly the Tier-A lever keys scan() reads (allowed_strategies already
+    normalized list->set) plus id/born_ts/note for the dashboard.
+    """
+    out = []
+    try:
+        entries = raw.get("configs") if isinstance(raw, dict) else raw
+        if not isinstance(entries, list):
+            return out
+        builtin_ids = {c["id"] for c in CHALLENGER_CONFIGS}
+        for e in entries:
+            try:
+                if not isinstance(e, dict):
+                    raise ValueError("entry is not an object")
+                cid = e.get("id")
+                if not isinstance(cid, str) or not _LAB_ID_RE.match(cid):
+                    raise ValueError(f"id {cid!r} fails ^lab_[a-z0-9_]{{1,24}}$")
+                # Unreachable given the regex (built-ins never start with lab_),
+                # kept as belt-and-suspenders against a future built-in rename.
+                if cid in builtin_ids:
+                    raise ValueError(f"id {cid!r} shadows a built-in config")
+                if any(c["id"] == cid for c in out):
+                    raise ValueError(f"duplicate id {cid!r}")
+
+                # entry_conf_floor: must BE a confidence (fraction of 1) to clamp at
+                # all — anything outside [0,1] is garbage, not a bold choice.
+                floor = _num(e.get("entry_conf_floor"))
+                if floor is None or not (0.0 <= floor <= 1.0):
+                    raise ValueError(f"entry_conf_floor {e.get('entry_conf_floor')!r} is not a confidence fraction")
+                floor = min(max(floor, _LAB_CONF_CLAMP[0]), _LAB_CONF_CLAMP[1])
+
+                min_rr = e.get("min_rr")
+                if min_rr is not None:
+                    min_rr = _num(min_rr)
+                    if min_rr is None:
+                        raise ValueError("min_rr is neither null nor a number")
+                    min_rr = min(max(min_rr, _LAB_RR_CLAMP[0]), _LAB_RR_CLAMP[1])
+
+                risk = {}
+                for k in ("risk_min", "risk_max"):
+                    v = e.get(k)
+                    if v is not None:
+                        v = _num(v)
+                        if v is None:
+                            raise ValueError(f"{k} is neither null nor a number")
+                        v = min(max(v, _LAB_RISK_CLAMP[0]), _LAB_RISK_CLAMP[1])
+                    risk[k] = v
+                if (risk["risk_min"] is not None and risk["risk_max"] is not None
+                        and risk["risk_min"] > risk["risk_max"]):
+                    raise ValueError("risk_min > risk_max")
+
+                allowed = e.get("allowed_strategies")
+                if allowed is not None:
+                    if not isinstance(allowed, (list, tuple, set)):
+                        raise ValueError("allowed_strategies is neither null nor a list")
+                    allowed = set(allowed)                     # normalize list -> set
+                    if not allowed or not allowed <= _LAB_STRATEGY_KEYS:
+                        raise ValueError(f"allowed_strategies {sorted(allowed)} not a subset of the 8 strategy keys")
+
+                born = _num(e.get("born_ts"))                  # tolerant: bad ts != bad config
+                out.append({
+                    "id": cid,
+                    "entry_conf_floor": floor,
+                    "min_rr": min_rr,
+                    "allowed_strategies": allowed,
+                    "risk_min": risk["risk_min"],
+                    "risk_max": risk["risk_max"],
+                    "born_ts": born if born is not None else time.time(),
+                    "note": str(e.get("note", ""))[:200],
+                })
+            except Exception as ex:
+                log("AUTOPILOT", f"lab config dropped: {ex}", "WRN")
+        if len(out) > LAB_MAX_SLOTS:
+            log("AUTOPILOT", f"lab file has {len(out)} valid configs — keeping first {LAB_MAX_SLOTS}", "WRN")
+            out = out[:LAB_MAX_SLOTS]
+    except Exception as ex:
+        log("AUTOPILOT", f"lab sanitize failed: {ex}", "WRN")
+        out = []
+    return out
+
+
+def _read_lab_file():
+    """(sanitized configs, file mtime) — ([], None) when the file doesn't exist.
+
+    mtime is captured BEFORE the read so a write that lands mid-read is seen as a
+    change on the next refresh rather than silently swallowed.
+    """
+    path = _lab_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return [], None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as ex:
+        log("AUTOPILOT", f"lab file unreadable: {ex}", "WRN")
+        return [], mtime
+    return sanitize_lab_configs(raw), mtime
 
 
 def _state_path():
@@ -231,8 +392,8 @@ class Autopilot:
         if bs.is_live():
             raise RuntimeError("Autopilot refuses to start while is_live() is True")
 
-        self.configs = {c["id"]: c for c in CHALLENGER_CONFIGS}
-        self.order   = [c["id"] for c in CHALLENGER_CONFIGS]
+        self.configs = {}
+        self.order   = []
         self.champion_id = None            # None == FLAT (honest default)
         self.allocation  = "FLAT"
         self.last_switch = {"ts": 0.0, "from": None, "to": None, "why": "init"}
@@ -248,20 +409,101 @@ class Autopilot:
         self.traders = {}
         self.engines = {}                  # id -> {pair -> SignalEngine}
         self.last_sig = {}                 # id -> {pair -> last signal}
-        for cid, cfg in self.configs.items():
-            t = bs.PaperTrader(force_paper=True, no_persist=True,
-                               start_balance=CHALLENGER_START)
-            if cfg.get("risk_min") is not None:
-                t._force_risk_min = cfg["risk_min"]
-            if cfg.get("risk_max") is not None:
-                t._force_risk_max = cfg["risk_max"]
-            # Hard belt-and-suspenders: a force_paper trader must never be live.
-            assert not t._is_live(), f"challenger {cid} unexpectedly live"
-            self.traders[cid]  = t
-            self.engines[cid]  = {}
-            self.last_sig[cid] = {}
+        for cfg in CHALLENGER_CONFIGS:
+            self._add_challenger(cfg)
+
+        # Lab intake: append this cycle's nominations AFTER the 6 built-ins so the
+        # built-ins keep their identities/positions no matter what the lab wrote.
+        # _lab_check_ts=0 lets the first decide() re-stat the file immediately (a
+        # no-op unless research_lab wrote between now and then — mtime is cached).
+        self._lab_check_ts = 0.0
+        lab_cfgs, self._lab_mtime = _read_lab_file()
+        for cfg in lab_cfgs:
+            self._add_challenger(cfg)
+            log("AUTOPILOT", f"lab challenger loaded: {cfg['id']}")
 
         self._load()
+
+    def _add_challenger(self, cfg):
+        """Register one config (built-in or lab) with its own sandboxed trader.
+
+        The ONE place a challenger enters the pool, so the sandbox invariant
+        (force_paper + no_persist + the _is_live assert) is enforced identically
+        for lab nominations and built-ins — a lab entry gets zero extra powers.
+        """
+        cid = cfg["id"]
+        t = bs.PaperTrader(force_paper=True, no_persist=True,
+                           start_balance=CHALLENGER_START)
+        if cfg.get("risk_min") is not None:
+            t._force_risk_min = cfg["risk_min"]
+        if cfg.get("risk_max") is not None:
+            t._force_risk_max = cfg["risk_max"]
+        # Hard belt-and-suspenders: a force_paper trader must never be live.
+        assert not t._is_live(), f"challenger {cid} unexpectedly live"
+        self.configs[cid] = cfg
+        if cid not in self.order:
+            self.order.append(cid)
+        self.traders[cid]  = t
+        self.engines[cid]  = {}
+        self.last_sig[cid] = {}
+
+    def _retire_challenger(self, cid):
+        """Drop one config from every per-id structure; heal the champion pointer.
+
+        Touches ONLY the retired id's entries — every other challenger keeps its
+        trader object (and therefore its in-memory trade history) untouched. If
+        the retiree was champion, fall back to FLAT EXPLICITLY here rather than
+        relying on the next decide() to notice the dangling id.
+        """
+        for d in (self.configs, self.traders, self.engines, self.last_sig, self.scores):
+            d.pop(cid, None)
+        if cid in self.order:
+            self.order.remove(cid)
+        if self.champion_id == cid:
+            self.champion_id = None
+            self.allocation  = "FLAT"
+            self.last_switch = {"ts": time.time(), "from": cid, "to": None,
+                                "why": f"champion {cid} retired from pool -> FLAT"}
+            log("AUTOPILOT", f"champion {cid} retired from pool -> FLAT", "WRN")
+
+    def refresh_lab_configs(self):
+        """Hot-swap lab slots from the nomination file. Throttled + mtime-gated.
+
+        Called from decide(); at most one os.path.getmtime per LAB_REFRESH_SECS,
+        and the file is re-read/re-sanitized only when its mtime moved. Diff logic:
+        new lab ids are ADDED with a fresh trader/engine; ids gone from the file
+        are RETIRED (via _retire_challenger, which also heals the champion); an id
+        present in both but with CHANGED levers is retired-and-readded so its score
+        history can't mix two lever sets. Built-ins are never in the diff.
+        """
+        now = time.time()
+        if now - self._lab_check_ts < LAB_REFRESH_SECS:
+            return
+        self._lab_check_ts = now
+        try:
+            mtime = os.path.getmtime(_lab_path())
+        except OSError:
+            mtime = None
+        if mtime == self._lab_mtime:
+            return
+        cfgs, self._lab_mtime = _read_lab_file()
+        want = {c["id"]: c for c in cfgs}
+        have = [cid for cid in self.order if cid.startswith("lab_")]
+        for cid in have:
+            if cid not in want:
+                self._retire_challenger(cid)
+                log("AUTOPILOT", f"lab challenger retired: {cid}")
+            elif any(want[cid].get(k) != self.configs[cid].get(k)
+                     for k in _LAB_LEVER_KEYS):
+                self._retire_challenger(cid)
+                self._add_challenger(want[cid])
+                log("AUTOPILOT", f"lab challenger re-nominated with new levers — fresh start: {cid}")
+            else:
+                self.configs[cid] = want[cid]   # same levers: refresh note/born_ts only
+        for cid, cfg in want.items():
+            if cid not in self.configs:
+                self._add_challenger(cfg)
+                log("AUTOPILOT", f"lab challenger added: {cid}")
 
     # ── introspection ─────────────────────────────────────────────────────────
     def n_configs(self):
@@ -465,6 +707,12 @@ class Autopilot:
             self._save()
             return {"champion": None, "allocation": "FLAT", "scores": self.scores}
 
+        # Lab intake first (throttled + mtime-gated inside), so this decision runs
+        # over the current pool. A retired champion is healed to FLAT in there;
+        # score() below then rebuilds self.scores from the surviving traders only,
+        # so a dangling lab id can never appear in `eligible`.
+        self.refresh_lab_configs()
+
         scores = self.score()
         eligible = {cid: s for cid, s in scores.items() if s["clears_cost"]}
 
@@ -562,6 +810,14 @@ class Autopilot:
         self.last_switch  = data.get("last_switch", self.last_switch)
         self.decision_log = data.get("decision_log", [])
         self.scores       = data.get("scores", {})
+        # Explicit heal: the persisted champion may be a lab id whose nomination
+        # was withdrawn while we were down. A champion outside the current pool
+        # can never be allowed to gate the real book — force FLAT immediately
+        # instead of waiting for the next decide() to notice.
+        if self.champion_id is not None and self.champion_id not in self.configs:
+            log("AUTOPILOT", f"restored champion {self.champion_id} not in pool -> FLAT", "WRN")
+            self.champion_id = None
+            self.allocation  = "FLAT"
         log("AUTOPILOT", f"state restored — champion={self.champion_id or 'FLAT'}")
 
     # ── surfacing ──────────────────────────────────────────────────────────────
@@ -573,8 +829,11 @@ class Autopilot:
             s = self.scores.get(cid, {})
             n = len(t.trades)
             wins = sum(1 for tr in t.trades if tr.get("pnl", 0) >= 0)
+            is_lab = cid.startswith("lab_")   # sanitizer guarantees the namespace
             challengers.append({
                 "id": cid,
+                "origin": "lab" if is_lab else "builtin",
+                "born_ts": self.configs[cid].get("born_ts") if is_lab else None,
                 "config": {k: (list(v) if isinstance(v, set) else v)
                            for k, v in self.configs[cid].items() if k != "id"},
                 "balance": round(t.balance, 2),
@@ -602,6 +861,7 @@ class Autopilot:
             "cost_gate_pct": round(bs.ROUND_TRIP_COST_PCT * 100, 3),
             "t_margin": T_MARGIN,
             "min_oos_trades": MIN_OOS_TRADES,
+            "lab_slots": [cid for cid in self.order if cid.startswith("lab_")],
             "challengers": challengers,
             "decision_log": self.decision_log[-15:],
         }

@@ -11,6 +11,7 @@ import time
 import os
 import json
 import sys
+import subprocess
 import re
 import math
 import statistics
@@ -64,6 +65,7 @@ _TAG_COLOUR = {
     "BTC DOM": _C.BLUE,
     "FUNDING": _C.BLUE,
     "TRENDING":_C.BLUE,
+    "RESEARCH":_C.BLUE,
     "SWITCH":  _C.CYAN,
     "POLL":    _C.GREY,
     "DB":      _C.GREY,
@@ -7868,6 +7870,114 @@ def _morning_brief_loop(trader):
         except Exception as e:
             log("BOT", f"MorningBrief error: {e}", "ERR")
 
+# ── Research lab scheduler ────────────────────────────────────────────────────
+# Nightly out-of-process strategy sweeps (research_lab.py --cycle). The lab runs
+# as a SUBPROCESS so a crash, an OOM, or a runaway sweep can never take the
+# trading bot down with it — this thread only spawns, watches, and logs.
+# Paper-only by construction: the lab writes research_state.json plus (max 3)
+# lab_challengers.json nominations that autopilot.py sanitizes on intake;
+# nothing here touches live-order endpoints or PAPER_LOCK.
+_research_proc = None   # live subprocess.Popen for the current lab cycle (None when idle)
+
+def _research_enabled():
+    """Env gate, re-read on every use so docker-compose can flip RESEARCH_LAB
+    without a code change. Explicit truthy set so a typo like RESEARCH_LAB=off
+    can never accidentally enable (same inverted-list reasoning as AUTOPILOT)."""
+    return os.environ.get("RESEARCH_LAB", "0").strip().lower() in ("1", "true", "yes", "on")
+
+def _research_next_run_ts():
+    """Next scheduled lab run as epoch seconds.
+
+    Pure epoch arithmetic instead of the datetime dance the other schedulers
+    use: naive utcnow().timestamp() silently assumes LOCAL time and would shift
+    the run hour on any box not set to UTC. Epoch seconds are UTC by definition,
+    so day-start = now - now % 86400 needs no timezone handling at all."""
+    try:
+        hour = int(os.environ.get("RESEARCH_HOUR_UTC", "4")) % 24
+    except Exception:
+        hour = 4   # unparsable env → documented default, never a dead thread
+    now = time.time()
+    nxt = now - (now % 86400) + hour * 3600
+    if nxt <= now:
+        nxt += 86400
+    return nxt
+
+def _research_run_cycle():
+    """Spawn one lab cycle and watch it to completion (blocks THIS thread only).
+
+    stdout/stderr append to {DATA_DIR}/research_cycle.log so a dead cycle can be
+    diagnosed after the fact; the file is trimmed to its last 200KB before each
+    spawn so it can never eat the data volume. If a previous cycle is somehow
+    still alive (budget overrun), skip instead of stacking a second sweep onto
+    the same CPU the live scanner needs."""
+    global _research_proc
+    if _research_proc is not None and _research_proc.poll() is None:
+        log("RESEARCH", f"previous lab cycle still running (pid={_research_proc.pid}) — skipping this trigger")
+        return
+    log_path = os.path.join(_DATA_DIR, "research_cycle.log")
+    try:   # cap: keep only the tail so the append-mode log never grows unbounded
+        if os.path.getsize(log_path) > 200 * 1024:
+            with open(log_path, "rb") as f:
+                f.seek(-200 * 1024, io.SEEK_END)
+                tail = f.read()
+            with open(log_path, "wb") as f:
+                f.write(tail)
+    except OSError:
+        pass   # absent file — nothing to trim
+    try:
+        with open(log_path, "ab") as lf:
+            # cwd pinned to this file's directory: research_lab.py resolves its
+            # siblings (history CSVs via DATA_DIR, strategy imports) from there.
+            _research_proc = subprocess.Popen(
+                [sys.executable, "research_lab.py", "--cycle"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stdout=lf, stderr=lf)
+    except Exception as e:
+        log("RESEARCH", f"failed to spawn lab cycle: {e}", "ERR")
+        return
+    log("RESEARCH", f"lab cycle started pid={_research_proc.pid} "
+                    f"(budget {os.environ.get('RESEARCH_BUDGET_MINS', '45')}m)")
+    started = time.time()
+    while _research_proc.poll() is None:   # watch-only; the lab enforces its own budget
+        time.sleep(30)
+    rc   = _research_proc.returncode
+    mins = (time.time() - started) / 60
+    log("RESEARCH", f"lab cycle finished rc={rc} after {mins:.0f}m",
+        "INFO" if rc == 0 else "ERR")
+
+def _research_loop():
+    """Daily scheduler for the research lab. Fires at RESEARCH_HOUR_UTC (default
+    04:00 UTC — dead hours for both US and EU sessions, so the sweep competes
+    least with live scanning). Boot catch-up: a redeploy at 05:00 would
+    otherwise mean ~23h with no research, so if the ledger says the last run is
+    >20h old (or never happened) we run once after a 600s settle delay. The env
+    gate is re-read every iteration, and everything is try/excepted because this
+    thread must never die."""
+    try:   # ── boot catch-up ──
+        last = 0.0
+        try:
+            with open(os.path.join(_DATA_DIR, "research_state.json"), encoding="utf-8") as f:
+                last = float(json.load(f).get("last_run_ts", 0) or 0)
+        except Exception:
+            pass   # absent or corrupt ledger counts as "never ran"
+        if _research_enabled() and time.time() - last > 20 * 3600:
+            time.sleep(600)          # let feeds warm + first scan land before stealing CPU
+            if _research_enabled():  # re-check: 10 min is plenty of time to flip it off
+                _research_run_cycle()
+    except Exception as e:
+        log("RESEARCH", f"boot catch-up error: {e}", "ERR")
+    while True:
+        try:
+            # Sleep to the next daily slot (same shape as _morning_brief_loop,
+            # just epoch-based). max() guards a clock step going negative.
+            time.sleep(max(30, _research_next_run_ts() - time.time()))
+            if not _research_enabled():
+                continue   # slept to the slot but the gate is off — just reschedule
+            _research_run_cycle()
+        except Exception as e:
+            log("RESEARCH", f"loop error: {e}", "ERR")
+            time.sleep(60)   # do not spin if something is persistently broken
+
 def _trade_preview_loop(trader):
     while True:
         time.sleep(5)
@@ -10463,6 +10573,35 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       </div>
     </div>
 
+    <div class="sh"><span>Research Lab</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">nightly strategy sweeps - paper only</span></div>
+    <div class="sim-card" id="rs_card">
+      <div class="sim-off-msg" id="rs_off_msg">Research lab idle - first run pending</div>
+      <div id="rs_stats_wrap" style="display:none">
+        <div class="sim-grid">
+          <div>
+            <div class="sim-stat-lbl">Cycles</div>
+            <div class="sim-stat-val" id="rs_runs">—</div>
+          </div>
+          <div>
+            <div class="sim-stat-lbl">Tested</div>
+            <div class="sim-stat-val" id="rs_tested">—</div>
+          </div>
+          <div>
+            <div class="sim-stat-lbl">Cleared</div>
+            <div class="sim-stat-val" id="rs_cleared">—</div>
+          </div>
+          <div>
+            <div class="sim-stat-lbl">Challengers</div>
+            <div class="sim-stat-val" id="rs_slots">—</div>
+          </div>
+          <div>
+            <div class="sim-stat-lbl">Last Run</div>
+            <div class="sim-stat-val" id="rs_last">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="sh"><span>Bot Activity</span><span style="font-size:.58rem;color:var(--mu);font-weight:400">live scan feed</span></div>
     <div id="activity_feed" style="padding:0 12px 4px">
       <div class="no-data" style="padding:16px 0">Waiting for first scan…</div>
@@ -11503,7 +11642,7 @@ function goTab(t){
     pg.addEventListener('touchstart',e=>{if(pg.scrollTop===0){sy=e.touches[0].clientY;arm=true;}},{passive:true});
     pg.addEventListener('touchmove',e=>{if(arm&&e.touches[0].clientY-sy>65)ptr.classList.add('show');},{passive:true});
     pg.addEventListener('touchend',()=>{
-      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchAutopilot();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAutoNotes().then(renderJournal);}
+      if(ptr.classList.contains('show')){fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();fetchSim();fetchAutopilot();fetchResearch();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAutoNotes().then(renderJournal);}
       ptr.classList.remove('show');arm=false;
     },{passive:true});
   });
@@ -13481,7 +13620,7 @@ function renderExitReasons(trades){
 /* ── TICK ── */
 function tick(){
   if(--_tick<=0){
-    fetchStatus();fetchCandles();fetchHistory();fetchSim();fetchAutopilot();
+    fetchStatus();fetchCandles();fetchHistory();fetchSim();fetchAutopilot();fetchResearch();
     if(_tab==='market'){fetchMarket();fetchForecast();}
     if(_tab==='stats'){fetchHourly();drawDownChart();}
     _tick=30;
@@ -14504,6 +14643,40 @@ async function toggleAutopilot(){
   }catch(e){console.warn('toggleAutopilot',e);}
 }
 
+/* ── RESEARCH LAB (read-only nightly sweep status) ── */
+async function fetchResearch(){
+  try{
+    const d=await(await fetch('/research')).json();
+    renderResearch(d);
+  }catch(e){console.warn('research',e);}
+}
+function renderResearch(d){
+  const off=$('rs_off_msg'),wrap=$('rs_stats_wrap');
+  const hasRun=!!(d&&d.last_run_ts);
+  if(off){
+    off.style.display=hasRun?'none':'';
+    if(!hasRun&&d&&!d.enabled)off.textContent='Research lab is OFF - set RESEARCH_LAB=1 to enable';
+  }
+  if(wrap)wrap.style.display=hasRun?'':'none';
+  if(!hasRun)return;
+  if($('rs_runs'))$('rs_runs').textContent=(d.runs_count||0).toString();
+  if($('rs_tested'))$('rs_tested').textContent=(d.params_tested||0).toString();
+  if($('rs_cleared'))$('rs_cleared').textContent=(d.families_cleared||0).toString();
+  if($('rs_slots'))$('rs_slots').textContent=(d.lab_challengers?d.lab_challengers.length:0).toString();
+  const el=$('rs_last');
+  if(el){
+    if(d.running){el.textContent='running now';el.style.color='var(--g)';}
+    else{
+      const secs=Math.max(0,Math.round(Date.now()/1000-d.last_run_ts));
+      let txt;
+      if(secs<3600)txt=Math.round(secs/60)+'m ago';
+      else if(secs<86400)txt=Math.round(secs/3600)+'h ago';
+      else txt=Math.round(secs/86400)+'d ago';
+      el.textContent=txt;el.style.color='';
+    }
+  }
+}
+
 /* ── NEWS FORECAST ── */
 async function fetchForecast(){
   try{
@@ -15297,7 +15470,7 @@ fetchOrderFlow();setInterval(fetchOrderFlow,45000);  // tape TTL is 45s server-s
 fetchAutoNotes().then(renderJournal);setInterval(fetchAutoNotes,60000);
 initValueFlash();     // must run BEFORE the first fetch so it captures baselines
 fetchStatus();fetchCandles();fetchHistory();fetchMarket();fetchDailyPnl();fetchHourly();fetchAlerts();
-fetchSim();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();loadIQ();
+fetchSim();fetchResearch();fetchForecast();fetchBestSetups();fetchBotMsgs();fetchAchievements();loadQuiz();loadIQ();
 fetchPrices();setInterval(fetchPrices,8000);
 setInterval(fetchStatus,15000);setInterval(loadIQ,60000);
 initSSE();initWebPush();
@@ -15755,6 +15928,8 @@ def _web_status():
                                     "persisted_enabled": _autopilot_mod.autopilot_persisted_enabled()}
         except Exception:
             payload["autopilot"] = {"enabled": False}
+    # Research lab compact block — same safe reads as /research, HUD-friendly.
+    payload["research"] = _research_compact()
     return _Response(json.dumps(payload), mimetype="application/json",
                       headers={"Access-Control-Allow-Origin": "*"})
 
@@ -15896,6 +16071,8 @@ def _web_healthz():
                                 "persisted_enabled": _autopilot_mod.autopilot_persisted_enabled()}
         except Exception:
             pass
+    # Research lab summary — compact on purpose, /healthz is polled constantly.
+    _hz["research"] = _research_compact()
     return _Response(json.dumps(_hz), mimetype="application/json")
 
 @_flask_app.route("/history")
@@ -16062,6 +16239,78 @@ def _web_autopilot():
     except Exception as e:
         return _Response(json.dumps({"enabled": True, "error": str(e)}),
                          mimetype="application/json")
+
+def _research_compact():
+    """Three-key research summary for /status and /healthz — the Noluv HUD polls
+    those constantly, so keep this to one small file read and no sorting."""
+    out = {"enabled": _research_enabled(), "last_run_ts": None, "families_cleared": 0}
+    try:
+        with open(os.path.join(_DATA_DIR, "research_state.json"), encoding="utf-8") as f:
+            st = json.load(f)
+        out["last_run_ts"] = st.get("last_run_ts")
+        out["families_cleared"] = sum(1 for v in (st.get("family_results") or {}).values()
+                                      if isinstance(v, dict) and v.get("clears"))
+    except Exception:
+        pass   # absent/corrupt ledger → honest empty state, never an error
+    return out
+
+@_flask_app.route("/research")
+def _web_research():
+    """Read-only research lab summary for the dashboard card + external HUDs.
+
+    No PIN: it exposes sweep statistics only — no controls, no balances, and the
+    lab can only be enabled via env, so there is nothing here to abuse. Every
+    file read is individually wrapped: absent files (fresh install, lab never
+    ran) must yield a well-formed empty state, not a 500."""
+    out = {
+        "enabled":          _research_enabled(),
+        "running":          False,
+        "last_run_ts":      None,
+        "next_run_ts":      _research_next_run_ts(),
+        "runs_count":       0,
+        "params_tested":    0,     # last cycle's sweep size (dashboard card)
+        "families_cleared": 0,
+        "family_results":   {},
+        "lab_challengers":  [],
+        "last_digest":      "",
+    }
+    # "running" = lockfile fresher than the lab's 3h stale horizon. Deliberately
+    # NOT checking pid-alive: pids lie across container restarts, and the lab's
+    # own takeover logic already handles a stale lock.
+    try:
+        with open(os.path.join(_DATA_DIR, "research.lock"), encoding="utf-8") as f:
+            out["running"] = time.time() - float(json.load(f).get("ts", 0)) < 3 * 3600
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(_DATA_DIR, "research_state.json"), encoding="utf-8") as f:
+            st = json.load(f)
+        out["last_run_ts"] = st.get("last_run_ts")
+        runs = st.get("runs") or []
+        out["runs_count"] = len(runs)
+        if runs:
+            out["params_tested"] = runs[-1].get("params_tested", 0)
+        fam = {k: v for k, v in (st.get("family_results") or {}).items()
+               if isinstance(v, dict)}
+        out["families_cleared"] = sum(1 for v in fam.values() if v.get("clears"))
+        def _t_key(kv):   # |t_oos| sort key, tolerant of null/missing values
+            try:
+                return abs(float(kv[1].get("t_oos") or 0))
+            except Exception:
+                return 0.0
+        out["family_results"] = dict(sorted(fam.items(), key=_t_key, reverse=True)[:8])
+        out["last_digest"] = st.get("last_digest", "")
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(_DATA_DIR, "lab_challengers.json"), encoding="utf-8") as f:
+            cfgs = json.load(f).get("configs") or []
+        out["lab_challengers"] = [c.get("id") for c in cfgs
+                                  if isinstance(c, dict) and c.get("id")]
+    except Exception:
+        pass
+    return _Response(json.dumps(out), mimetype="application/json",
+                     headers={"Cache-Control": "no-store"})
 
 @_flask_app.route("/export/trades.csv")
 def _web_export_csv():
@@ -17908,6 +18157,17 @@ def main():
         log("BOOT", f"Autopilot init FAILED — staying disabled: {_ap_e}\n{_ap_tb.format_exc()}", "ERR")
         _autopilot = None
 
+    # ── Research lab (nightly paper-only strategy sweeps, subprocess) ─────────
+    # State only in the log line — the scheduler thread itself re-reads the env
+    # gate every iteration, so flipping RESEARCH_LAB in compose needs no restart
+    # of anything but the container it already restarts.
+    if _research_enabled():
+        log("BOOT", f"Research lab ENABLED — next cycle "
+                    f"{time.strftime('%H:%M', time.gmtime(_research_next_run_ts()))} UTC "
+                    f"(budget {os.environ.get('RESEARCH_BUDGET_MINS', '45')}m)")
+    else:
+        log("BOOT", "Research lab OFF (set RESEARCH_LAB=1 for nightly sweeps)")
+
     _auto_notes_backfill(trader)
 
     threading.Thread(target=_position_watchdog, args=(trader, _sim_trader),
@@ -17967,6 +18227,7 @@ def main():
         ("Morning brief",     _morning_brief_loop,  (trader,)),
         ("Trade preview",     _trade_preview_loop,  (trader,)),
         ("Kraken WS prices",  _kraken_ws_loop,      ()),
+        ("Research lab",      _research_loop,       ()),
         ("Watchdog",          _watchdog_loop,       ()),
         ("Heartbeat",         _heartbeat_loop,      (trader,)),
         ("Web dashboard",     _start_web_server,    (trader,)),
