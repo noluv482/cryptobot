@@ -16975,6 +16975,8 @@ def _web_control():
             _sim_enabled = False
         elif action == "toggle_sim":
             _sim_enabled = not _sim_enabled
+        if action in ("sim_on", "sim_off", "toggle_sim") and _sim_trader:
+            _sim_trader._save()      # the switch survives restarts (same as the TG path)
         else:
             _paused = not _paused
             tg_msg = ("⏸ *Trading PAUSED* via dashboard\nThe bot will not open new trades."
