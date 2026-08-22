@@ -3235,8 +3235,13 @@ def _orderbook_wall(pair, price, target, stop, sig):
 
 # ── Paper trader ──────────────────────────────────────────────────────────────
 class PaperTrader:
-    def __init__(self, no_persist=False, force_paper=False, start_balance=None):
+    def __init__(self, no_persist=False, force_paper=False, start_balance=None,
+                 state_path=None):
         self._no_persist    = no_persist or force_paper
+        # A force_paper instance stays out of the DB and the shared paper_state
+        # file, but may carry its OWN state file (the sim book) so it survives
+        # restarts. Backtests pass no state_path and remain fully memory-only.
+        self._state_path    = state_path
         self._force_paper   = force_paper
         self._start_balance = start_balance if start_balance is not None else PAPER_START
         self.balance       = self._start_balance
@@ -3299,7 +3304,7 @@ class PaperTrader:
         self._min_size_warn_ts = {}  # pair → last time "order too small" tg() was sent
         self._force_risk_min = None  # when set, overrides global RISK_MIN for this trader
         self._force_risk_max = None  # when set, overrides global RISK_MAX for this trader
-        if not force_paper:
+        if not force_paper or state_path:
             self._load()
         if LIVE_MODE and not force_paper:
             if LIVE_EXCHANGE == "binance":
@@ -3392,6 +3397,18 @@ class PaperTrader:
 
     def _load(self):
         if self._no_persist:
+            if self._state_path and os.path.exists(self._state_path):
+                try:
+                    with open(self._state_path) as f:
+                        d = json.load(f)
+                    global _paper_mode
+                    pm = _paper_mode      # _apply_state writes this global; the
+                    self._apply_state(d)  # sim's file must never drive the real
+                    _paper_mode = pm      # book's paper/live flag
+                    log("SIM", f"Loaded from file  balance=${self.balance:.2f}  "
+                               f"positions={len(self.positions)}  trades={len(self.trades)}")
+                except Exception as e:
+                    log("SIM", f"Load error: {e}", "ERR")
             return
         if db.connected:
             state = db.load_state()
@@ -3446,6 +3463,15 @@ class PaperTrader:
 
     def _save(self):
         if self._no_persist:
+            if self._state_path:
+                try:
+                    tmp = self._state_path + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump({**self._state_dict(), "sim_enabled": _sim_enabled},
+                                  f, indent=2)
+                    os.replace(tmp, self._state_path)  # atomic: kill mid-write can't corrupt
+                except Exception as e:
+                    log("SIM", f"File save error: {e}", "ERR")
             return
         self._save_db()
         self._save_file()
@@ -7168,6 +7194,7 @@ def _dispatch_callback(data, query, trader):
             tg("⚠️ Sim trader not initialized — restart the bot.", plain=True)
             return
         _sim_enabled = True
+        _sim_trader._save()          # the switch survives restarts
         tg(f"📄 *Sim trading ON*\n"
            f"Running `${_sim_trader._start_balance:,.0f}` virtual account in background.\n"
            f"Sim balance: `${_sim_trader.balance:,.2f}` | Trades: `{len(_sim_trader.trades)}`\n"
@@ -7176,6 +7203,8 @@ def _dispatch_callback(data, query, trader):
 
     elif data == "sim_off":
         _sim_enabled = False
+        if _sim_trader:
+            _sim_trader._save()      # the switch survives restarts
         sim_bal = f"${_sim_trader.balance:,.2f}" if _sim_trader else "—"
         tg(f"📄 *Sim trading OFF*\nFinal sim balance: `{sim_bal}`\nType *sim on* to resume.")
 
@@ -18119,12 +18148,22 @@ def main():
 
     trader = PaperTrader()
 
-    # Create the parallel sim trader ($2000 virtual account, always paper)
-    global _sim_trader, _btc_benchmark_start
-    _sim_trader = PaperTrader(force_paper=True, start_balance=2000.0)
+    # Create the parallel sim trader ($2000 virtual account, always paper).
+    # Its book lives in its own sim_state.json so a redeploy/restart no longer
+    # wipes the balance, open positions, or the on/off switch.
+    global _sim_trader, _btc_benchmark_start, _sim_enabled
+    _sim_trader = PaperTrader(force_paper=True, start_balance=2000.0,
+                              state_path=os.path.join(_DATA_DIR, "sim_state.json"))
     _sim_trader._force_risk_min = 0.20   # sim uses fake money — trade bigger to learn faster
     _sim_trader._force_risk_max = 0.50
-    log("BOOT", "Sim trader initialized — $2000 virtual account ready (type 'sim on' to start)")
+    try:
+        if os.path.exists(_sim_trader._state_path):
+            with open(_sim_trader._state_path) as _sf:
+                _sim_enabled = bool(json.load(_sf).get("sim_enabled", _sim_enabled))
+    except Exception:
+        pass
+    log("BOOT", f"Sim trader initialized — ${_sim_trader.balance:,.2f} virtual account "
+                + ("(running)" if _sim_enabled else "(type 'sim on' to start)"))
 
     # ── Autopilot (paper-only champion/challenger allocator) ──────────────────
     # OFF by default: nothing changes unless the owner sets AUTOPILOT=1. When off,
