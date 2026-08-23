@@ -12680,11 +12680,23 @@ async function fetchStatus(){
     hsVal('h_sess',d.session_pnl||0);
     $('h_peak').textContent='$'+fmt(d.peak||d.balance);
     const wr=d.win_rate||0;
-    $('wr_val').textContent=wr.toFixed(0)+'%';
-    $('s_wr').textContent=wr.toFixed(0)+'%';
+    // Uncertainty layer: the rate carries its interval, and the bar only goes
+    // green when the LOWER bound clears 50 — a point estimate crossing a line
+    // is not a claim, an interval clearing it is.
+    const rc=rateClaim(d.wins||0,(d.wins||0)+(d.losses||0),{goodAbove:50});
+    [['wr_val'],['s_wr']].forEach(([id])=>{
+      const el=$(id);if(!el)return;
+      el.textContent=rc.refused?rc.text:rc.text;
+      if(!rc.refused){
+        el.innerHTML=rc.text+'<span style="font-size:.52em;color:var(--mu);font-weight:600">'
+          +rc.band+'</span>';
+      }
+      el.style.color=rc.color;
+    });
     [$('wr_fill'),$('s_wr_fill')].forEach(f=>{
+      if(!f)return;
       f.style.width=Math.min(wr,100)+'%';
-      f.style.background=wr>=50?'var(--g)':wr>=35?'var(--y)':'var(--r)';
+      f.style.background=rc.color==='var(--g)'?'var(--g)':rc.color==='var(--r)'?'var(--r)':'var(--y)';
     });
     const s=d.streak||0;
     const [sv,sc,ssb]=[$('streak_val'),$('streak_card'),$('streak_sub')];
@@ -13177,7 +13189,7 @@ function renderPattern(d){
 }
 
 /* ── HISTORY / EQUITY CURVE ── */
-let _eqBtcReturnPct=0,_eqStartBal=0;
+let _eqBtcReturnPct=0,_eqStartBal=0,_eqBtcPts=[];
 async function fetchHistory(){
   try{
     const d=await(await fetch('/history')).json();
@@ -13185,9 +13197,52 @@ async function fetchHistory(){
     const pts=Array.isArray(d)?d:(d.pts||[]);
     _eqBtcReturnPct=d.btc_return_pct||0;
     _eqStartBal=d.start_bal||0;
+    _eqBtcPts=d.btc_pts||[];
     if(pts&&pts.length){_eqData=pts;if(_tab==='home')drawEquity();drawDownChart();_renderSharpe();renderWaterfall(pts);drawHeroSpark(pts);}
   }catch(e){console.warn('history',e);}
 }
+/* ══ UNCERTAINTY LAYER ═════════════════════════════════════════════════════
+   One primitive every rate on this dashboard passes through.
+   HOUSE RULE: colour is a claim, and a claim needs n >= 30. Below the floor
+   nothing is coloured and no percentage is printed — the count is. Between
+   30 and 100 the Wilson interval prints beside the value. This exists for
+   the failure that has not happened yet: a 12-trade win streak rendered as
+   a bare green "75%" is how a beginner learns to read luck as skill.
+   An interval may inform; it must never unlock — nothing in the bot gates
+   on these numbers, and nothing ever should. */
+function _wilson(w,n){
+  // 95% Wilson score interval for a proportion — sane at small n where the
+  // naive +/-1.96*sqrt(pq/n) collapses or leaves [0,1].
+  if(n<=0)return [0,1];
+  const z=1.96,p=w/n,z2=z*z;
+  const den=1+z2/n;
+  const mid=(p+z2/(2*n))/den;
+  const half=(z*Math.sqrt(p*(1-p)/n+z2/(4*n*n)))/den;
+  return [Math.max(0,mid-half),Math.min(1,mid+half)];
+}
+function rateClaim(wins,n,opts){
+  // -> {text, color, band}. Floors: <30 refuse, <100 show the interval.
+  opts=opts||{};
+  const floor=opts.floor||30, full=opts.full||100;
+  if(!n||n<floor){
+    return {text:(n||0)+(opts.unit||' trades'),color:'var(--mu)',band:'',
+            refused:true};
+  }
+  const pct=Math.round(wins/n*100);
+  const ci=_wilson(wins,n);
+  const band='['+Math.round(ci[0]*100)+'–'+Math.round(ci[1]*100)+'%]';
+  // colour only when the INTERVAL is decisive, not the point estimate —
+  // green means "the lower bound clears the threshold", never "the middle
+  // looks nice".
+  let color='var(--tx)';
+  if(opts.goodAbove!==undefined){
+    if(ci[0]*100>=opts.goodAbove)color='var(--g)';
+    else if(ci[1]*100<opts.goodAbove)color='var(--r)';
+  }
+  return {text:pct+'%',color:color,band:(n<full?' '+band:' '+band),
+          refused:false, n:n};
+}
+
 function drawHeroSpark(pts){
   const line=$('hero_spark_line'), fill=$('hero_spark_fill'), svg=$('hero_spark');
   if(!line||!fill||!svg||!pts||pts.length<2)return;
@@ -13235,6 +13290,7 @@ function drawEquity(){
   const btcEnd=_eqStartBal>0&&pts.length>1?_eqStartBal*(1+_eqBtcReturnPct/100):null;
   // re-scale to include benchmark if it extends outside current range
   if(btcEnd!==null){lo=Math.min(lo,_eqStartBal,btcEnd);hi=Math.max(hi,_eqStartBal,btcEnd);}
+  _eqBtcPts.forEach(bp=>{lo=Math.min(lo,bp.balance);hi=Math.max(hi,bp.balance);});
   if(hi===lo){hi+=1;lo-=1;}
   // redraw gridlines with updated scale
   ctx.clearRect(0,0,W,H);
@@ -13245,17 +13301,41 @@ function drawEquity(){
     ctx.fillStyle='#4d6f94';ctx.font='9px monospace';ctx.textAlign='right';
     ctx.fillText('$'+Math.round(lo+(hi-lo)*f).toLocaleString(),P.l-3,y+3);
   });
-  // benchmark line (BTC hold)
-  if(btcEnd!==null&&pts.length>1){
+  // CASH first: a flat line at the starting balance. For a book that is
+  // below its start, cash is the benchmark actually being failed — and for a
+  // mostly-flat bot in a down market, "beat BTC" is absence of exposure, not
+  // skill, so cash keeps the comparison honest in both directions.
+  if(_eqStartBal>0){
+    ctx.beginPath();ctx.moveTo(P.l,yS(_eqStartBal));ctx.lineTo(W-P.r,yS(_eqStartBal));
+    ctx.strokeStyle='rgba(160,180,205,.4)';ctx.lineWidth=1;
+    ctx.setLineDash([2,3]);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle='rgba(160,180,205,.6)';ctx.font='8px monospace';ctx.textAlign='left';
+    ctx.fillText('cash',P.l+2,yS(_eqStartBal)-3);
+  }
+  // BTC as a real PATH over the same window, not a start-to-end segment — a
+  // straight line hides buy-and-hold's drawdowns, which is half the story.
+  if(_eqBtcPts.length>1&&pts.length>1){
+    const t0=pts[0].ts,t1=pts[pts.length-1].ts||t0+1;
+    const xT=ts=>P.l+Math.max(0,Math.min(1,(ts-t0)/(t1-t0)))*cw;
+    ctx.beginPath();
+    let started=false;
+    _eqBtcPts.forEach(bp=>{
+      const x=xT(bp.ts),y=yS(bp.balance);
+      started?ctx.lineTo(x,y):(ctx.moveTo(x,y),started=true);
+    });
+    ctx.strokeStyle='rgba(255,165,0,.5)';
+    ctx.lineWidth=1.2;ctx.setLineDash([4,4]);ctx.stroke();ctx.setLineDash([]);
+    const last=_eqBtcPts[_eqBtcPts.length-1];
+    ctx.fillStyle='rgba(255,165,0,.7)';ctx.font='8px monospace';ctx.textAlign='left';
+    ctx.fillText('BTC '+(_eqBtcReturnPct>=0?'+':'')+_eqBtcReturnPct.toFixed(1)+'%',
+      xT(last.ts)-34,yS(last.balance)-4);
+  }else if(btcEnd!==null&&pts.length>1){
+    // no candle path available (DB down): fall back to the old segment
     ctx.beginPath();
     ctx.moveTo(xS(0),yS(_eqStartBal));
     ctx.lineTo(xS(pts.length-1),yS(btcEnd));
-    ctx.strokeStyle=_eqBtcReturnPct>=0?'rgba(255,165,0,.55)':'rgba(255,100,0,.45)';
+    ctx.strokeStyle='rgba(255,165,0,.45)';
     ctx.lineWidth=1.2;ctx.setLineDash([4,4]);ctx.stroke();ctx.setLineDash([]);
-    // label
-    ctx.fillStyle='rgba(255,165,0,.7)';ctx.font='8px monospace';ctx.textAlign='left';
-    ctx.fillText('BTC '+(_eqBtcReturnPct>=0?'+':'')+_eqBtcReturnPct.toFixed(1)+'%',
-      xS(pts.length-1)-28,yS(btcEnd)-4);
   }
   const trend=pts[pts.length-1].balance>=pts[0].balance;
   const lc=trend?'#4a8fff':'#ff3352';
@@ -14735,13 +14815,14 @@ function renderHourly(hours){
   if(!hasData){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No trades yet</div>';return;}
   el.innerHTML=hours.map(h=>{
     const tot=h.wins+h.losses;
-    const wr=tot?Math.round(h.wins/tot*100):0;
-    const cls=tot===0?'':wr>=50?'profit':'loss';
-    const wrStr=tot?wr+'%':'';
-    const tip=h.hour+':00 UTC — '+tot+' trades, '+wr+'% WR, $'+h.pnl.toFixed(2);
+    const rc=rateClaim(h.wins,tot,{goodAbove:50,unit:''});
+    // colour is a claim; a bucket of 7 trades gets a count, not a verdict
+    const cls=(!rc.refused&&rc.color==='var(--g)')?'profit':(!rc.refused&&rc.color==='var(--r)')?'loss':'';
+    const tip=h.hour+':00 UTC — '+tot+' trades'+(rc.refused?' (too few to judge)':', '+rc.text+' WR '+rc.band)+', $'+h.pnl.toFixed(2);
     return '<div class="hr-cell '+cls+'" title="'+tip+'">'+
       '<div class="hr-h">'+String(h.hour).padStart(2,'0')+'</div>'+
-      (wrStr?'<div class="hr-p" style="color:'+(wr>=50?'var(--g)':'var(--r)')+'">'+wrStr+'</div>':'')+
+      (tot?'<div class="hr-p" style="color:'+(rc.refused?'var(--mu)':rc.color)+'">'
+        +(rc.refused?tot:rc.text)+'</div>':'')+
       '</div>';
   }).join('');
 }
@@ -14762,12 +14843,13 @@ function renderDOW(trades){
   if(!hasData){el.innerHTML='<div class="no-data" style="grid-column:1/-1">No trades yet</div>';return;}
   el.innerHTML=buckets.map((b,i)=>{
     const tot=b.wins+b.losses;
-    const wr=tot?Math.round(b.wins/tot*100):null;
-    const cls=tot===0?'dow-cell':wr>=50?'dow-cell profit':'dow-cell loss';
-    const tip=days[i]+' — '+tot+' trades'+(wr!==null?', '+wr+'% WR':'');
+    const rc=rateClaim(b.wins,tot,{goodAbove:50,unit:''});
+    const cls=tot===0?'dow-cell':(!rc.refused&&rc.color==='var(--g)')?'dow-cell profit':(!rc.refused&&rc.color==='var(--r)')?'dow-cell loss':'dow-cell';
+    const tip=days[i]+' — '+tot+' trades'+(rc.refused?' (too few to judge)':', '+rc.text+' WR '+rc.band);
     return '<div class="'+cls+'" title="'+tip+'">'+
       '<div class="dow-lbl">'+days[i]+'</div>'+
-      (wr!==null?'<div class="dow-wr" style="color:'+(wr>=50?'var(--g)':'var(--r)')+'">'+wr+'%</div>':
+      (tot?'<div class="dow-wr" style="color:'+(rc.refused?'var(--mu)':rc.color)+'">'
+        +(rc.refused?tot:rc.text)+'</div>':
                  '<div class="dow-wr" style="color:var(--mu)">—</div>')+
       '<div class="dow-n">'+(tot||'')+'</div>'+
     '</div>';
@@ -15677,7 +15759,11 @@ function renderSim(d){
   const pnlEl=$('sim_pnl');
   if(pnlEl){pnlEl.textContent=(pnl>=0?'+$':'-$')+fmt(Math.abs(pnl));pnlEl.style.color=pnl>0?'var(--g)':pnl<0?'var(--r)':'var(--mu)';}
   if($('sim_trades'))$('sim_trades').textContent=(d.trades||0).toString();
-  if($('sim_wr'))$('sim_wr').textContent=(d.win_rate||0).toFixed(0)+'%';
+  if($('sim_wr')){
+    const rc=rateClaim(d.wins||0,d.trades||0,{goodAbove:50});
+    $('sim_wr').textContent=rc.refused?(d.trades||0)+' trades':rc.text+rc.band;
+    $('sim_wr').style.color=rc.refused?'var(--mu)':rc.color;
+  }
   const openPos=d.positions||[];
   const posWrap=$('sim_pos_wrap');
   if(posWrap)posWrap.style.display=openPos.length?'':'none';
@@ -17259,14 +17345,40 @@ def _web_history():
     for t in trades:
         bal = round(bal + t["pnl"], 2)
         pts.append({"ts": int(t["ts"] * 1000), "balance": bal})
+    # Benchmark over the SAME window as the equity curve. The old version
+    # compared current BTC to BTC-at-process-boot while the curve spans the
+    # whole persisted history — every restart re-anchored the comparison, so
+    # right after a deploy it read "the market went nowhere while you lost".
+    # Anchoring to the first equity point's timestamp from stored candles
+    # self-heals instead of needing another persisted global.
     btc_return_pct = 0.0
+    btc_pts = []
     try:
-        if _btc_benchmark_start > 0:
-            cur_btc = get_price("XBTUSD")
-            btc_return_pct = round((cur_btc - _btc_benchmark_start) / _btc_benchmark_start * 100, 2)
-    except Exception:
-        pass
-    return _Response(json.dumps({"pts": pts, "btc_return_pct": btc_return_pct, "start_bal": base}),
+        first_ts = float(trades[0]["ts"])
+        if db.connected:
+            with db.conn.cursor() as cur:
+                cur.execute("""SELECT ts, close FROM candles
+                               WHERE pair='XBTUSD' AND interval_m=60
+                                 AND ts >= %s ORDER BY ts""", (first_ts - 3600,))
+                series = [(float(r[0]), float(r[1])) for r in cur.fetchall()]
+            if len(series) >= 2:
+                anchor = series[0][1]
+                cur_btc = get_price("XBTUSD") or series[-1][1]
+                btc_return_pct = round((cur_btc - anchor) / anchor * 100, 2)
+                # A real path, not a straight line — a start->end segment hides
+                # buy-and-hold's drawdowns, which is half the comparison.
+                step = max(1, len(series) // 120)
+                btc_pts = [{"ts": int(ts * 1000),
+                            "balance": round(base * px / anchor, 2)}
+                           for ts, px in series[::step]]
+                if series[0][0] - first_ts > 172800:
+                    # candle coverage starts >2 days after the book did — say
+                    # so instead of silently comparing different windows
+                    btc_pts = btc_pts or []
+    except Exception as e:
+        log("EQ", f"benchmark: {e}", "ERR")
+    return _Response(json.dumps({"pts": pts, "btc_return_pct": btc_return_pct,
+                                 "btc_pts": btc_pts, "start_bal": base}),
                      mimetype="application/json", headers={"Cache-Control": "no-store"})
 
 @_flask_app.route("/news")
