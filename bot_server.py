@@ -11775,7 +11775,9 @@ function mtSetSl(pct){
     b.classList.toggle('on', parseFloat(b.dataset.sl)===pct));
   const lvl=_mtLevel(pct,-1), f=$('mt_sl'), v=$('mt_sl_val');
   if(f)f.value = lvl?lvl.toFixed(8):'';
-  if(v)v.textContent = lvl ? ('-'+pct+'% = '+_fmtPrice(lvl)) : 'not set';
+  // Say "against you", not "-5%": for a short the stop sits ABOVE the price,
+  // and a minus sign next to a higher number is how people mis-set stops.
+  if(v)v.textContent = lvl ? (pct+'% against you = '+_fmtPrice(lvl)) : 'not set';
   mtPreview();
 }
 function mtSetTp(pct){
@@ -11784,7 +11786,7 @@ function mtSetTp(pct){
     b.classList.toggle('on', parseFloat(b.dataset.tp)===pct));
   const lvl=_mtLevel(pct,1), f=$('mt_tp'), v=$('mt_tp_val');
   if(f)f.value = lvl?lvl.toFixed(8):'';
-  if(v)v.textContent = lvl ? ('+'+pct+'% = '+_fmtPrice(lvl)) : 'not set';
+  if(v)v.textContent = lvl ? (pct+'% your way = '+_fmtPrice(lvl)) : 'not set';
   mtPreview();
 }
 function mtSetHz(h){
