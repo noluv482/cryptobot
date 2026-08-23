@@ -10152,6 +10152,84 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
    chart tab was previously read-only, which is what made it feel inert.     */
 .mt-panel{margin:10px 12px 18px;padding:12px;border-radius:12px;
   background:var(--glass,rgba(255,255,255,.03));border:1px solid var(--bd)}
+
+/* ── app-style refresh (2026-08-23) ────────────────────────────────────────
+   Reads like a trading app instead of a form: the money is the biggest thing
+   on screen, the side is chosen before anything else (a stop only means
+   something once direction is known), and stop/target/hold are PERCENT chips
+   rather than price fields you have to type on a phone. That last one is not
+   cosmetic — a plan that is one tap to set actually gets set, and a trade with
+   no declared exit can be held until it recovers, which manufactures a win
+   rate out of nothing.                                                      */
+.mt-hero{display:flex;align-items:flex-end;gap:12px;padding:4px 2px 12px;
+  border-bottom:1px solid var(--bd);margin-bottom:11px}
+.mt-hero-lbl{font-family:var(--fn);font-size:.5rem;letter-spacing:.14em;
+  color:var(--mu);margin-bottom:3px}
+.mt-hero-bal{font-family:var(--fn);font-size:1.85rem;font-weight:700;color:var(--tx);
+  font-variant-numeric:tabular-nums;line-height:1;letter-spacing:-.02em}
+.mt-hero-pl{font-family:var(--fn);font-size:.72rem;font-weight:700;margin-top:5px;
+  font-variant-numeric:tabular-nums}
+.mt-hero-r{margin-left:auto;text-align:right;font-family:var(--fn);font-size:.54rem;
+  color:var(--mu);line-height:1.7}
+.mt-hero-r b{color:var(--tx);font-size:.68rem}
+
+/* the bot's own read on this coin — the learning loop made visible */
+.mt-botread{display:none;align-items:center;gap:8px;padding:8px 10px;margin-bottom:11px;
+  border-radius:9px;background:rgba(74,143,255,.07);border:1px solid rgba(74,143,255,.22)}
+.mt-br-tag{font-family:var(--fn);font-size:.46rem;letter-spacing:.12em;color:var(--b);
+  flex-shrink:0}
+.mt-br-txt{font-family:var(--fn);font-size:.56rem;color:var(--tx);line-height:1.5}
+.mt-br-txt em{font-style:normal;color:var(--mu)}
+
+.mt-side-row{display:flex;gap:7px;margin-bottom:10px}
+.mt-side-btn{flex:1;background:rgba(255,255,255,.03);border:1px solid var(--bd2);
+  color:var(--mu);border-radius:9px;font-family:var(--fn);font-size:.62rem;
+  font-weight:700;letter-spacing:.06em;padding:11px 0;cursor:pointer;min-height:44px;
+  transition:background .13s,border-color .13s,color .13s}
+.mt-side-btn[data-side="BUY"].on{background:rgba(0,204,116,.16);border-color:var(--g);
+  color:var(--g)}
+.mt-side-btn[data-side="SELL"].on{background:rgba(255,51,82,.14);border-color:var(--r);
+  color:var(--r)}
+
+.mt-field{margin-bottom:10px}
+.mt-field-hd{display:flex;align-items:baseline;gap:8px;margin-bottom:6px}
+.mt-field-hd .mt-lbl{letter-spacing:.12em}
+.mt-field-val{margin-left:auto;font-family:var(--fn);font-size:.6rem;
+  color:var(--tx);font-variant-numeric:tabular-nums}
+.mt-field-val.mu{color:var(--mu)}
+.mt-chips{display:flex;gap:6px}
+.mt-chip{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--bd2);
+  color:var(--mu);border-radius:8px;font-family:var(--fn);font-size:.55rem;
+  font-weight:700;padding:9px 0;cursor:pointer;min-height:38px;
+  transition:background .13s,border-color .13s,color .13s}
+.mt-chip.on{background:rgba(74,143,255,.16);border-color:var(--b);color:var(--tx)}
+.mt-chip.on.risk{background:rgba(255,51,82,.16);border-color:var(--r);color:var(--r)}
+.mt-chip.on.good{background:rgba(0,204,116,.14);border-color:var(--g);color:var(--g)}
+
+/* open position card */
+.mt-poscard{padding:12px;border-radius:11px;background:rgba(0,0,0,.22);
+  border:1px solid var(--bd2);margin-bottom:10px}
+.mt-pos-top{display:flex;align-items:center;gap:9px;margin-bottom:9px}
+.mt-pos-tag{font-family:var(--fn);font-size:.56rem;font-weight:700;letter-spacing:.06em;
+  padding:3px 8px;border-radius:6px}
+.mt-pos-tag.long{background:rgba(0,204,116,.16);color:var(--g)}
+.mt-pos-tag.short{background:rgba(255,51,82,.16);color:var(--r)}
+.mt-pos-sub{font-family:var(--fn);font-size:.54rem;color:var(--mu);
+  font-variant-numeric:tabular-nums}
+.mt-pos-pnl{margin-left:auto;font-family:var(--fn);font-size:1.15rem;font-weight:700;
+  font-variant-numeric:tabular-nums;line-height:1}
+.mt-pos-pct{font-family:var(--fn);font-size:.58rem;text-align:right;
+  font-variant-numeric:tabular-nums;margin-top:3px}
+/* where price sits between the stop and the target */
+.mt-track{position:relative;height:6px;border-radius:99px;background:var(--bd2);
+  margin:11px 0 5px;overflow:visible}
+.mt-track-fill{position:absolute;left:0;top:0;height:100%;border-radius:99px;
+  background:linear-gradient(90deg,var(--r),var(--y),var(--g));opacity:.35;width:100%}
+.mt-track-dot{position:absolute;top:50%;width:11px;height:11px;border-radius:50%;
+  background:var(--tx);border:2px solid var(--bg);transform:translate(-50%,-50%);
+  transition:left .4s ease}
+.mt-track-lbls{display:flex;justify-content:space-between;font-family:var(--fn);
+  font-size:.5rem;color:var(--mu);font-variant-numeric:tabular-nums}
 .mt-head{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
 .mt-title{font-family:var(--fn);font-size:.52rem;letter-spacing:.12em;color:var(--mu)}
 .mt-bal{font-family:var(--fn);font-size:.95rem;font-weight:700;color:var(--tx);
@@ -10866,19 +10944,46 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 
     <!-- Manual paper trading: your own book, separate from the bot's -->
     <div class="mt-panel" id="mt_panel">
-      <div class="mt-head">
-        <span class="mt-title">YOUR PAPER BOOK</span>
-        <span class="mt-bal" id="mt_bal">—</span>
-        <span class="mt-pl" id="mt_pl"></span>
+      <div class="mt-hero">
+        <div>
+          <div class="mt-hero-lbl">PAPER BALANCE</div>
+          <div class="mt-hero-bal" id="mt_bal">—</div>
+          <div class="mt-hero-pl" id="mt_pl"></div>
+        </div>
+        <div class="mt-hero-r" id="mt_stats">—</div>
+      </div>
+
+      <!-- The learning loop, made visible. Deliberately shows PROGRESS, not the
+           bot's live opinion on this coin: putting the bot's call right above
+           the buy button would push these trades into echoing it, and trades
+           that echo the bot measure the bot, not the trader. The whole value of
+           this book is that it is an independent second opinion. -->
+      <div class="mt-botread" id="mt_botread">
+        <span class="mt-br-tag">LEARNING</span>
+        <span class="mt-br-txt" id="mt_br_txt"></span>
       </div>
 
       <div class="mt-open" id="mt_open" style="display:none">
-        <div class="mt-open-row">
-          <span class="mt-side" id="mt_side">—</span>
-          <span class="mt-entry" id="mt_entry">—</span>
-          <span class="mt-upnl" id="mt_upnl">—</span>
+        <div class="mt-poscard">
+          <div class="mt-pos-top">
+            <span class="mt-pos-tag" id="mt_side">—</span>
+            <div>
+              <div class="mt-pos-sub" id="mt_entry">—</div>
+              <div class="mt-pos-sub" id="mt_liqrow"></div>
+            </div>
+            <div style="margin-left:auto;text-align:right">
+              <div class="mt-pos-pnl" id="mt_upnl">—</div>
+              <div class="mt-pos-pct" id="mt_upnl_pct"></div>
+            </div>
+          </div>
+          <div class="mt-track" id="mt_track" style="display:none">
+            <div class="mt-track-fill"></div>
+            <div class="mt-track-dot" id="mt_track_dot" style="left:50%"></div>
+          </div>
+          <div class="mt-track-lbls" id="mt_track_lbls" style="display:none">
+            <span id="mt_track_lo">—</span><span id="mt_track_hi">—</span>
+          </div>
         </div>
-        <div class="mt-liqrow" id="mt_liqrow"></div>
         <div class="mt-sltp-row">
           <span class="mt-lbl">STOP</span>
           <input class="mt-sltp" id="mt_sl_live" type="number" inputmode="decimal" placeholder="none" step="any">
@@ -10890,36 +10995,78 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       </div>
 
       <div class="mt-entryform" id="mt_form">
-        <div class="mt-lev-row">
-          <span class="mt-lbl">LEVERAGE</span>
-          <button class="mt-lev active" data-lev="1"  onclick="mtSetLev(1)">1x</button>
-          <button class="mt-lev" data-lev="2"  onclick="mtSetLev(2)">2x</button>
-          <button class="mt-lev" data-lev="5"  onclick="mtSetLev(5)">5x</button>
-          <button class="mt-lev" data-lev="10" onclick="mtSetLev(10)">10x</button>
-          <button class="mt-lev" data-lev="20" onclick="mtSetLev(20)">20x</button>
+        <div class="mt-side-row">
+          <button class="mt-side-btn on" data-side="BUY"  onclick="mtSetSide('BUY')">LONG</button>
+          <button class="mt-side-btn"    data-side="SELL" onclick="mtSetSide('SELL')">SHORT</button>
         </div>
-        <div class="mt-liqwarn" id="mt_liqwarn"></div>
-        <div class="mt-size-row">
-          <span class="mt-lbl">SIZE $</span>
-          <input class="mt-size" id="mt_size" type="number" inputmode="decimal"
-                 value="100" min="1" step="10">
-          <button class="mt-quick" onclick="mtSetSize(0.25)">25%</button>
-          <button class="mt-quick" onclick="mtSetSize(0.5)">50%</button>
-          <button class="mt-quick" onclick="mtSetSize(1)">MAX</button>
+
+        <div class="mt-field">
+          <div class="mt-field-hd"><span class="mt-lbl">SIZE</span>
+            <span class="mt-field-val" id="mt_size_val">—</span></div>
+          <div class="mt-size-row" style="margin-bottom:6px">
+            <input class="mt-size" id="mt_size" type="number" inputmode="decimal"
+                   value="100" min="1" step="10" oninput="mtPreview()">
+            <button class="mt-quick" onclick="mtSetSize(0.25)">25%</button>
+            <button class="mt-quick" onclick="mtSetSize(0.5)">50%</button>
+            <button class="mt-quick" onclick="mtSetSize(1)">MAX</button>
+          </div>
         </div>
-        <div class="mt-sltp-row">
-          <span class="mt-lbl">STOP</span>
-          <input class="mt-sltp" id="mt_sl" type="number" inputmode="decimal" placeholder="optional" step="any">
-          <span class="mt-lbl">TARGET</span>
-          <input class="mt-sltp" id="mt_tp" type="number" inputmode="decimal" placeholder="optional" step="any">
+
+        <div class="mt-field">
+          <div class="mt-field-hd"><span class="mt-lbl">LEVERAGE</span>
+            <span class="mt-field-val mu" id="mt_liqwarn"></span></div>
+          <div class="mt-chips">
+            <button class="mt-chip on" data-lev="1"  onclick="mtSetLev(1)">1x</button>
+            <button class="mt-chip" data-lev="2"  onclick="mtSetLev(2)">2x</button>
+            <button class="mt-chip" data-lev="5"  onclick="mtSetLev(5)">5x</button>
+            <button class="mt-chip" data-lev="10" onclick="mtSetLev(10)">10x</button>
+            <button class="mt-chip" data-lev="20" onclick="mtSetLev(20)">20x</button>
+          </div>
         </div>
-        <div class="mt-btn-row">
-          <button class="mt-btn mt-buy"  onclick="mtOpen('BUY')">BUY / LONG</button>
-          <button class="mt-btn mt-sell" onclick="mtOpen('SELL')">SELL / SHORT</button>
+
+        <div class="mt-field">
+          <div class="mt-field-hd"><span class="mt-lbl">STOP</span>
+            <span class="mt-field-val" id="mt_sl_val">not set</span></div>
+          <div class="mt-chips">
+            <button class="mt-chip" data-sl="1"  onclick="mtSetSl(1)">1%</button>
+            <button class="mt-chip" data-sl="2"  onclick="mtSetSl(2)">2%</button>
+            <button class="mt-chip" data-sl="5"  onclick="mtSetSl(5)">5%</button>
+            <button class="mt-chip" data-sl="10" onclick="mtSetSl(10)">10%</button>
+            <button class="mt-chip" data-sl="0"  onclick="mtSetSl(0)">none</button>
+          </div>
+          <input type="hidden" id="mt_sl">
         </div>
+
+        <div class="mt-field">
+          <div class="mt-field-hd"><span class="mt-lbl">TARGET</span>
+            <span class="mt-field-val" id="mt_tp_val">not set</span></div>
+          <div class="mt-chips">
+            <button class="mt-chip" data-tp="2"  onclick="mtSetTp(2)">2%</button>
+            <button class="mt-chip" data-tp="5"  onclick="mtSetTp(5)">5%</button>
+            <button class="mt-chip" data-tp="10" onclick="mtSetTp(10)">10%</button>
+            <button class="mt-chip" data-tp="20" onclick="mtSetTp(20)">20%</button>
+            <button class="mt-chip" data-tp="0"  onclick="mtSetTp(0)">none</button>
+          </div>
+          <input type="hidden" id="mt_tp">
+        </div>
+
+        <!-- Max hold. Without it, "held two days" is an outcome rather than a
+             decision, and the exit cannot be scored later. -->
+        <div class="mt-field">
+          <div class="mt-field-hd"><span class="mt-lbl">MAX HOLD</span>
+            <span class="mt-field-val mu" id="mt_hz_val">not set</span></div>
+          <div class="mt-chips">
+            <button class="mt-chip" data-hz="4"   onclick="mtSetHz(4)">4h</button>
+            <button class="mt-chip" data-hz="24"  onclick="mtSetHz(24)">1d</button>
+            <button class="mt-chip" data-hz="72"  onclick="mtSetHz(72)">3d</button>
+            <button class="mt-chip" data-hz="168" onclick="mtSetHz(168)">1w</button>
+            <button class="mt-chip" data-hz="0"   onclick="mtSetHz(0)">none</button>
+          </div>
+        </div>
+
+        <button class="mt-btn mt-buy" id="mt_go" onclick="mtOpen(_mtSide)">LONG</button>
       </div>
 
-      <div class="mt-stats" id="mt_stats">—</div>
       <div class="mt-msg" id="mt_msg"></div>
     </div>
   </div>
@@ -11572,18 +11719,92 @@ let _mtBook={balance:0,positions:[],count:0,win_rate:0,realised:0};
 let _mtLev=1;
 let _mtPos=null;   // your open position on the charted pair, for overlay lines
 
+var _mtSide='BUY', _mtSlPct=0, _mtTpPct=0, _mtHz=0;
+
+function _mtPx(){
+  // Last charted close is the only live price this view already has; the
+  // percent chips resolve against it.
+  return (_cdData&&_cdData.length)?_cdData[_cdData.length-1].c:0;
+}
+
+function mtSetSide(s){
+  _mtSide=s;
+  document.querySelectorAll('.mt-side-btn').forEach(b=>
+    b.classList.toggle('on', b.dataset.side===s));
+  const go=$('mt_go');
+  if(go){ go.textContent = (s==='BUY'?'LONG':'SHORT');
+          go.className = 'mt-btn '+(s==='BUY'?'mt-buy':'mt-sell'); }
+  // A stop sits below entry for a long and above it for a short, so the
+  // percentages have to be re-resolved whenever the side flips.
+  mtSetSl(_mtSlPct); mtSetTp(_mtTpPct); mtPreview();
+}
+
 function mtSetLev(l){
   _mtLev=l;
-  document.querySelectorAll('.mt-lev').forEach(b=>
-    b.classList.toggle('active', parseInt(b.dataset.lev,10)===l));
+  document.querySelectorAll('[data-lev]').forEach(b=>{
+    const on=parseInt(b.dataset.lev,10)===l;
+    b.classList.toggle('on', on); b.classList.toggle('active', on);
+    b.classList.toggle('risk', on&&l>=10);
+  });
   const w=$('mt_liqwarn');
-  if(!w)return;
-  if(l<=1){ w.textContent=''; return; }
-  // The move that wipes out the margin. Showing it up front is the whole point:
-  // 20x sounds like 20x the profit until you see it dies on a 4.5% move.
-  const pct=((1/l)-0.005)*100;
-  w.textContent='liquidated by a '+pct.toFixed(1)+'% move against you  ·  fees x'+l;
-  w.style.color = l>=10 ? 'var(--r)' : 'var(--y)';
+  if(w){
+    if(l<=1){ w.textContent='spot — no liquidation'; w.style.color='var(--mu)'; }
+    else{
+      // The move that wipes out the margin. Showing it up front is the whole
+      // point: 20x sounds like 20x the profit until you see it dies on a 4.5%
+      // move. Fees scale with leverage too, because they are charged on
+      // notional — leverage multiplies the cost of being wrong, not just the
+      // upside.
+      const pct=((1/l)-0.005)*100;
+      w.textContent='liquidated by a '+pct.toFixed(1)+'% move  ·  fees x'+l;
+      w.style.color = l>=10 ? 'var(--r)' : 'var(--y)';
+    }
+  }
+  mtPreview();
+}
+
+function _mtLevel(pct,dir){
+  // dir=-1 for a stop, +1 for a target, flipped when short
+  const px=_mtPx(); if(!px||!pct)return null;
+  const s=(_mtSide==='BUY')?1:-1;
+  return px*(1+(dir*s*pct/100));
+}
+function mtSetSl(pct){
+  _mtSlPct=pct;
+  document.querySelectorAll('[data-sl]').forEach(b=>
+    b.classList.toggle('on', parseFloat(b.dataset.sl)===pct));
+  const lvl=_mtLevel(pct,-1), f=$('mt_sl'), v=$('mt_sl_val');
+  if(f)f.value = lvl?lvl.toFixed(8):'';
+  if(v)v.textContent = lvl ? ('-'+pct+'% = '+_fmtPrice(lvl)) : 'not set';
+  mtPreview();
+}
+function mtSetTp(pct){
+  _mtTpPct=pct;
+  document.querySelectorAll('[data-tp]').forEach(b=>
+    b.classList.toggle('on', parseFloat(b.dataset.tp)===pct));
+  const lvl=_mtLevel(pct,1), f=$('mt_tp'), v=$('mt_tp_val');
+  if(f)f.value = lvl?lvl.toFixed(8):'';
+  if(v)v.textContent = lvl ? ('+'+pct+'% = '+_fmtPrice(lvl)) : 'not set';
+  mtPreview();
+}
+function mtSetHz(h){
+  _mtHz=h;
+  document.querySelectorAll('[data-hz]').forEach(b=>
+    b.classList.toggle('on', parseFloat(b.dataset.hz)===h));
+  const v=$('mt_hz_val');
+  if(v)v.textContent = h ? (h<24?h+' hours':(h/24)+' days') : 'not set';
+}
+
+function mtPreview(){
+  // Notional and what the round trip costs on it. Cost is shown next to size
+  // because it is the number that decides whether a small move was ever worth
+  // taking: 64% of this book's trades moved less than the cost of making them.
+  const el=$('mt_size_val'); if(!el)return;
+  const sz=parseFloat(($('mt_size')||{}).value||'0')||0;
+  const notional=sz*(_mtLev||1);
+  const cost=notional*0.0130;
+  el.textContent = sz ? ('notional $'+notional.toFixed(0)+'  ·  round trip -$'
+                         +cost.toFixed(2)) : '—';
 }
 
 function _mtMsg(text,cls){
@@ -11605,8 +11826,26 @@ async function fetchManual(){
     const pl=$('mt_pl');
     pl.textContent=(d.realised>=0?'+':'')+d.realised.toFixed(2);
     pl.className='mt-pl '+(d.realised>0?'c-g':d.realised<0?'c-r':'c-mu');
-    $('mt_stats').textContent=d.count+' trades · '+d.win_rate+'% win'
-      +(d.liquidated?'  ·  '+d.liquidated+' liquidated':'');
+    // Trades and open exposure, not a win rate headline: without an enforced
+    // stop a win rate measures patience rather than profitability.
+    const openN=(d.positions||[]).length;
+    $('mt_stats').innerHTML='<b>'+d.count+'</b> closed'
+      +(openN?'<br>'+openN+' open now':'')
+      +(d.liquidated?'<br>'+d.liquidated+' liquidated':'');
+    // Every trade here is recorded with what the bot thought at that moment and
+    // what the market did for 48h after. This strip shows how far that record
+    // is from being able to say anything — 30 trades is where a coin flip and
+    // a real edge start to look different.
+    const br=$('mt_botread'), brt=$('mt_br_txt');
+    if(br&&brt){
+      const need=30-d.count;
+      br.style.display='flex';
+      brt.innerHTML = need>0
+        ? ('recording every trade with the bot&apos;s read and what happened next.  '
+           +'<em>'+need+' more closed trades before this can tell skill from luck.</em>')
+        : ('<em>'+d.count+' trades recorded — enough to start measuring. '
+           +'Run manual_report.py.</em>');
+    }
     // Only show a position if it is for the coin currently on screen —
     // otherwise the Close button would act on a pair you cannot see.
     const p=(d.positions||[]).find(x=>x.pair===pair);
@@ -11614,13 +11853,31 @@ async function fetchManual(){
       $('mt_open').style.display='';
       $('mt_form').style.display='none';
       $('mt_side').textContent=p.side==='BUY'?'LONG':'SHORT';
-      $('mt_side').className='mt-side '+(p.side==='BUY'?'c-g':'c-r');
+      $('mt_side').className='mt-pos-tag '+(p.side==='BUY'?'long':'short');
       const lev=p.leverage||1;
       $('mt_entry').textContent='@ '+_fmtPrice(p.entry)+'  ·  $'+p.size.toFixed(0)
         +(lev>1?'  ·  '+lev+'x':'');
-      const u=$('mt_upnl');
-      u.textContent=(p.pnl>=0?'+':'')+p.pnl.toFixed(2)+'  ('+(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(2)+'%)';
-      u.className='mt-upnl '+(p.pnl>0?'c-g':p.pnl<0?'c-r':'c-mu');
+      const u=$('mt_upnl'), uq=$('mt_upnl_pct');
+      u.textContent=(p.pnl>=0?'+':'')+'$'+Math.abs(p.pnl).toFixed(2);
+      u.className='mt-pos-pnl '+(p.pnl>0?'c-g':p.pnl<0?'c-r':'c-mu');
+      if(uq){
+        uq.textContent=(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(2)+'%';
+        uq.className='mt-pos-pct '+(p.pnl>0?'c-g':p.pnl<0?'c-r':'c-mu');
+      }
+      // Where price currently sits between the stop and the target. A number
+      // says how much you are up; this says how close the trade is to being
+      // over, in either direction.
+      const tr=$('mt_track'), trl=$('mt_track_lbls');
+      if(tr&&trl){
+        const lo=p.stop_loss, hi=p.take_profit, px=_mtPx();
+        if(lo&&hi&&px&&hi!==lo){
+          const frac=Math.max(0,Math.min(1,(px-Math.min(lo,hi))/Math.abs(hi-lo)));
+          tr.style.display=''; trl.style.display='';
+          $('mt_track_dot').style.left=(frac*100).toFixed(1)+'%';
+          $('mt_track_lo').textContent='stop '+_fmtPrice(Math.min(lo,hi));
+          $('mt_track_hi').textContent='target '+_fmtPrice(Math.max(lo,hi));
+        }else{ tr.style.display='none'; trl.style.display='none'; }
+      }
       _mtPos=p;                        // chart draws entry/stop/target from this
       const sli=$('mt_sl_live'),tpi=$('mt_tp_live');
       if(sli&&document.activeElement!==sli)sli.value=p.stop_loss||'';
@@ -11652,6 +11909,7 @@ async function mtOpen(side){
       body:JSON.stringify({pair:pair,side:side,size:size,leverage:_mtLev,
         stop_loss:parseFloat($('mt_sl').value)||null,
         take_profit:parseFloat($('mt_tp').value)||null,
+        horizon_h:_mtHz||null,
         device_id:_getDeviceId()})});
     const d=await r.json();
     if(d.error){_mtMsg(d.error,'err');return;}
@@ -11784,7 +12042,10 @@ function goTab(t){
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   pg.classList.add('active');
   tb.classList.add('active');
-  if(t==='chart'){drawCandles();fetchManual();fetchOrderFlow();}
+  if(t==='chart'){drawCandles();fetchManual();fetchOrderFlow();
+    // Resolve the percent chips against the price now on screen, and put the
+    // action button in the right state, before anything is tapped.
+    mtSetSide(_mtSide);mtSetLev(_mtLev);}
   if(t==='home'){drawEquity();}
   if(t==='market'){fetchMarket();fetchForecast();loadQuiz();}
   if(t==='stats'){drawDownChart();fetchCalibration();}
