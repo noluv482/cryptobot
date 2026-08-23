@@ -1119,6 +1119,13 @@ class Database:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS ss_done ON shadow_signals(fwd_done, ts)")
+            # 2026-08-24: the gate-loosening audit needed ADX and ER per signal
+            # and they were never recorded — both had to be recomputed from
+            # stored candles, and the strict subset came back too small to
+            # judge (22 independent signals). Recorded natively from now on so
+            # the audit gets cheaper and exact as the sample grows.
+            for _col in ("adx", "er"):
+                cur.execute(f"ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS {_col} FLOAT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS exit_lab (
                     id SERIAL PRIMARY KEY, ts_entry FLOAT, ts_exit FLOAT,
@@ -1405,15 +1412,18 @@ class Database:
             with self.conn.cursor() as cur:
                 cur.execute("""INSERT INTO shadow_signals
                     (ts,pair,sig,price,conf,rsi,atr_pct,reach_pct,stop_pct,tgt_pct,
-                     rr_gross,rr_net,vol_ratio,funding,regime,hour,dow,pillars,fkey)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     rr_gross,rr_net,vol_ratio,funding,regime,hour,dow,pillars,fkey,
+                     adx,er)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                            %s,%s)
                     RETURNING id""",
                     (r.get("ts"), r.get("pair"), r.get("sig"), r.get("price"),
                      r.get("conf"), r.get("rsi"), r.get("atr_pct"), r.get("reach_pct"),
                      r.get("stop_pct"), r.get("tgt_pct"), r.get("rr_gross"),
                      r.get("rr_net"), r.get("vol_ratio"), r.get("funding"),
                      r.get("regime"), r.get("hour"), r.get("dow"),
-                     r.get("pillars"), r.get("fkey")))
+                     r.get("pillars"), r.get("fkey"),
+                     r.get("adx"), r.get("er")))
                 return cur.fetchone()[0]
         except Exception as e:
             log("DB", f"log_shadow: {e}", "ERR"); return None
@@ -8788,6 +8798,13 @@ def trading_loop(trader):
                                 "dow": datetime.utcnow().weekday(),
                                 "pillars": json.dumps(pillars or {}),
                                 "fkey": fkey,
+                                # The two gates with a documented loosening
+                                # trail (ADX 20->8, ER 0.15->0.03). Recomputed
+                                # here rather than plumbed out of the engine;
+                                # cheap, and the audit needs the value the
+                                # LIVE window saw.
+                                "adx": calc_adx(highs, lows, closes),
+                                "er": calc_efficiency_ratio(closes),
                             })
                         except Exception:
                             pass
