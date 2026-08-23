@@ -1704,6 +1704,81 @@ btc_dominance   = {"pct": 50.0, "prev_pct": 50.0, "rising": False}
 funding_rates   = {}   # pair → last funding rate float (from Binance futures)
 trending_boost  = {}   # pair → bonus score from social/trending sources
 _paused         = False
+
+# ── Runtime settings persistence ─────────────────────────────────────────────
+# Every dashboard/Telegram control used to write an in-memory global and
+# nothing else — and this bot restarts on every git push, so pause state, coin
+# toggles, price alerts, risk sliders and the rest silently reverted to env
+# defaults all the time. One file, written atomically on every change, loaded
+# at boot AFTER env defaults so an explicit saved choice wins (the autopilot
+# pattern).
+#
+# DELIBERATELY EXCLUDED: PAPER_LOCK, LIVE_MODE, exchange keys, anything that
+# could move the bot toward real orders. A settings file must never be a path
+# around the paper lock.
+_RUNTIME_SETTINGS_FILE = os.path.join(_DATA_DIR, "runtime_settings.json")
+
+def _save_runtime_settings():
+    try:
+        payload = {
+            "paused":            _paused,
+            "rt_max_positions":  _rt_max_positions,
+            "rt_max_drawdown":   _rt_max_drawdown,
+            "trade_preview":     _trade_preview_mode,
+            "daily_limits":      _daily_limits,
+            "risk_max":          RISK_MAX,
+            "disabled_pairs":    sorted(_disabled_pairs),
+            "price_alerts":      _price_alerts,
+        }
+        tmp = _RUNTIME_SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, _RUNTIME_SETTINGS_FILE)   # atomic: no torn file on kill
+    except Exception as e:
+        log("SET", f"save_runtime_settings: {e}", "ERR")
+
+def _load_runtime_settings():
+    """Boot-time restore. Every field is optional and individually guarded so
+    one bad value cannot take the rest down with it."""
+    global _paused, _rt_max_positions, _rt_max_drawdown, _trade_preview_mode
+    global _daily_limits, RISK_MIN, RISK_MAX, MAX_TOTAL_RISK
+    global _disabled_pairs, _price_alerts
+    if not os.path.exists(_RUNTIME_SETTINGS_FILE):
+        return
+    try:
+        with open(_RUNTIME_SETTINGS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception as e:
+        log("SET", f"load_runtime_settings: {e}", "ERR")
+        return
+    try:
+        if isinstance(d.get("paused"), bool):
+            _paused = d["paused"]
+        v = d.get("rt_max_positions")
+        if isinstance(v, int) and 0 <= v <= 10:
+            _rt_max_positions = v
+        v = d.get("rt_max_drawdown")
+        if isinstance(v, (int, float)) and 0.0 <= v <= 50.0:
+            _rt_max_drawdown = float(v)
+        if isinstance(d.get("trade_preview"), bool):
+            _trade_preview_mode = d["trade_preview"]
+        if isinstance(d.get("daily_limits"), bool):
+            _daily_limits = d["daily_limits"]
+        v = d.get("risk_max")
+        if isinstance(v, (int, float)) and 0.03 <= v <= 0.30:
+            RISK_MAX       = round(float(v), 3)
+            RISK_MIN       = round(RISK_MAX * 0.35, 3)
+            MAX_TOTAL_RISK = min(0.80, round(RISK_MAX * 2, 2))
+        v = d.get("disabled_pairs")
+        if isinstance(v, list):
+            _disabled_pairs = {p for p in v if isinstance(p, str)}
+        v = d.get("price_alerts")
+        if isinstance(v, dict):
+            _price_alerts = v
+        log("SET", f"runtime settings restored ({len(d)} fields)"
+                   + (" — PAUSED" if _paused else ""))
+    except Exception as e:
+        log("SET", f"apply_runtime_settings: {e}", "ERR")
 _paper_mode     = False   # when True: forces paper trading even if live keys are loaded
 # Hard paper lock. Outranks LIVE_MODE and _paper_mode, and unlike them cannot be
 # switched off from the dashboard or Telegram — only by editing .env and
@@ -4960,6 +5035,7 @@ class PaperTrader:
         if not self._force_paper and self.peak > 0 and (self.peak - self.balance) / self.peak >= MAX_SESSION_DD:
             with _state_lock:
                 _paused = True
+                _save_runtime_settings()
             dd_pct = (self.peak - self.balance) / self.peak * 100
             tg(f"⚠️ *Max drawdown hit — trading PAUSED*\n"
                f"Balance dropped `{dd_pct:.1f}%` from peak `${self.peak:.2f}`\n"
@@ -6205,6 +6281,7 @@ def _alert_loop(trader):
                 else:
                     kept.append(a)
             _price_alerts[pair] = kept
+            _save_runtime_settings()
         time.sleep(30)
 
 # ── Top-coin display updater ─────────────────────────────────────────────────
@@ -7743,6 +7820,7 @@ def _dispatch_callback(data, query, trader):
     elif data == "pause":
         with _state_lock:
             _paused = True
+            _save_runtime_settings()   # pause must survive a restart, both paths
         tg_buttons(
             "⏸ *Trading PAUSED*\nThe bot will not open new trades.",
             [[{"text": "▶ Resume Trading", "callback_data": "resume"},
@@ -7752,6 +7830,7 @@ def _dispatch_callback(data, query, trader):
     elif data == "resume":
         with _state_lock:
             _paused = False
+            _save_runtime_settings()
         tg_buttons(
             "▶ *Trading RESUMED*\nThe bot is back to scanning for signals.",
             [[{"text": "⏸ Pause Trading", "callback_data": "pause"},
@@ -17720,6 +17799,7 @@ def _web_togglepair():
         _disabled_pairs.add(pair)
         log("LIVE", f"Pair {pair} disabled via dashboard")
         threading.Thread(target=tg, args=(f"🚫 *{pair} disabled* via dashboard — no new signals for this pair",), daemon=True).start()
+    _save_runtime_settings()
     return _Response(json.dumps({"ok": True, "disabled": list(_disabled_pairs)}),
                      mimetype="application/json")
 
@@ -17809,6 +17889,8 @@ def _web_settings():
                 status = "ON — stops after 10 trades or -10% day loss" if _daily_limits else "OFF"
                 threading.Thread(target=tg, args=(
                     f"{'🔒' if _daily_limits else '🔓'} *Daily Limits {('ON' if _daily_limits else 'OFF')}* via dashboard\n_{status}_",), daemon=True).start()
+    if _flask_request.method == "POST":
+        _save_runtime_settings()
     trader = _web_trader_ref[0] if _web_trader_ref else None
     loss_streak = trader.consecutive_losses if trader else 0
     streak_cool = trader._streak_cool_until if trader else 0
@@ -18159,6 +18241,7 @@ def _web_control():
         now_sim     = _sim_enabled
     if tg_msg:
         threading.Thread(target=tg, args=(tg_msg,), daemon=True).start()
+    _save_runtime_settings()
     _push_sse("control", {"paused": now_paused, "paper_mode": now_paper, "sim_enabled": now_sim})
     return _Response(json.dumps({"paused": now_paused, "paper_mode": now_paper,
                                   "mode": "LIVE" if is_live() else "PAPER",
@@ -18970,6 +19053,7 @@ def _web_alert_post():
     if not pair or not target:
         return _Response('{"error":"pair and target required"}', status=400, mimetype="application/json")
     _price_alerts.setdefault(pair, []).append({"target": target, "above": above, "label": label})
+    _save_runtime_settings()
     name = next((c["name"] for c in SCAN_UNIVERSE if c["pair"] == pair), pair)
     tg(f"🔔 Web alert set: {name} {'above' if above else 'below'} ${target:,.4f}", plain=True)
     return _Response('{"ok":true}', mimetype="application/json")
@@ -18977,6 +19061,7 @@ def _web_alert_post():
 @_flask_app.route("/alert/<pair>", methods=["DELETE"])
 def _web_alert_delete(pair):
     _price_alerts.pop(pair, None)
+    _save_runtime_settings()
     return _Response('{"ok":true}', mimetype="application/json")
 
 @_flask_app.route("/push/vapid_key")
@@ -19431,6 +19516,10 @@ def main():
                 _sim_enabled = bool(json.load(_sf).get("sim_enabled", _sim_enabled))
     except Exception:
         pass
+    # Restore everything the owner set from the dashboard or Telegram —
+    # pause state, coin toggles, alerts, risk/limits. Runs after env defaults
+    # so an explicit saved choice wins; never touches PAPER_LOCK or keys.
+    _load_runtime_settings()
     log("BOOT", f"Sim trader initialized — ${_sim_trader.balance:,.2f} virtual account "
                 + ("(running)" if _sim_enabled else "(type 'sim on' to start)"))
 
