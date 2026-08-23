@@ -1128,6 +1128,27 @@ class Database:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS el_done ON exit_lab(done, ts_entry)")
+            # manual_lab (2026-08-23): the OWNER's own hand-placed trades, with
+            # the bot's view of that pair at the moment he acted. The manual
+            # book records only entry/exit/pnl, which cannot teach anything —
+            # there is no feature to learn FROM. What makes this learnable is
+            # bot_gate: if he profitably takes trades a specific gate rejected,
+            # that gate is worth re-examining (the same shape as the min_conf
+            # finding). Kept in its OWN table so human trades can never
+            # contaminate the bot's own statistics, which are the thing being
+            # measured. Forward returns filled by _learning_filler_loop.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS manual_lab (
+                    id SERIAL PRIMARY KEY, ts_entry FLOAT, ts_exit FLOAT,
+                    pair TEXT, side TEXT, entry FLOAT, exitp FLOAT,
+                    size FLOAT, leverage INT, notional FLOAT,
+                    pnl FLOAT, held_mins FLOAT, exit_reason TEXT,
+                    bot_sig TEXT, bot_conf FLOAT, bot_gate TEXT,
+                    shadow_id INT, bot_in_pair INT, regime TEXT,
+                    fwd6 FLOAT, fwd24 FLOAT, fwd48 FLOAT, fwd_done INT DEFAULT 0
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS ml_done ON manual_lab(fwd_done, ts_entry)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS candles (
                     pair        TEXT    NOT NULL,
@@ -1399,6 +1420,75 @@ class Database:
                             (f24, f48, eid))
         except Exception as e:
             log("DB", f"fill_exit: {e}", "ERR")
+
+    # ── manual lab: the owner's own trades + what the bot thought ────────
+    def bot_view_of(self, pair, ts, window_s=7200):
+        """The bot's own most recent verdict on this pair near ts, read back
+        from shadow_signals. Derived from the producer rather than recomputed,
+        so it cannot drift from what the bot actually decided."""
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT id,sig,conf,rejected_by,regime FROM shadow_signals
+                               WHERE pair=%s AND ts BETWEEN %s AND %s
+                               ORDER BY abs(ts - %s) LIMIT 1""",
+                            (pair, ts - window_s, ts + window_s, ts))
+                return cur.fetchone()
+        except Exception as e:
+            log("DB", f"bot_view_of: {e}", "ERR"); return None
+
+    def log_manual(self, r):
+        """One hand-placed trade at OPEN time. Returns row id or None.
+        Must never raise into the manual-open request path."""
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""INSERT INTO manual_lab
+                    (ts_entry,pair,side,entry,size,leverage,notional,
+                     bot_sig,bot_conf,bot_gate,shadow_id,bot_in_pair,regime)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id""",
+                    (r.get("ts_entry"), r.get("pair"), r.get("side"), r.get("entry"),
+                     r.get("size"), r.get("leverage"), r.get("notional"),
+                     r.get("bot_sig"), r.get("bot_conf"), r.get("bot_gate"),
+                     r.get("shadow_id"), r.get("bot_in_pair"), r.get("regime")))
+                return cur.fetchone()[0]
+        except Exception as e:
+            log("DB", f"log_manual: {e}", "ERR"); return None
+
+    def close_manual(self, pair, ts_exit, exitp, pnl, held_mins, reason):
+        """Stamp the outcome on the newest still-open manual row for this pair."""
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""UPDATE manual_lab SET ts_exit=%s, exitp=%s, pnl=%s,
+                                      held_mins=%s, exit_reason=%s
+                               WHERE id = (SELECT id FROM manual_lab
+                                           WHERE pair=%s AND ts_exit IS NULL
+                                           ORDER BY ts_entry DESC LIMIT 1)""",
+                            (ts_exit, exitp, pnl, held_mins, reason, pair))
+        except Exception as e:
+            log("DB", f"close_manual: {e}", "ERR")
+
+    def manual_pending(self, older_than_s, limit=200):
+        if not self.conn: return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT id,ts_entry,pair,side,entry FROM manual_lab
+                               WHERE fwd_done=0 AND ts_entry < %s
+                               ORDER BY ts_entry LIMIT %s""", (older_than_s, limit))
+                return cur.fetchall()
+        except Exception as e:
+            log("DB", f"manual_pending: {e}", "ERR"); return []
+
+    def fill_manual(self, mid, f6, f24, f48):
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""UPDATE manual_lab SET fwd6=%s, fwd24=%s, fwd48=%s,
+                               fwd_done=1 WHERE id=%s""", (f6, f24, f48, mid))
+        except Exception as e:
+            log("DB", f"fill_manual: {e}", "ERR")
 
     def pillar_win_rates(self):
         """Per-pillar win rate when that pillar was ACTIVE. Min 10 samples."""
@@ -17418,6 +17508,11 @@ def _manual_check_exits(prices=None):
                 "ts": time.time(),
             })
             del book["positions"][pair]
+            try:
+                db.close_manual(pair, time.time(), exit_px, pnl,
+                                round((time.time() - p["opened_at"]) / 60, 1), reason)
+            except Exception:
+                pass
             lvl = "WARN" if reason == "liquidated" else "INFO"
             log("MANUAL", f"{reason.upper()} {pair} {p['side']} {lev}x @ {exit_px:.6f} "
                           f"pnl {pnl:+.2f}", lvl)
@@ -17594,6 +17689,27 @@ def _manual_open():
             "name": pair.replace("USD", "/USD"),
         }
         _manual_save(book)
+    # Learning lab: record what the BOT thought about this pair at the moment
+    # the human overrode it. Entry/exit/pnl alone can never teach anything —
+    # bot_gate is the feature that makes a hand trade learnable. Never allowed
+    # to break the request: every DB helper swallows its own errors.
+    try:
+        _bv = db.bot_view_of(pair, time.time())
+        _bt = _web_trader_ref[0] if _web_trader_ref else None
+        db.log_manual({
+            "ts_entry": time.time(), "pair": pair, "side": side, "entry": fill,
+            "size": size, "leverage": lev, "notional": notional,
+            "shadow_id": _bv[0] if _bv else None,
+            "bot_sig":   _bv[1] if _bv else None,
+            "bot_conf":  _bv[2] if _bv else None,
+            # '' in shadow_signals means the bot TOOK it; None means the bot
+            # never even evaluated this pair near this moment. Different facts.
+            "bot_gate": (_bv[3] or "TAKEN") if _bv else "NOT_EVALUATED",
+            "regime":   _bv[4] if _bv else None,
+            "bot_in_pair": 1 if (_bt and pair in getattr(_bt, "positions", {})) else 0,
+        })
+    except Exception as _me:
+        log("MANUAL", f"lab hook: {_me}", "ERR")
     log("MANUAL", f"opened {side} {pair} ${size:.2f} @ {lev}x "
                   f"(notional ${notional:.2f}) @ {fill:.6f}"
                   + (f" liq {liq:.6f}" if liq else ""))
@@ -17644,6 +17760,11 @@ def _manual_close():
         })
         del book["positions"][pair]
         _manual_save(book)
+    try:
+        db.close_manual(pair, time.time(), exit_fill, pnl,
+                        round((time.time() - p["opened_at"]) / 60, 1), "manual close")
+    except Exception:
+        pass
     log("MANUAL", f"closed {pair} pnl {pnl:+.4f}")
     return _Response(json.dumps({"ok": True, "pnl": pnl}), mimetype="application/json")
 
@@ -18021,9 +18142,11 @@ def _learning_filler_loop():
             cutoff = time.time() - 49 * 3600
             srows = db.shadow_pending(cutoff)
             erows = db.exit_pending(cutoff)
-            if not srows and not erows:
+            mrows = db.manual_pending(cutoff)
+            if not srows and not erows and not mrows:
                 continue
-            pairs = {r[2] for r in srows} | {r[2] for r in erows}
+            pairs = ({r[2] for r in srows} | {r[2] for r in erows}
+                     | {r[2] for r in mrows})
             books = {}
             for pr in pairs:
                 try:
@@ -18074,6 +18197,26 @@ def _learning_filler_loop():
                     f24 = -f24 if f24 is not None else None
                     f48 = -f48
                 db.fill_exit(eid, f24, f48)
+                filled += 1
+            # The owner's own trades: what the market did AFTER he entered,
+            # independent of when he chose to get out. Separates his entry
+            # timing from his exit timing — the bot's own loss decomposition
+            # put 0.000% in the entry and -0.211% in the exits, so the same
+            # split has to be measurable for a human before anything he does
+            # can be copied.
+            for mid, ts_m, pr, side, entry in mrows:
+                bars = books.get(pr) or []
+                if not bars or not entry:
+                    continue
+                if ts_m + 6 * 3600 < bars[0][0]:
+                    db.fill_manual(mid, None, None, None)   # predates the window
+                    continue
+                cs = [close_at(bars, ts_m + h * 3600) for h in (6, 24, 48)]
+                if cs[2] is None:
+                    continue                                 # 48h not elapsed yet
+                sgn = -1 if str(side).upper() in ("SELL", "SHORT") else 1
+                f6, f24, f48 = [(sgn * (c - entry) / entry) if c else None for c in cs]
+                db.fill_manual(mid, f6, f24, f48)
                 filled += 1
             if filled:
                 log("LAB", f"filled forward returns for {filled} row(s)")

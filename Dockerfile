@@ -11,6 +11,9 @@ COPY bot_server.py .
 # committed to the repo but missing from the image — "run it in the container"
 # failed on a file that was never there.
 COPY learning_report.py .
+# Same reason: this one reads the owner's manual book from /data and the
+# manual_lab table, so it only works from inside the container.
+COPY manual_report.py .
 # bot_server.py imports this at boot (the paper autopilot allocator). Committed
 # to the repo but, like learning_report.py above, it MUST be copied in explicitly
 # or `import autopilot` raises ModuleNotFoundError and autopilot silently disables.
