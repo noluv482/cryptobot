@@ -1131,12 +1131,29 @@ class Database:
             # manual_lab (2026-08-23): the OWNER's own hand-placed trades, with
             # the bot's view of that pair at the moment he acted. The manual
             # book records only entry/exit/pnl, which cannot teach anything —
-            # there is no feature to learn FROM. What makes this learnable is
-            # bot_gate: if he profitably takes trades a specific gate rejected,
-            # that gate is worth re-examining (the same shape as the min_conf
-            # finding). Kept in its OWN table so human trades can never
-            # contaminate the bot's own statistics, which are the thing being
-            # measured. Forward returns filled by _learning_filler_loop.
+            # there is no feature to learn FROM.
+            #
+            # THE BINDING CONSTRAINT HERE IS CENSORING, NOT SAMPLE SIZE, and
+            # bias does not shrink with n: a trade with no declared stop can be
+            # held until it comes back, which manufactures a high win rate out
+            # of a zero-edge process. So the PLAN is recorded at open
+            # (plan_stop/plan_target/plan_horizon_h) and every opening is
+            # logged, including ones still running — an n=100 sample of
+            # self-selected closes is MORE dangerous than n=4, because it
+            # lends confidence to a biased estimate.
+            #
+            # bot_gate is captured because it is free and flags what to go look
+            # at in the lab. It is NOT the primary instrument for judging a
+            # gate: shadow_signals runs that same measurement automatically
+            # with ~100x the sample and no selection bias (the human produces
+            # ~1 override observation a week — years to power a single gate).
+            #
+            # WRITE-ONLY FROM THE BOT'S SIDE. No scan/gate/entry path may ever
+            # read this table. If the bot adapted to his trades while he watches
+            # the bot, the two stop being independent samples and BOTH
+            # measurement systems are destroyed at once — irreversibly, since
+            # past data cannot be de-contaminated. test_manual_lab.py enforces
+            # this from the AST.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS manual_lab (
                     id SERIAL PRIMARY KEY, ts_entry FLOAT, ts_exit FLOAT,
@@ -1145,10 +1162,20 @@ class Database:
                     pnl FLOAT, held_mins FLOAT, exit_reason TEXT,
                     bot_sig TEXT, bot_conf FLOAT, bot_gate TEXT,
                     shadow_id INT, bot_in_pair INT, regime TEXT,
+                    plan_stop FLOAT, plan_target FLOAT, plan_horizon_h FLOAT,
+                    fee_rt_pct FLOAT, bal_at_open FLOAT, concurrent_open INT,
+                    echo TEXT, exit_rule TEXT,
                     fwd6 FLOAT, fwd24 FLOAT, fwd48 FLOAT, fwd_done INT DEFAULT 0
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS ml_done ON manual_lab(fwd_done, ts_entry)")
+            # Columns added after the table first shipped; ALTER so an existing
+            # deployment picks them up without a migration step.
+            for _col, _typ in (("plan_stop", "FLOAT"), ("plan_target", "FLOAT"),
+                               ("plan_horizon_h", "FLOAT"), ("fee_rt_pct", "FLOAT"),
+                               ("bal_at_open", "FLOAT"), ("concurrent_open", "INT"),
+                               ("echo", "TEXT"), ("exit_rule", "TEXT")):
+                cur.execute(f"ALTER TABLE manual_lab ADD COLUMN IF NOT EXISTS {_col} {_typ}")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS candles (
                     pair        TEXT    NOT NULL,
@@ -1445,30 +1472,62 @@ class Database:
             with self.conn.cursor() as cur:
                 cur.execute("""INSERT INTO manual_lab
                     (ts_entry,pair,side,entry,size,leverage,notional,
-                     bot_sig,bot_conf,bot_gate,shadow_id,bot_in_pair,regime)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     bot_sig,bot_conf,bot_gate,shadow_id,bot_in_pair,regime,
+                     plan_stop,plan_target,plan_horizon_h,fee_rt_pct,
+                     bal_at_open,concurrent_open,echo)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                            %s,%s,%s,%s,%s,%s,%s)
                     RETURNING id""",
                     (r.get("ts_entry"), r.get("pair"), r.get("side"), r.get("entry"),
                      r.get("size"), r.get("leverage"), r.get("notional"),
                      r.get("bot_sig"), r.get("bot_conf"), r.get("bot_gate"),
-                     r.get("shadow_id"), r.get("bot_in_pair"), r.get("regime")))
+                     r.get("shadow_id"), r.get("bot_in_pair"), r.get("regime"),
+                     r.get("plan_stop"), r.get("plan_target"),
+                     r.get("plan_horizon_h"), r.get("fee_rt_pct"),
+                     r.get("bal_at_open"), r.get("concurrent_open"), r.get("echo")))
                 return cur.fetchone()[0]
         except Exception as e:
             log("DB", f"log_manual: {e}", "ERR"); return None
 
-    def close_manual(self, pair, ts_exit, exitp, pnl, held_mins, reason):
-        """Stamp the outcome on the newest still-open manual row for this pair."""
+    def close_manual(self, pair, ts_exit, exitp, pnl, held_mins, reason,
+                     exit_rule=None):
+        """Stamp the outcome on the newest still-open manual row for this pair.
+
+        A silent no-op here IS a censored trade — the opening stays in the
+        table forever with no outcome and quietly drops out of every closed
+        statistic — so zero rows updated is logged at ERR, not swallowed."""
         if not self.conn: return
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""UPDATE manual_lab SET ts_exit=%s, exitp=%s, pnl=%s,
-                                      held_mins=%s, exit_reason=%s
+                                      held_mins=%s, exit_reason=%s, exit_rule=%s
                                WHERE id = (SELECT id FROM manual_lab
                                            WHERE pair=%s AND ts_exit IS NULL
+                                             AND ts_entry <= %s
                                            ORDER BY ts_entry DESC LIMIT 1)""",
-                            (ts_exit, exitp, pnl, held_mins, reason, pair))
+                            (ts_exit, exitp, pnl, held_mins, reason,
+                             exit_rule or "DISCRETIONARY", pair, ts_exit))
+                if cur.rowcount == 0:
+                    log("DB", f"close_manual: no open row for {pair} — that "
+                              f"opening is now censored from the stats", "ERR")
         except Exception as e:
             log("DB", f"close_manual: {e}", "ERR")
+
+    def censor_open_manual(self, reason="BOOK_RESET"):
+        """Close out every still-open manual row at once. Called when the book
+        is reset: without this, positions open at reset time vanish from the
+        closed-trade population entirely, which is survivorship bias baked in
+        at the source."""
+        if not self.conn: return 0
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""UPDATE manual_lab SET ts_exit=%s, exit_reason=%s,
+                                      exit_rule=%s
+                               WHERE ts_exit IS NULL""",
+                            (time.time(), reason.lower(), reason))
+                return cur.rowcount
+        except Exception as e:
+            log("DB", f"censor_open_manual: {e}", "ERR"); return 0
 
     def manual_pending(self, older_than_s, limit=200):
         if not self.conn: return []
@@ -17382,6 +17441,13 @@ _manual_lock = threading.Lock()
 # Leverage tiers match the bot's own (Cautious/Moderate/Confident/Max Bet) so the
 # two books stay comparable.
 MANUAL_LEVERAGE = {1: "Spot", 2: "Cautious", 5: "Moderate", 10: "Confident", 20: "Max Bet"}
+# What a round trip really costs this account, snapshotted onto every manual_lab
+# row at open. The book itself still charges KRAKEN_FEE (changing that mid-book
+# would make old and new trades incomparable); this is the honest number the
+# report scores against. Kraken restructured 2026-07-09 — base tier is now
+# 0.40% maker / 0.80% taker, so a realistic round trip is ~1.30%, and it is
+# charged on NOTIONAL, which means leverage multiplies it.
+MANUAL_FEE_RT_PCT = float(os.environ.get("MANUAL_FEE_RT_PCT", "0.0130"))
 # Maintenance margin: the equity fraction below which the position is closed out.
 # Without this, leverage is a free P&L multiplier and the book teaches exactly the
 # wrong lesson — on a real exchange a 10x long is liquidated by a ~9.5% move.
@@ -17509,8 +17575,13 @@ def _manual_check_exits(prices=None):
             })
             del book["positions"][pair]
             try:
+                # A planned exit and a change of mind are different decisions;
+                # the ratio between them IS the disposition-effect measurement.
+                _rule = {"take profit": "PLAN_TARGET", "stop loss": "PLAN_STOP",
+                         "liquidated": "LIQUIDATION"}.get(reason, "DISCRETIONARY")
                 db.close_manual(pair, time.time(), exit_px, pnl,
-                                round((time.time() - p["opened_at"]) / 60, 1), reason)
+                                round((time.time() - p["opened_at"]) / 60, 1),
+                                reason, _rule)
             except Exception:
                 pass
             lvl = "WARN" if reason == "liquidated" else "INFO"
@@ -17696,6 +17767,14 @@ def _manual_open():
     try:
         _bv = db.bot_view_of(pair, time.time())
         _bt = _web_trader_ref[0] if _web_trader_ref else None
+        # Contamination flag, derived here rather than self-reported: the
+        # dashboard shows the bot's own signals on the same screen, so a trade
+        # that agrees with a live bot signal may be echoing the bot rather than
+        # expressing independent judgment. Those rows measure the bot's signal,
+        # not his, and the report must not pool them with the rest.
+        _echo = "INDEPENDENT"
+        if _bv and _bv[1]:
+            _echo = "ECHO" if str(_bv[1]).upper() == side else "CONTRA"
         db.log_manual({
             "ts_entry": time.time(), "pair": pair, "side": side, "entry": fill,
             "size": size, "leverage": lev, "notional": notional,
@@ -17707,6 +17786,19 @@ def _manual_open():
             "bot_gate": (_bv[3] or "TAKEN") if _bv else "NOT_EVALUATED",
             "regime":   _bv[4] if _bv else None,
             "bot_in_pair": 1 if (_bt and pair in getattr(_bt, "positions", {})) else 0,
+            # The PLAN, recorded before the outcome is known. Without this an
+            # exit is decided after the fact and "held 2 days" is an outcome
+            # rather than a decision — the censoring that manufactures win
+            # rates out of nothing.
+            "plan_stop": sl, "plan_target": tp,
+            "plan_horizon_h": (float(d.get("horizon_h")) if d.get("horizon_h")
+                               else None),
+            # Cost snapshot: this constant has already changed once mid-book
+            # (Kraken restructured 2026-07-09) and will change again. Rows must
+            # stay honest about what a trade actually cost at the time.
+            "fee_rt_pct": MANUAL_FEE_RT_PCT,
+            "bal_at_open": book["balance"],
+            "concurrent_open": len(book["positions"]) - 1,
         })
     except Exception as _me:
         log("MANUAL", f"lab hook: {_me}", "ERR")
@@ -17775,6 +17867,15 @@ def _manual_reset():
         return _Response('{"error":"unauthorized"}', status=403, mimetype="application/json")
     with _manual_lock:
         _manual_save({"balance": MANUAL_START, "positions": {}, "trades": []})
+    # Anything open at reset time would otherwise stay outcome-less in the lab
+    # forever and silently drop out of every closed-trade statistic — losers
+    # disappearing at reset is survivorship bias at the source.
+    try:
+        _n = db.censor_open_manual("BOOK_RESET")
+        if _n:
+            log("MANUAL", f"book reset — {_n} open lab row(s) closed as BOOK_RESET")
+    except Exception:
+        pass
     log("MANUAL", "book reset")
     return _Response('{"ok":true}', mimetype="application/json")
 

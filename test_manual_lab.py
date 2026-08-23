@@ -89,7 +89,7 @@ for node in ast.walk(tree):
             # trade into it (on_signal/close would enter the bot's own stats)
             if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
                 if sub.func.attr in ("on_signal", "_open", "log_trade"):
-                    leaks.append(f"{node.name}→{sub.func.attr}")
+                    leaks.append(f"{node.name} -> {sub.func.attr}")
 check("manual paths never write into the bot's own trade stats", not leaks, str(leaks))
 
 # the lab table must be its own table, not shadow_signals
@@ -97,6 +97,50 @@ src = open(SRC, encoding="utf-8").read()
 check("manual_lab is a separate table", "CREATE TABLE IF NOT EXISTS manual_lab" in src)
 check("manual rows carry the gate the human overrode", "bot_gate" in src)
 check("'never evaluated' is distinct from 'taken'", "NOT_EVALUATED" in src)
+
+# 4. WRITE-ONLY — the bot must never read its owner's trades back
+# If the bot adapted to his trades while he watches the bot's signals, the two
+# stop being independent samples and BOTH measurement systems are destroyed at
+# once — and irreversibly, because past data cannot be de-contaminated. So the
+# lab is write-only from the trading side: only the logging helpers, the
+# backfill loop, and the offline report may touch it.
+ALLOWED = {
+    "_manual_open", "_manual_close", "_manual_check_exits", "_manual_reset",
+    "_learning_filler_loop",
+    # the DB helpers themselves
+    "log_manual", "close_manual", "fill_manual", "manual_pending",
+    "censor_open_manual", "bot_view_of",
+    "_init", "_init_schema",   # the CREATE/ALTER lives here by definition
+}
+LAB_CALLS = {"log_manual", "close_manual", "fill_manual", "manual_pending",
+             "censor_open_manual"}
+readers = []
+for node in ast.walk(tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if node.name in ALLOWED:
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) \
+                    and sub.func.attr in LAB_CALLS:
+                readers.append(f"{node.name} -> {sub.func.attr}")
+            elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
+                    and "manual_lab" in sub.value:
+                readers.append(f"{node.name} -> SQL(manual_lab)")
+check("no trading path reads the manual lab (feedback-loop guard)",
+      not readers, str(sorted(set(readers))[:5]))
+
+# 5. CENSORING — the guards that make a growing sample trustworthy
+check("the PLAN is recorded at open (stop/target/horizon)",
+      all(k in src for k in ("plan_stop", "plan_target", "plan_horizon_h")))
+check("book reset closes open rows instead of dropping them",
+      "censor_open_manual" in src and "BOOK_RESET" in src)
+check("a close that matches no open row is logged, not swallowed",
+      "censored from the stats" in src)
+check("real round-trip cost is snapshotted per row", "fee_rt_pct" in src)
+check("contamination flag is derived, not self-reported",
+      all(k in src for k in ("ECHO", "CONTRA", "INDEPENDENT")))
+check("exits are classified as planned vs discretionary",
+      all(k in src for k in ("PLAN_TARGET", "PLAN_STOP", "DISCRETIONARY")))
 
 print()
 if FAILS:

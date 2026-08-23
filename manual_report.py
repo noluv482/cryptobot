@@ -45,6 +45,7 @@ import sys
 import time
 
 MIN_N_INFER = 30          # below this: descriptive only, no inference
+MIN_NEFF_INFER = 15       # AND this many INDEPENDENT spans — both required
 MIN_N_GATE  = 20          # per-gate override claims need at least this many
 COST_MODELED = 0.0052     # what the book charged (maker-era model)
 COST_REAL    = 0.0130     # Kraken Tier 1 since 2026-07-09, round trip
@@ -140,7 +141,34 @@ def main():
     wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
     longs = sum(1 for t in trades if t.get("side", "").upper() == "BUY")
     pnl_total = sum(t.get("pnl", 0) for t in trades)
-    print(f"wins: {wins}/{n}    longs: {longs}/{n}    total P&L: ${pnl_total:+,.2f}")
+    print(f"longs: {longs}/{n}    closed P&L: ${pnl_total:+,.2f}")
+    # Win rate is deliberately NOT the headline. A book with no enforced stop
+    # has a mechanically high win rate — you can always hold a loser until it
+    # comes back — and can still have deeply negative expectancy. Mean return
+    # is the only comparable number.
+    print(f"(win rate {wins}/{n} is shown for completeness only — without an "
+          f"enforced stop it measures\n patience, not profitability)")
+
+    # OPEN positions are marked to market and never dropped. Counting only
+    # closed trades is survivorship bias in its purest form: winners get taken
+    # and counted, losers stay open and uncounted.
+    open_pos = book.get("positions", {})
+    if open_pos:
+        print(f"\n  STILL OPEN — excluded from every number above:")
+        for pr, p in open_pos.items():
+            last = candles(conn, pr, time.time() - 7 * 86400, time.time())
+            cur = last[-1][1] if last else None
+            if cur:
+                sgn = 1 if p.get("side", "BUY").upper() == "BUY" else -1
+                mv = sgn * (cur - p["entry"]) / p["entry"]
+                upnl = mv * p.get("size", 0) * float(p.get("leverage", 1) or 1)
+                print(f"    {pr} {p.get('side')} {p.get('leverage')}x  "
+                      f"entry {p['entry']:.4f} → {cur:.4f}  "
+                      f"move {mv*100:+.2f}%  unrealised ${upnl:+,.2f}"
+                      f"  ({(time.time()-p.get('opened_at', time.time()))/3600:.1f}h)")
+                if upnl < 0:
+                    print(f"      ↑ this is an open LOSS. A record of "
+                          f"'{wins}/{n} wins' that excludes it is not a record.")
 
     if longs == n and n > 0:
         print("\n  !! EVERY trade is a LONG. 'Did it profit' therefore measures the")
@@ -243,18 +271,44 @@ def main():
         print(f"      are ONE bet on the market, counted {n} times. "
               f"Effective sample ≈ {len(merged)}.")
 
-    if n < MIN_N_INFER:
-        print(f"\n  ⚠ {n} trades is NOT enough to conclude anything.")
-        print(f"    {wins}/{n} wins happens by pure chance {100*0.5**n:.1f}% of the time")
-        print(f"    at a 50/50 coin flip. Statistical inference starts at "
-              f"~{MIN_N_INFER} trades;")
-        print(f"    a claim about a specific gate needs ~{MIN_N_GATE} trades that "
-              f"overrode THAT gate.")
+    # Equal-weighted mean with the single largest position removed: at n=4 one
+    # 5x trade is $380 of $487, so the account return is mostly one bet's size,
+    # not four decisions.
+    if n > 1:
+        big = max(trades, key=lambda t: abs(t.get("pnl", 0)))
+        rest = [t for t in trades if t is not big]
+        print(f"  P&L excluding the single largest trade  : "
+              f"${sum(t.get('pnl', 0) for t in rest):+,.2f} over {len(rest)} trades"
+              f"   (largest alone: ${big.get('pnl', 0):+,.2f})")
+
+    n_eff = len(merged)
+    if n < MIN_N_INFER or n_eff < MIN_NEFF_INFER:
+        print(f"\n  ⚠ {n} closed trades (effective sample ≈ {n_eff}) is NOT enough")
+        print(f"    to tell skill from luck, and no good-looking number above "
+              f"changes that.")
+        print(f"\n    {wins}/{n} wins happens {100*0.5**n:.1f}% of the time on pure "
+              f"coin flips.")
+        # The comparison that actually lands: a LOSING strategy with a high win
+        # rate — exactly what a no-stop book looks like — opens like this often.
+        print(f"    A strategy that loses money on average but wins 65% of "
+              f"individual trades")
+        print(f"    (what holding losers until they recover produces) opens "
+              f"{n}-0 about {100*0.65**n:.0f}% of")
+        print(f"    the time — roughly 1 run in {round(1/0.65**n)}. Both stories "
+              f"fit this record equally well.")
+        print(f"\n    At n={n} it is arithmetically impossible to prove an edge: "
+              f"the smallest")
+        print(f"    p-value a sign test can produce is 1/{2**n} = {1/2**n:.4f}, "
+              f"which does not clear 0.05.")
+        print(f"\n    Statistical inference starts at ~{MIN_N_INFER} trades AND "
+              f"~{MIN_NEFF_INFER} independent spans;")
+        print(f"    a claim about one specific gate needs ~{MIN_N_GATE} trades "
+              f"that overrode THAT gate.")
         print("\n    What the numbers above ARE: a description of what happened.")
         print("    What they are NOT: evidence that this approach makes money.")
         print("    Nothing here justifies risking real money.")
     else:
-        print(f"\n  n={n} — inference enabled. See per-gate breakdown above.")
+        print(f"\n  n={n}, n_eff={n_eff} — inference enabled.")
 
     print("\n  Every future manual trade is now recorded with the bot's full view")
     print("  at that moment, so this report gets sharper as the sample grows.\n")
