@@ -833,11 +833,11 @@ COINGECKO_TO_KRAKEN = {
 
 RANKS = [
     {"name": "Rookie",    "min": 0,     "emoji": "🟤", "unlock": "You're just getting started. Every trade is a lesson."},
-    {"name": "Trader",    "min": 250,   "emoji": "⚪", "unlock": "You proved you can grow. Now stay consistent."},
-    {"name": "Pro",       "min": 500,   "emoji": "🟡", "unlock": "You're not lucky — you're skilled. Keep pushing."},
-    {"name": "Expert",    "min": 1000,  "emoji": "🟠", "unlock": "Most bots never get here. You're in rare territory."},
-    {"name": "Elite",     "min": 2500,  "emoji": "🔵", "unlock": "You're in the top 1%. Keep that momentum going."},
-    {"name": "Legend",    "min": 5000,  "emoji": "🔴", "unlock": "Half way to $10k. You're built different."},
+    {"name": "Trader",    "min": 250,   "emoji": "⚪", "unlock": "Balance passed $250."},
+    {"name": "Pro",       "min": 500,   "emoji": "🟡", "unlock": "Balance passed $500."},
+    {"name": "Expert",    "min": 1000,  "emoji": "🟠", "unlock": "Balance passed $1,000 — back above where this book started."},
+    {"name": "Elite",     "min": 2500,  "emoji": "🔵", "unlock": "Balance passed $2,500."},
+    {"name": "Legend",    "min": 5000,  "emoji": "🔴", "unlock": "Balance passed $5,000 — half way to the $10k goal."},
     {"name": "GOAT",      "min": 10000, "emoji": "👑", "unlock": "Hit $10,000. Most never get here. Keep stacking."},
     {"name": "Diamond",   "min": 15000, "emoji": "💎", "unlock": "$15k. You're not stopping, are you."},
     {"name": "Immortal",  "min": 25000, "emoji": "⚡", "unlock": "$25,000. A quarter of the way to greatness."},
@@ -1286,6 +1286,42 @@ class Database:
         except Exception as e:
             log("DB", f"confidence_calibration error: {e}", "ERR")
             return {}
+
+    def exit_attribution(self):
+        """EVERY exit reason: count, total dollars, average, win rate, median hold.
+
+        best_exit_reason() below computes the same population and its only
+        consumer keeps row [0] — so the phone gets "Best exit: X" with no n,
+        which is a cherry-pick of the top bucket out of a table the code
+        already had in full. This returns the whole table plus a reconciling
+        total, because the interesting fact about this book is not which exit
+        looks best, it is that one reason accounts for most of the closes.
+
+        Rows come back ordered by COUNT, never by P&L: ordering by P&L is what
+        turns a breakdown into a leaderboard and invites picking a winner from
+        buckets of six.
+        """
+        if not self.conn: return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT reason,
+                           COUNT(*)                                   AS n,
+                           ROUND(SUM(pnl)::numeric, 2)                AS total,
+                           ROUND(AVG(pnl)::numeric, 4)                AS avg_pnl,
+                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)   AS wins,
+                           ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP
+                                  (ORDER BY held_mins))::numeric, 0)  AS med_hold
+                    FROM trades
+                    WHERE reason IS NOT NULL
+                    GROUP BY reason
+                    ORDER BY n DESC
+                """)
+                return [{"reason": r[0], "n": r[1], "total": float(r[2] or 0),
+                         "avg": float(r[3] or 0), "wins": int(r[4] or 0),
+                         "med_hold": float(r[5] or 0)} for r in cur.fetchall()]
+        except Exception as e:
+            log("DB", f"exit_attribution: {e}", "ERR"); return []
 
     def best_exit_reason(self):
         """Which exit reason has the best avg PnL."""
@@ -3218,9 +3254,16 @@ def analyse_intelligence(trades):
         if cal:
             for tier, d in cal.items():
                 lines.append(f"  {tier.capitalize()} conf: `{d['wr']:.0f}%` WR ({d['n']} trades)")
+        # Was: "Best exit: {top row} avg $X" — the single best bucket out of a
+        # table this query already returns in full, with no n beside it. Exit
+        # reasons are not randomly assigned (the stale exit fires on trades
+        # that went nowhere, the trail on trades that moved), so the top row is
+        # a different population, not a better rule. Show the biggest buckets
+        # by COUNT with their totals instead.
         if exit_stats:
-            best_exit = exit_stats[0]
-            lines.append(f"  Best exit: `{best_exit[0]}` avg `{best_exit[2]:+.2f}$`")
+            by_n = sorted(exit_stats, key=lambda r: -r[1])[:3]
+            lines.append("  Exits: " + " · ".join(
+                f"`{r[0]}` {r[1]}x avg `{r[2]:+.2f}$`" for r in by_n))
     else:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         lines.append("⚫ _Add PostgreSQL on Railway to enable lifetime learning_")
@@ -3518,6 +3561,7 @@ class PaperTrader:
         else:
             self.positions = pos_data
         # Restore weekly peak
+        self._quiz_xp              = d.get("quiz_xp", 0)
         self._weekly_peak          = d.get("weekly_peak", self.balance)
         self._weekly_dd_paused     = d.get("weekly_dd_paused", False)
         self._streak_gate_disabled = d.get("streak_gate_disabled", False)
@@ -3597,7 +3641,11 @@ class PaperTrader:
                 "weekly_dd_paused":     self._weekly_dd_paused,
                 "streak_gate_disabled": self._streak_gate_disabled,
                 "pair_day_pnl":         dict(self._pair_day_pnl),
-                "pair_day_date":        dict(self._pair_day_date)}
+                "pair_day_date":        dict(self._pair_day_date),
+                # Quiz XP was set, read and incremented but never saved, so the
+                # displayed level silently dropped on every redeploy — the bot
+                # redeploys on each push, so this quietly reset all the time.
+                "quiz_xp":              self._quiz_xp}
 
     def _save_file(self):
         try:
@@ -6990,10 +7038,20 @@ def _backtest_coin(pair, bt_limit=720, bt_interval=5):
                 reason = "timeout"
 
             if reason:
-                pnl = ((price - p["entry"]) / p["entry"] if side == "BUY"
-                       else (p["entry"] - price) / p["entry"])
+                gross = ((price - p["entry"]) / p["entry"] if side == "BUY"
+                         else (p["entry"] - price) / p["entry"])
+                # The replay used to report the raw price move while the live
+                # paper book charges a full round trip on every trade — so the
+                # backtest was flattered by ROUND_TRIP_COST_PCT per trade,
+                # which is larger than the live average P&L per trade. Any
+                # "backtest vs live" comparison built on that was measuring the
+                # missing fee, not the strategy.
+                net = gross - ROUND_TRIP_COST_PCT
                 trades.append({"side": side, "entry": p["entry"], "exit": price,
-                               "pnl_pct": round(pnl, 4), "bars": p["bars"], "reason": reason})
+                               "pnl_pct": round(net, 4),
+                               "gross_pct": round(gross, 4),
+                               "cost_pct": round(ROUND_TRIP_COST_PCT, 4),
+                               "bars": p["bars"], "reason": reason})
                 position = None
 
     return trades
@@ -7043,16 +7101,31 @@ def _cmd_backtest(trader):
         for t in all_trades:
             by_reason[t["reason"]] = by_reason.get(t["reason"], 0) + 1
 
-        verdict = "✅ Looks profitable" if total > 0 and wr >= 45 else \
-                  "🟡 Marginal — review gate settings" if total > 0 else \
-                  "🔴 Losing — signals need more filtering"
+        # A verdict needs a sample behind it. This used to print "Looks
+        # profitable" whenever 60 hours across 10 coins happened to end green
+        # with a win rate over 45 — no n gate at all, on a strategy measured at
+        # t = +0.04 over 1,421 signals. At these sample sizes the only honest
+        # output is a description.
+        gross_total = sum(t.get("gross_pct", t["pnl_pct"]) for t in all_trades) * 100
+        cost_drag   = gross_total - total
+        n = len(all_trades)
+        if n < 30:
+            verdict = (f"⚪ {n} trades — too few to judge. This is a description "
+                       f"of 60 hours, not evidence about the strategy.")
+        elif total > 0:
+            verdict = (f"🟡 Green over 60h on {n} trades. Needs an out-of-sample "
+                       f"window before it means anything.")
+        else:
+            verdict = f"🔴 Negative after costs over 60h on {n} trades."
 
         lines = [
             f"🔬 *Backtest Results* _(60h · 5-min candles · {len(SCAN_UNIVERSE[:10])} coins)_",
             "━━━━━━━━━━━━━━━━━━━━",
             f"{verdict}",
             f"Trades:    `{len(all_trades)}` · Win Rate: `{wr:.0f}%`",
-            f"Total P&L: `{'+'if total>=0 else ''}{total:.2f}%`",
+            f"Total P&L: `{'+'if total>=0 else ''}{total:.2f}%` _(after costs)_",
+            f"  gross `{'+'if gross_total>=0 else ''}{gross_total:.2f}%` "
+            f"− fees `{abs(cost_drag):.2f}%`",
             f"Avg win:   `+{avg_w:.2f}%` · Avg loss: `{avg_l:.2f}%`",
             f"Best:  `+{best['pnl_pct']*100:.2f}%` ({best['side']})",
             f"Worst: `{worst['pnl_pct']*100:.2f}%` ({worst['side']})",
@@ -7060,7 +7133,16 @@ def _cmd_backtest(trader):
         ]
         if errors:
             lines.append(f"_Skipped: {', '.join(errors)}_")
+        # What this replay cannot do. Stated every time rather than remembered
+        # once: an unqualified backtest number is the most over-trusted figure
+        # in retail trading.
         lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(
+            f"_Assumes: {ROUND_TRIP_COST_PCT*100:.2f}% round trip charged per "
+            f"trade · fills at the candle close, so a bar that wicks through "
+            f"the stop and closes back above it does NOT stop you out here but "
+            f"would live · no order book, no partial fills · one 60h window, "
+            f"in-sample, no out-of-sample split._")
         lines.append("*By coin (sorted by P&L):*")
 
         for name, ct in sorted(per_coin.items(),
@@ -9181,7 +9263,12 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
      border:none;background:none;color:var(--mu);padding:0;min-height:44px;
      transition:color .12s}
 .tab.active{color:var(--b)}
-.tab-ico{font-size:1.3rem;line-height:1}
+.tab-ico{width:22px;height:22px;line-height:0;display:flex;align-items:center;
+         justify-content:center}
+.tab-ico svg{width:22px;height:22px;display:block}
+/* The active tab thickens its stroke rather than only changing hue, so the
+   selection survives a glance and does not rely on colour alone. */
+.tab.active .tab-ico svg{stroke-width:2.3}
 .tab-lbl{font-size:.5rem;letter-spacing:.07em;font-weight:700;
           text-transform:uppercase;line-height:1}
 
@@ -9211,6 +9298,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .pill-up{background:rgba(0,204,116,.12);color:var(--g)}
 .pill-dn{background:rgba(255,51,82,.1);color:var(--r)}
 .pill-fl{background:rgba(77,111,148,.1);color:var(--mu)}
+.hero-spark{display:block;width:100%;height:44px;margin:13px 0 2px;
+  color:var(--mu);overflow:visible}
+.hero-spark.up{color:var(--g)}
+.hero-spark.dn{color:var(--r)}
 .hero-sub{display:flex;margin-top:14px;border-top:1px solid var(--bd2);padding-top:14px}
 .hs-item{flex:1;padding-right:10px}
 .hs-item+.hs-item{padding-left:10px;border-left:1px solid var(--bd2)}
@@ -9615,6 +9706,47 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   color:var(--mu);font-size:.68rem;font-weight:600;cursor:pointer;transition:all .15s}
 .tf-chip.active{background:rgba(74,143,255,.15);border-color:rgba(74,143,255,.4);color:var(--b)}
 /* ── PRICE ALERT SHEET ── */
+/* ══ SETUP HISTORY ════════════════════════════════════════════════════════
+   The honest inversion of a "what will happen next" panel. This project
+   measured its own signal at t = +0.04 over 1,421 trades, so a confidence
+   number here would be theatre. What the data CAN answer is what followed the
+   last times this pair signalled this way — a distribution, with the cost
+   line drawn across it. Opened deliberately, never parked above the buy
+   button, so it informs rather than steers.                                */
+.sh-sheet{position:fixed;inset:0;z-index:480;display:none}
+.sh-sheet.open{display:block}
+.sh-overlay{position:absolute;inset:0;background:rgba(0,0,0,.65)}
+.sh-panel{position:absolute;bottom:0;left:0;right:0;max-height:88vh;overflow-y:auto;
+  background:var(--s0);border-radius:20px 20px 0 0;border-top:1px solid var(--bd2);
+  padding:18px 18px calc(20px + var(--sb))}
+.sh-grab{width:38px;height:4px;border-radius:99px;background:var(--bd3);
+  margin:0 auto 15px}
+.sh-lead{font-size:1.16rem;font-weight:650;line-height:1.3;letter-spacing:-.01em;
+  margin-bottom:7px}
+.sh-sub{font-size:.78rem;color:var(--mu);line-height:1.5;margin-bottom:17px}
+.sh-hist{display:flex;align-items:flex-end;gap:3px;height:76px;margin-bottom:8px}
+.sh-bar{flex:1;border-radius:2px 2px 0 0;background:var(--bd3);transition:height .45s ease}
+.sh-axis{display:flex;justify-content:space-between;font-family:var(--fn);
+  font-size:.54rem;color:var(--mu);padding-bottom:13px;border-bottom:1px solid var(--bd)}
+.sh-stats{display:flex;padding:14px 0 4px}
+.sh-stat{flex:1}
+.sh-stat b{display:block;font-family:var(--fn);font-size:1.06rem;font-weight:700;
+  font-variant-numeric:tabular-nums}
+.sh-stat span{font-family:var(--fn);font-size:.54rem;letter-spacing:.12em;
+  color:var(--mu);display:block;margin-top:4px}
+.sh-cost{margin-top:15px;padding:13px 14px;border-radius:11px;
+  background:rgba(255,179,0,.06);border:1px solid rgba(255,179,0,.24);
+  font-size:.8rem;line-height:1.5}
+.sh-note{margin-top:14px;font-size:.7rem;color:var(--mu);line-height:1.55}
+.sh-btn{width:100%;margin-top:16px;background:rgba(255,255,255,.05);
+  border:1px solid var(--bd2);color:var(--tx);border-radius:11px;padding:13px 0;
+  min-height:46px;cursor:pointer;font-family:var(--fn);font-size:.7rem;
+  font-weight:700;letter-spacing:.06em}
+.mt-hist-btn{width:100%;margin-top:9px;background:rgba(74,143,255,.09);
+  border:1px solid rgba(74,143,255,.3);color:var(--b);border-radius:10px;
+  padding:11px 0;min-height:44px;cursor:pointer;font-family:var(--fn);
+  font-size:.6rem;font-weight:700;letter-spacing:.07em}
+
 .alert-sheet{position:fixed;inset:0;z-index:300;display:none}
 .alert-sheet.open{display:block}
 .alert-overlay{position:absolute;inset:0;background:rgba(0,0,0,.6)}
@@ -9672,9 +9804,15 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
 .news-ico.bear{background:rgba(255,51,82,.12);color:var(--r)}
 .news-ico.neu{background:var(--bd2);color:var(--mu)}
 .news-body{flex:1;min-width:0}
-.news-coin{font-size:.72rem;font-weight:700;line-height:1.2;margin-bottom:2px}
-.news-hl{font-size:.65rem;color:var(--tx);opacity:.85;line-height:1.4;word-break:break-word}
-.news-meta{font-size:.52rem;color:var(--mu);margin-top:3px;display:flex;gap:8px}
+/* The HEADLINE is the news; the ticker is a label on it. This had them the
+   other way round — coin at .72rem bold, headline at .65rem and 85% opacity —
+   so the thing you actually read was the quietest element in the row. */
+.news-coin{font-family:var(--fn);font-size:.54rem;letter-spacing:.09em;
+  font-weight:700;color:var(--mu);line-height:1.2;margin-bottom:4px}
+.news-hl{font-size:.83rem;color:var(--tx);line-height:1.45;word-break:break-word;
+  font-weight:550}
+.news-meta{font-size:.56rem;color:var(--mu);margin-top:5px;display:flex;gap:9px;
+  align-items:center}
 .news-impact{font-weight:700}
 .news-impact.hi{color:var(--r)}
 .news-impact.md{color:var(--y)}
@@ -9937,7 +10075,10 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
    can tell at a glance which line you wrote and which the machine did. */
 /* Both clamped on the card — a bot note runs to ~8 lines and an unclamped feed
    of them is unscannable. The full text is one tap away in the modal. */
-.jnl-note-auto{font-size:.7rem;color:var(--mu);line-height:1.5;white-space:pre-wrap;
+/* Body copy, not a label. This was set at .7rem in --mu (#4a7aaa on #030912,
+   about 3:1) — the app's best writing rendered in the colour reserved for
+   captions, which is most of why nobody read it. */
+.jnl-note-auto{font-size:.82rem;color:#b6cbe2;line-height:1.55;white-space:pre-wrap;
   border-left:2px solid rgba(124,58,237,.45);padding-left:8px;margin-top:6px;
   overflow:hidden;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical}
 .jnl-note-mine{font-size:.78rem;color:var(--tx);line-height:1.45;margin-top:6px;
@@ -9952,6 +10093,68 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   font-weight:800;color:#a78bfa;margin-bottom:6px}
 .tnote-auto-txt{font-size:.7rem;color:var(--mu);line-height:1.55;white-space:pre-wrap}
 .tnote-btn.has-auto{border-color:rgba(124,58,237,.4);color:#a78bfa}
+/* ══ NOTE READER ══════════════════════════════════════════════════════════
+   The bot writes a note on every close, and there are 168 of them — by far
+   the most writing in the app, and until now dumped as small grey pre-wrap
+   text nobody would read. This treats them as what they are: a written record
+   worth reading. Type does the work — a real scale, a comfortable measure,
+   and rhythm between blocks.                                               */
+.nr-sheet{position:fixed;inset:0;z-index:520;display:none}
+.nr-sheet.open{display:block}
+.nr-panel{position:absolute;inset:0;background:var(--bg);overflow-y:auto;
+  padding-bottom:calc(28px + var(--sb));-webkit-overflow-scrolling:touch}
+.nr-top{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:12px;
+  padding:14px 16px;background:rgba(3,9,18,.88);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--bd)}
+.nr-back{background:none;border:none;color:var(--tx);padding:0;cursor:pointer;
+  display:flex;align-items:center;min-height:44px;min-width:44px}
+.nr-top-t{font-size:.86rem;font-weight:650;color:var(--tx)}
+.nr-body{padding:22px 20px 0;max-width:34rem;margin:0 auto}
+.nr-chips{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:15px}
+.nr-chip{font-family:var(--fn);font-size:.6rem;font-weight:700;letter-spacing:.04em;
+  padding:6px 11px;border-radius:99px;background:rgba(255,255,255,.05);
+  border:1px solid var(--bd2);color:var(--mu)}
+.nr-chip.win{background:rgba(0,230,118,.12);border-color:rgba(0,230,118,.35);color:var(--g)}
+.nr-chip.loss{background:rgba(255,51,102,.1);border-color:rgba(255,51,102,.32);color:var(--r)}
+/* The headline: the biggest type in the app after the balance. */
+.nr-title{font-size:2rem;font-weight:750;line-height:1.12;letter-spacing:-.025em;
+  color:var(--tx);text-wrap:balance;margin-bottom:9px}
+.nr-sub{font-size:.8rem;color:var(--mu);margin-bottom:22px}
+/* The move, given the weight it deserves rather than buried mid-sentence. */
+.nr-move{display:flex;align-items:flex-end;gap:14px;padding:16px 0 18px;
+  border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);margin-bottom:22px}
+.nr-move-big{font-family:var(--fn);font-size:1.9rem;font-weight:700;line-height:1;
+  font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.nr-move-sub{font-family:var(--fn);font-size:.72rem;color:var(--mu);
+  font-variant-numeric:tabular-nums;padding-bottom:3px}
+.nr-facts{display:flex;flex-direction:column;gap:13px;margin-bottom:24px}
+.nr-fact{display:flex;gap:13px;align-items:flex-start}
+.nr-fact-k{font-family:var(--fn);font-size:.56rem;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--mu);width:46px;flex-shrink:0;padding-top:3px}
+.nr-fact-v{font-size:.88rem;line-height:1.55;color:var(--tx);flex:1}
+.nr-h{font-family:var(--fn);font-size:.56rem;letter-spacing:.13em;text-transform:uppercase;
+  color:rgba(100,150,200,.7);margin-bottom:13px}
+.nr-obs{display:flex;flex-direction:column;gap:15px;margin-bottom:26px}
+.nr-ob{display:flex;gap:12px;align-items:flex-start}
+.nr-ob-dot{width:5px;height:5px;border-radius:50%;background:var(--b);
+  margin-top:8px;flex-shrink:0}
+.nr-ob-t{font-size:.92rem;line-height:1.62;color:var(--tx);flex:1}
+.nr-ob-t code{font-family:var(--fn);font-size:.82em;background:var(--s1);
+  padding:1px 5px;border-radius:4px;color:var(--mu)}
+.nr-mine{margin-bottom:24px;padding:15px 16px;border-radius:12px;
+  background:rgba(245,161,28,.06);border:1px solid rgba(245,161,28,.22)}
+.nr-mine-h{font-family:var(--fn);font-size:.54rem;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--y);margin-bottom:8px}
+.nr-mine-t{font-size:.9rem;line-height:1.6;color:var(--tx);white-space:pre-wrap}
+.nr-foot{font-size:.7rem;color:var(--mu);line-height:1.6;padding-top:18px;
+  border-top:1px solid var(--bd)}
+.nr-nav{display:flex;gap:9px;margin-top:20px}
+.nr-nav button{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--bd2);
+  color:var(--tx);border-radius:11px;padding:13px 0;min-height:46px;cursor:pointer;
+  font-family:var(--fn);font-size:.62rem;font-weight:700;letter-spacing:.06em}
+.nr-nav button:disabled{opacity:.35}
+
 /* ── NOTE TAG CHIPS ── */
 .tnote-tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
 .tag-chip{padding:5px 11px;border-radius:99px;border:1px solid var(--bd2);
@@ -10027,7 +10230,13 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   border-top:1px solid var(--bd);
 }
 .tab.active{color:var(--b)}
-.tab.active .tab-ico{filter:drop-shadow(0 0 6px rgba(41,121,255,0.6))}
+.tab.active .tab-ico{filter:drop-shadow(0 0 7px rgba(41,121,255,0.45))}
+/* A short bar above the active tab: the selection reads instantly at the very
+   bottom of the screen, where the icon itself is easy to miss. */
+.tab{position:relative}
+.tab.active::before{content:"";position:absolute;top:0;left:50%;
+  transform:translateX(-50%);width:22px;height:2px;border-radius:0 0 2px 2px;
+  background:var(--b)}
 
 /* ══ DESKTOP ═══════════════════════════════════════════════════════════════
    The whole UI was mobile-only: no width cap anywhere, so on a 1920px monitor
@@ -10121,6 +10330,9 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   input,textarea,select{font-size:16px!important}
   /* Apple HIG minimum touch target is 44px. These were 30-34px. */
   .mt-lev,.mt-quick,.zoom-btn,.ind-btn,.iv-btn{min-height:44px}
+  /* NB: the trade-panel chips are NOT listed here. Their own rules are defined
+     later in this stylesheet at equal specificity, so a 44px override here
+     would silently lose the cascade — the base heights carry it instead. */
   .zoom-btn{min-width:44px}
   /* Keep the arrows comfortably tappable without covering more of the strip. */
   .strip-arrow{width:40px}
@@ -10200,7 +10412,7 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 .mt-chips{display:flex;gap:6px}
 .mt-chip{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--bd2);
   color:var(--mu);border-radius:8px;font-family:var(--fn);font-size:.55rem;
-  font-weight:700;padding:9px 0;cursor:pointer;min-height:38px;
+  font-weight:700;padding:9px 0;cursor:pointer;min-height:44px;
   transition:background .13s,border-color .13s,color .13s}
 .mt-chip.on{background:rgba(74,143,255,.16);border-color:var(--b);color:var(--tx)}
 .mt-chip.on.risk{background:rgba(255,51,82,.16);border-color:var(--r);color:var(--r)}
@@ -10305,6 +10517,26 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
 }
 .hero-dec{opacity:0.45}
 .hero-lbl{letter-spacing:.16em;font-size:.55rem}
+
+/* ══ POLISH PASS ══════════════════════════════════════════════════════════
+   Three small things doing most of the work of "looks designed":
+   1. a hairline highlight along the top of every card, which is how a raised
+      surface reads on a dark ground;
+   2. section headers that are a rule with a label on it rather than floating
+      text, so the page has visible structure while scrolling;
+   3. one consistent radius and border recipe instead of several.          */
+.qcard,.card,#rank_card,#iq_card,.mc-grid>*,.goal-wrap,.rg-wrap,.chal-wrap{
+  position:relative;
+}
+.qcard::after,#rank_card::after,#iq_card::after{
+  content:"";position:absolute;top:0;left:12px;right:12px;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.09),transparent);
+  pointer-events:none;
+}
+.sh{display:flex;align-items:center;gap:10px}
+.sh::after{content:"";flex:1;height:1px;
+  background:linear-gradient(90deg,var(--bd),transparent)}
+.sh span{flex-shrink:0}
 
 /* ── Pill badge glow ── */
 .pill-up{background:rgba(0,230,118,0.1);color:var(--g);box-shadow:0 0 12px var(--glow-g)}
@@ -10545,6 +10777,21 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
         <span class="hero-int" id="bal_int">—</span><span class="hero-dec" id="bal_dec"></span>
       </div>
       <div class="hero-pill pill-fl" id="hero_pill">+$0.00 today</div>
+      <!-- The balance is a number; this is its shape. Every trading app worth
+           looking at shows the line, because "down $21" and "down $21 after
+           being up $40" are different facts. -->
+      <svg class="hero-spark" id="hero_spark" viewBox="0 0 320 44" preserveAspectRatio="none"
+           aria-hidden="true">
+        <defs>
+          <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="currentColor" stop-opacity=".22"/>
+            <stop offset="100%" stop-color="currentColor" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <path id="hero_spark_fill" fill="url(#sparkFill)" d=""></path>
+        <path id="hero_spark_line" fill="none" stroke="currentColor" stroke-width="1.6"
+              stroke-linejoin="round" stroke-linecap="round" d=""></path>
+      </svg>
       <div class="hero-sub">
         <div class="hs-item">
           <div class="hs-lbl">Today</div>
@@ -10915,6 +11162,7 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
     <div class="ind-row">
       <button class="ind-btn active" id="btn_sr" onclick="toggleSR()" title="Support/resistance the bot picks targets and stops from">S/R</button>
       <button class="ind-btn active" id="btn_cost" onclick="toggleCost()" title="Move needed to clear fees + slippage — targets inside this band cannot profit">COST</button>
+      <button class="ind-btn" id="btn_blocked" onclick="toggleRejects()" title="Signals the bot wanted to take here and the gate that refused them">BLOCKED</button>
       <button class="ind-btn" id="btn_bb" onclick="toggleBB()" title="Bollinger Bands (20,2)">BB</button>
       <button class="ind-btn" id="btn_macd" onclick="toggleMACD()" title="MACD (12,26,9)">MACD</button>
       <button class="ind-btn zoom-btn" onclick="cdZoom(1)"  title="Zoom out (show more bars)">&minus;</button>
@@ -11065,6 +11313,8 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
         </div>
 
         <button class="mt-btn mt-buy" id="mt_go" onclick="mtOpen(_mtSide)">LONG</button>
+        <button class="mt-hist-btn" onclick="openSetupHistory()">
+          WHAT USUALLY HAPPENS AFTER THIS SETUP</button>
       </div>
 
       <div class="mt-msg" id="mt_msg"></div>
@@ -11074,6 +11324,13 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   <!-- TRADES -->
   <div class="page" id="pg-pos">
     <div class="ptr" id="ptr-pos">&#8635; Refreshing…</div>
+    <!-- Where the money went, split by how each trade ended. Sits first
+         because it is the most diagnostic view in the app: it is what showed
+         that this book had 84 timeouts and zero genuine take-profits. -->
+    <div class="sh"><span>How Trades End</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">every close, by exit</span></div>
+    <div id="exit_attr" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 14px;overflow:hidden">
+      <div class="no-data" style="padding:16px 0">Loading&#8230;</div>
+    </div>
     <div class="sh"><span>Open Positions</span></div>
     <div class="dd-alert" id="dd_alert">&#128683; Drawdown limit reached — new trades paused</div>
     <div class="dd-alert" id="weekly_dd_alert" style="display:none;background:rgba(255,152,0,.12);border-color:rgba(255,152,0,.35);color:var(--y)">&#9203; Weekly drawdown pause — new entries blocked until Monday</div>
@@ -11251,30 +11508,30 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   <!-- MARKET -->
   <div class="page" id="pg-market">
     <div class="ptr" id="ptr-market">&#8635; Refreshing&#8230;</div>
-    <div class="sh"><span>Price Alerts</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">tap &#128276; on any coin to set</span></div>
-    <div id="alert_list_wrap" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;overflow:hidden">
-      <div class="no-data" id="alert_list_empty">No alerts set</div>
-      <div id="alert_list_items"></div>
-    </div>
     <div class="sh"><span>Market Heatmap</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">26 coins · 15-min signals</span></div>
     <div class="hm-grid" id="hm_grid">
       <div class="no-data" style="grid-column:1/-1">Loading&#8230;</div>
     </div>
-    <div class="sh"><span>&#127873; Pattern Quiz</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">test your trading knowledge</span></div>
-    <div id="quiz_box" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;padding:14px 15px">
-      <div class="no-data">Loading&#8230;</div>
-    </div>
-    <div class="sh"><span>&#128275; Coin Controls</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">toggle coins on/off</span></div>
-    <div id="coin_ctrl_list" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;overflow:hidden">
-      <div class="no-data">Loading&#8230;</div>
+    <div class="sh"><span>Crypto News</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">sentiment scan</span></div>
+    <div id="news_feed" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 16px;padding:0 14px">
+      <div class="no-data" style="padding:16px 0">Loading&#8230;</div>
     </div>
     <div class="sh"><span>News Forecast</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">score · trend · sentiment</span></div>
     <div id="forecast_panel" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;padding:12px 14px">
       <div class="no-data" style="padding:8px 0">Loading&#8230;</div>
     </div>
-    <div class="sh"><span>Crypto News</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">sentiment scan</span></div>
-    <div id="news_feed" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 16px;padding:0 14px">
-      <div class="no-data" style="padding:16px 0">Loading&#8230;</div>
+    <div class="sh"><span>Price Alerts</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">tap &#128276; on any coin to set</span></div>
+    <div id="alert_list_wrap" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;overflow:hidden">
+      <div class="no-data" id="alert_list_empty">No alerts set</div>
+      <div id="alert_list_items"></div>
+    </div>
+    <div class="sh"><span>&#128275; Coin Controls</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">toggle coins on/off</span></div>
+    <div id="coin_ctrl_list" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;overflow:hidden">
+      <div class="no-data">Loading&#8230;</div>
+    </div>
+    <div class="sh"><span>&#127873; Pattern Quiz</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">test your trading knowledge</span></div>
+    <div id="quiz_box" style="background:var(--s0);border:1px solid var(--bd);border-radius:12px;margin:0 16px 12px;padding:14px 15px">
+      <div class="no-data">Loading&#8230;</div>
     </div>
   </div>
 
@@ -11303,6 +11560,31 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   </div>
 
 </div><!-- /pages -->
+
+<!-- Note reader -->
+<div class="nr-sheet" id="nr_sheet">
+  <div class="nr-panel">
+    <div class="nr-top">
+      <button class="nr-back" onclick="closeReader()" aria-label="Back">
+        <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
+      </button>
+      <div class="nr-top-t">Journal</div>
+    </div>
+    <div class="nr-body" id="nr_body"></div>
+  </div>
+</div>
+
+<!-- Setup history sheet -->
+<div class="sh-sheet" id="sh_sheet">
+  <div class="sh-overlay" onclick="closeSetupHistory()"></div>
+  <div class="sh-panel">
+    <div class="sh-grab"></div>
+    <div id="sh_body"></div>
+    <button class="sh-btn" onclick="closeSetupHistory()">CLOSE</button>
+  </div>
+</div>
 
 <!-- Coin detail sheet -->
 <div class="cd-sheet" id="cd_sheet">
@@ -11573,29 +11855,33 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
   </div>
 </div>
 
+<!-- Line icons rather than emoji: emoji render as someone else's artwork at
+     someone else's weight, never take the active colour, and are the single
+     loudest tell that an app was assembled rather than designed. These inherit
+     currentColor, so the active tab tints them. -->
 <nav class="tabbar">
   <button class="tab active" id="tab-home" onclick="goTab('home')">
-    <div class="tab-ico">&#127968;</div>
+    <div class="tab-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 3l9 6.5V20a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 20z"/><path d="M9.5 21.5v-7h5v7"/></svg></div>
     <div class="tab-lbl">Home</div>
   </button>
   <button class="tab" id="tab-chart" onclick="goTab('chart')">
-    <div class="tab-ico">&#128200;</div>
+    <div class="tab-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3v3.5M7 17.5V21M17 3v5.5M17 19.5V21"/><rect x="4.5" y="6.5" width="5" height="11" rx="1.2"/><rect x="14.5" y="8.5" width="5" height="11" rx="1.2"/></svg></div>
     <div class="tab-lbl">Chart</div>
   </button>
   <button class="tab" id="tab-pos" onclick="goTab('pos')">
-    <div class="tab-ico">&#128260;</div>
+    <div class="tab-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h13l-3.5-3.5"/><path d="M20 16H7l3.5 3.5"/></svg></div>
     <div class="tab-lbl">Trades</div>
   </button>
   <button class="tab" id="tab-stats" onclick="goTab('stats')">
-    <div class="tab-ico">&#128202;</div>
+    <div class="tab-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V13"/><path d="M10 20V6"/><path d="M16 20v-5"/><path d="M22 20V9"/></svg></div>
     <div class="tab-lbl">Stats</div>
   </button>
   <button class="tab" id="tab-market" onclick="goTab('market')">
-    <div class="tab-ico">&#127760;</div>
+    <div class="tab-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3.5 9h17M3.5 15h17"/><path d="M12 3c2.4 2.6 3.6 5.6 3.6 9s-1.2 6.4-3.6 9c-2.4-2.6-3.6-5.6-3.6-9S9.6 5.6 12 3z"/></svg></div>
     <div class="tab-lbl">Market</div>
   </button>
   <button class="tab" id="tab-journal" onclick="goTab('journal')">
-    <div class="tab-ico">&#128203;</div>
+    <div class="tab-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 3.5h13a1 1 0 0 1 1 1v15a1 1 0 0 1-1 1h-13a2 2 0 0 1 0-4h13"/><path d="M9 8h6.5"/></svg></div>
     <div class="tab-lbl">Journal</div>
   </button>
 </nav>
@@ -11606,6 +11892,7 @@ const TAB_ORDER=['home','chart','pos','stats','market','journal'];
 let _tab='home',_paused=false,_notif=false;
 let _eqData=[],_cdData=[],_cdHover=-1,_tick=30;
 let _ema20=[],_ema50=[],_cdTrades=[],_cdOpenPos=[],_cdPatSig='NONE',_cdPair='',_cdIv=15;
+let _cdRejects=[],_showRejects=false;   // signals a gate refused, drawn on the chart
 let _cdMeta={};                 // S/R levels + cost floor from /candles
 // Pan/zoom view over the candle buffer. _cdView.n = bars visible, _cdView.off =
 // bars scrolled back from the newest. Kept as an offset rather than refetching
@@ -11795,6 +12082,175 @@ function mtSetHz(h){
     b.classList.toggle('on', parseFloat(b.dataset.hz)===h));
   const v=$('mt_hz_val');
   if(v)v.textContent = h ? (h<24?h+' hours':(h/24)+' days') : 'not set';
+}
+
+/* ── NOTE READER ──────────────────────────────────────────────────────────
+   The bot's note is plain text with a shape: a headline, an Entry line, an
+   Exit line, then bullet observations. Parsing that shape back out is what
+   lets it be SET as an article instead of dumped as a paragraph.
+   NB: newlines are built with fromCharCode(10) on purpose — the page lives in
+   a non-raw Python string, where a literal backslash-n would become a real
+   line break and kill the whole script. */
+var _NL = String.fromCharCode(10);
+var _nrList = [], _nrIdx = -1;
+
+function parseAutoNote(txt){
+  const out={head:'',move:'',pnl:'',entry:'',exit:'',obs:[]};
+  if(!txt)return out;
+  const lines=txt.split(_NL);
+  for(let i=0;i<lines.length;i++){
+    const l=lines[i].trim();
+    if(!l)continue;
+    if(i===0){
+      out.head=l;
+      // "LONG ZEC/USD - $586 -> $614 (+4.80%) - +$0.15": pull the two numbers
+      // that matter out of the headline so they can be set large.
+      const m=l.match(/\(([-+][0-9.]+%)\)/);      if(m)out.move=m[1];
+      const p=l.match(/([-+]\$[0-9,.]+)\s*$/);    if(p)out.pnl=p[1];
+      continue;
+    }
+    if(l.indexOf('Entry:')===0){ out.entry=l.slice(6).trim(); continue; }
+    if(l.indexOf('Exit:')===0){  out.exit =l.slice(5).trim(); continue; }
+    if(l.charAt(0)==='•'){  out.obs.push(l.slice(1).trim()); continue; }
+    out.obs.push(l);
+  }
+  return out;
+}
+
+function closeReader(){
+  const s=$('nr_sheet'); if(s)s.classList.remove('open');
+}
+
+function openReader(key){
+  const sheet=$('nr_sheet'), body=$('nr_body');
+  if(!sheet||!body)return;
+  // The journal feed defines its own esc() inside a map callback, so it is not
+  // in scope here. Note text is the bot's own output, but it is still going
+  // into innerHTML — escape it rather than trust the producer.
+  const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const idx=_nrList.findIndex(n=>n.key===key);
+  if(idx<0)return;
+  _nrIdx=idx;
+  const n=_nrList[idx];
+  const a=parseAutoNote(n.autoText||'');
+  const win=(n.pnl!==null&&n.pnl!==undefined)?(n.pnl>=0):null;
+  const dt=n.ts?new Date(n.ts).toLocaleDateString('en-US',
+    {weekday:'long',month:'long',day:'numeric'}):'';
+  const rel=n.ts?_relTime(n.ts):'';
+  const col=win===null?'var(--mu)':(win?'var(--g)':'var(--r)');
+
+  let chips='<span class="nr-chip">'+esc(n.coin||'')+'</span>';
+  if(win!==null)chips+='<span class="nr-chip '+(win?'win':'loss')+'">'
+    +(win?'WIN':'LOSS')+'</span>';
+  if(n.autoText)chips+='<span class="nr-chip">WRITTEN BY THE BOT</span>';
+
+  let facts='';
+  if(a.entry)facts+='<div class="nr-fact"><div class="nr-fact-k">Entry</div>'
+    +'<div class="nr-fact-v">'+esc(a.entry)+'</div></div>';
+  if(a.exit)facts+='<div class="nr-fact"><div class="nr-fact-k">Exit</div>'
+    +'<div class="nr-fact-v">'+esc(a.exit)+'</div></div>';
+
+  const obs=a.obs.map(function(o){
+    // backticks around a pattern key become inline code
+    const html=esc(o).replace(/`([^`]+)`/g,'<code>$1</code>');
+    return '<div class="nr-ob"><span class="nr-ob-dot"></span>'
+      +'<div class="nr-ob-t">'+html+'</div></div>';
+  }).join('');
+
+  body.innerHTML=
+    '<div class="nr-chips">'+chips+'</div>'
+    +'<h1 class="nr-title">'+esc(n.coin||'Trade')+'</h1>'
+    +'<div class="nr-sub">'+esc(dt)+(rel?' &middot; '+esc(rel):'')+'</div>'
+    +(a.move||a.pnl
+      ? '<div class="nr-move">'
+        +'<div class="nr-move-big" style="color:'+col+'">'+esc(a.pnl||a.move)+'</div>'
+        +(a.move&&a.pnl?'<div class="nr-move-sub">'+esc(a.move)+' move</div>':'')
+        +'</div>'
+      : '')
+    +(facts?'<div class="nr-facts">'+facts+'</div>':'')
+    +(n.text?'<div class="nr-mine"><div class="nr-mine-h">Your note</div>'
+      +'<div class="nr-mine-t">'+esc(n.text)+'</div></div>':'')
+    +(obs?'<div class="nr-h">What the record shows</div>'
+      +'<div class="nr-obs">'+obs+'</div>':'')
+    +'<div class="nr-foot">Written automatically the moment this trade closed. '
+      +'Every sentence is a field from the trade record or a count over earlier '
+      +'trades &mdash; nothing here is generated prose, so it cannot invent a '
+      +'detail that did not happen.</div>'
+    +'<div class="nr-nav">'
+      +'<button onclick="readerStep(1)"'+(idx>=_nrList.length-1?' disabled':'')+'>OLDER</button>'
+      +'<button onclick="readerStep(-1)"'+(idx<=0?' disabled':'')+'>NEWER</button>'
+    +'</div>';
+  sheet.classList.add('open');
+  const p=sheet.querySelector('.nr-panel'); if(p)p.scrollTop=0;
+}
+
+function readerStep(d){
+  const i=_nrIdx+d;
+  if(i<0||i>=_nrList.length)return;
+  openReader(_nrList[i].key);
+}
+
+function _relTime(ts){
+  const s=Math.max(0,(Date.now()-ts)/1000);
+  if(s<3600)return Math.round(s/60)+' minutes ago';
+  if(s<86400)return Math.round(s/3600)+' hours ago';
+  const d=Math.round(s/86400);
+  return d===1?'yesterday':(d+' days ago');
+}
+
+function closeSetupHistory(){
+  const s=$('sh_sheet'); if(s)s.classList.remove('open');
+}
+async function openSetupHistory(){
+  const pair=_cdPair||_botPair; if(!pair)return;
+  const sheet=$('sh_sheet'), body=$('sh_body');
+  if(!sheet||!body)return;
+  body.innerHTML='<div class="sh-sub">Reading what the bot recorded...</div>';
+  sheet.classList.add('open');
+  let d={};
+  try{
+    d=await(await fetch('/setup_history?pair='+encodeURIComponent(pair)
+      +'&side='+encodeURIComponent(_mtSide||'BUY'))).json();
+  }catch(e){ d={}; }
+  const name=pair.replace('USD','/USD');
+  const dir=(_mtSide==='SELL')?'short':'long';
+  if(!d.ready){
+    // Saying "not enough yet" is the honest output; a number from 6 samples
+    // would be worse than no number at all.
+    body.innerHTML='<div class="sh-lead">Not enough history yet.</div>'
+      +'<div class="sh-sub">The bot has recorded '+(d.n||0)+' finished signal(s) on '
+      +name+'. It needs about 10 before the shape of the outcomes means anything.</div>';
+    return;
+  }
+  const med=(d.median*100), up=d.up_pct, cost=(d.cost_rt*100);
+  const mx=Math.max.apply(null,d.buckets)||1;
+  let bars='';
+  for(let i=0;i<d.buckets.length;i++){
+    const h=Math.max(3,Math.round(d.buckets[i]/mx*76));
+    const col=i<5?'var(--r)':(i===5?'var(--bd3)':'var(--g)');
+    bars+='<div class="sh-bar" style="height:'+h+'px;background:'+col+';opacity:.75"></div>';
+  }
+  const beats=med>cost;
+  body.innerHTML=
+    '<div class="sh-lead">The bot has seen this setup '+d.n+' times.</div>'
+    +'<div class="sh-sub">Every recorded '+dir+' signal on '+name+', and what the next '
+    +'48 hours actually did. This is history, not a forecast.</div>'
+    +'<div class="sh-hist">'+bars+'</div>'
+    +'<div class="sh-axis"><span>-6%</span><span>0</span><span>+6%</span></div>'
+    +'<div class="sh-stats">'
+      +'<div class="sh-stat"><b style="color:'+(med>=0?'var(--g)':'var(--r)')+'">'
+        +(med>=0?'+':'')+med.toFixed(2)+'%</b><span>MEDIAN</span></div>'
+      +'<div class="sh-stat"><b>'+up.toFixed(0)+'%</b><span>WENT UP</span></div>'
+      +'<div class="sh-stat"><b style="color:var(--mu)">'+d.n+'</b><span>SAMPLES</span></div>'
+    +'</div>'
+    +'<div class="sh-cost">A '+(_mtLev||1)+'x trade needs <b style="color:var(--y)">+'
+      +(cost*(_mtLev||1)).toFixed(2)+'%</b> just to break even. The typical outcome here was '
+      +'<b>'+(med>=0?'+':'')+med.toFixed(2)+'%</b>'
+      +(beats?' — which clears it.':' — which does not clear it.')+'</div>'
+    +'<div class="sh-note">The bot has its own opinion on this pair, and it is worth '
+      +'knowing that its signal measured t = +0.04 across 1,421 trades: statistically a '
+      +'coin flip. Treat any confidence figure as a label it assigned, not a probability.</div>';
 }
 
 function mtPreview(){
@@ -12049,6 +12505,7 @@ function goTab(t){
     // action button in the right state, before anything is tapped.
     mtSetSide(_mtSide);mtSetLev(_mtLev);}
   if(t==='home'){drawEquity();}
+  if(t==='pos'){fetchExitAttribution();}
   if(t==='market'){fetchMarket();fetchForecast();loadQuiz();}
   if(t==='stats'){drawDownChart();fetchCalibration();}
   if(t==='journal'){fetchDailyPnl();fetchAutoNotes().then(renderJournal);}
@@ -12426,12 +12883,12 @@ function renderRank(d){
   const bar=pct.toFixed(1)+'%';
   const nextInfo='Next: '+(d.next_rank_emoji||'')+' '+(d.next_rank||'—')+' @ $'+(d.next_rank_min||0).toLocaleString();
   const unlock={
-    'Rookie':'Every trade is a lesson.',
-    'Trader':'You proved you can grow.',
-    'Pro':'Skill, not luck.',
-    'Expert':'Rare territory.',
-    'Elite':'Top 1%.',
-    'Legend':'Built different.',
+    'Rookie':'Balance under $250.',
+    'Trader':'Balance milestone: $250.',
+    'Pro':'Balance milestone: $500.',
+    'Expert':'Balance milestone: $1,000.',
+    'Elite':'Balance milestone: $2,500.',
+    'Legend':'Balance milestone: $5,000.',
     'GOAT':'$10k hit.',
     'Diamond':'$15k strong.',
     'Immortal':'$25k mastered.',
@@ -12565,7 +13022,7 @@ function renderPattern(d){
     $('pat_name').textContent=d.chart_pattern;
     const ap=d.all_patterns||{};
     const cp=Object.values(ap).find(p=>p.name===d.chart_pattern);
-    $('pat_str').textContent=cp?Math.round(cp.strength*100)+'% conf':'';
+    $('pat_str').textContent='';   // was a fixed per-pattern literal shown as '% conf'
     pb.style.display='inline-flex';
   } else if(pb){pb.style.display='none';}
 
@@ -12603,7 +13060,7 @@ function renderPattern(d){
     const bg=bull?'rgba(0,204,116,.07)':'rgba(255,51,82,.07)';
     const bdr=bull?'rgba(0,204,116,.2)':'rgba(255,51,82,.2)';
     const ico=bull?'▲':'▼';
-    const str=v.strength?Math.round(v.strength*100)+'%':'—';
+    const str='';   // pattern strength is a hardcoded constant, not a measurement
     const chartLine=v.name?
       '<div style="font-weight:700;font-size:.78rem;color:var(--tx)">📐 '+v.name+'</div>':'';
     const candleLine=v.candle_name?
@@ -12632,8 +13089,30 @@ async function fetchHistory(){
     const pts=Array.isArray(d)?d:(d.pts||[]);
     _eqBtcReturnPct=d.btc_return_pct||0;
     _eqStartBal=d.start_bal||0;
-    if(pts&&pts.length){_eqData=pts;if(_tab==='home')drawEquity();drawDownChart();_renderSharpe();renderWaterfall(pts);}
+    if(pts&&pts.length){_eqData=pts;if(_tab==='home')drawEquity();drawDownChart();_renderSharpe();renderWaterfall(pts);drawHeroSpark(pts);}
   }catch(e){console.warn('history',e);}
+}
+function drawHeroSpark(pts){
+  const line=$('hero_spark_line'), fill=$('hero_spark_fill'), svg=$('hero_spark');
+  if(!line||!fill||!svg||!pts||pts.length<2)return;
+  const W=320,H=44;
+  // Last ~120 points: enough to show the shape, few enough to stay readable.
+  const p=pts.slice(-120).map(x=>(typeof x==='number')?x:(x.balance||0)).filter(v=>v>0);
+  if(p.length<2)return;
+  let lo=Math.min.apply(null,p), hi=Math.max.apply(null,p);
+  if(hi-lo<1e-9){lo-=1;hi+=1;}
+  const pad=(hi-lo)*0.14; lo-=pad; hi+=pad;
+  const xs=i=>(i/(p.length-1))*W;
+  const ys=v=>H-((v-lo)/(hi-lo))*H;
+  let d='M '+xs(0).toFixed(1)+' '+ys(p[0]).toFixed(1);
+  for(let i=1;i<p.length;i++)d+=' L '+xs(i).toFixed(1)+' '+ys(p[i]).toFixed(1);
+  line.setAttribute('d',d);
+  fill.setAttribute('d',d+' L '+W+' '+H+' L 0 '+H+' Z');
+  // Coloured against where the run STARTED, not against the previous tick —
+  // the honest question is whether the account is ahead, not whether the last
+  // point ticked up.
+  const up=p[p.length-1]>=p[0];
+  svg.className.baseVal='hero-spark '+(up?'up':'dn');
 }
 function drawEquity(){
   const cv=$('eq_cv');
@@ -12747,6 +13226,33 @@ function drawDownChart(){
 }
 
 /* ── INDICATOR TOGGLES ── */
+async function fetchRejects(){
+  const pair=_cdPair||_botPair;
+  if(!pair){_cdRejects=[];return;}
+  // Only as far back as the chart can show, so the payload matches the view.
+  const since=(_cdData&&_cdData.length)?(_cdData[0].t/1000-3600):0;
+  try{
+    const d=await(await fetch('/rejects?pair='+encodeURIComponent(pair)
+      +'&since='+Math.floor(since))).json();
+    _cdRejects=d.rows||[];
+  }catch(e){ _cdRejects=[]; }
+}
+async function toggleRejects(){
+  _showRejects=!_showRejects;
+  const b=$('btn_blocked');if(b)b.classList.toggle('active',_showRejects);
+  if(_showRejects&&!_cdRejects.length)await fetchRejects();
+  if(_showRejects){
+    // The counts are the point: this pair's signals are overwhelmingly
+    // refused, and by a small number of gates.
+    const by={};
+    _cdRejects.forEach(r=>{by[r.gate]=(by[r.gate]||0)+1;});
+    const top=Object.keys(by).sort((a,b)=>by[b]-by[a]).slice(0,3)
+      .map(k=>k+' '+by[k]).join(' · ');
+    if(_cdRejects.length)showToast(_cdRejects.length+' signals blocked here',top,'',3200);
+    else showToast('No blocked signals recorded','on this pair in view','',2600);
+  }
+  if(_cdData.length)drawCandles();
+}
 function toggleBB(){
   _showBB=!_showBB;
   const b=$('btn_bb');if(b)b.classList.toggle('active',_showBB);
@@ -13054,6 +13560,10 @@ function renderLivePrices(){
 
 function selectCoin(pair,sym){
   _cdPair=pair;
+  // Rejects belong to a pair, so drop them the moment the pair changes rather
+  // than drawing the previous coin's decisions on this coin's candles.
+  _cdRejects=[];
+  if(_showRejects)fetchRejects().then(()=>{if(_cdData.length)drawCandles();});
   _cdOpenPos=(_openPairs.has(pair)?[]:[]); // will update on next status
   fetchManual();          // the panel is per-coin, so refresh on switch
   fetchOrderFlow();
@@ -13335,6 +13845,40 @@ function drawCandles(){
       ctx.strokeStyle='rgba(255,255,255,.35)';ctx.lineWidth=1;ctx.stroke();
     }
   });
+  // ── Signals the bot WANTED but a gate refused ───────────────────────────
+  // Hollow, so they read as things that did NOT happen next to the solid
+  // markers of trades that did. This is the biggest population in the system
+  // (3,219 recorded against 168 taken) and the actual answer to "why isn't it
+  // trading" — shown at the price and the minute it was decided.
+  // Colour is the gate's REPORT CARD, not the signal's direction: once the
+  // 48h outcome is known, green means refusing paid off, red means the gate
+  // cost a move. Grey while the outcome is still pending.
+  if(_showRejects&&_cdRejects.length){
+    _cdRejects.forEach(rj=>{
+      const i=tsToIdx(rj.ts*1000);
+      if(i<0||!data[i])return;
+      const isBuy=(rj.sig==='BUY');
+      const x=xC(i);
+      const y=isBuy?yP(data[i].l)+16:yP(data[i].h)-16;
+      let col='rgba(140,170,200,.55)';
+      if(rj.fwd48!==null&&rj.fwd48!==undefined){
+        const missed=isBuy?rj.fwd48:-rj.fwd48;   // what skipping it cost
+        col=(missed>0.013)?'rgba(255,51,102,.75)':'rgba(0,230,118,.6)';
+      }
+      ctx.strokeStyle=col;ctx.lineWidth=1.3;
+      ctx.beginPath();
+      if(isBuy){ctx.moveTo(x,y-6);ctx.lineTo(x-4,y+1.5);ctx.lineTo(x+4,y+1.5);}
+      else{ctx.moveTo(x,y+6);ctx.lineTo(x-4,y-1.5);ctx.lineTo(x+4,y-1.5);}
+      ctx.closePath();ctx.stroke();
+    });
+    // legend: without it the hollow markers are just decoration
+    ctx.font='8px monospace';ctx.textAlign='left';
+    ctx.fillStyle='rgba(140,170,200,.75)';
+    ctx.fillText(_cdRejects.length+' blocked  ',P.l+2,P.t+20);
+    ctx.fillStyle='rgba(0,230,118,.8)';ctx.fillText('gate right',P.l+58,P.t+20);
+    ctx.fillStyle='rgba(255,51,102,.8)';ctx.fillText('gate cost a move',P.l+108,P.t+20);
+  }
+
   // Time axis  (anchored to candle section, not full canvas height)
   const CHART_B=320-P.b;
   ctx.fillStyle='#4d6f94';ctx.font='8px monospace';ctx.textAlign='center';
@@ -13709,7 +14253,7 @@ async function fetchMarket(){
       const cls=(dis?'':'')+(bull?'bull':bear?'bear':'');
       const sigCol=dis?'var(--mu)':bull?'var(--g)':bear?'var(--r)':'var(--mu)';
       const sigTxt=dis?'— OFF':bull?'▲ BULL':bear?'▼ BEAR':'— NONE';
-      const str=c.strength>0?Math.round(c.strength*100)+'%':'';
+      const str='';   // see above: never measured, so never shown as a percentage
       return '<div class="hm-cell '+cls+'" data-pair="'+c.pair+'" style="'+(dis?'opacity:.45':'')+'" onclick="openCoinDetail(this.dataset.pair)">'+
         '<div style="display:flex;align-items:flex-start;justify-content:space-between">'+
           '<div class="hm-name">'+c.name+'</div>'+
@@ -14972,6 +15516,23 @@ function renderBacktestResult(r){
         '</div>';
     }).join('');
   }
+  // Gross vs net and the replay's blind spots, shown WITH the result — a
+  // backtest number without its assumptions is the most over-trusted figure
+  // in retail trading.
+  if(list){
+    const g=r.gross_pnl_pct, cd=r.cost_drag_pct;
+    let extra='';
+    if(g!==undefined&&cd!==undefined){
+      extra+='<div class="mono" style="font-size:.6rem;color:var(--mu);margin-top:9px">'
+        +'gross '+(g>=0?'+':'')+g.toFixed(2)+'% − fees '+Math.abs(cd).toFixed(2)
+        +'% = net '+(tot>=0?'+':'')+tot.toFixed(2)+'%</div>';
+    }
+    if(r.assumptions){
+      extra+='<div style="font-size:.6rem;color:var(--mu);line-height:1.55;margin-top:7px;'
+        +'padding-top:8px;border-top:1px solid var(--bd)">Assumes: '+r.assumptions+'</div>';
+    }
+    list.innerHTML+=extra;
+  }
   $('bt_result').style.display='';
   _renderBtvsLive(r);
   showToast('Backtest Done',r.trades+' trades · '+r.win_rate+'% WR · avg '+(avg>=0?'+':'')+avg.toFixed(2)+'%',
@@ -15177,11 +15738,64 @@ async function fetchNews(){
     renderNews(d.items||[]);
   }catch(e){console.warn('news',e);}
 }
+async function fetchExitAttribution(){
+  const el=$('exit_attr'); if(!el)return;
+  let d={};
+  try{ d=await(await fetch('/exit_attribution')).json(); }catch(e){ d={}; }
+  const rows=d.rows||[], tot=d.total||{}, MIN=d.min_n||20;
+  if(!rows.length){
+    el.innerHTML='<div class="no-data" style="padding:16px 0">No closed trades yet</div>';
+    return;
+  }
+  const maxN=Math.max.apply(null,rows.map(r=>r.n))||1;
+  const money=v=>(v>=0?'+$':'-$')+Math.abs(v).toFixed(2);
+  const body=rows.map(r=>{
+    const share=Math.round(r.n/maxN*100);
+    const wr=Math.round(r.wins/Math.max(r.n,1)*100);
+    const col=r.total>0?'var(--g)':r.total<0?'var(--r)':'var(--mu)';
+    // Under the floor the average is a point estimate on a handful of trades,
+    // so the count and the sum are shown and the average is suppressed.
+    const thin=r.n<MIN;
+    return '<div style="padding:12px 14px;border-bottom:1px solid var(--bd)">'
+      +'<div style="display:flex;align-items:baseline;gap:9px;margin-bottom:7px">'
+        +'<span style="font-size:.8rem;color:var(--tx);font-weight:600">'+r.reason+'</span>'
+        +'<span class="mono" style="font-size:.6rem;color:var(--mu)">'+r.n+' trades'
+          +(thin?' · too few to average':' · '+wr+'% won · '+Math.round(r.med_hold)+'m median')+'</span>'
+        +'<span class="mono" style="margin-left:auto;font-size:.86rem;font-weight:700;'
+          +'color:'+col+'">'+money(r.total)+'</span>'
+      +'</div>'
+      +'<div style="height:4px;border-radius:99px;background:rgba(255,255,255,.06);overflow:hidden">'
+        +'<div style="height:100%;width:'+share+'%;border-radius:99px;background:'
+        +(thin?'var(--bd3)':'var(--b)')+'"></div></div>'
+      +(thin?'':'<div class="mono" style="font-size:.56rem;color:var(--mu);margin-top:5px">'
+        +'avg '+money(r.avg)+' per trade</div>')
+    +'</div>';
+  }).join('');
+  const tw=Math.round((tot.wins||0)/Math.max(tot.n||1,1)*100);
+  el.innerHTML=body
+    +'<div style="padding:12px 14px;background:rgba(255,255,255,.03);'
+      +'display:flex;align-items:baseline;gap:9px">'
+      +'<span style="font-size:.76rem;color:var(--tx);font-weight:700">All closes</span>'
+      +'<span class="mono" style="font-size:.6rem;color:var(--mu)">'+(tot.n||0)
+        +' trades · '+tw+'% won</span>'
+      +'<span class="mono" style="margin-left:auto;font-size:.86rem;font-weight:700;color:'
+        +((tot.total||0)>=0?'var(--g)':'var(--r)')+'">'+money(tot.total||0)+'</span>'
+    +'</div>'
+    +'<div style="padding:11px 14px;font-size:.62rem;color:var(--mu);line-height:1.55">'
+      +'Exit reasons are not randomly assigned — the stale exit fires on trades '
+      +'that went nowhere, the trail on trades that moved. These are different '
+      +'populations, not competing rules. Ordered by how often each fires.'
+    +'</div>';
+}
 function renderNews(items){
   const el=$('news_feed');if(!el)return;
   if(!items.length){el.innerHTML='<div class="no-data" style="padding:16px 0">No news yet</div>';return;}
   el.innerHTML=items.map(n=>{
-    const bull=n.sentiment==='bullish',bear=n.sentiment==='bearish';
+    // The feed sends BULLISH/BEARISH in caps; this compared against lowercase,
+    // so every item fell through to neutral and the sentiment the bot actually
+    // computes has never once been shown.
+    const s=String(n.sentiment||'').toUpperCase();
+    const bull=s==='BULLISH',bear=s==='BEARISH';
     const ico=bull?'▲':bear?'▼':'—';
     const icoCls=bull?'bull':bear?'bear':'neu';
     const impCls=n.impact==='HIGH'?'hi':n.impact==='MEDIUM'?'md':'lo';
@@ -15786,7 +16400,7 @@ function openCoinDetail(pair){
   const oiCol=oiTrend==='RISING'?'var(--g)':oiTrend==='FALLING'?'var(--r)':'var(--mu)';
   const newsS=coin.news||'NEUTRAL';
   const newsCol=newsS==='BULLISH'?'var(--g)':newsS==='BEARISH'?'var(--r)':'var(--mu)';
-  const conf=coin.strength>0?Math.round(coin.strength*100)+'%':'—';
+  const conf='unscored';   // pattern shapes carry a fixed weight, not a measured probability
   $('cd_grid').innerHTML=
     '<div class="cd-stat"><div class="cd-stat-lbl">Signal</div><div class="cd-stat-val" style="color:'+sigCol+'">'+(sig==='BULL'?'▲ BULL':sig==='BEAR'?'▼ BEAR':'— NONE')+'</div></div>'+
     '<div class="cd-stat"><div class="cd-stat-lbl">Confidence</div><div class="cd-stat-val">'+conf+'</div></div>'+
@@ -15847,21 +16461,39 @@ function renderJournal(){
   if(!parsed.length){
     el.innerHTML='<div class="no-data" style="padding:20px 16px">No notes with tag: '+_journalFilter+'</div>';return;
   }
+  // Hand the reader the same ordered list the feed shows, so OLDER/NEWER walk
+  // the notes in the order on screen rather than some other order.
+  _nrList=parsed;
   el.innerHTML=parsed.map(n=>{
     const tagHtml=n.tags.length?'<div class="jnl-note-tags">'+n.tags.map(t=>'<span class="jnl-tag">'+t+'</span>').join('')+'</div>':'';
     const pnlStr=n.pnl!=null?(n.pnl>=0?'+$':'-$')+Math.abs(n.pnl).toFixed(2):'';
     const pnlCol=n.pnl>0?'color:var(--g)':n.pnl<0?'color:var(--r)':'';
     // Escape only. Newlines are CSS's job (white-space:pre-wrap) — see openNote.
     const esc=s=>s.replace(/</g,'&lt;');
-    return '<div class="jnl-note-card" data-key="'+n.key+'" data-coin="'+n.coin+'" onclick="openNote(this.dataset.key,this.dataset.coin)">'+
+    // The card opens the READER; the pencil still opens the editor, so
+    // annotating a trade is one deliberate tap rather than the default.
+    return '<div class="jnl-note-card" data-key="'+n.key+'" data-coin="'+n.coin+'" onclick="openReader(this.dataset.key)">'+
       '<div class="jnl-note-hdr">'+
         '<div class="jnl-note-coin">'+n.coin+(pnlStr?' <span style="'+pnlCol+'">'+pnlStr+'</span>':'')+
           (n.autoText?'<span class="jnl-bot-badge">bot</span>':'')+'</div>'+
         '<div class="jnl-note-date">'+n.date+'</div>'+
       '</div>'+
       (n.text?'<div class="jnl-note-mine">'+esc(n.text)+'</div>':'')+
-      (n.autoText?'<div class="jnl-note-auto">'+esc(n.autoText)+'</div>':'')+
+      // Feed shows the lead line only; the full note lives in the reader.
+      (n.autoText?'<div class="jnl-note-auto" style="white-space:normal;'
+        +'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;'
+        +'overflow:hidden">'+esc(n.autoText.split(_NL)[0])+'</div>':'')+
       tagHtml+
+      '<div style="display:flex;align-items:center;gap:6px;margin-top:9px">'+
+        '<span style="font-family:var(--fn);font-size:.54rem;letter-spacing:.1em;'
+          +'color:var(--b)">READ</span>'+
+        '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--b)" '
+          +'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">'
+          +'<path d="M9 6l6 6-6 6"/></svg>'+
+        '<button class="tnote-btn" style="margin-left:auto" data-key="'+n.key+'" '
+          +'data-coin="'+n.coin+'" onclick="event.stopPropagation();'
+          +'openNote(this.dataset.key,this.dataset.coin)">annotate</button>'+
+      '</div>'+
     '</div>';
   }).join('');
   // Also populate the journal calendar
@@ -16634,6 +17266,108 @@ def _web_forecast():
         "ts":               int(time.time()),
     }), mimetype="application/json")
 
+@_flask_app.route("/exit_attribution")
+def _web_exit_attribution():
+    """Where the money actually went, split by how each trade ended."""
+    rows = db.exit_attribution() if db.connected else []
+    tot = {"n": sum(r["n"] for r in rows),
+           "total": round(sum(r["total"] for r in rows), 2),
+           "wins": sum(r["wins"] for r in rows)}
+    return _Response(json.dumps({"rows": rows, "total": tot,
+                                 "min_n": 20}),
+                     mimetype="application/json")
+
+
+@_flask_app.route("/rejects")
+def _web_rejects():
+    """Signals the bot WANTED to take on this pair, and the gate that stopped it.
+
+    The chart shows what the bot did. This shows what it nearly did — which is
+    the far bigger population (3,219 recorded signals against 168 trades) and
+    the actual answer to "why isn't it trading". Each row carries the gate that
+    rejected it and, once the filler loop has caught up, what the price did over
+    the next 48h — so a gate can be seen being right or wrong at the exact spot
+    on the chart where it fired.
+
+    Read-only, no auth (same class as /candles). Never reads manual_lab.
+    """
+    pair = (_flask_request.args.get("pair") or "").strip().upper()
+    try:
+        since = float(_flask_request.args.get("since") or 0)
+    except (TypeError, ValueError):
+        since = 0
+    out = {"pair": pair, "rows": []}
+    if not pair or not db.connected:
+        return _Response(json.dumps(out), mimetype="application/json")
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute("""SELECT ts, sig, conf, rejected_by, fwd48, price
+                           FROM shadow_signals
+                           WHERE pair=%s AND ts >= %s AND rejected_by <> ''
+                           ORDER BY ts DESC LIMIT 300""", (pair, since))
+            out["rows"] = [{"ts": float(r[0]), "sig": r[1], "conf": r[2],
+                            "gate": r[3], "fwd48": r[4], "price": r[5]}
+                           for r in cur.fetchall()]
+    except Exception as e:
+        log("DB", f"rejects: {e}", "ERR")
+    return _Response(json.dumps(out), mimetype="application/json")
+
+
+@_flask_app.route("/setup_history")
+def _web_setup_history():
+    """What actually happened the last times this pair signalled this way.
+
+    The honest inversion of a "chart intelligence" panel. Predicting the next
+    move is exactly what this project measured and failed to do (t = +0.04 over
+    1,421 signals), so this answers a question the data CAN support: of the
+    signals already recorded on this pair and side, what did the following 48
+    hours actually do?
+
+    Returns a distribution, not a forecast. Read-only, no auth (same class as
+    /candles and /prices), and it never touches manual_lab — the human's own
+    book must stay out of anything the trading side can see.
+    """
+    pair = (_flask_request.args.get("pair") or "").strip().upper()
+    side = (_flask_request.args.get("side") or "").strip().upper()
+    out = {"pair": pair, "side": side, "n": 0, "ready": False}
+    if not pair or not db.connected:
+        return _Response(json.dumps(out), mimetype="application/json")
+    try:
+        with db.conn.cursor() as cur:
+            # fwd48 is signed LONG-relative by the filler loop, so a SELL
+            # signal's outcome is the negated move.
+            cur.execute("""SELECT fwd48 FROM shadow_signals
+                           WHERE pair=%s AND fwd_done=1 AND fwd48 IS NOT NULL
+                             AND (%s='' OR sig=%s)""",
+                        (pair, side, side))
+            vals = [float(r[0]) for r in cur.fetchall() if r[0] is not None]
+    except Exception as e:
+        log("DB", f"setup_history: {e}", "ERR")
+        return _Response(json.dumps(out), mimetype="application/json")
+    if side == "SELL":
+        vals = [-v for v in vals]
+    n = len(vals)
+    out["n"] = n
+    if n < 10:                       # too few to describe, and saying so beats a number
+        out["note"] = "not enough recorded signals on this pair yet"
+        return _Response(json.dumps(out), mimetype="application/json")
+    vals.sort()
+    lo, hi = -0.06, 0.06
+    buckets = [0] * 11
+    for v in vals:
+        idx = int((min(max(v, lo), hi) - lo) / ((hi - lo) / 11))
+        buckets[min(idx, 10)] += 1
+    out.update({
+        "ready":   True,
+        "median":  vals[n // 2],
+        "up_pct":  100.0 * sum(1 for v in vals if v > 0) / n,
+        "buckets": buckets,
+        # The bar any of this has to clear before it is worth trading at all.
+        "cost_rt": MANUAL_FEE_RT_PCT,
+    })
+    return _Response(json.dumps(out), mimetype="application/json")
+
+
 @_flask_app.route("/sim")
 def _web_sim():
     if _sim_trader is None:
@@ -16799,10 +17533,19 @@ def _web_backtest_run():
             wins = sum(1 for t in trades if t.get("pnl_pct", 0) > 0)
             pnl_pcts = [t.get("pnl_pct", 0) for t in trades]
             total_pct = round(sum(pnl_pcts) * 100, 2)
+            gross_pct = round(sum(t.get("gross_pct", t.get("pnl_pct", 0))
+                                  for t in trades) * 100, 2)
             _backtest_state["result"] = {
                 "pair": pair, "trades": n, "wins": wins, "losses": n - wins,
                 "win_rate": round(wins / max(n, 1) * 100, 1),
                 "total_pnl_pct": total_pct,
+                "gross_pnl_pct": gross_pct,
+                "cost_drag_pct": round(gross_pct - total_pct, 2),
+                "assumptions": (f"{ROUND_TRIP_COST_PCT*100:.2f}% round trip per "
+                                f"trade; fills at candle close (a wick through "
+                                f"the stop that closes back above it does not "
+                                f"stop out here, but would live); one 60h "
+                                f"window, in-sample"),
                 "avg_pnl_pct": round(total_pct / max(n, 1), 2),
                 "recent_trades": [{"pnl_pct": round(t.get("pnl_pct",0)*100,2),
                                     "reason": t.get("reason",""), "bars": t.get("bars",0),

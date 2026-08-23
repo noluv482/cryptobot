@@ -124,7 +124,12 @@ for node in ast.walk(tree):
                     and sub.func.attr in LAB_CALLS:
                 readers.append(f"{node.name} -> {sub.func.attr}")
             elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
-                    and "manual_lab" in sub.value:
+                    and "manual_lab" in sub.value \
+                    and any(k in sub.value.upper()
+                            for k in ("FROM", "INTO", "UPDATE", "TABLE", "JOIN")):
+                # SQL against the table, not prose that merely names it — a
+                # docstring saying "never touches manual_lab" is the guard
+                # being documented, not broken.
                 readers.append(f"{node.name} -> SQL(manual_lab)")
 check("no trading path reads the manual lab (feedback-loop guard)",
       not readers, str(sorted(set(readers))[:5]))

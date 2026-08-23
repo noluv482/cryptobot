@@ -23,3 +23,7 @@ paper_state.json
 notes.json
 data/history/
 ohlc_cache/
+
+# Dashboard preview: frozen copies of live API responses (real balances,
+# trades and notes). The repo is public — these stay local.
+design/
