@@ -955,10 +955,13 @@ class Autopilot:
         """The dict the web routes render."""
         challengers = []
         for cid in self.order:
-            t = self.traders[cid]
+            # cf_only entrants have no live sandbox trader — they exist purely
+            # in the counterfactual scoring path. The KeyError here took the
+            # whole /autopilot payload down on the first deploy with them.
+            t = self.traders.get(cid)
             s = self.scores.get(cid, {})
-            n = len(t.trades)
-            wins = sum(1 for tr in t.trades if tr.get("pnl", 0) >= 0)
+            n = len(t.trades) if t else 0
+            wins = sum(1 for tr in t.trades if tr.get("pnl", 0) >= 0) if t else 0
             is_lab = cid.startswith("lab_")   # sanitizer guarantees the namespace
             challengers.append({
                 "id": cid,
@@ -966,13 +969,13 @@ class Autopilot:
                 "born_ts": self.configs[cid].get("born_ts") if is_lab else None,
                 "config": {k: (list(v) if isinstance(v, set) else v)
                            for k, v in self.configs[cid].items() if k != "id"},
-                "balance": round(t.balance, 2),
-                "pnl": round(t.balance - CHALLENGER_START, 2),
+                "balance": round(t.balance, 2) if t else None,
+                "pnl": round(t.balance - CHALLENGER_START, 2) if t else None,
                 "trades": n,
                 "wins": wins,
                 "losses": n - wins,
                 "win_rate": round(wins / max(n, 1) * 100, 1),
-                "open_positions": len(t.positions),
+                "open_positions": len(t.positions) if t else 0,
                 "n_oos": s.get("n_oos", 0),
                 "oos_edge_pct": round(s["oos_edge"] * 100, 4) if s.get("oos_edge") is not None else None,
                 "t": round(s["t"], 2) if s.get("t") is not None else None,

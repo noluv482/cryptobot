@@ -137,6 +137,22 @@ check("standings ship in status()", '"standings":' in SRC_AP)
 check("cf_only entrants get no live trader",
       'if cfg.get("cf_only"):' in SRC_AP)
 
+# status() must survive cf_only entrants — the KeyError('strict_gates') that
+# took down /autopilot live got here because the test asserted the pieces but
+# never CALLED the real status() with a mixed pool. Build a real instance
+# (DB-less: lab file read and _load tolerate absence) and call it.
+try:
+    inst = ap.Autopilot()
+    st = inst.status()
+    ok = isinstance(st, dict) and "standings" in st and len(st["challengers"]) >= 9
+    cf_rows = [c for c in st["challengers"] if c["id"] == "strict_gates"]
+    check("real status() succeeds with cf_only entrants in the pool", ok,
+          list(st.keys())[:6] if isinstance(st, dict) else st)
+    check("cf_only entrant appears in challengers with null balance",
+          bool(cf_rows) and cf_rows[0]["balance"] is None)
+except Exception as e:
+    check("real status() succeeds with cf_only entrants in the pool", False, e)
+
 SRC_BS = bs._DASHBOARD_HTML
 check("standings render in the dashboard", 'ap_standings' in SRC_BS)
 check("standings colour only on CLEARS, not on a nice middle number",
