@@ -95,9 +95,16 @@ _FEE_RATE = (bs.BINANCE_FEE        if bs.USE_BINANCE else
 #   min_rr            : minimum reward:risk after ATR reshaping (None -> PAPER_MIN_RR)
 #   allowed_strategies: subset of _classify_strategy keys the config will trade (None -> all)
 #   risk_min/risk_max : per-instance stake band (sizing only; None -> global RISK_MIN/MAX)
+# Counterfactual configs are scored only on shadow_signals rows recorded AFTER
+# this epoch (set at feature ship). strict_gates in particular was suggested by
+# an audit OVER the existing rows — grading it on those same rows would be the
+# in-sample sin this whole module exists to prevent. Future rows only.
+AP_CF_EPOCH = 1787545000.0    # 2026-08-24, counterfactual scoring shipped
+
 CHALLENGER_CONFIGS = [
     {   # CHAMPION starts here — mirrors the default paper book / _sim_trader
         "id": "base",
+        "cf": {"conf": None, "horizon": "fwd48"},
         "entry_conf_floor": ATTEMPT_CONF_MIN,
         "min_rr": None,
         "allowed_strategies": None,
@@ -105,6 +112,7 @@ CHALLENGER_CONFIGS = [
     },
     {   # more selective: higher confidence + tighter R:R
         "id": "selective",
+        "cf": {"conf": 0.55, "rr": 1.5, "horizon": "fwd48"},
         "entry_conf_floor": 0.55,
         "min_rr": 1.5,
         "allowed_strategies": None,
@@ -123,6 +131,24 @@ CHALLENGER_CONFIGS = [
         "min_rr": 1.5,
         "allowed_strategies": {"MOMENTUM_BREAKOUT", "TREND_CONTINUATION", "MULTI_SIGNAL"},
         "risk_min": None, "risk_max": None,
+    },
+    {   # ORIGINAL gate thresholds, as a tournament entrant instead of a belief.
+        # The gate-loosening audit (analyze_gate_loosening.py) could not judge
+        # these at n_indep=22; here they compete on every future signal and get
+        # crowned only by the same bars as everyone else. cf_only: the live
+        # challenger path cannot filter on ADX/ER — shadow rows now record both.
+        "id": "strict_gates", "cf_only": True,
+        "cf": {"conf": 0.50, "adx": 18.0, "er": 0.15, "horizon": "fwd48"},
+    },
+    {   # EXIT family: the measured loss decomposition put 0.000% in entries and
+        # -0.211% in exits, yet every other challenger varies entries. These two
+        # hold the same entries and vary only how long the trade lives.
+        "id": "exit_6h", "cf_only": True,
+        "cf": {"conf": None, "horizon": "fwd6"},
+    },
+    {
+        "id": "exit_24h", "cf_only": True,
+        "cf": {"conf": None, "horizon": "fwd24"},
     },
     {   # mean-reversion / pattern family only
         "id": "reversion",
@@ -432,8 +458,22 @@ class Autopilot:
         for lab nominations and built-ins — a lab entry gets zero extra powers.
         """
         cid = cfg["id"]
+        if cfg.get("cf_only"):
+            # Scored purely from the recorded signal stream — no live sandbox
+            # trader, no engines. It exists in configs/order so it appears in
+            # standings and can be crowned like anyone else.
+            self.configs[cid] = cfg
+            if cid not in self.order:
+                self.order.append(cid)
+            return
+        # Each live challenger persists its OWN book (the sim's state_path
+        # mechanism). Without this, every deploy wiped all challenger trades —
+        # and this pipeline deploys on every push, so no challenger could ever
+        # mathematically reach MIN_OOS_TRADES. The tournament ran forever and
+        # could never conclude.
         t = bs.PaperTrader(force_paper=True, no_persist=True,
-                           start_balance=CHALLENGER_START)
+                           start_balance=CHALLENGER_START,
+                           state_path=os.path.join(bs._DATA_DIR, f"ap_{cid}.json"))
         if cfg.get("risk_min") is not None:
             t._force_risk_min = cfg["risk_min"]
         if cfg.get("risk_max") is not None:
@@ -448,6 +488,12 @@ class Autopilot:
         self.last_sig[cid] = {}
 
     def _retire_challenger(self, cid):
+        try:
+            _f = os.path.join(bs._DATA_DIR, f"ap_{cid}.json")
+            if os.path.exists(_f):
+                os.remove(_f)
+        except Exception:
+            pass
         """Drop one config from every per-id structure; heal the champion pointer.
 
         Touches ONLY the retired id's entries — every other challenger keeps its
@@ -664,6 +710,73 @@ class Autopilot:
         t = edge / (sd / math.sqrt(n))
         return n, edge, t, statistics.fmean(gross)
 
+    def score_counterfactual(self, cfg):
+        """Score one config against the RECORDED signal stream.
+
+        The live sandbox books starve: challengers only trade when the main
+        pipeline fires (~1-2/day), so MIN_OOS_TRADES took months even before
+        deploys wiped the books. But shadow_signals records EVERY evaluated
+        signal with 6/24/48h outcomes — a config with expressible filters can
+        be scored against all of them.
+
+        Honesty terms, stated: fills are the recorded signal price (optimistic
+        — no queue, no spread), the exit is a FIXED horizon (fwdN), and rows
+        are non-overlapping per pair at that horizon (overlap inflated t ~3x
+        elsewhere in this project). Costs are charged in full. Rows before
+        AP_CF_EPOCH (or the config's own birth, if later) never count — a
+        config suggested by an audit over past rows is graded only on rows it
+        has never seen.
+        """
+        spec = cfg.get("cf")
+        if not spec or not bs.db.connected:
+            return None
+        horizon = spec.get("horizon", "fwd48")
+        if horizon not in ("fwd6", "fwd24", "fwd48"):
+            return None
+        born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
+        try:
+            with bs.db.conn.cursor() as cur:
+                cur.execute(f"""SELECT ts, pair, sig, conf, adx, er, rr_net, {horizon}
+                               FROM shadow_signals
+                               WHERE fwd_done=1 AND {horizon} IS NOT NULL
+                                 AND sig IN ('BUY','SELL') AND ts > %s
+                               ORDER BY pair, ts""", (born,))
+                rows = cur.fetchall()
+        except Exception as e:
+            log("AUTOPILOT", f"cf score {cfg['id']}: {e}", "WRN")
+            return None
+        hor_s = {"fwd6": 6, "fwd24": 24, "fwd48": 48}[horizon] * 3600
+        nets, last_kept = [], {}
+        for ts, pair, sig, conf, adx, er, rr_net, fwd in rows:
+            if spec.get("conf") is not None and (conf is None or float(conf) < spec["conf"]):
+                continue
+            if spec.get("adx") is not None and (adx is None or float(adx) < spec["adx"]):
+                continue
+            if spec.get("er") is not None and (er is None or float(er) < spec["er"]):
+                continue
+            if spec.get("rr") is not None and (rr_net is None or float(rr_net) < spec["rr"]):
+                continue
+            lk = last_kept.get(pair)
+            if lk is not None and float(ts) - lk < hor_s:
+                continue                       # overlapping forward window
+            last_kept[pair] = float(ts)
+            gross = float(fwd) if sig == "BUY" else -float(fwd)
+            nets.append((gross - bs.ROUND_TRIP_COST_PCT, gross))
+        n = len(nets)
+        if n < 2:
+            return {"n_oos": n, "oos_edge": None, "t": None,
+                    "gross_edge": None, "clears_cost": False, "via": "cf"}
+        net = [x[0] for x in nets]
+        gross_l = [x[1] for x in nets]
+        edge = statistics.fmean(net)
+        sd = statistics.pstdev(net)
+        t = (edge / (sd / math.sqrt(n))) if sd > 1e-12 else None
+        g = statistics.fmean(gross_l)
+        clears = (n >= MIN_OOS_TRADES and t is not None and edge > 0
+                  and t >= T_MARGIN and g > bs.ROUND_TRIP_COST_PCT)
+        return {"n_oos": n, "oos_edge": edge, "t": t, "gross_edge": g,
+                "clears_cost": bool(clears), "via": "cf"}
+
     def score(self):
         """Per-config OOS net-of-cost scoring. Returns {id: {...}}.
 
@@ -676,25 +789,42 @@ class Autopilot:
         net-of-fee return already charges the cost that baseline exists to subtract.
         """
         out = {}
-        for cid, t in self.traders.items():
-            rows = self._trade_returns(t.trades)
-            n_all = len(rows)
-            res = {"id": cid, "n": n_all, "n_oos": 0, "oos_edge": None,
+        for cid, cfg in self.configs.items():
+            t = self.traders.get(cid)
+            res = {"id": cid, "n": 0, "n_oos": 0, "oos_edge": None,
                    "t": None, "avg_pnl_net": None, "gross_edge": None,
-                   "clears_cost": False, "balance": round(t.balance, 2)}
-            if n_all >= MIN_TOTAL_TRADES:
-                mid = n_all // 2
-                is_rows, oos_rows = rows[:mid], rows[mid:]
-                _, is_edge, _, _ = self._stats(is_rows)
-                n_o, o_edge, o_t, o_gross = self._stats(oos_rows)
-                res.update({"n_oos": n_o, "oos_edge": o_edge, "t": o_t,
-                            "avg_pnl_net": o_edge, "gross_edge": o_gross})
-                if (n_o >= MIN_OOS_TRADES and o_edge is not None and o_t is not None
-                        and is_edge is not None):
-                    clears = (o_edge > 0 and o_t >= T_MARGIN
-                              and o_gross is not None and o_gross > bs.ROUND_TRIP_COST_PCT
-                              and (is_edge > 0))  # same direction in-sample
-                    res["clears_cost"] = bool(clears)
+                   "clears_cost": False, "via": "live",
+                   "balance": round(t.balance, 2) if t else None}
+            if t is not None:
+                rows = self._trade_returns(t.trades)
+                n_all = len(rows)
+                res["n"] = n_all
+                if n_all >= MIN_TOTAL_TRADES:
+                    mid = n_all // 2
+                    is_rows, oos_rows = rows[:mid], rows[mid:]
+                    _, is_edge, _, _ = self._stats(is_rows)
+                    n_o, o_edge, o_t, o_gross = self._stats(oos_rows)
+                    res.update({"n_oos": n_o, "oos_edge": o_edge, "t": o_t,
+                                "avg_pnl_net": o_edge, "gross_edge": o_gross})
+                    if (n_o >= MIN_OOS_TRADES and o_edge is not None and o_t is not None
+                            and is_edge is not None):
+                        clears = (o_edge > 0 and o_t >= T_MARGIN
+                                  and o_gross is not None and o_gross > bs.ROUND_TRIP_COST_PCT
+                                  and (is_edge > 0))  # same direction in-sample
+                        res["clears_cost"] = bool(clears)
+            # Counterfactual read from the recorded stream. Real fills outrank
+            # simulated ones: cf drives the record ONLY while the live book is
+            # still short of MIN_OOS_TRADES. Once a live book graduates, it
+            # speaks for itself and cf becomes a footnote.
+            cf = self.score_counterfactual(cfg) if cfg.get("cf") or cfg.get("cf_only") else None
+            if cf is not None:
+                res["cf_n_oos"] = cf["n_oos"]
+                res["cf_edge"] = cf["oos_edge"]
+                res["cf_t"] = cf["t"]
+                if res["n_oos"] < MIN_OOS_TRADES:
+                    res.update({"n_oos": cf["n_oos"], "oos_edge": cf["oos_edge"],
+                                "t": cf["t"], "gross_edge": cf["gross_edge"],
+                                "clears_cost": cf["clears_cost"], "via": "cf"})
             out[cid] = res
         self.scores = out
         return out
@@ -861,6 +991,14 @@ class Autopilot:
             "cost_gate_pct": round(bs.ROUND_TRIP_COST_PCT * 100, 3),
             "t_margin": T_MARGIN,
             "min_oos_trades": MIN_OOS_TRADES,
+            "cf_epoch": AP_CF_EPOCH,
+            "standings": [
+                {**{k: (self.scores.get(cid) or {}).get(k) for k in
+                    ("n", "n_oos", "oos_edge", "t", "clears_cost", "via")},
+                 "id": cid,
+                 "cf_only": bool(self.configs.get(cid, {}).get("cf_only"))}
+                for cid in self.order if cid in self.configs
+            ],
             "lab_slots": [cid for cid in self.order if cid.startswith("lab_")],
             "challengers": challengers,
             "decision_log": self.decision_log[-15:],

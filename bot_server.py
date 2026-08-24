@@ -11184,6 +11184,10 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
             <div class="sim-stat-val" id="ap_nch">—</div>
           </div>
         </div>
+        <!-- The tournament, visible: every challenger's progress toward the
+             bar, not just the winner's name. FLAT stops meaning "broken" the
+             moment you can see nobody has earned the crown yet. -->
+        <div id="ap_standings" style="margin-top:11px"></div>
       </div>
     </div>
 
@@ -15834,6 +15838,39 @@ function renderAutopilot(d){
   if($('ap_champ'))$('ap_champ').textContent=d.champion||'FLAT';
   if($('ap_gate'))$('ap_gate').textContent=(d.cost_gate_pct!=null?d.cost_gate_pct+'%':'—');
   if($('ap_nch'))$('ap_nch').textContent=(d.challengers?d.challengers.length:0).toString();
+  // Standings: progress toward the promotion bar for every entrant. Colour is
+  // a claim here like everywhere else — a row only goes green when it CLEARS
+  // (n>=20 AND t>=2 AND beats cost), never because its middle number looks
+  // nice at n=6.
+  const st=$('ap_standings');
+  if(st&&d.standings&&d.standings.length){
+    const need=d.min_oos_trades||20;
+    st.innerHTML='<div style="font-family:var(--fn);font-size:.5rem;letter-spacing:.12em;'
+      +'color:var(--mu);margin-bottom:7px">STANDINGS — first to n'+need
+      +' with t&ge;'+(d.t_margin||2)+' after costs takes the book</div>'
+      +d.standings.map(r=>{
+        const n=r.n_oos||0;
+        const frac=Math.min(1,n/need);
+        const clr=r.clears_cost?'var(--g)':'var(--bd3)';
+        const edge=(r.oos_edge!=null&&n>=need)
+          ?((r.oos_edge>=0?'+':'')+(r.oos_edge*100).toFixed(2)+'% t '+(r.t!=null?r.t.toFixed(1):'—'))
+          :(n+'/'+need);
+        const via=r.via==='cf'?' <span style="color:var(--mu)">rec</span>':'';
+        return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+          +'<span class="mono" style="font-size:.6rem;color:var(--tx);width:92px;'
+            +'overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+r.id+via+'</span>'
+          +'<div style="flex:1;height:4px;border-radius:99px;background:rgba(255,255,255,.06);'
+            +'overflow:hidden"><div style="height:100%;width:'+(frac*100).toFixed(0)
+            +'%;border-radius:99px;background:'+clr+'"></div></div>'
+          +'<span class="mono" style="font-size:.56rem;width:88px;text-align:right;'
+            +'color:'+(r.clears_cost?'var(--g)':'var(--mu)')+'">'+edge+'</span>'
+        +'</div>';
+      }).join('')
+      +'<div style="font-size:.56rem;color:var(--mu);line-height:1.5;margin-top:5px">'
+      +'&ldquo;rec&rdquo; rows are scored on recorded signals with fixed-horizon exits '
+      +'&mdash; fills simulated, costs charged, future signals only. Real fills '
+      +'outrank them once a book reaches n'+need+'.</div>';
+  }
 }
 async function toggleAutopilot(){
   if(!_pinUnlocked){showToast('🔒 Unlock with PIN first','',2500);return;}
