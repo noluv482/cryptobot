@@ -11151,7 +11151,7 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
           <div class="sim-bal-lbl">Allocation</div>
           <div class="sim-bal" id="ap_alloc" style="font-size:1.1rem">—</div>
         </div>
-        <button class="sim-toggle" id="ap_toggle_btn" onclick="toggleAutopilot()">OFF</button>
+        <button class="sim-toggle" id="ap_toggle_btn" onclick="toggleAutopilot()">&#8230;</button>
       </div>
       <div class="sim-off-msg" id="ap_off_msg">Autopilot is OFF — tap to enable</div>
       <div id="ap_stats_wrap" style="display:none">
@@ -15802,7 +15802,15 @@ function renderAutopilot(d){
   _apEnabled=!!(d&&d.enabled);
   const btn=$('ap_toggle_btn'),off=$('ap_off_msg'),wrap=$('ap_stats_wrap');
   if(btn){btn.textContent=_apEnabled?'ON':'OFF';btn.className='sim-toggle'+(_apEnabled?' on':'');}
-  if(off)off.style.display=_apEnabled?'none':'';
+  if(off){
+    off.style.display=_apEnabled?'none':'';
+    if(!_apEnabled&&d&&d.boot_error){
+      off.textContent='Autopilot hit an error at startup and is retrying '
+        +'automatically every 5 min: '+d.boot_error;
+    }else if(!_apEnabled){
+      off.textContent='Autopilot is OFF — tap to enable';
+    }
+  }
   if(wrap)wrap.style.display=_apEnabled?'':'none';
   if(!_apEnabled)return;
   const alloc=d.allocation||'FLAT';
@@ -19663,8 +19671,35 @@ def main():
     except Exception as _ap_e:
         import traceback as _ap_tb
         _autopilot_boot_error = f"{type(_ap_e).__name__}: {_ap_e}"
-        log("BOOT", f"Autopilot init FAILED — staying disabled: {_ap_e}\n{_ap_tb.format_exc()}", "ERR")
+        log("BOOT", f"Autopilot init FAILED — will keep retrying: {_ap_e}\n{_ap_tb.format_exc()}", "ERR")
         _autopilot = None
+
+    # A failed init used to stay failed for the container's whole life — with
+    # a deploy-per-push pipeline that turned any transient boot hiccup into
+    # "autopilot randomly off until the next deploy", which the owner
+    # experienced as "the autopilot keeps turning off". If the persisted
+    # choice says ON and the instance is missing, keep trying in the
+    # background until it sticks.
+    def _autopilot_retry_loop():
+        global _autopilot, _autopilot_boot_error
+        while True:
+            time.sleep(300)
+            try:
+                if _autopilot is not None:
+                    continue
+                import autopilot as _mod
+                if _mod.autopilot_persisted_state() is not True:
+                    continue          # owner's choice is OFF (or never chosen)
+                _autopilot = _mod.Autopilot()
+                _autopilot_boot_error = None
+                log("AUTOPILOT", "recovered by retry loop — "
+                    f"{_autopilot.n_configs()} challengers, "
+                    f"champion={_autopilot.champion_id or 'FLAT'}")
+            except Exception as _re:
+                _autopilot_boot_error = f"{type(_re).__name__}: {_re}"
+                log("AUTOPILOT", f"retry failed (next in 5 min): {_re}", "WRN")
+    threading.Thread(target=_autopilot_retry_loop, daemon=True,
+                     name="autopilot-retry").start()
 
     # ── Research lab (nightly paper-only strategy sweeps, subprocess) ─────────
     # State only in the log line — the scheduler thread itself re-reads the env
