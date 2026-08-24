@@ -4903,10 +4903,15 @@ class PaperTrader:
                          balance=self.balance,
                          stop_type=stop_label)
         _p = self.positions[pair]
-        threading.Thread(target=_send_position_chart,
-                         args=(pair, _p["entry"], _p["side"],
-                               _p.get("trail_stop")),
-                         daemon=True).start()
+        # Only the MAIN book announces with a chart — the sim and the autopilot
+        # challengers run through this same _open, and without this guard each
+        # of them sent its own duplicate "position open" photo (the close-side
+        # send below already had it).
+        if not self._force_paper:
+            threading.Thread(target=_send_position_chart,
+                             args=(pair, _p["entry"], _p["side"],
+                                   _p.get("trail_stop")),
+                             daemon=True).start()
 
     def _close(self, price, name, reason, pair):
         global _paused
@@ -6820,6 +6825,8 @@ _CHART_COLORS = {
     "MUTED":    "#6e7681",
 }
 
+_chart_lock = threading.Lock()   # pyplot: one figure build at a time, ever
+
 def _make_price_chart(pair, entry=None, entry_side=None,
                       trail_stop=None, exit_price=None, exit_pnl=None):
     """Generate a dark-theme candlestick + RSI chart for a pair.
@@ -6830,7 +6837,11 @@ def _make_price_chart(pair, entry=None, entry_side=None,
     except Exception as e:
         log("CHART", f"klines failed {pair}: {e}", "ERR")
         return None
-    try:
+    # pyplot is global-state and NOT thread-safe: two chart threads at once
+    # (open + live update, or two books opening together) interleaved their
+    # figures — blank sends and "no renderer" errors. One lock, whole build.
+    with _chart_lock:
+      try:
         n   = len(closes)
         x   = list(range(n))
         col = _CHART_COLORS
@@ -6992,12 +7003,12 @@ def _make_price_chart(pair, entry=None, entry_side=None,
         fig.subplots_adjust(left=0.07, right=0.78, top=0.93, bottom=0.03)
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+        fig.savefig(buf, format="png", dpi=140,
                     facecolor=fig.get_facecolor())
         buf.seek(0)
         plt.close(fig)
         return buf
-    except Exception as e:
+      except Exception as e:
         log("CHART", f"_make_price_chart {pair}: {e}", "ERR")
         try: plt.close("all")
         except Exception: pass
@@ -7303,7 +7314,11 @@ def _cmd_equity(trader):
 
     fig.tight_layout()
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+    # Same fix as _make_price_chart: save THIS figure, never pyplot's global
+    # "current" one — under concurrent chart threads that saved someone
+    # else's empty canvas. tight_layout above already frames it, so the
+    # fragile bbox_inches="tight" renderer pass is dropped here too.
+    fig.savefig(buf, format="png", dpi=130,
                 facecolor=fig.get_facecolor())
     buf.seek(0)
     plt.close(fig)
