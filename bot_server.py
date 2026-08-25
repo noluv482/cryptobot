@@ -11156,6 +11156,12 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
           <div class="sim-pos-hdr">Open Positions</div>
           <div id="sim_pos_list"></div>
         </div>
+        <!-- What the sim is actually DOING: its closed trades, newest first.
+             Aggregates alone made this card a scoreboard with no game. -->
+        <div id="sim_trades_wrap" style="display:none;margin-top:10px">
+          <div class="sim-pos-hdr">Its Trades</div>
+          <div id="sim_trades_list"></div>
+        </div>
       </div>
     </div>
 
@@ -15795,6 +15801,37 @@ function renderSim(d){
       '</div>';
     }).join('');
   }
+  // The sim's closed trades, newest first — coin, side, how it ended, what it
+  // made or lost, and how long it ran. Same facts a main-book trade row shows,
+  // because a trade you cannot see is a trade you cannot learn from.
+  const simTr=d.recent_trades||[];
+  const trWrap=$('sim_trades_wrap');
+  if(trWrap)trWrap.style.display=simTr.length?'':'none';
+  if($('sim_trades_list')){
+    $('sim_trades_list').innerHTML=simTr.map(t=>{
+      const win=(t.pnl||0)>=0;
+      const isLong=(t.side||'').toUpperCase().indexOf('L')===0||t.side==='BUY';
+      const held=t.held_mins>=60?Math.round(t.held_mins/60)+'h':Math.round(t.held_mins||0)+'m';
+      const when=t.ts?new Date(t.ts>2e10?t.ts:t.ts*1000)
+        .toLocaleDateString('en-US',{month:'short',day:'numeric'}):'';
+      return '<div class="sim-pos-row">'+
+        '<span style="display:flex;align-items:center;gap:7px;min-width:0">'+
+          '<span style="font-family:var(--fn);font-size:.56rem;font-weight:700;'
+            +'padding:2px 6px;border-radius:5px;flex-shrink:0;'
+            +(isLong?'background:rgba(0,204,116,.13);color:var(--g)'
+                    :'background:rgba(255,51,82,.12);color:var(--r)')+'">'
+            +(isLong?'L':'S')+'</span>'+
+          '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+            +(t.coin||'')+'</span>'+
+          '<span style="font-size:.6rem;color:var(--mu);flex-shrink:0">'
+            +(t.reason||'')+' · '+held+(when?' · '+when:'')+'</span>'+
+        '</span>'+
+        '<span style="color:'+(win?'var(--g)':'var(--r)')
+          +';font-variant-numeric:tabular-nums;flex-shrink:0">'
+          +(win?'+$':'-$')+fmt(Math.abs(t.pnl||0))+'</span>'+
+      '</div>';
+    }).join('');
+  }
 }
 async function toggleSim(){
   try{
@@ -17665,6 +17702,19 @@ def _web_sim():
         "losses":     n - wins,
         "win_rate":   round(wins / max(n, 1) * 100, 1),
         "positions":  open_pos,
+        # The sim's actual trades, newest first. The card used to show only
+        # aggregates, so "what is the sim DOING" had no answer on the site —
+        # the owner had to ssh into the box to see a single sim trade.
+        "recent_trades": [{
+            "coin":  t.get("coin") or t.get("pair", ""),
+            "side":  t.get("side", ""),
+            "pnl":   round(float(t.get("pnl", 0)), 2),
+            "reason": t.get("reason", ""),
+            "held_mins": round(float(t.get("held_mins", 0))),
+            "ts":    t.get("ts", 0),
+            "entry": t.get("entry_price") or t.get("entry"),
+            "exit":  t.get("exit_price") or t.get("exit"),
+        } for t in list(_sim_trader.trades)[-12:][::-1]],
     }), mimetype="application/json")
 
 @_flask_app.route("/autopilot")
