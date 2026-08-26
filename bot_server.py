@@ -1072,6 +1072,21 @@ class Database:
             # 15m-vs-1h comparison a real starting sample. New inserts always set
             # timeframe, so NULL can only mean "pre-migration".
             cur.execute("UPDATE trades SET timeframe = 15 WHERE timeframe IS NULL")
+            # cfg_hash: fingerprint of every gate/risk setting live when the
+            # trade was OPENED. NULL means "before stamping existed" — never
+            # backfilled, because guessing a past config would be fiction.
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS cfg_hash TEXT")
+            # config_ledger: cfg_hash → the full settings snapshot behind it.
+            # A trade stamped a1b2c3 stays explainable after every slider has
+            # moved since: the ledger row says exactly what the bot's config
+            # was at that moment. Append-only; rows are never rewritten.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS config_ledger (
+                    cfg_hash   TEXT PRIMARY KEY,
+                    first_seen FLOAT,
+                    snapshot   TEXT
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
                     id         INT PRIMARY KEY DEFAULT 1,
@@ -1237,17 +1252,21 @@ class Database:
     def save_trade(self, t):
         if not self.conn: return
         try:
+            # Named-param INSERT raises KeyError on a missing key, and older
+            # callers do not pass cfg_hash — default it rather than crash a close.
+            t = {**t}
+            t.setdefault("cfg_hash", "")
             with self.conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO trades
                       (ts, coin, pair, side, entry, exit_price, pnl, held_mins,
                        reason, confidence, nasdaq_mood, news_sent, balance_after,
-                       strategy, timeframe)
+                       strategy, timeframe, cfg_hash)
                     VALUES
                       (%(ts)s,%(coin)s,%(pair)s,%(side)s,%(entry)s,%(exit_price)s,
                        %(pnl)s,%(held_mins)s,%(reason)s,%(confidence)s,
                        %(nasdaq_mood)s,%(news_sent)s,%(balance_after)s,
-                       %(strategy)s,%(timeframe)s)
+                       %(strategy)s,%(timeframe)s,%(cfg_hash)s)
                 """, t)
         except Exception as e:
             log("DB", f"Save error: {e}", "ERR")
@@ -1595,6 +1614,52 @@ class Database:
         except Exception as e:
             log("DB", f"fill_manual: {e}", "ERR")
 
+    def manual_history(self, limit=15):
+        """The owner's CLOSED hand trades as the lab recorded them — newest
+        first, plus whole-book counts. DISPLAY ONLY: this renders the owner's
+        own record back to the owner. It is deliberately NOT usable by the
+        trading side — test_manual_lab.py treats manual_history like the other
+        lab calls, so any trading path that touches it fails the build. The
+        write-only guard protects the BOT from adapting to the human; the
+        human reading his own closed trades breaks nothing."""
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT ts_entry, ts_exit, pair, side, leverage,
+                                      pnl, held_mins, exit_rule, bot_gate,
+                                      bot_sig, echo
+                               FROM manual_lab WHERE ts_exit IS NOT NULL
+                               ORDER BY ts_exit DESC LIMIT %s""", (limit,))
+                rows = [{"ts_entry": r[0], "ts_exit": r[1], "pair": r[2],
+                         "side": r[3], "leverage": r[4],
+                         "pnl": round(float(r[5]), 2) if r[5] is not None else None,
+                         "held_mins": r[6], "exit_rule": r[7] or "",
+                         "bot_gate": r[8] or "", "bot_sig": r[9] or "",
+                         "echo": r[10] or ""} for r in cur.fetchall()]
+                cur.execute("""SELECT count(*),
+                                      count(*) FILTER (WHERE exit_rule LIKE 'PLAN%%'),
+                                      count(*) FILTER (WHERE side='SELL'),
+                                      count(*) FILTER (WHERE pnl > 0)
+                               FROM manual_lab WHERE ts_exit IS NOT NULL""")
+                n, plan, shorts, wins = cur.fetchone()
+                return {"rows": rows, "closed": n, "plan_exits": plan,
+                        "shorts": shorts, "wins": wins}
+        except Exception as e:
+            log("DB", f"manual_history: {e}", "ERR"); return None
+
+    def ensure_config(self, cfg_hash, snapshot_json):
+        """Record a config fingerprint the first time it is seen. Idempotent —
+        the ledger keeps the FIRST sighting so first_seen means what it says."""
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""INSERT INTO config_ledger (cfg_hash, first_seen, snapshot)
+                               VALUES (%s,%s,%s)
+                               ON CONFLICT (cfg_hash) DO NOTHING""",
+                            (cfg_hash, time.time(), snapshot_json))
+        except Exception as e:
+            log("DB", f"ensure_config: {e}", "ERR")
+
     def pillar_win_rates(self):
         """Per-pillar win rate when that pillar was ACTIVE. Min 10 samples."""
         if not self.conn: return {}
@@ -1736,6 +1801,39 @@ def _save_runtime_settings():
         os.replace(tmp, _RUNTIME_SETTINGS_FILE)   # atomic: no torn file on kill
     except Exception as e:
         log("SET", f"save_runtime_settings: {e}", "ERR")
+
+def _cfg_snapshot():
+    """Everything that decides WHICH trades the bot takes and how big they are,
+    as one plain dict. This is the answer to "why did results change?" — when
+    a stat moves, the stamped fingerprint says whether the config moved with
+    it. Keys are a fixed, secret-free set: no API keys, no PAPER_LOCK, no
+    tokens — the snapshot lands in the DB verbatim and must stay shareable."""
+    try:
+        champ = _autopilot.champion_id if _autopilot else None
+    except Exception:
+        champ = None
+    return {
+        "interval_m":      INTERVAL,
+        "min_confidence":  MIN_CONFIDENCE,
+        "adx_min":         ADX_MIN,
+        "er_min":          ER_MIN,
+        "min_rr_live":     MIN_RR_RATIO,
+        "min_rr_paper":    PAPER_MIN_RR,
+        "risk_max":        RISK_MAX,
+        "max_positions":   _rt_max_positions,
+        "max_drawdown":    _rt_max_drawdown,
+        "daily_limits":    _daily_limits,
+        "disabled_pairs":  sorted(_disabled_pairs),
+        "round_trip_cost": ROUND_TRIP_COST_PCT,
+        "ap_champion":     champ or "",
+        "code_version":    os.environ.get("GIT_SHA", ""),
+    }
+
+def _cfg_fingerprint():
+    """10-hex-char stamp of the current config. Same settings → same stamp,
+    any settings change → new stamp, deterministically (sorted keys)."""
+    snap = json.dumps(_cfg_snapshot(), sort_keys=True)
+    return hashlib.sha256(snap.encode()).hexdigest()[:10]
 
 def _load_runtime_settings():
     """Boot-time restore. Every field is optional and individually guarded so
@@ -4854,7 +4952,18 @@ class PaperTrader:
                 target = round(fill + _min_tgt_dist if side == "LONG" else fill - _min_tgt_dist, 8)
         effective_target = float("inf") if (side == "LONG"  and self._trail_only(pair)) else \
                            0.0          if (side == "SHORT" and self._trail_only(pair)) else target
-        self.positions[pair] = {"side": side, "entry": fill,
+        # Config stamp — the gate/risk settings live at THIS moment, so the
+        # trade stays attributable after settings change. Real book only: sim
+        # and backtest opens must not spam the ledger.
+        _cfg_h = ""
+        if not self._no_persist and not self._force_paper:
+            try:
+                _cfg_h = _cfg_fingerprint()
+                db.ensure_config(_cfg_h, json.dumps(_cfg_snapshot(), sort_keys=True))
+            except Exception as _ce:
+                log("CFG", f"stamp at open: {_ce}", "ERR")
+        self.positions[pair] = {"cfg_hash": _cfg_h,
+                                "side": side, "entry": fill,
                                 "contracts": contracts, "margin": margin,
                                 "target": effective_target, "opened_at": time.time(),
                                 "confidence": confidence, "leverage": leverage,
@@ -4986,7 +5095,10 @@ class PaperTrader:
                      "confidence": p.get("confidence", 0.0),
                      "held_mins": held_mins, "reason": reason, "ts": time.time(),
                      "fkey": p.get("fkey", ""), "hour": datetime.utcnow().hour,
-                     "pillars": p.get("pillars", {})}
+                     "pillars": p.get("pillars", {}),
+                     # stamped at OPEN — the config that DECIDED this trade,
+                     # not whatever the settings happen to be at close time
+                     "cfg_hash": p.get("cfg_hash", "")}
         self.trades.append(trade_rec)
         # Bot writes its own journal note. After the append so the note can quote
         # history, and wrapped inside _auto_note_record so a note can never take
@@ -5028,6 +5140,7 @@ class PaperTrader:
                 "balance_after": self.balance,
                 "strategy": p.get("strategy", "") or "",
                 "timeframe": INTERVAL,
+                "cfg_hash": p.get("cfg_hash", ""),
             })
             _push_sse("trade_close", {"name": name, "side": p["side"],
                                        "pnl": pnl, "reason": reason,
@@ -9858,6 +9971,23 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   padding:11px 0;min-height:44px;cursor:pointer;font-family:var(--fn);
   font-size:.6rem;font-weight:700;letter-spacing:.07em}
 
+/* My Trades — the lab's record of the owner's own closed trades */
+.mt-lab-hd{display:flex;align-items:baseline;justify-content:space-between;
+  margin:14px 2px 7px;font-family:var(--fn);font-size:.6rem;font-weight:700;
+  letter-spacing:.08em;color:var(--mu)}
+.mt-lab-sub{font-size:.58rem;font-weight:400;letter-spacing:0}
+.mt-lab-row{display:flex;align-items:center;justify-content:space-between;
+  gap:8px;padding:7px 2px;border-bottom:1px solid var(--bd)}
+.mt-lab-row:last-child{border-bottom:none}
+.mt-lab-left{display:flex;align-items:center;gap:7px;min-width:0;flex:1}
+.mt-lab-chip{font-family:var(--fn);font-size:.54rem;font-weight:700;
+  padding:2px 6px;border-radius:5px;flex-shrink:0;letter-spacing:.03em}
+.mt-lab-meta{font-size:.58rem;color:var(--mu);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.mt-lab-pnl{font-variant-numeric:tabular-nums;font-size:.72rem;
+  font-weight:600;flex-shrink:0}
+.mt-lab-note{margin-top:8px;font-size:.58rem;color:var(--mu);line-height:1.5}
+
 .alert-sheet{position:fixed;inset:0;z-index:300;display:none}
 .alert-sheet.open{display:block}
 .alert-overlay{position:absolute;inset:0;background:rgba(0,0,0,.6)}
@@ -11439,6 +11569,16 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
       </div>
 
       <div class="mt-msg" id="mt_msg"></div>
+
+      <!-- The lab's copy of his CLOSED trades: did the exit follow the written
+           plan, and what did the bot think at entry. Closed trades only — the
+           bot's LIVE opinion stays off this tab on purpose (see the LEARNING
+           note above): retrospective feedback teaches, live opinion leads. -->
+      <div id="mt_lab_wrap" style="display:none">
+        <div class="mt-lab-hd"><span>MY TRADES</span><span class="mt-lab-sub" id="mt_lab_sub"></span></div>
+        <div id="mt_lab_list"></div>
+        <div class="mt-lab-note" id="mt_lab_note"></div>
+      </div>
     </div>
   </div>
 
@@ -12523,7 +12663,66 @@ async function mtClose(){
     if(d.error){_mtMsg(d.error,'err');return;}
     _mtMsg('closed  '+(d.pnl>=0?'+':'')+d.pnl.toFixed(2),d.pnl>=0?'ok':'err');
     fetchManual();
+    setTimeout(fetchManualLab,600);   // the lab row is stamped in the close request
   }catch(e){_mtMsg('failed: '+e,'err');}
+}
+
+/* ── MY TRADES — the lab's record of his own closed trades ────────────────
+   Shows the two facts the lab exists to capture: whether the EXIT followed
+   the written plan (his discipline), and what the bot thought at ENTRY
+   (independence). Retrospective only — closed trades, never a live opinion. */
+async function fetchManualLab(){
+  try{
+    const d=await(await fetch('/manual/lab?device_id='+encodeURIComponent(_getDeviceId()))).json();
+    if(d.error)return;
+    const wrap=$('mt_lab_wrap');if(!wrap)return;
+    const rows=d.rows||[];
+    wrap.style.display=rows.length?'':'none';
+    if(!rows.length)return;
+    const sub=$('mt_lab_sub');
+    if(sub)sub.textContent=d.closed+' closed · '+(d.plan_exits||0)+' exits by plan';
+    $('mt_lab_list').innerHTML=rows.map(t=>{
+      const win=(t.pnl||0)>=0;
+      const isLong=t.side==='BUY';
+      const coin=(t.pair||'').replace(/USD$/,'');
+      const held=t.held_mins>=60?Math.round(t.held_mins/60)+'h':Math.round(t.held_mins||0)+'m';
+      const when=t.ts_exit?new Date(t.ts_exit*1000)
+        .toLocaleDateString('en-US',{month:'short',day:'numeric'}):'';
+      const rule=(t.exit_rule||'');
+      const planned=rule.indexOf('PLAN')===0;
+      const ruleChip=planned
+        ?'<span class="mt-lab-chip" style="background:rgba(0,204,116,.13);color:var(--g)">PLAN ✓</span>'
+        :rule==='BOOK_RESET'
+        ?'<span class="mt-lab-chip" style="background:rgba(255,255,255,.06);color:var(--mu)">RESET</span>'
+        :'<span class="mt-lab-chip" style="background:rgba(255,255,255,.06);color:var(--mu)">HAND</span>';
+      // what the bot thought at ENTRY: a gate name means it said no
+      const g=t.bot_gate||'';
+      const botTxt=(g&&g!=='NOT_EVALUATED')?'bot said no ('+g+')'
+        :(t.bot_sig==='BUY'||t.bot_sig==='SELL')?'bot: '+t.bot_sig.toLowerCase()
+        :'bot: no view';
+      const lev=(t.leverage||1)>1?(t.leverage+'x · '):'';
+      return '<div class="mt-lab-row">'+
+        '<span class="mt-lab-left">'+
+          '<span class="mt-lab-chip" style="'+(isLong
+            ?'background:rgba(0,204,116,.13);color:var(--g)'
+            :'background:rgba(255,51,82,.12);color:var(--r)')+'">'+(isLong?'L':'S')+'</span>'+
+          '<span style="font-weight:600;flex-shrink:0">'+coin+'</span>'+ruleChip+
+          '<span class="mt-lab-meta">'+lev+held+(when?' · '+when:'')+' · '+botTxt
+            +(t.echo==='ECHO'?' · echo':'')+'</span>'+
+        '</span>'+
+        '<span class="mt-lab-pnl" style="color:'+(win?'var(--g)':'var(--r)')+'">'
+          +(win?'+$':'-$')+Math.abs(t.pnl||0).toFixed(2)+'</span>'+
+      '</div>';
+    }).join('');
+    const note=$('mt_lab_note');
+    if(note){
+      const need=(d.target||30)-d.closed;
+      note.textContent=(need>0
+        ?need+' more closed trades before this record can tell skill from luck.'
+        :'Enough recorded to start measuring — ask for your report.')
+        +((d.shorts||0)===0?' All longs so far — a few shorts would make the record stronger.':'');
+    }
+  }catch(e){console.warn('mlab',e);}
 }
 
 /* ── VALUE-CHANGE FLASH ──────────────────────────────────────────────────
@@ -15139,6 +15338,12 @@ function renderDiagnostics(d){
   if(d.live_mode && !d.paper_mode && !d.paused && d.streak_cooldown===0){
     rows.push({icon:'🟢',cls:'diag-ok',title:'Live trading active',sub:'Bot is scanning and will execute real orders on the next qualifying signal'});
   }
+  // Config fingerprint — every new trade is stamped with this, so when the
+  // stats change you can prove whether the settings changed with them.
+  if(d.cfg_hash){
+    rows.push({icon:'🧾',cls:'diag-ok',title:'Config '+d.cfg_hash,
+      sub:'stamped on every new trade — any settings change creates a new fingerprint'});
+  }
   el.innerHTML=rows.map(r=>'<div class="diag-row">'+
     '<div class="diag-icon">'+r.icon+'</div>'+
     '<div class="diag-body"><div class="diag-title '+r.cls+'">'+r.title+'</div>'+
@@ -16816,6 +17021,7 @@ initStripDrag();
 initStripArrows();
 markSkeletons();      // shimmer the value readouts until the first poll lands
 fetchManual();setInterval(fetchManual,6000);   // manual paper book
+fetchManualLab();setInterval(fetchManualLab,30000);  // his closed trades, from the lab
 fetchOrderFlow();setInterval(fetchOrderFlow,45000);  // tape TTL is 45s server-side
 // Loaded at start, not only on the Journal tab, so the 🤖 marker on a trade row
 // is right the moment the row appears. Only grows when a trade closes.
@@ -17929,6 +18135,7 @@ def _web_livecheck():
         "streak_cooldown":     max(0, round(streak_cool - time.time())),
         "streak_gate_disabled": streak_gate_off,
         "balance":             round(bal, 2),
+        "cfg_hash":            _cfg_fingerprint(),
     }
     # Also fire the Telegram diagnostic in the background so it arrives in chat
     def _fire():
@@ -18135,6 +18342,9 @@ def _web_settings():
         "daily_limits":       _daily_limits,
         "paper_balance":      round(trader.balance, 2) if trader else PAPER_START,
         "streak_gate_disabled": trader._streak_gate_disabled if trader else False,
+        # the fingerprint every NEW trade gets stamped with right now — changes
+        # the moment any setting above changes
+        "cfg_hash":           _cfg_fingerprint(),
     }), mimetype="application/json")
 
 @_flask_app.route("/api/keys", methods=["GET", "POST"])
@@ -19031,6 +19241,25 @@ def _manual_status():
         "leverage_tiers": {str(k): v for k, v in sorted(MANUAL_LEVERAGE.items())},
         "liquidated": sum(1 for t in book["trades"] if t.get("liquidated")),
     }), mimetype="application/json", headers={"Cache-Control": "no-store"})
+
+
+@_flask_app.route("/manual/lab")
+def _web_manual_lab():
+    """The owner's CLOSED trades as the lab recorded them — did the exit follow
+    the written plan, and what did the bot think at entry. DISPLAY ONLY: the
+    owner reading his own record back. The bot's trading paths still never
+    read manual_lab — test_manual_lab.py holds that line from the AST, and
+    this endpoint is on its allowlist by name."""
+    if not _request_is_authorized():
+        return _Response('{"error":"unauthorized"}', status=403, mimetype="application/json")
+    d = db.manual_history(limit=15)
+    if d is None:
+        return _Response(json.dumps({"rows": [], "closed": 0}), mimetype="application/json")
+    # 30 closed trades is where a coin flip and a real edge start to look
+    # different — same bar the LEARNING strip on the trade form quotes.
+    d["target"] = 30
+    return _Response(json.dumps(d), mimetype="application/json",
+                     headers={"Cache-Control": "no-store"})
 
 
 @_flask_app.route("/manual/open", methods=["POST"])

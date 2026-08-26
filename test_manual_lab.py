@@ -111,9 +111,15 @@ ALLOWED = {
     "log_manual", "close_manual", "fill_manual", "manual_pending",
     "censor_open_manual", "bot_view_of",
     "_init", "_init_schema",   # the CREATE/ALTER lives here by definition
+    # DISPLAY ONLY: manual_history renders the owner's own closed trades back
+    # to the owner on the dashboard (/manual/lab). The guard exists to stop
+    # the BOT adapting to his trades — the human reading his own record
+    # breaks nothing. manual_history is itself in LAB_CALLS below, so any
+    # trading path that calls it still fails this test.
+    "manual_history", "_web_manual_lab",
 }
 LAB_CALLS = {"log_manual", "close_manual", "fill_manual", "manual_pending",
-             "censor_open_manual"}
+             "censor_open_manual", "manual_history"}
 readers = []
 for node in ast.walk(tree):
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -146,6 +152,21 @@ check("contamination flag is derived, not self-reported",
       all(k in src for k in ("ECHO", "CONTRA", "INDEPENDENT")))
 check("exits are classified as planned vs discretionary",
       all(k in src for k in ("PLAN_TARGET", "PLAN_STOP", "DISCRETIONARY")))
+
+# 6. VISIBLE — the record is on the site, not only in a CLI report
+check("/manual/lab endpoint exists", '_flask_app.route("/manual/lab")' in src)
+_saved = bs.db.conn
+try:
+    bs.db.conn = None
+    check("manual_history survives no DB", bs.db.manual_history() is None)
+finally:
+    bs.db.conn = _saved
+check("dashboard renders the My Trades panel",
+      all(k in src for k in ("mt_lab_wrap", "mt_lab_list", "fetchManualLab")))
+check("panel is wired into the boot sequence",
+      "setInterval(fetchManualLab" in src)
+check("panel shows plan-vs-hand exits and the bot's entry view",
+      all(k in src for k in ("PLAN ✓", "bot said no", "bot: no view")))
 
 print()
 if FAILS:
