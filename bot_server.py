@@ -1196,7 +1196,13 @@ class Database:
             for _col, _typ in (("plan_stop", "FLOAT"), ("plan_target", "FLOAT"),
                                ("plan_horizon_h", "FLOAT"), ("fee_rt_pct", "FLOAT"),
                                ("bal_at_open", "FLOAT"), ("concurrent_open", "INT"),
-                               ("echo", "TEXT"), ("exit_rule", "TEXT")):
+                               ("echo", "TEXT"), ("exit_rule", "TEXT"),
+                               # plan replay: what the WRITTEN plan would have
+                               # paid on a hand-exited trade, filled offline by
+                               # the learning filler. plan_exit NULL = pending.
+                               ("plan_pnl", "FLOAT"), ("plan_exit", "TEXT"),
+                               # 1 = opened inside the 15-min post-loss window
+                               ("post_loss", "INT DEFAULT 0")):
                 cur.execute(f"ALTER TABLE manual_lab ADD COLUMN IF NOT EXISTS {_col} {_typ}")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS candles (
@@ -1539,9 +1545,9 @@ class Database:
                     (ts_entry,pair,side,entry,size,leverage,notional,
                      bot_sig,bot_conf,bot_gate,shadow_id,bot_in_pair,regime,
                      plan_stop,plan_target,plan_horizon_h,fee_rt_pct,
-                     bal_at_open,concurrent_open,echo)
+                     bal_at_open,concurrent_open,echo,post_loss)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                            %s,%s,%s,%s,%s,%s,%s)
+                            %s,%s,%s,%s,%s,%s,%s,%s)
                     RETURNING id""",
                     (r.get("ts_entry"), r.get("pair"), r.get("side"), r.get("entry"),
                      r.get("size"), r.get("leverage"), r.get("notional"),
@@ -1549,7 +1555,8 @@ class Database:
                      r.get("shadow_id"), r.get("bot_in_pair"), r.get("regime"),
                      r.get("plan_stop"), r.get("plan_target"),
                      r.get("plan_horizon_h"), r.get("fee_rt_pct"),
-                     r.get("bal_at_open"), r.get("concurrent_open"), r.get("echo")))
+                     r.get("bal_at_open"), r.get("concurrent_open"), r.get("echo"),
+                     int(r.get("post_loss") or 0)))
                 return cur.fetchone()[0]
         except Exception as e:
             log("DB", f"log_manual: {e}", "ERR"); return None
@@ -1627,25 +1634,81 @@ class Database:
             with self.conn.cursor() as cur:
                 cur.execute("""SELECT ts_entry, ts_exit, pair, side, leverage,
                                       pnl, held_mins, exit_rule, bot_gate,
-                                      bot_sig, echo
+                                      bot_sig, echo, entry, notional, plan_stop,
+                                      fee_rt_pct, plan_pnl, plan_exit, post_loss,
+                                      exit_reason
                                FROM manual_lab WHERE ts_exit IS NOT NULL
                                ORDER BY ts_exit DESC LIMIT %s""", (limit,))
-                rows = [{"ts_entry": r[0], "ts_exit": r[1], "pair": r[2],
-                         "side": r[3], "leverage": r[4],
-                         "pnl": round(float(r[5]), 2) if r[5] is not None else None,
-                         "held_mins": r[6], "exit_rule": r[7] or "",
-                         "bot_gate": r[8] or "", "bot_sig": r[9] or "",
-                         "echo": r[10] or ""} for r in cur.fetchall()]
+                rows = []
+                for r in cur.fetchall():
+                    row = {"ts_entry": r[0], "ts_exit": r[1], "pair": r[2],
+                           "side": r[3], "leverage": r[4],
+                           "pnl": round(float(r[5]), 2) if r[5] is not None else None,
+                           "held_mins": r[6], "exit_rule": r[7] or "",
+                           "bot_gate": r[8] or "", "bot_sig": r[9] or "",
+                           "echo": r[10] or "",
+                           "plan_pnl": round(float(r[15]), 2) if r[15] is not None else None,
+                           "plan_exit": r[16] or "", "post_loss": int(r[17] or 0),
+                           "exit_reason": r[18] or ""}
+                    # R-multiple: net result over the dollars the WRITTEN stop
+                    # put at risk (incl. round-trip cost). Only computable when
+                    # a stop was actually planned — no stop, no R, honestly.
+                    entry, notional, pstop, fee_rt = r[11], r[12], r[13], r[14]
+                    if (row["pnl"] is not None and entry and notional and pstop
+                            and entry > 0):
+                        risk = notional * abs(entry - pstop) / entry \
+                             + notional * (fee_rt or 0.013)
+                        if risk > 0:
+                            row["r"] = round(row["pnl"] / risk, 2)
+                    rows.append(row)
                 cur.execute("""SELECT count(*),
                                       count(*) FILTER (WHERE exit_rule LIKE 'PLAN%%'),
                                       count(*) FILTER (WHERE side='SELL'),
-                                      count(*) FILTER (WHERE pnl > 0)
+                                      count(*) FILTER (WHERE pnl > 0),
+                                      COALESCE(SUM(plan_pnl - pnl) FILTER (
+                                          WHERE exit_rule='DISCRETIONARY'
+                                            AND plan_pnl IS NOT NULL), 0),
+                                      count(*) FILTER (
+                                          WHERE exit_rule='DISCRETIONARY'
+                                            AND plan_pnl IS NOT NULL)
                                FROM manual_lab WHERE ts_exit IS NOT NULL""")
-                n, plan, shorts, wins = cur.fetchone()
+                n, plan, shorts, wins, hand_delta, hand_n = cur.fetchone()
                 return {"rows": rows, "closed": n, "plan_exits": plan,
-                        "shorts": shorts, "wins": wins}
+                        "shorts": shorts, "wins": wins,
+                        # money the plan would have paid MINUS what hand exits
+                        # actually took. Positive = pulling out early has cost
+                        # him money; negative = his hands have beaten his plans.
+                        "hand_delta": round(float(hand_delta), 2),
+                        "hand_n": hand_n}
         except Exception as e:
             log("DB", f"manual_history: {e}", "ERR"); return None
+
+    def manual_plan_pending(self, limit=100):
+        """Hand-exited rows whose written plan has not been replayed yet.
+        Guarded like every lab call — only the filler loop may consume this."""
+        if not self.conn: return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT id, ts_entry, pair, side, entry, notional,
+                                      leverage, plan_stop, plan_target,
+                                      plan_horizon_h, fee_rt_pct
+                               FROM manual_lab
+                               WHERE ts_exit IS NOT NULL
+                                 AND exit_rule='DISCRETIONARY'
+                                 AND plan_exit IS NULL
+                               ORDER BY ts_entry LIMIT %s""", (limit,))
+                return cur.fetchall()
+        except Exception as e:
+            log("DB", f"manual_plan_pending: {e}", "ERR"); return []
+
+    def fill_manual_plan(self, mid, plan_pnl, plan_exit):
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""UPDATE manual_lab SET plan_pnl=%s, plan_exit=%s
+                               WHERE id=%s""", (plan_pnl, plan_exit, mid))
+        except Exception as e:
+            log("DB", f"fill_manual_plan: {e}", "ERR")
 
     def ensure_config(self, cfg_hash, snapshot_json):
         """Record a config fingerprint the first time it is seen. Idempotent —
@@ -9971,6 +10034,27 @@ body{background:var(--bg);color:var(--tx);font-family:var(--fu);
   padding:11px 0;min-height:44px;cursor:pointer;font-family:var(--fn);
   font-size:.6rem;font-weight:700;letter-spacing:.07em}
 
+/* The bet line: what this trade risks and pays, net of fees */
+.mt-bet{margin:10px 2px 2px;padding:9px 11px;border-radius:9px;
+  background:rgba(255,255,255,.04);border:1px solid var(--bd);
+  font-size:.66rem;line-height:1.55;font-variant-numeric:tabular-nums}
+.mt-bet.bad{background:rgba(255,51,82,.08);border-color:rgba(255,51,82,.35)}
+/* Daily loss meter / lockout strip */
+.mt-daily{margin:0 2px 10px;padding:8px 11px;border-radius:9px;
+  background:rgba(255,255,255,.04);border:1px solid var(--bd);
+  font-size:.6rem;color:var(--mu);line-height:1.5;
+  font-variant-numeric:tabular-nums}
+.mt-daily.warn{background:rgba(255,193,7,.08);border-color:rgba(255,193,7,.35);
+  color:var(--y)}
+.mt-daily.locked{background:rgba(255,51,82,.08);border-color:rgba(255,51,82,.35);
+  color:var(--r)}
+/* Hand-exit confirm sheet */
+.mt-ccf{margin-top:10px;padding:11px;border-radius:10px;
+  background:rgba(255,255,255,.04);border:1px solid var(--bd2)}
+.mt-ccf-ctx{font-size:.64rem;line-height:1.55;margin-bottom:8px}
+.mt-ccf-why{font-family:var(--fn);font-size:.56rem;font-weight:700;
+  letter-spacing:.07em;color:var(--mu);margin-bottom:6px}
+
 /* My Trades — the lab's record of the owner's own closed trades */
 .mt-lab-hd{display:flex;align-items:baseline;justify-content:space-between;
   margin:14px 2px 7px;font-family:var(--fn);font-size:.6rem;font-weight:700;
@@ -11483,6 +11567,8 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
             <span id="mt_track_lo">—</span><span id="mt_track_hi">—</span>
           </div>
         </div>
+        <!-- Max hold made real: the countdown to the plan's own exit. -->
+        <div class="mt-pos-sub" id="mt_hold_row" style="display:none"></div>
         <div class="mt-sltp-row">
           <span class="mt-lbl">STOP</span>
           <input class="mt-sltp" id="mt_sl_live" type="number" inputmode="decimal" placeholder="none" step="any">
@@ -11491,9 +11577,29 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
           <button class="mt-quick" onclick="mtSaveSltp()">SET</button>
         </div>
         <button class="mt-btn mt-close" onclick="mtClose()">CLOSE POSITION</button>
+        <!-- Hand-exit confirm: shows what the plan still expects, then asks
+             WHY, while it is fresh. Fixed vocabulary — free text at close time
+             turns into rationalization; four honest words do not. -->
+        <div class="mt-ccf" id="mt_close_confirm" style="display:none">
+          <div class="mt-ccf-ctx" id="mt_ccf_ctx"></div>
+          <div class="mt-ccf-why">why are you closing?</div>
+          <div class="mt-chips">
+            <button class="mt-chip" onclick="mtCloseGo('fear_giveback')">fear of giveback</button>
+            <button class="mt-chip" onclick="mtCloseGo('looked_done')">looked done</button>
+            <button class="mt-chip" onclick="mtCloseGo('news')">news</button>
+            <button class="mt-chip" onclick="mtCloseGo('bored')">bored</button>
+          </div>
+          <div class="mt-chips" style="margin-top:6px">
+            <button class="mt-chip" onclick="mtCloseGo('')">just close it</button>
+            <button class="mt-chip" onclick="mtCloseCancel()">cancel</button>
+          </div>
+        </div>
       </div>
 
       <div class="mt-entryform" id="mt_form">
+        <!-- Daily loss meter + post-loss cooldown. Derived from the book, so
+             they survive restarts; the lockout is enforced server-side too. -->
+        <div class="mt-daily" id="mt_daily" style="display:none"></div>
         <div class="mt-side-row">
           <button class="mt-side-btn on" data-side="BUY"  onclick="mtSetSide('BUY')">LONG</button>
           <button class="mt-side-btn"    data-side="SELL" onclick="mtSetSide('SELL')">SHORT</button>
@@ -11563,6 +11669,10 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
           </div>
         </div>
 
+        <!-- The bet, stated before it exists: dollars at the stop, dollars at
+             the target, and the R:R AFTER the 1.30% round trip — the number
+             that decides whether this trade was ever worth taking. -->
+        <div class="mt-bet" id="mt_bet" style="display:none"></div>
         <button class="mt-btn mt-buy" id="mt_go" onclick="mtOpen(_mtSide)">LONG</button>
         <button class="mt-hist-btn" onclick="openSetupHistory()">
           WHAT USUALLY HAPPENS AFTER THIS SETUP</button>
@@ -12268,6 +12378,7 @@ let _mtLev=1;
 let _mtPos=null;   // your open position on the charted pair, for overlay lines
 
 var _mtSide='BUY', _mtSlPct=0, _mtTpPct=0, _mtHz=0;
+var _mtCooldown=false, _mtOpenArmed=0;
 
 function _mtPx(){
   // Last charted close is the only live price this view already has; the
@@ -12524,6 +12635,33 @@ function mtPreview(){
   const cost=notional*0.0130;
   el.textContent = sz ? ('notional $'+notional.toFixed(0)+'  ·  round trip -$'
                          +cost.toFixed(2)) : '—';
+  // THE BET, stated before it exists: dollars lost at the stop, dollars made
+  // at the target, both including the round trip — and the R:R that survives
+  // the fees. A target that nets negative shows red BEFORE the tap.
+  const bet=$('mt_bet'); if(!bet)return;
+  if(!sz||(!_mtSlPct&&!_mtTpPct)){bet.style.display='none';return;}
+  let parts=[],bad=false;
+  let riskNet=null;
+  if(_mtSlPct){
+    riskNet=notional*(_mtSlPct/100)+cost;
+    parts.push('at stop <b style="color:var(--r)">-$'+riskNet.toFixed(2)+'</b>');
+  }
+  if(_mtTpPct){
+    const gainNet=notional*(_mtTpPct/100)-cost;
+    bad=gainNet<=0;
+    parts.push('at target <b style="color:'+(gainNet>0?'var(--g)':'var(--r)')+'">'
+      +(gainNet>=0?'+':'-')+'$'+Math.abs(gainNet).toFixed(2)+'</b>'
+      +(bad?' — fees eat this target':''));
+    if(riskNet&&gainNet>0){
+      const rr=gainNet/riskNet;
+      parts.push('<b style="color:'+(rr>=1.5?'var(--g)':rr>=1?'var(--tx)':'var(--y)')+'">'
+        +rr.toFixed(1)+'R</b> after fees');
+      if(rr<1)parts[parts.length-1]+=' — risking more than the win pays';
+    }
+  }
+  bet.innerHTML=parts.join('  ·  ');
+  bet.className='mt-bet'+(bad?' bad':'');
+  bet.style.display='';
 }
 
 function _mtMsg(text,cls){
@@ -12564,6 +12702,37 @@ async function fetchManual(){
            +'<em>'+need+' more closed trades before this can tell skill from luck.</em>')
         : ('<em>'+d.count+' trades recorded — enough to start measuring. '
            +'Run manual_report.py.</em>');
+    }
+    // Daily loss meter + post-loss cooldown. The lock is enforced server-side;
+    // this is the honest gauge so it never arrives as a surprise.
+    const dm=$('mt_daily'), day=d.daily||{}, goBtn=$('mt_go');
+    const cdLeft=(d.cooldown_until||0)-Math.floor(Date.now()/1000);
+    _mtCooldown=cdLeft>0;
+    if(dm){
+      if(day.locked){
+        dm.className='mt-daily locked';
+        dm.innerHTML='<b>locked for today</b> — down $'+Math.abs(day.today_pnl).toFixed(2)
+          +' of your $'+day.limit.toFixed(2)+' daily limit. Entries unlock at UTC midnight. '
+          +'The limit was set while you were calm; now is when it holds.';
+        dm.style.display='';
+      }else if(day.limit>0&&day.today_pnl<0&&(-day.today_pnl)>=day.limit*0.5){
+        dm.className='mt-daily warn';
+        dm.innerHTML='half your daily risk is spent — <b>$'+day.remaining.toFixed(2)
+          +'</b> of losses left before today locks';
+        dm.style.display='';
+      }else if(cdLeft>0){
+        dm.className='mt-daily warn';
+        dm.innerHTML='post-loss cooldown — <b>'+Math.ceil(cdLeft/60)
+          +'m</b> left. Judgment runs hot for ~20 min after a loss; an entry now gets tagged.';
+        dm.style.display='';
+      }else{
+        dm.style.display='none';
+      }
+    }
+    if(goBtn){
+      goBtn.disabled=!!day.locked;
+      if(day.locked)goBtn.textContent='LOCKED TODAY';
+      else goBtn.textContent=_mtSide==='BUY'?'LONG':'SHORT';
     }
     // Only show a position if it is for the coin currently on screen —
     // otherwise the Close button would act on a pair you cannot see.
@@ -12610,10 +12779,24 @@ async function fetchManual(){
           +'  ·  price '+(p.price_move_pct>=0?'+':'')+p.price_move_pct.toFixed(2)+'%';
         lr.className='mt-liqrow'+(near?' near':'');
       }else{ lr.textContent='spot — cannot be liquidated'; lr.className='mt-liqrow'; }
+      // Max-hold countdown: the plan's own exit, counting down in the open.
+      const hr=$('mt_hold_row');
+      if(hr){
+        if(p.horizon_h&&p.opened_at){
+          const left=p.opened_at+p.horizon_h*3600-Math.floor(Date.now()/1000);
+          hr.style.display='';
+          hr.textContent=left>0
+            ?('auto-close in '+(left>=3600?Math.floor(left/3600)+'h '
+              +Math.round(left%3600/60)+'m':Math.max(1,Math.round(left/60))+'m')
+              +' — your max-hold plan')
+            :'max hold reached — closing on the next check';
+        }else{ hr.style.display='none'; }
+      }
     }else{
       _mtPos=null;
       $('mt_open').style.display='none';
       $('mt_form').style.display='';
+      mtCloseCancel();   // a stale confirm sheet must not greet the next trade
     }
   }catch(e){}
 }
@@ -12622,6 +12805,14 @@ async function mtOpen(side){
   if(!pair){_mtMsg('pick a coin first','err');return;}
   const size=parseFloat($('mt_size').value||'0');
   if(!(size>0)){_mtMsg('enter a size','err');return;}
+  // Post-loss cooldown: soft, not a ban — one extra tap, and the trade gets
+  // tagged so the record can later price what post-loss entries cost.
+  if(_mtCooldown&&Date.now()-_mtOpenArmed>8000){
+    _mtOpenArmed=Date.now();
+    _mtMsg('post-loss cooldown — tap again if you still want this (it gets tagged)','err');
+    return;
+  }
+  _mtOpenArmed=0;
   try{
     const r=await fetch('/manual/open',{method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -12653,12 +12844,38 @@ async function mtSaveSltp(){
     fetchManual();drawCandles();
   }catch(e){_mtMsg('failed: '+e,'err');}
 }
-async function mtClose(){
+function mtClose(){
+  // Step 1: not a close yet — a mirror. What does the plan still expect, and
+  // why is the hand overriding it? Fat fingers can't close a leveraged book.
+  const cf=$('mt_close_confirm'), ctx=$('mt_ccf_ctx');
+  if(!cf){mtCloseGo('');return;}
+  const p=_mtPos||{};
+  let bits=[];
+  if(p.pnl!==undefined)bits.push('You are '+(p.pnl>=0?'up +$':'down -$')
+    +Math.abs(p.pnl).toFixed(2));
+  const px=_mtPx();
+  if(p.take_profit&&px){
+    const away=Math.abs(p.take_profit-px)/px*100;
+    bits.push('target is '+away.toFixed(1)+'% away');
+  }
+  if(p.horizon_h&&p.opened_at){
+    const left=p.opened_at+p.horizon_h*3600-Math.floor(Date.now()/1000);
+    if(left>0)bits.push((left>=3600?Math.floor(left/3600)+'h':Math.round(left/60)+'m')
+      +' left on your max hold');
+  }
+  ctx.innerHTML=bits.length?bits.join(' · ')+'.':'Closing by hand.';
+  cf.style.display='';
+}
+function mtCloseCancel(){
+  const cf=$('mt_close_confirm'); if(cf)cf.style.display='none';
+}
+async function mtCloseGo(reason){
+  mtCloseCancel();
   const pair=_cdPair||_botPair;
   try{
     const r=await fetch('/manual/close',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({pair:pair,device_id:_getDeviceId()})});
+      body:JSON.stringify({pair:pair,reason:reason||null,device_id:_getDeviceId()})});
     const d=await r.json();
     if(d.error){_mtMsg(d.error,'err');return;}
     _mtMsg('closed  '+(d.pnl>=0?'+':'')+d.pnl.toFixed(2),d.pnl>=0?'ok':'err');
@@ -12701,26 +12918,60 @@ async function fetchManualLab(){
         :(t.bot_sig==='BUY'||t.bot_sig==='SELL')?'bot: '+t.bot_sig.toLowerCase()
         :'bot: no view';
       const lev=(t.leverage||1)>1?(t.leverage+'x · '):'';
-      return '<div class="mt-lab-row">'+
+      // R: result over the dollars the WRITTEN stop risked. Only exists when
+      // a stop was planned — no stop, no R.
+      const rTxt=(t.r!==undefined&&t.r!==null)
+        ?' · <b>'+(t.r>=0?'+':'')+t.r.toFixed(1)+'R</b>':'';
+      // The money the hand exit left on the table (or saved) vs the plan —
+      // the replay is filled offline, so it appears once the window resolves.
+      let deltaLine='';
+      if(t.plan_pnl!==null&&t.plan_pnl!==undefined&&rule==='DISCRETIONARY'){
+        const delta=t.plan_pnl-(t.pnl||0);
+        if(Math.abs(delta)>=0.5){
+          deltaLine=delta>0
+            ?'<div class="mt-lab-meta" style="color:var(--r);margin-top:2px">'
+              +'plan would have paid '+(t.plan_pnl>=0?'+$':'-$')
+              +Math.abs(t.plan_pnl).toFixed(2)+' — pulling out cost $'
+              +delta.toFixed(2)+'</div>'
+            :'<div class="mt-lab-meta" style="color:var(--g);margin-top:2px">'
+              +'hand exit saved $'+Math.abs(delta).toFixed(2)
+              +' vs the plan</div>';
+        }
+      }
+      return '<div class="mt-lab-row" style="flex-wrap:wrap">'+
         '<span class="mt-lab-left">'+
           '<span class="mt-lab-chip" style="'+(isLong
             ?'background:rgba(0,204,116,.13);color:var(--g)'
             :'background:rgba(255,51,82,.12);color:var(--r)')+'">'+(isLong?'L':'S')+'</span>'+
           '<span style="font-weight:600;flex-shrink:0">'+coin+'</span>'+ruleChip+
           '<span class="mt-lab-meta">'+lev+held+(when?' · '+when:'')+' · '+botTxt
-            +(t.echo==='ECHO'?' · echo':'')+'</span>'+
+            +(t.echo==='ECHO'?' · echo':'')
+            +(t.post_loss?' · post-loss':'')
+            +((t.exit_reason||'').indexOf('hand: ')===0
+              ?' · '+t.exit_reason.slice(6).replace(/_/g,' '):'')+'</span>'+
         '</span>'+
         '<span class="mt-lab-pnl" style="color:'+(win?'var(--g)':'var(--r)')+'">'
-          +(win?'+$':'-$')+Math.abs(t.pnl||0).toFixed(2)+'</span>'+
+          +(win?'+$':'-$')+Math.abs(t.pnl||0).toFixed(2)+rTxt+'</span>'+
+        (deltaLine?'<span style="flex-basis:100%">'+deltaLine+'</span>':'')+
       '</div>';
     }).join('');
     const note=$('mt_lab_note');
     if(note){
       const need=(d.target||30)-d.closed;
-      note.textContent=(need>0
+      let txt=(need>0
         ?need+' more closed trades before this record can tell skill from luck.'
         :'Enough recorded to start measuring — ask for your report.')
         +((d.shorts||0)===0?' All longs so far — a few shorts would make the record stronger.':'');
+      // The running verdict on pulling out early, priced in dollars. Honest in
+      // both directions: if his hands beat his plans, it says so.
+      if(d.hand_n>0){
+        txt+=' Hand exits vs your written plans: '
+          +(d.hand_delta>0?'-$'+d.hand_delta.toFixed(2)+' left on the table'
+            :d.hand_delta<0?'+$'+Math.abs(d.hand_delta).toFixed(2)+' saved by exiting early'
+            :'dead even')
+          +' across '+d.hand_n+' replayed trade'+(d.hand_n===1?'':'s')+'.';
+      }
+      note.textContent=txt;
     }
   }catch(e){console.warn('mlab',e);}
 }
@@ -18990,6 +19241,102 @@ MANUAL_FEE_RT_PCT = float(os.environ.get("MANUAL_FEE_RT_PCT", "0.0130"))
 # Without this, leverage is a free P&L multiplier and the book teaches exactly the
 # wrong lesson — on a real exchange a 10x long is liquidated by a ~9.5% move.
 MANUAL_MAINT_MARGIN = 0.005
+# Daily loss limit on the manual book, % of the day's starting balance. Paper
+# money is where the lockout habit has to form — FTMO-style: hit it and the
+# entry buttons lock until UTC midnight. Derived from closed trades each time,
+# so it is restart-proof for free.
+MANUAL_DAILY_LOSS_PCT = float(os.environ.get("MANUAL_DAILY_LOSS_PCT", "3.0"))
+# Post-loss cooldown: judgment is measurably impaired for ~20-30 min after a
+# loss. Short and soft (extra confirm + a tag), never a hard ban — the gambling
+# literature says long lockouts backfire.
+MANUAL_COOLDOWN_S = 900
+
+
+def _manual_daily(book, now=None):
+    """Today's closed P&L vs the daily loss limit. Limit is a % of the day's
+    STARTING balance (current balance minus today's realised), so one early
+    win cannot quietly widen how much can be lost later in the day."""
+    now = now or time.time()
+    today = datetime.utcfromtimestamp(now).strftime("%Y-%m-%d")
+    today_pnl = sum(t.get("pnl", 0.0) for t in book.get("trades", [])
+                    if t.get("ts") and
+                    datetime.utcfromtimestamp(t["ts"]).strftime("%Y-%m-%d") == today)
+    day_start = book.get("balance", MANUAL_START) - today_pnl
+    limit = round(max(day_start, 0.0) * MANUAL_DAILY_LOSS_PCT / 100.0, 2)
+    return {"today_pnl": round(today_pnl, 2), "limit": limit,
+            "locked": limit > 0 and today_pnl <= -limit,
+            "remaining": round(max(0.0, limit + today_pnl), 2)}
+
+
+def _manual_cooldown_until(book, now=None):
+    """End of the post-loss window, or 0. Based on the newest closed trade:
+    a loss starts the clock, a win clears it."""
+    now = now or time.time()
+    trades = book.get("trades", [])
+    if not trades:
+        return 0
+    last = trades[-1]
+    if last.get("pnl", 0.0) >= 0 or not last.get("ts"):
+        return 0
+    until = last["ts"] + MANUAL_COOLDOWN_S
+    return round(until) if until > now else 0
+
+
+def _plan_replay(side, entry, notional, size, fee_side_pct,
+                 plan_stop, plan_target, horizon_h, ts_entry, bars):
+    """What the WRITTEN plan would have paid, walked over real OHLC bars.
+
+    bars: [(ts, close, high, low)] ascending. Returns (plan_pnl, plan_exit):
+      PLAN_STOP / PLAN_TARGET — the level was touched (filled AT the level)
+      PLAN_TIME               — max hold expired; filled at that bar's close
+      NO_PLAN                 — nothing written to replay
+      NO_DATA                 — bars do not cover the entry
+      (None, None)            — not resolvable yet, try again later
+
+    Honesty rules: a bar that touches BOTH levels resolves to the STOP —
+    crediting the target would manufacture profit out of ambiguity. A bar that
+    STARTED before the entry is skipped for touch tests (its extremes may
+    predate the trade). The loss is clamped at the posted margin, the same
+    floor liquidation enforces on the real book."""
+    if not plan_stop and not plan_target and not horizon_h:
+        return None, "NO_PLAN"
+    if not bars or ts_entry + 6 * 3600 < bars[0][0]:
+        return None, "NO_DATA"
+    is_buy = str(side).upper() in ("BUY", "LONG")
+    deadline = ts_entry + horizon_h * 3600 if horizon_h else None
+    hard_cap = ts_entry + 48 * 3600   # no-horizon plans are scored at 48h,
+                                      # the same window every lab number uses
+    exit_px, rule = None, None
+    for ts, close, high, low in bars:
+        if ts < ts_entry:
+            continue
+        if deadline and ts >= deadline:
+            exit_px, rule = close, "PLAN_TIME"
+            break
+        stop_hit = plan_stop and ((low <= plan_stop) if is_buy else (high >= plan_stop))
+        tgt_hit = plan_target and ((high >= plan_target) if is_buy else (low <= plan_target))
+        if stop_hit:                      # stop wins same-bar ambiguity
+            exit_px, rule = plan_stop, "PLAN_STOP"
+            break
+        if tgt_hit:
+            exit_px, rule = plan_target, "PLAN_TARGET"
+            break
+        if not deadline and ts >= hard_cap:
+            exit_px, rule = close, "PLAN_TIME"
+            break
+    if exit_px is None:
+        # neither level touched and the window is not fully covered yet
+        end_needed = deadline or hard_cap
+        if bars[-1][0] < end_needed:
+            return None, None             # pending — bars will grow
+        exit_px, rule = bars[-1][1], "PLAN_TIME"
+    move = (exit_px - entry) / entry
+    if not is_buy:
+        move = -move
+    pnl = round(move * notional - notional * fee_side_pct, 4)
+    if size:
+        pnl = max(pnl, round(-size, 4))   # margin floor, like liquidation
+    return pnl, rule
 
 
 def _manual_liq_price(side, entry, leverage):
@@ -19082,12 +19429,40 @@ def _manual_check_exits(prices=None):
                 continue
             is_buy = p["side"] == "BUY"
             liq, sl, tp = p.get("liq_price"), p.get("stop_loss"), p.get("take_profit")
-            if liq and ((px <= liq) if is_buy else (px >= liq)):
+            # Intrabar extremes since entry: last price alone misses spikes
+            # between checks — at 10-20x a wick IS the liquidation. Bars that
+            # STARTED before the entry are excluded (their extremes may predate
+            # the trade). Falls back to last price when no candles exist.
+            hi = lo = px
+            try:
+                if db.conn:
+                    with db.conn.cursor() as _cur:
+                        _cur.execute("""SELECT high, low FROM candles
+                                        WHERE pair=%s AND interval_m=15
+                                          AND ts >= %s
+                                        ORDER BY ts DESC LIMIT 8""",
+                                     (pair, int(p.get("opened_at", 0))))
+                        for _h, _l in _cur.fetchall():
+                            hi, lo = max(hi, _h), min(lo, _l)
+            except Exception:
+                pass
+            adverse  = lo if is_buy else hi     # worst price the trade saw
+            favorable = hi if is_buy else lo    # best price the trade saw
+            # Adverse levels are checked on the WICK; when a wick crosses both
+            # the liquidation and the stop, liquidation wins (the gap went
+            # through it — reporting the friendlier stop understates the loss).
+            if liq and ((adverse <= liq) if is_buy else (adverse >= liq)):
                 hits.append((pair, p, liq, "liquidated"))
-            elif sl and ((px <= sl) if is_buy else (px >= sl)):
+            elif sl and ((adverse <= sl) if is_buy else (adverse >= sl)):
                 hits.append((pair, p, sl, "stop loss"))
-            elif tp and ((px >= tp) if is_buy else (px <= tp)):
+            elif tp and ((favorable >= tp) if is_buy else (favorable <= tp)):
                 hits.append((pair, p, tp, "take profit"))
+            elif p.get("horizon_h") and \
+                    time.time() - p.get("opened_at", time.time()) >= p["horizon_h"] * 3600:
+                # Max hold is part of the written plan; enforcing it is what
+                # makes "held two days" a decision instead of an outcome.
+                _mh_px = px * (1 - SLIPPAGE) if is_buy else px * (1 + SLIPPAGE)
+                hits.append((pair, p, _mh_px, "max hold"))
 
         for pair, p, exit_px, reason in hits:
             lev = p.get("leverage", 1)
@@ -19116,6 +19491,7 @@ def _manual_check_exits(prices=None):
                 # A planned exit and a change of mind are different decisions;
                 # the ratio between them IS the disposition-effect measurement.
                 _rule = {"take profit": "PLAN_TARGET", "stop loss": "PLAN_STOP",
+                         "max hold": "PLAN_TIME",
                          "liquidated": "LIQUIDATION"}.get(reason, "DISCRETIONARY")
                 db.close_manual(pair, time.time(), exit_px, pnl,
                                 round((time.time() - p["opened_at"]) / 60, 1),
@@ -19126,10 +19502,12 @@ def _manual_check_exits(prices=None):
             log("MANUAL", f"{reason.upper()} {pair} {p['side']} {lev}x @ {exit_px:.6f} "
                           f"pnl {pnl:+.2f}", lvl)
             try:
-                icon = "*LIQUIDATED*" if reason == "liquidated" else (
-                    "*Take profit*" if reason == "take profit" else "*Stop loss*")
+                icon = {"liquidated": "*LIQUIDATED*", "take profit": "*Take profit*",
+                        "max hold": "*Max hold reached*"}.get(reason, "*Stop loss*")
                 tg(f"{icon} — your manual {lev}x {p['side']} on {pair}\n"
-                   f"P&L: `{pnl:+.2f}`")
+                   f"P&L: `{pnl:+.2f}`"
+                   + ("\n_Closed by your own max-hold plan._"
+                      if reason == "max hold" else ""))
             except Exception:
                 pass
         if hits:
@@ -19240,6 +19618,9 @@ def _manual_status():
         "realised": round(book["balance"] - MANUAL_START, 2),
         "leverage_tiers": {str(k): v for k, v in sorted(MANUAL_LEVERAGE.items())},
         "liquidated": sum(1 for t in book["trades"] if t.get("liquidated")),
+        # discipline state, derived from the book itself so it survives restarts
+        "daily": _manual_daily(book),
+        "cooldown_until": _manual_cooldown_until(book),
     }), mimetype="application/json", headers={"Cache-Control": "no-store"})
 
 
@@ -19292,6 +19673,17 @@ def _manual_open():
         if size <= 0 or size > book["balance"]:
             return _Response(json.dumps({"error": f"size must be between 0 and {book['balance']:.2f}"}),
                              status=400, mimetype="application/json")
+        # Daily loss limit — enforced by the system, not willpower. The limit
+        # was set while calm; mid-tilt is exactly when it must hold.
+        _day = _manual_daily(book)
+        if _day["locked"]:
+            return _Response(json.dumps({
+                "error": f"daily loss limit hit (-${_day['limit']:.2f}) — "
+                         f"entries unlock at UTC midnight"}),
+                status=409, mimetype="application/json")
+        # Post-loss window: stamped on the row, never blocking. The tag is what
+        # lets the record later say what post-loss entries actually cost.
+        _post_loss = 1 if _manual_cooldown_until(book) else 0
         price = get_price(pair)
         if not price:
             return _Response('{"error":"no price for that pair"}', status=503, mimetype="application/json")
@@ -19315,6 +19707,9 @@ def _manual_open():
             "stop_loss": sl, "take_profit": tp,
             "opened_at": time.time(), "fee_paid": fee,
             "name": pair.replace("USD", "/USD"),
+            # stored so max-hold is ENFORCED (PLAN_TIME auto-close), not just
+            # recorded — a plan element the site ignores trains bad habits
+            "horizon_h": (float(d.get("horizon_h")) if d.get("horizon_h") else None),
         }
         _manual_save(book)
     # Learning lab: record what the BOT thought about this pair at the moment
@@ -19356,6 +19751,7 @@ def _manual_open():
             "fee_rt_pct": MANUAL_FEE_RT_PCT,
             "bal_at_open": book["balance"],
             "concurrent_open": len(book["positions"]) - 1,
+            "post_loss": _post_loss,
         })
     except Exception as _me:
         log("MANUAL", f"lab hook: {_me}", "ERR")
@@ -19409,12 +19805,19 @@ def _manual_close():
         })
         del book["positions"][pair]
         _manual_save(book)
+    # WHY he closed by hand, captured while it is fresh — retro-journaling gets
+    # rationalized. Fixed vocabulary so the record stays aggregatable; anything
+    # else collapses to the plain untagged close.
+    _tag = (d.get("reason") or "").strip()
+    if _tag not in ("fear_giveback", "looked_done", "news", "bored"):
+        _tag = ""
     try:
         db.close_manual(pair, time.time(), exit_fill, pnl,
-                        round((time.time() - p["opened_at"]) / 60, 1), "manual close")
+                        round((time.time() - p["opened_at"]) / 60, 1),
+                        ("hand: " + _tag) if _tag else "manual close")
     except Exception:
         pass
-    log("MANUAL", f"closed {pair} pnl {pnl:+.4f}")
+    log("MANUAL", f"closed {pair} pnl {pnl:+.4f}" + (f" ({_tag})" if _tag else ""))
     return _Response(json.dumps({"ok": True, "pnl": pnl}), mimetype="application/json")
 
 
@@ -19787,12 +20190,15 @@ def _learning_filler_loop():
         if d.get("error"):
             return []
         key = next(k for k in d["result"] if k != "last")
-        return [(int(c[0]), float(c[4])) for c in d["result"][key]]
+        # (ts, close, high, low) — highs/lows so the plan replay can test
+        # whether a written stop/target was TOUCHED, not just where closes were
+        return [(int(c[0]), float(c[4]), float(c[2]), float(c[3]))
+                for c in d["result"][key]]
 
     def close_at(bars, when):
-        for t, c in bars:
-            if t >= when:
-                return c
+        for row in bars:
+            if row[0] >= when:
+                return row[1]
         return None
 
     log("LAB", "learning filler loop started (30 min cadence)")
@@ -19803,10 +20209,11 @@ def _learning_filler_loop():
             srows = db.shadow_pending(cutoff)
             erows = db.exit_pending(cutoff)
             mrows = db.manual_pending(cutoff)
-            if not srows and not erows and not mrows:
+            prows = db.manual_plan_pending()
+            if not srows and not erows and not mrows and not prows:
                 continue
             pairs = ({r[2] for r in srows} | {r[2] for r in erows}
-                     | {r[2] for r in mrows})
+                     | {r[2] for r in mrows} | {r[2] for r in prows})
             books = {}
             for pr in pairs:
                 try:
@@ -19877,6 +20284,24 @@ def _learning_filler_loop():
                 sgn = -1 if str(side).upper() in ("SELL", "SHORT") else 1
                 f6, f24, f48 = [(sgn * (c - entry) / entry) if c else None for c in cs]
                 db.fill_manual(mid, f6, f24, f48)
+                filled += 1
+            # Plan replay: for every HAND-exited trade, what would the WRITTEN
+            # plan have paid? The delta is the money pulling out early actually
+            # cost (or saved — honesty cuts both ways). Fee matches the real
+            # close path: exit-side fee only, entry fee is sunk in both worlds.
+            for (mid, ts_m, pr, side, entry, notional, lev, pstop, ptgt,
+                 phz, _fee_rt) in prows:
+                bars = books.get(pr) or []
+                if not entry or not notional:
+                    db.fill_manual_plan(mid, None, "NO_PLAN")
+                    continue
+                size = notional / lev if lev else notional
+                pnl, rule = _plan_replay(side, entry, notional, size,
+                                         KRAKEN_FEE, pstop, ptgt, phz,
+                                         ts_m, bars)
+                if rule is None:
+                    continue                              # not resolvable yet
+                db.fill_manual_plan(mid, pnl, rule)
                 filled += 1
             if filled:
                 log("LAB", f"filled forward returns for {filled} row(s)")

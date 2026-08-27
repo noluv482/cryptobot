@@ -117,9 +117,13 @@ ALLOWED = {
     # breaks nothing. manual_history is itself in LAB_CALLS below, so any
     # trading path that calls it still fails this test.
     "manual_history", "_web_manual_lab",
+    # plan replay: filled by the learning filler (already allowed), read back
+    # only through manual_history. Guarded like every other lab call.
+    "manual_plan_pending", "fill_manual_plan",
 }
 LAB_CALLS = {"log_manual", "close_manual", "fill_manual", "manual_pending",
-             "censor_open_manual", "manual_history"}
+             "censor_open_manual", "manual_history",
+             "manual_plan_pending", "fill_manual_plan"}
 readers = []
 for node in ast.walk(tree):
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -167,6 +171,27 @@ check("panel is wired into the boot sequence",
       "setInterval(fetchManualLab" in src)
 check("panel shows plan-vs-hand exits and the bot's entry view",
       all(k in src for k in ("PLAN ✓", "bot said no", "bot: no view")))
+
+# 7. PLAN REPLAY — pulling out early gets a price tag
+check("hand-exited rows get their plan replayed (plan_pnl/plan_exit columns)",
+      all(k in src for k in ('"plan_pnl", "FLOAT"', '"plan_exit", "TEXT"')))
+check("replay is conservative: same-bar ambiguity resolves to the stop",
+      "stop wins same-bar ambiguity" in src)
+check("panel prices the early exit", "pulling out cost" in src)
+check("honesty cuts both ways: a saving hand exit says so",
+      "hand exit saved" in src)
+_saved = bs.db.conn
+try:
+    bs.db.conn = None
+    check("manual_plan_pending survives no DB", bs.db.manual_plan_pending() == [])
+    ok = True
+    try:
+        bs.db.fill_manual_plan(1, 0.0, "PLAN_STOP")
+    except Exception:
+        ok = False
+    check("fill_manual_plan survives no DB", ok)
+finally:
+    bs.db.conn = _saved
 
 print()
 if FAILS:
