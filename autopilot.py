@@ -150,6 +150,17 @@ CHALLENGER_CONFIGS = [
         "id": "exit_24h", "cf_only": True,
         "cf": {"conf": None, "horizon": "fwd24"},
     },
+    {   # TREND-LOOSENING hypothesis (the owner's, 2026-08-27): "take the
+        # signals net_rr blocks when the market is trending" — born from one
+        # winning hand trade on SOL. The retrospective slice said no (ADX>=30:
+        # gross +0.78% but net -0.52% at n_indep=6 — too small to prove either
+        # side), so the idea competes here instead of changing the live gate.
+        # No conf/er/rr floors on purpose: this IS the loosening, isolated.
+        # born_ts is HARDCODED to the registration moment: the rows that
+        # generated the hypothesis must never be the rows that grade it.
+        "id": "trend_rr", "cf_only": True, "born_ts": 1787875000.0,
+        "cf": {"adx": 30.0, "horizon": "fwd48"},
+    },
     {   # mean-reversion / pattern family only
         "id": "reversion",
         "entry_conf_floor": 0.50,

@@ -62,6 +62,19 @@ check("strict_gates uses the ORIGINAL thresholds",
 check("strict_gates is cf_only (live path cannot filter adx/er)",
       sg.get("cf_only") is True)
 
+# trend_rr: the owner's loosening hypothesis, admitted as an entrant instead
+# of a gate change. Its born_ts is the load-bearing detail — the retrospective
+# audit that suggested it ran on post-epoch rows, so falling back to
+# AP_CF_EPOCH would grade the hypothesis on the data that generated it.
+check("trend_rr entrant exists", "trend_rr" in ids)
+tr = next(c for c in ap.CHALLENGER_CONFIGS if c["id"] == "trend_rr")
+check("trend_rr is the pure loosening: ADX floor only, no conf/er/rr",
+      tr["cf"] == {"adx": 30.0, "horizon": "fwd48"} and tr.get("cf_only") is True)
+check("trend_rr is pre-registered AFTER the audit rows (hardcoded born_ts)",
+      float(tr.get("born_ts") or 0) > ap.AP_CF_EPOCH)
+check("cf scorer honors a config's own birth over the epoch",
+      "max(AP_CF_EPOCH, float(cfg.get(\"born_ts\") or 0))" in SRC_AP)
+
 # 2. the cf scorer, driven with a synthetic recorded stream through the REAL code
 class FakeCursor:
     def __init__(self, rows): self.rows = rows
