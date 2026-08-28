@@ -9,17 +9,118 @@ jobs:
   deploy:
     runs-on: self-hosted
     steps:
-      - name: Deploy latest code
+      # 1) Pull the new code into the checkout the compose stack builds from.
+      #    (Same git dance as before — just split out so preflight can inspect the
+      #    freshly-synced tree before anything is built or restarted.)
+      - name: Sync latest code
+        shell: bash
         run: |
           cd ~/cryptobot
           git fetch origin
           git checkout main
           git reset --hard origin/main
-          docker compose build bot
-          docker compose up -d bot
-          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) deployed commit $(git rev-parse --short HEAD)" >> ~/deploy.log
-          echo "Deploy complete at $(date)"
-          docker ps | grep cryptobot-bot
+          echo "Synced to $(git rev-parse --short HEAD)"
+
+      # 2) PREFLIGHT — abort the deploy if the new code cannot even compile/import.
+      #    The bot runs under `restart: unless-stopped`, so a syntax error or a
+      #    broken top-level import would otherwise become a silent crash-loop with
+      #    the previous good code already gone. Runs in a bare python:3.11-slim
+      #    (already cached locally — it is the Dockerfile base image), with NO
+      #    project deps and NO network: preflight_check.py py_compiles every .py
+      #    with SyntaxWarning->error and does a dependency-tolerant import smoke of
+      #    bot_server / autopilot / research_lab. A non-zero exit fails this step,
+      #    which skips every step below, so a bad commit never reaches the running
+      #    bot. Read-only bind mount so the check can never mutate the checkout.
+      - name: Preflight (compile + import smoke)
+        shell: bash
+        run: |
+          cd ~/cryptobot
+          docker run --rm --network none \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD":/src:ro -w /src \
+            python:3.11-slim \
+            python preflight_check.py
+
+      # 3) BUILD + DEPLOY + POST-DEPLOY HEALTH VERIFY, with automatic image rollback.
+      #    Ordering here is load-bearing:
+      #      a. Capture the image the CURRENTLY-RUNNING bot uses and tag it
+      #         cryptobot-bot:prev BEFORE `build`, because `build` overwrites the
+      #         cryptobot-bot:latest tag in place; :prev is the only handle left on
+      #         the old image afterwards. (The cache-cap step below is builder-only
+      #         and never deletes tagged images, so :prev survives.)
+      #      b. build + up -d the new image.
+      #      c. Poll /healthz (honest: 503 when unhealthy) for ~150s, wall-clock
+      #         bounded. `curl -f` treats any HTTP >=400 as failure, and a
+      #         crash-looping container refuses the connection outright — both count
+      #         as unhealthy. Host port 8081 -> container 8080 (docker-compose.yml).
+      #      d. If it never becomes healthy: re-point cryptobot-bot:latest back at
+      #         :prev and force-recreate (rollback to the last good image), then exit
+      #         non-zero. If there was no previous image (first deploy) there is
+      #         nothing to roll back to, so just fail.
+      - name: Build, deploy and health-verify (auto-rollback)
+        shell: bash
+        run: |
+          cd ~/cryptobot
+          DEPLOY_SHA="$(git rev-parse --short HEAD)"
+
+          # a) Capture the currently-running bot image for rollback (BEFORE build).
+          PREV_CID="$(docker compose ps -q bot 2>/dev/null || true)"
+          PREV_IMG=""
+          if [ -n "$PREV_CID" ]; then
+            PREV_IMG="$(docker inspect --format '{{.Image}}' "$PREV_CID" 2>/dev/null || true)"
+          fi
+          if [ -z "$PREV_IMG" ]; then
+            # No running container to read from — fall back to the last built tag.
+            PREV_IMG="$(docker image inspect --format '{{.Id}}' cryptobot-bot:latest 2>/dev/null || true)"
+          fi
+          if [ -n "$PREV_IMG" ]; then
+            docker tag "$PREV_IMG" cryptobot-bot:prev
+            echo "Rollback point captured: cryptobot-bot:prev -> $PREV_IMG"
+          else
+            echo "No previous bot image found; a rollback will not be possible this run."
+          fi
+
+          # b) Build + deploy the new image.
+          if ! docker compose build bot; then
+            echo "ERROR: build failed for $DEPLOY_SHA; running bot left untouched."
+            exit 1
+          fi
+          docker compose up -d bot || echo "WARN: 'compose up' returned non-zero; health verify will decide."
+
+          # c) Post-deploy health verify — poll /healthz for ~150s (bounded, covers a cold-start first-scan cycle).
+          HEALTH_URL="http://localhost:8081/healthz"
+          DEADLINE=$(( $(date +%s) + 150 ))
+          healthy=0
+          attempt=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            attempt=$((attempt + 1))
+            if curl -fsS -m 5 "$HEALTH_URL" >/dev/null 2>&1; then
+              healthy=1
+              echo "Health check passed on attempt $attempt ($HEALTH_URL)"
+              break
+            fi
+            echo "Health check attempt $attempt: not healthy yet, retrying in 3s..."
+            sleep 3
+          done
+
+          # d) Roll back if it never became healthy.
+          if [ "$healthy" -ne 1 ]; then
+            echo "ERROR: $DEPLOY_SHA failed health check after ~150s."
+            if [ -n "$PREV_IMG" ]; then
+              echo "Rolling back to previous image (cryptobot-bot:prev)..."
+              docker tag cryptobot-bot:prev cryptobot-bot:latest
+              docker compose up -d --force-recreate bot
+              echo "Rolled back to previous image. Deploy $DEPLOY_SHA REJECTED."
+            else
+              echo "No previous image to roll back to; leaving stack as-is. Deploy $DEPLOY_SHA REJECTED."
+            fi
+            exit 1
+          fi
+
+          # e) Success — preserve the original deploy-log line and ps check.
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) deployed commit $DEPLOY_SHA" >> ~/deploy.log
+          echo "Deploy complete: $DEPLOY_SHA healthy at $(date)"
+          docker ps | grep cryptobot-bot || true
 
       # Every deploy rebuilds the image and leaves a new set of cache layers
       # behind, and nothing ever removed them: 259 entries / 14.3GB had built up,
@@ -33,6 +134,7 @@ jobs:
       # and the flag was renamed across Docker versions (--keep-storage ->
       # --reserved-space) so both spellings are tried.
       - name: Cap Docker build cache
+        shell: bash
         run: |
           docker builder prune -f --keep-storage 3GB \
             || docker builder prune -f --reserved-space 3GB \

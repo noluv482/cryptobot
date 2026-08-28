@@ -2011,6 +2011,7 @@ _klines_cache: dict = {}   # pair → (closes,highs,lows,volumes,opens,raw_rows,
 _KLINES_TTL   = 300        # 5 min; 15-min candles only change every 15 min
 
 _last_scan_ts: float = 0.0  # updated after each trading-loop cycle; watchdog alerts on stall
+_HEALTHZ_MAX_SCAN_AGE = 180  # /healthz reports unhealthy if the last scan is older than this (s)
 
 _ob_cache: dict = {}       # pair → {"ratio": float, "ts": float} from WS ticker bid/ask qty
 
@@ -12477,8 +12478,8 @@ function parseAutoNote(txt){
       out.head=l;
       // "LONG ZEC/USD - $586 -> $614 (+4.80%) - +$0.15": pull the two numbers
       // that matter out of the headline so they can be set large.
-      const m=l.match(/\(([-+][0-9.]+%)\)/);      if(m)out.move=m[1];
-      const p=l.match(/([-+]\$[0-9,.]+)\s*$/);    if(p)out.pnl=p[1];
+      const m=l.match(/\\(([-+][0-9.]+%)\\)/);      if(m)out.move=m[1];
+      const p=l.match(/([-+]\\$[0-9,.]+)\\s*$/);    if(p)out.pnl=p[1];
       continue;
     }
     if(l.indexOf('Entry:')===0){ out.entry=l.slice(6).trim(); continue; }
@@ -12990,7 +12991,7 @@ const _FLASH_IDS=['hdr_price','ci_price','ci_chg','ci_pnl_badge',
                   'sim_bal','sim_pnl','rank_cur_bal'];
 const _flashPrev=new Map();
 function _numOf(s){
-  const m=String(s||'').replace(/[, ]/g,'').match(/-?\d+(\.\d+)?/);
+  const m=String(s||'').replace(/[, ]/g,'').match(/-?\\d+(\\.\\d+)?/);
   return m?parseFloat(m[0]):null;
 }
 function _flashEl(el){
@@ -14029,7 +14030,7 @@ async function fetchPrices(){
 }
 function _fmtPrice(p){
   if(!p&&p!==0)return '—';
-  if(p>=1000)return '$'+p.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,',');
+  if(p>=1000)return '$'+p.toFixed(0).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');
   if(p>=1)return '$'+p.toFixed(2);
   if(p>=0.01)return '$'+p.toFixed(4);
   return '$'+p.toPrecision(3);
@@ -17855,12 +17856,32 @@ def _web_healthz():
     trader = _web_trader_ref[0] if _web_trader_ref else None
     scan_age = round(time.time() - _last_scan_ts, 1) if _last_scan_ts else None
     ws_live  = bool(_prices_cache and (time.time() - _prices_cache_ts) < 60)
+    # Honest health: "ok" is DERIVED, never hard-coded. A deploy health-check and
+    # external monitor treat this endpoint as the source of truth, so a stalled,
+    # never-scanned, or DB-less-when-DB-expected process must report unhealthy.
+    #  - db_ok: DB connected, OR a paper run with no DATABASE_URL configured (a
+    #    legitimate JSON-only config). A configured-but-disconnected DB, or any
+    #    live run without DB, is NOT ok.
+    #  - first_scan_done: the trading loop has completed at least one cycle.
+    #  - scan_fresh: that last scan is within the staleness threshold.
+    #  - ws_live: prices are fresh.
+    db_expected  = is_live() or bool(os.environ.get("DATABASE_URL"))
+    db_ok        = bool(db.connected) or not db_expected
+    first_scan_done = _last_scan_ts > 0
+    scan_fresh   = first_scan_done and scan_age is not None and scan_age < _HEALTHZ_MAX_SCAN_AGE
+    ok = db_ok and ws_live and first_scan_done and scan_fresh
     _hz = {
-        "ok":       True,
-        "scan_age": scan_age,
-        "db":       db.connected,
-        "ws_live":  ws_live,
-        "balance":  round(trader.balance, 2) if trader else None,
+        "ok":         ok,
+        "scan_age":   scan_age,
+        "db":         db.connected,
+        "ws_live":    ws_live,
+        "balance":    round(trader.balance, 2) if trader else None,
+        # Fields the monitor can use to see WHY ok is false without re-deriving it.
+        "db_ok":           db_ok,
+        "db_expected":     db_expected,
+        "first_scan_done": first_scan_done,
+        "scan_fresh":      scan_fresh,
+        "scan_max_age":    _HEALTHZ_MAX_SCAN_AGE,
     }
     # Autopilot summary — always report enabled state so the Noluv HUD can show it.
     if _autopilot is not None:
@@ -17882,7 +17903,10 @@ def _web_healthz():
             pass
     # Research lab summary — compact on purpose, /healthz is polled constantly.
     _hz["research"] = _research_compact()
-    return _Response(json.dumps(_hz), mimetype="application/json")
+    # 503 when unhealthy so deploy health-checks and external monitors fail loudly
+    # instead of trusting a 200 from a stalled/DB-less process.
+    return _Response(json.dumps(_hz), status=(200 if ok else 503),
+                     mimetype="application/json")
 
 @_flask_app.route("/history")
 def _web_history():
