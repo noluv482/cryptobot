@@ -106,6 +106,18 @@ check("archive drops the still-forming bar", "[:-1])" in SRC
 check("archive stores interval 1 via the shared saver",
       "db.save_candles(pair, 1," in SRC)
 
+# ── 5b. SIGNAL MESSAGES CARRY THEIR VERDICT ─────────────────────────────────
+# A Telegram alert with entry/size/leverage reads as an order confirmation;
+# sending it and then silently refusing the trade taught the owner to ask
+# "why doesn't the bot trade its own signals". Every branch now speaks.
+check("signal message is built once and always sent WITH a verdict",
+      "_sig_msg = (" in SRC and "tg(_sig_msg)" not in SRC)
+for verdict in ("Watch only", "autopilot is ", "below this pair's floor",
+                "Maker order resting", "Taking it"):
+    check(f"verdict branch exists: {verdict!r}", ("tg(_sig_msg + " in SRC) and verdict in SRC)
+check("expired maker orders notify instead of dying silently",
+      "Order expired — " in SRC)
+
 # ── 5. find_signal grows the venue-cost question ────────────────────────────
 check("find_signal takes --cost", '"--cost"' in FS_SRC)
 check("verdict warns that battery windows overlap",

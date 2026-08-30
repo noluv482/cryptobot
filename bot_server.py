@@ -8708,12 +8708,20 @@ def trading_loop(trader):
                         _px = get_price(_pp_pair)
                         if not _px:
                             continue
-                        if _resolve_pending_entry(_pp_pair, _px, trader) == "filled":
+                        _pe = _resolve_pending_entry(_pp_pair, _px, trader)
+                        if _pe == "filled":
                             trader.on_signal(_pp["sig"], _pp["limit"], _pp["stop"],
                                              _pp["target"], _pp["name"], _pp["conf"],
                                              _pp_pair, atr=_pp.get("atr"),
                                              fkey=_pp.get("fkey", ""),
                                              pillars=_pp.get("pillars") or {})
+                        elif _pe == "expired":
+                            # the signal message promised "told either way" —
+                            # an order that dies unnoticed is the old silence
+                            tg(f"⏳ *Order expired — {_pp.get('name', _pp_pair)}*\n"
+                               f"Maker {_pp.get('sig','')} at `${_pp.get('limit',0):.4f}` "
+                               f"never filled — price didn't come back through it. "
+                               f"No position was opened.")
                     except Exception as e:
                         log("ORDER", f"pending {_pp_pair}: {e}", "ERR")
                         _pending_entries.pop(_pp_pair, None)
@@ -9186,10 +9194,21 @@ def trading_loop(trader):
                         _pat_note = ""
                         if _cpn: _pat_note += f"\n📐 Chart: `{_cpn}`"
                         if _cdn: _pat_note += f"\n🕯️ Candle: `{_cdn}`"
-                        tg(f"{emoji} *{sig} Signal — {coin['name']}*\n"
+                        # The signal message carries its own VERDICT. It used
+                        # to fire here with entry/size/leverage — reading like
+                        # an order confirmation — and then the remaining gates
+                        # refused silently. A signal alert that does not say
+                        # what happened to the signal is how the owner ends up
+                        # asking why the bot "doesn't trade its own signals".
+                        _sig_msg = (
+                           f"{emoji} *{sig} Signal — {coin['name']}*\n"
                            f"Enter: `${plan['enter']:.4f}` | Exit: `${target:.4f}` | Stop: `${stop:.4f}`\n"
                            f"R:R: `{_rr_str}:1` | EMA: `{ema:.2f}` | RSI: `{rsi}` | Conf: `{int(conf*100)}%`\n"
                            f"Size: `{risk*100:.1f}%` | Leverage: *{leverage}x*{_pat_note}")
+                        if not _main_open:
+                            tg(_sig_msg + "\n👁 *Watch only* — book not taking "
+                               "entries (position already open, paused, or at "
+                               "max positions).")
                         if _main_open:
                             # ── Autopilot allocation seam (paper-only) ──────────
                             # Honest default is FLAT: place the REAL paper entry only
@@ -9198,6 +9217,10 @@ def trading_loop(trader):
                             # recorded the signal. No-op when AUTOPILOT is off.
                             if _autopilot is not None and not _autopilot.allows(pair, "base"):
                                 db.mark_shadow(_sid, taken=False, rejected="autopilot_flat")
+                                tg(_sig_msg + "\n🚫 *Not traded* — autopilot is "
+                                   "FLAT: no config has proven a real edge yet, "
+                                   "so the book stays parked. The signal was "
+                                   "recorded and will be graded.")
                                 last_sigs[pair] = sig
                                 continue
                             # Check the confidence floor BEFORE resting an order.
@@ -9211,6 +9234,9 @@ def trading_loop(trader):
                                 log("GATE", f"{coin['name']} skipped — confidence "
                                             f"{conf:.0%} below floor {_floor:.0%}")
                                 db.mark_shadow(_sid, rejected="min_conf")
+                                tg(_sig_msg + f"\n🚫 *Not traded* — confidence "
+                                   f"`{conf:.0%}` is below this pair's floor "
+                                   f"`{_floor:.0%}`.")
                                 last_sigs[pair] = sig
                                 continue
 
@@ -9231,8 +9257,15 @@ def trading_loop(trader):
                                 log("ORDER", f"{coin['name']} passive {sig} limit resting at "
                                              f"{price:.6f} (maker; expires in "
                                              f"{MAKER_FILL_WAIT_SCANS} scans)")
+                                tg(_sig_msg + f"\n📥 *Maker order resting* at "
+                                   f"`${price:.4f}` — becomes a trade only if "
+                                   f"price trades back through it. May expire "
+                                   f"unfilled; you'll be told either way.")
                             else:
                                 db.mark_shadow(_sid, taken=True, rejected="")
+                                tg(_sig_msg + "\n⚡ *Taking it* — order going to "
+                                   "the paper book now (final risk checks can "
+                                   "still refuse).")
                                 trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
                                                  atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
 
