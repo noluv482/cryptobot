@@ -101,7 +101,7 @@ check("snapshot keys are a fixed set", set(snap) == {
     "interval_m", "min_confidence", "adx_min", "er_min", "min_rr_live",
     "min_rr_paper", "risk_max", "max_positions", "max_drawdown",
     "daily_limits", "disabled_pairs", "round_trip_cost", "ap_champion",
-    "code_version"}, str(sorted(snap)))
+    "code_version", "trail_enabled", "disaster_stop_atr"}, str(sorted(snap)))
 check("snapshot is JSON-serializable with sorted keys",
       json.dumps(snap, sort_keys=True) == json.dumps(snap, sort_keys=True))
 

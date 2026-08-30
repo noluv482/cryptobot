@@ -434,6 +434,23 @@ KRAKEN_MAKER_FEE = float(os.environ.get('KRAKEN_MAKER_FEE', '0.004')) # maker: r
 # ~1% of signals on daily bars, but it is NOT free and the paper model below
 # simulates the misses rather than pretending every order fills.
 USE_MAKER_ENTRIES = os.environ.get("USE_MAKER_ENTRIES", "1") not in ("0", "false", "False")
+# A resting limit at the touch is BACK of the queue: real fills need price to
+# trade THROUGH the level. Fill-on-touch is the best-documented way a paper
+# bot flatters itself (adversely-selected fills: you get the losers, miss the
+# winners). 0.05% through-distance ~ one tick of real queue displacement.
+MAKER_FILL_THROUGH_PCT = float(os.environ.get("MAKER_FILL_THROUGH_PCT", "0.0005"))
+# Trailing-stop ratchet, OFF by default since 2026-08-30. Four independent
+# measurements condemned it: exit_lab paired replay (actual exits gave up
+# 4.7%/trade vs holding 24h, t=-3.1, n=29), exit attribution (-$10.98 over 79
+# trades, the book's largest single wound), the sim (8 of 8 trades killed by
+# trail), and theory (Kaminski & Lo: stops only add value under MOMENTUM at
+# the exit horizon — this market measured decade-stable 15m MEAN REVERSION,
+# where a ratchet systematically sells local bottoms). With the trail off the
+# stop is a static disaster stop several ATRs wide; targets and the existing
+# time exits do the work. Flip TRAIL_ENABLED=1 to restore the old behavior —
+# the config stamp records which mode every trade was opened under.
+TRAIL_ENABLED = os.environ.get("TRAIL_ENABLED", "0") not in ("0", "false", "False")
+DISASTER_STOP_ATR_MULT = float(os.environ.get("DISASTER_STOP_ATR_MULT", "3.0"))
 # How long a passive limit rests before being cancelled, in scan cycles. Must be
 # scaled to the BAR, not a fixed count: the first version used 3 scans = 3
 # minutes on a 1h bar, so essentially nothing could ever fill. The backtest that
@@ -973,11 +990,16 @@ def _resolve_pending_entry(pair, price, trader):
         _pending_entries.pop(pair, None)
         log("ORDER", f"{pair} pending entry malformed ({sorted(p)}) — dropped", "ERR")
         return "expired"
-    touched = (price <= limit) if side in ("BUY", "LONG") else (price >= limit)
+    # THROUGH the limit, not merely touching it — at a touch the resting order
+    # is back of the queue and usually unfilled; counting touches as fills is
+    # systematically optimistic in exactly the adversely-selected direction.
+    _thr = (limit * (1 - MAKER_FILL_THROUGH_PCT) if side in ("BUY", "LONG")
+            else limit * (1 + MAKER_FILL_THROUGH_PCT))
+    touched = (price <= _thr) if side in ("BUY", "LONG") else (price >= _thr)
     if touched:
         _pending_entries.pop(pair, None)
         log("ORDER", f"{pair} passive entry filled at {limit:.6f} "
-                     f"(maker, waited {p['scans']} scans)")
+                     f"(maker, traded through, waited {p['scans']} scans)")
         return "filled"
     if p["scans"] >= MAKER_FILL_WAIT_SCANS:
         _pending_entries.pop(pair, None)
@@ -1139,7 +1161,12 @@ class Database:
             # stored candles, and the strict subset came back too small to
             # judge (22 independent signals). Recorded natively from now on so
             # the audit gets cheaper and exact as the sample grows.
-            for _col in ("adx", "er"):
+            for _col in ("adx", "er",
+                         # live bid-ask spread at signal time: a real cost the
+                         # 15m candles cannot see, so the 1.30% RT estimate is
+                         # a FLOOR on thin pairs. Recorded to make execution
+                         # cost a measured number instead of an assumption.
+                         "spread"):
                 cur.execute(f"ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS {_col} FLOAT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS exit_lab (
@@ -1438,9 +1465,9 @@ class Database:
                 cur.execute("""INSERT INTO shadow_signals
                     (ts,pair,sig,price,conf,rsi,atr_pct,reach_pct,stop_pct,tgt_pct,
                      rr_gross,rr_net,vol_ratio,funding,regime,hour,dow,pillars,fkey,
-                     adx,er)
+                     adx,er,spread)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                            %s,%s)
+                            %s,%s,%s)
                     RETURNING id""",
                     (r.get("ts"), r.get("pair"), r.get("sig"), r.get("price"),
                      r.get("conf"), r.get("rsi"), r.get("atr_pct"), r.get("reach_pct"),
@@ -1448,7 +1475,7 @@ class Database:
                      r.get("rr_net"), r.get("vol_ratio"), r.get("funding"),
                      r.get("regime"), r.get("hour"), r.get("dow"),
                      r.get("pillars"), r.get("fkey"),
-                     r.get("adx"), r.get("er")))
+                     r.get("adx"), r.get("er"), r.get("spread")))
                 return cur.fetchone()[0]
         except Exception as e:
             log("DB", f"log_shadow: {e}", "ERR"); return None
@@ -1888,6 +1915,8 @@ def _cfg_snapshot():
         "daily_limits":    _daily_limits,
         "disabled_pairs":  sorted(_disabled_pairs),
         "round_trip_cost": ROUND_TRIP_COST_PCT,
+        "trail_enabled":   TRAIL_ENABLED,
+        "disaster_stop_atr": DISASTER_STOP_ATR_MULT,
         "ap_champion":     champ or "",
         "code_version":    os.environ.get("GIT_SHA", ""),
     }
@@ -4110,6 +4139,8 @@ class PaperTrader:
     def _trail_only(self, pair):
         """True when trailing stop consistently earns more per trade than
         the fixed target. Lets winning trades run further."""
+        if not TRAIL_ENABLED:
+            return False   # no ratchet → a target-less trade would have no upside exit
         if self._no_persist or not db.connected:
             return False
         self._refresh_exit_cache(pair)
@@ -4472,21 +4503,27 @@ class PaperTrader:
             if closed_this_tick:
                 return   # position gone — skip trailing / lock-in blocks below
 
-            # Update trailing stop using stored ATR distance (or fixed % fallback).
-            # The floor is re-applied here, not just at open: the parabolic and
-            # divergence tighteners write p["atr_dist"] directly mid-trade and can
-            # push it under one round trip, which turns the trail into a guaranteed
-            # loss the moment it is touched.
-            atr_dist = p.get("atr_dist", price * TRAIL_PCT)
-            atr_dist = max(atr_dist, p["entry"] * ROUND_TRIP_COST_PCT * MIN_STOP_VS_COST_MULT)
-            if side == "LONG":
-                if price > p.get("trail_peak", p["entry"]):
-                    p["trail_peak"] = price
-                    p["trail_stop"] = round(price - atr_dist, 6)
-            else:
-                if price < p.get("trail_peak", p["entry"]):
-                    p["trail_peak"] = price
-                    p["trail_stop"] = round(price + atr_dist, 6)
+            # Trailing ratchet + breakeven push + tier locks: ALL of it gated
+            # behind TRAIL_ENABLED (default off — see the constant's autopsy).
+            # With the trail off, the stop set at open never moves: a static
+            # disaster stop, wide enough that only a genuinely broken trade
+            # touches it, while targets and time exits do the actual work.
+            if TRAIL_ENABLED:
+                # Update trailing stop using stored ATR distance (or fixed %
+                # fallback). The floor is re-applied here, not just at open:
+                # the parabolic and divergence tighteners write p["atr_dist"]
+                # directly mid-trade and can push it under one round trip,
+                # which turns the trail into a guaranteed loss when touched.
+                atr_dist = p.get("atr_dist", price * TRAIL_PCT)
+                atr_dist = max(atr_dist, p["entry"] * ROUND_TRIP_COST_PCT * MIN_STOP_VS_COST_MULT)
+                if side == "LONG":
+                    if price > p.get("trail_peak", p["entry"]):
+                        p["trail_peak"] = price
+                        p["trail_stop"] = round(price - atr_dist, 6)
+                else:
+                    if price < p.get("trail_peak", p["entry"]):
+                        p["trail_peak"] = price
+                        p["trail_stop"] = round(price + atr_dist, 6)
 
             # Breakeven stop: once up BREAKEVEN_PCT, push the stop to the price
             # where the trade actually nets zero — which is NOT the entry price.
@@ -4498,7 +4535,7 @@ class PaperTrader:
             # profitable side of breakeven is the right direction to be wrong.)
             _be = round(p["entry"] * (1 + ROUND_TRIP_COST_PCT) if side == "LONG"
                         else p["entry"] * (1 - ROUND_TRIP_COST_PCT), 6)
-            if not p.get("breakeven_set") and move >= BREAKEVEN_PCT:
+            if TRAIL_ENABLED and not p.get("breakeven_set") and move >= BREAKEVEN_PCT:
                 if side == "LONG":
                     if p["trail_stop"] < _be:
                         p["trail_stop"] = _be
@@ -4512,7 +4549,7 @@ class PaperTrader:
                 p["breakeven_set"] = True
 
             # Tier-2 trailing stop: at +10% move lock in ≥7% profit (3% trail from peak)
-            if not p.get("tier2_trail_set") and move >= 0.10:
+            if TRAIL_ENABLED and not p.get("tier2_trail_set") and move >= 0.10:
                 lock_stop = round(p["entry"] * 1.07 if side == "LONG" else p["entry"] * 0.93, 6)
                 tight_atr = round(price * 0.03, 8)  # 3% trail going forward
                 if side == "LONG" and lock_stop > p.get("trail_stop", 0):
@@ -4527,7 +4564,7 @@ class PaperTrader:
                     tg(f"🔐 *+7% Locked — {name}*\nUp `{move*100:.1f}%` → stop `${lock_stop:.4f}` (trail tightened to 3%)")
 
             # Tier-3 trailing stop: at +20% lock in ≥17% profit (1.5% trail from peak)
-            if not p.get("tier3_trail_set") and move >= 0.20:
+            if TRAIL_ENABLED and not p.get("tier3_trail_set") and move >= 0.20:
                 lock_stop = round(p["entry"] * 1.17 if side == "LONG" else p["entry"] * 0.83, 6)
                 tight_atr = round(price * 0.015, 8)  # 1.5% trail — preserve big winners
                 if side == "LONG" and lock_stop > p.get("trail_stop", 0):
@@ -4551,7 +4588,11 @@ class PaperTrader:
             if move >= MAX_TRADE_GAIN:
                 self._close(price, name, "profit cap",   pair); closed_this_tick = True
             elif hit_trail:
-                self._close(price, name, "trailing stop", pair); closed_this_tick = True
+                # honest attribution: with the ratchet off this is a static
+                # disaster stop, not a trail — the ledger must say which
+                self._close(price, name,
+                            "trailing stop" if TRAIL_ENABLED else "stop loss",
+                            pair); closed_this_tick = True
             elif mins_open >= _STRATEGIES.get(p.get("strategy", ""), {}).get("max_mins", MAX_TRADE_MINS):
                 self._close(price, name, "time limit",   pair); closed_this_tick = True
             elif mins_open >= STALE_EXIT_MINS and \
@@ -4994,7 +5035,11 @@ class PaperTrader:
                          f"{_min_stop_dist/fill*100:.2f}% (below one round-trip cost)")
             atr_dist   = round(_min_stop_dist, 8)
             stop_label = "cost floor"
-        trail_stop = round(fill - atr_dist if side == "LONG" else fill + atr_dist, 6)
+        # With the trail off, this stop never moves — so it is set WIDE
+        # (disaster insurance at several ATRs), per Kaminski/Lo: in a
+        # mean-reverting market a near stop is a machine for selling bottoms.
+        _stop_dist = atr_dist if TRAIL_ENABLED else atr_dist * DISASTER_STOP_ATR_MULT
+        trail_stop = round(fill - _stop_dist if side == "LONG" else fill + _stop_dist, 6)
         # R-multiple partial take levels: 1R and 2R from entry based on ATR distance
         r1_price = round(fill + atr_dist      if side == "LONG" else fill - atr_dist,      6)
         r2_price = round(fill + atr_dist * 2  if side == "LONG" else fill - atr_dist * 2,  6)
@@ -9053,8 +9098,15 @@ def trading_loop(trader):
                         _sid = None
                         try:
                             _cv = volumes[:-1] if volumes and len(volumes) > 3 else []
+                            # live spread at signal time — cached 30s, so this
+                            # is nearly always a dict lookup, not an API call
+                            try:
+                                _sp_now = _spread_pct(pair)
+                            except Exception:
+                                _sp_now = None
                             _sid = db.log_shadow({
                                 "ts": time.time(), "pair": pair, "sig": sig,
+                                "spread": _sp_now,
                                 "price": price, "conf": conf, "rsi": rsi,
                                 "atr_pct": (atr / price) if (atr and price) else None,
                                 "reach_pct": _reach,
@@ -20194,6 +20246,44 @@ def _position_watchdog(*traders):
 
 
 # ── Learning lab filler ───────────────────────────────────────────────────────
+def _m1_archive_loop():
+    """Archive 1-minute candles for every scanned pair into the candles table.
+
+    Exit rules are simulated on 15m bars today, and the community's best-
+    documented backtesting trap is exactly that: a tight stop judged on candles
+    coarser than its own timescale "sells just below the high of the candle
+    almost every time". 1m data makes honest intracandle exit simulation
+    possible. It only helps FUTURE measurements, so it starts accumulating now
+    rather than the day it is needed.
+
+    Load: one OHLC call per pair every ~2.2h (Kraken returns 720 1m bars = 12h
+    of coverage, so even hours of downtime lose nothing). Storage: ~47k
+    rows/day, ~2-3 GB/year in the candles table — prune when it matters."""
+    if os.environ.get("M1_ARCHIVE", "1") in ("0", "false", "False"):
+        log("M1", "1m archive disabled by env")
+        return
+    pairs = [c["pair"] for c in SCAN_UNIVERSE]
+    log("M1", f"1m candle archive started ({len(pairs)} pairs, one fetch/4 min)")
+    i = 0
+    while True:
+        try:
+            if db.conn and pairs:
+                pair = pairs[i % len(pairs)]
+                i += 1
+                r = requests.get(f"{BASE_URL}/OHLC",
+                                 params={"pair": pair, "interval": 1}, timeout=12)
+                d = r.json()
+                if not d.get("error"):
+                    key = next((k for k in d["result"] if k != "last"), None)
+                    if key:
+                        # drop the still-forming bar — a half-written candle
+                        # in the archive would poison intracandle replays
+                        db.save_candles(pair, 1, d["result"][key][:-1])
+        except Exception as e:
+            log("M1", f"archive: {e}", "WRN")
+        time.sleep(240)
+
+
 def _learning_filler_loop():
     """Fill forward returns for shadow signals and exit-lab counterfactuals.
 
@@ -20539,6 +20629,7 @@ def main():
         ("BTC Dominance",     _btc_dominance_loop,  ()),
         ("Funding rates",     _funding_loop,        ()),
         ("Learning filler",   _learning_filler_loop, ()),
+        ("1m archive",        _m1_archive_loop,     ()),
         ("Trending scanner",  _trending_loop,       ()),
         ("Coin switcher",     _switcher_loop,       (trader,)),
         ("Telegram poll",     _poll_loop,           (trader,)),

@@ -308,7 +308,11 @@ def main():
                     help="use data/history CSVs (multi-year) instead of the live API")
     ap.add_argument("--since", type=int, default=None,
                     help="with --history: trim to candles from this year on")
+    ap.add_argument("--cost", type=float, default=None,
+                    help="round-trip cost as a decimal (e.g. 0.0005 for the "
+                         "0.05%% futures venue); default: the live spot cost")
     args = ap.parse_args()
+    cost = args.cost if args.cost is not None else bs.ROUND_TRIP_COST_PCT
 
     pairs = ([p.strip() for p in args.pairs.split(",") if p.strip()]
              or [c["pair"] for c in bs.SCAN_UNIVERSE])
@@ -387,7 +391,15 @@ def main():
         print()
         print("  Still only ONE market regime and one exchange. Before this goes")
         print("  anywhere near money it needs a different period and a cost check:")
-        print(f"  the edge must exceed the {bs.ROUND_TRIP_COST_PCT*100:.2f}% round trip.")
+        print(f"  the edge must exceed the {cost*100:.2f}% round trip"
+              + (" (venue cost given via --cost)." if args.cost is not None
+                 else "."))
+        for name, hz, n_i, e_i, t_i, n_o, e_o, t_o in survivors:
+            mult = e_o / cost if cost > 0 else float("inf")
+            print(f"     {name} @ {hz}: OOS edge is {mult:+.2f}x that cost"
+                  + ("" if mult > 1 else " — does NOT clear it"))
+        print("  NOTE: these windows OVERLAP — any survivor must still pass the")
+        print("  non-overlapping re-test (see test_reversal_depth.py) before belief.")
     else:
         best = max(results, key=lambda r: abs(r[7])) if results else None
         print("  NOTHING SURVIVED. No candidate beat a direction-matched random")
