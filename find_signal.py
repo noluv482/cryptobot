@@ -188,11 +188,20 @@ def sig_volume_spike_fade(c, h, l, v, i, n=24):
 
 
 def sig_rsi_extreme(c, h, l, v, i):
-    """RSI mean reversion at extremes."""
+    """RSI mean reversion at extremes.
+
+    RSI is computed on a bounded 40-bar window, NOT the full history-to-date:
+    calc_rsi over an ever-growing slice made this one candidate O(n²) — it
+    ground for 20+ minutes across 33 multi-year pairs and died where every
+    other candidate finished in seconds (two identical silent deaths at this
+    exact point in the battery). Wilder smoothing technically carries longer
+    memory, so the windowed RSI is an approximation — accepted, documented,
+    and the same for every bar, in exchange for being computable at all.
+    """
     if i < 30:
         return None
     try:
-        r = bs.calc_rsi(c[:i + 1])
+        r = bs.calc_rsi(c[max(0, i - 40):i + 1])
     except Exception:
         return None
     if r is None:
