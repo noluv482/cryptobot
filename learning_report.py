@@ -1,119 +1,304 @@
 #!/usr/bin/env python3
-"""Read what the learning lab has gathered: were the gates right, and would a
-different exit have paid?
+"""REGIME STEP-1 + honesty dashboard over the shadow book. Read-only.
 
-Run on the server, where the database lives:
+Three honest tables from shadow_signals, nothing invented, every row carries
+its n and small samples say so out loud:
 
-    docker exec cryptobot-bot-1 python3 learning_report.py
+  1. REGIME x SIDE — for each (regime, sig): n, mean fwd24 NET of the
+     recorded live spread and honest round-trip fees, win rate with its
+     Wilson 95% interval, and a verdict. The verdict vocabulary is fixed:
+        'n too small'      below MIN_N_REGIME — a hypothesis, not a finding
+        'no edge shown'    interval straddles or sits under 50% / mean <= 0
+        'candidate (rig)'  Wilson LOWER bound > 50% AND mean net > 0 — still
+                           only a candidate: promote nothing without the rig
+                           (time split, second timeframe, de-overlap).
+  2. GATES — same math grouped by TAKEN vs rejected_by: a rejecting gate is
+     vindicated by NEGATIVE net numbers on its row.
+  3. SPREAD MAP — per (pair, hour-of-day) median and p75 of the live bid-ask
+     spread recorded at signal time, floors enforced (MIN_N_SPREAD=100 per
+     cell). Written to spread_hours.json for the bot to read as a gate input.
 
-Two questions, straight from the tables:
+spread_hours.json contract (the bot_server agent codes against this EXACTLY):
+    {pair: {hour: {"median_pct": float, "p75_pct": float, "n": int}}}
+    - hour is the string "0".."23" (JSON object keys are strings)
+    - median_pct / p75_pct are FRACTIONS of price (0.003 = 0.30%), the same
+      unit as shadow_signals.spread and bot_server._spread_pct
+    - only cells with n >= 100 are present; absence means "not enough data",
+      never "spread is fine"
+    - top-level "_meta" key carries generated_ts, min_n, units — pairs never
+      collide with it because no Kraken pair is named "_meta"
 
-  SHADOW — for every signal that reached the gates, taken or rejected, what
-  did price do next? A gate is earning its keep only if the signals it
-  rejected went on to LOSE. "Blocked 500 signals" is not a defense; "blocked
-  500 signals that averaged -0.4%" is.
+Costs: net = signed(fwd24) - recorded spread - HONEST_FEES_RT (0.012 =
+maker 0.4% entry + taker 0.8% exit, base tier; override env LR_FEES_RT).
+Rows with no recorded spread use 0.0 and the table discloses how many.
 
-  EXIT LAB — for every closed trade, the exit that happened vs holding a flat
-  24h/48h from the same entry, both net of the same round-trip cost.
+CLI (dsn from --dsn or DATABASE_URL env — never hardcoded):
+    python learning_report.py [--dsn postgres://...] [--out spread_hours.json]
 
-Read the n column before believing anything. The rsi_zone episode is the
-house rule: a suggestive number on a small sample is a hypothesis for the
-rig (time split, second timeframe, de-overlapped windows), not a change.
+Writes NOTHING to any table. Its only output is stdout + spread_hours.json.
 """
+import json
+import math
 import os
 import statistics
 import sys
+import time
 
-import bot_server as bs
+HONEST_FEES_RT = float(os.environ.get("LR_FEES_RT", "0.012"))
+MIN_N_REGIME   = 30      # below this a (regime, sig) row is 'n too small'
+MIN_N_SPREAD   = 100     # below this a (pair, hour) spread cell is omitted
+Z95            = 1.959963984540054
+
+DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "spread_hours.json")
 
 
-def fmt(v, pct=True):
-    if v is None:
-        return "     —"
-    return f"{v*100:+6.3f}%" if pct else f"{v:+6.2f}"
+# ── shared math ──────────────────────────────────────────────────────────────
+def wilson(wins, n, z=Z95):
+    """Wilson 95% interval for a binomial proportion -> (lo, hi)."""
+    if n <= 0:
+        return None, None
+    p = wins / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, center - half), min(1.0, center + half)
 
 
-def signed(sig, f):
-    if f is None:
+def percentile(vals, q):
+    """Linear-interpolated percentile of a non-empty list. q in [0,1]."""
+    s = sorted(vals)
+    if len(s) == 1:
+        return s[0]
+    pos = q * (len(s) - 1)
+    lo = int(pos)
+    frac = pos - lo
+    return s[lo] if lo + 1 >= len(s) else s[lo] * (1 - frac) + s[lo + 1] * frac
+
+
+def net_fwd24(sig, fwd24, spread, fees_rt=HONEST_FEES_RT):
+    """Signed fwd24 minus recorded spread minus honest fees. None if
+    unresolved. Missing spread counts 0.0 (callers disclose the count)."""
+    if fwd24 is None:
         return None
-    return -f if sig == "SELL" else f
+    signed = -fwd24 if sig == "SELL" else fwd24
+    return signed - (spread or 0.0) - fees_rt
 
 
-def main():
-    if not bs.db.connected:
-        print("no DATABASE_URL — run inside the bot container:")
-        print("  docker exec cryptobot-bot-1 python3 learning_report.py")
-        return 2
-    cur = bs.db.conn.cursor()
+# ── table builders (pure: rows in, structures out) ───────────────────────────
+def regime_table(rows, fees_rt=HONEST_FEES_RT, min_n=MIN_N_REGIME):
+    """rows: dicts with regime, sig, fwd24, spread.
+    -> list of {regime, sig, n, n_spread_missing, mean_net, win_rate,
+                wilson_lo, wilson_hi, verdict}, biggest n first."""
+    groups = {}
+    for r in rows:
+        net = net_fwd24(r.get("sig"), r.get("fwd24"), r.get("spread"), fees_rt)
+        if net is None:
+            continue
+        key = (r.get("regime") or "?", r.get("sig") or "?")
+        g = groups.setdefault(key, {"nets": [], "miss": 0})
+        g["nets"].append(net)
+        g["miss"] += 1 if r.get("spread") is None else 0
+    out = []
+    for (regime, sig), g in groups.items():
+        nets = g["nets"]
+        n = len(nets)
+        wins = sum(1 for v in nets if v > 0)
+        lo, hi = wilson(wins, n)
+        mean_net = statistics.fmean(nets)
+        if n < min_n:
+            verdict = "n too small"
+        elif lo is not None and lo > 0.5 and mean_net > 0:
+            verdict = "candidate (rig)"
+        else:
+            verdict = "no edge shown"
+        out.append({"regime": regime, "sig": sig, "n": n,
+                    "n_spread_missing": g["miss"], "mean_net": mean_net,
+                    "win_rate": wins / n, "wilson_lo": lo, "wilson_hi": hi,
+                    "verdict": verdict})
+    out.sort(key=lambda r: -r["n"])
+    return out
 
-    # ── shadow overview ──────────────────────────────────────────────────────
-    cur.execute("""SELECT taken, rejected_by, sig, fwd6, fwd24, fwd48
-                   FROM shadow_signals WHERE fwd_done=1""")
-    rows = cur.fetchall()
-    cur.execute("SELECT COUNT(*), MIN(ts), MAX(ts) FROM shadow_signals")
-    total, t0, t1 = cur.fetchone()
-    cur.execute("SELECT COUNT(*) FROM shadow_signals WHERE fwd_done=0")
-    pending = cur.fetchone()[0]
 
-    print("=" * 72)
-    print(f"  SHADOW BOOK — {total or 0} signals logged, "
-          f"{len(rows)} with outcomes, {pending} awaiting their 48h")
-    print("=" * 72)
-    if rows:
-        groups = {}
-        for taken, rej, sig, f6, f24, f48 in rows:
-            key = "TAKEN" if taken else (rej or "other")
-            groups.setdefault(key, []).append(
-                (signed(sig, f6), signed(sig, f24), signed(sig, f48)))
-        print(f"  {'group':12s} {'n':>5s} {'fwd 6h':>8s} {'fwd 24h':>8s} {'fwd 48h':>8s}")
-        print("  " + "-" * 46)
-        for key in sorted(groups, key=lambda k: -len(groups[k])):
-            g = groups[key]
-            m = [statistics.fmean([x[i] for x in g if x[i] is not None])
-                 if any(x[i] is not None for x in g) else None for i in range(3)]
-            print(f"  {key:12s} {len(g):>5d} {fmt(m[0]):>8s} {fmt(m[1]):>8s} {fmt(m[2]):>8s}")
-        print()
-        print("  Reading it: positive means the signal direction was right.")
-        print("  A rejecting gate is vindicated by NEGATIVE numbers on its row;")
-        print("  if its row is positive, the gate is blocking winners.")
+def gate_table(rows, fees_rt=HONEST_FEES_RT, min_n=MIN_N_REGIME):
+    """Same math grouped by TAKEN / rejected_by. A rejecting gate earns its
+    keep only when its row's mean net is NEGATIVE."""
+    groups = {}
+    for r in rows:
+        net = net_fwd24(r.get("sig"), r.get("fwd24"), r.get("spread"), fees_rt)
+        if net is None:
+            continue
+        key = "TAKEN" if r.get("taken") else (r.get("rejected_by") or "other")
+        groups.setdefault(key, []).append(net)
+    out = []
+    for key, nets in groups.items():
+        n = len(nets)
+        wins = sum(1 for v in nets if v > 0)
+        lo, hi = wilson(wins, n)
+        out.append({"group": key, "n": n,
+                    "mean_net": statistics.fmean(nets),
+                    "win_rate": wins / n, "wilson_lo": lo, "wilson_hi": hi,
+                    "verdict": "n too small" if n < min_n else ""})
+    out.sort(key=lambda r: -r["n"])
+    return out
+
+
+def spread_map(rows, min_n=MIN_N_SPREAD):
+    """rows: dicts with pair, hour, spread (fraction of price).
+    -> {pair: {"0".."23": {median_pct, p75_pct, n}}} — cells under min_n are
+    OMITTED, not zero-filled: absence means 'not enough data'."""
+    cells = {}
+    for r in rows:
+        pair, hour, sp = r.get("pair"), r.get("hour"), r.get("spread")
+        if pair is None or hour is None or sp is None:
+            continue
+        cells.setdefault(pair, {}).setdefault(int(hour) % 24, []).append(float(sp))
+    out = {}
+    for pair, hours in cells.items():
+        for hour, vals in hours.items():
+            if len(vals) < min_n:
+                continue
+            out.setdefault(pair, {})[str(hour)] = {
+                "median_pct": percentile(vals, 0.50),
+                "p75_pct": percentile(vals, 0.75),
+                "n": len(vals)}
+    return out
+
+
+# ── DB glue (read-only) ──────────────────────────────────────────────────────
+RESOLVED_SQL = """
+    SELECT regime, sig, fwd24, spread, taken, rejected_by
+    FROM shadow_signals
+    WHERE fwd_done=1 AND fwd24 IS NOT NULL AND sig IN ('BUY','SELL')
+"""
+RESOLVED_COLS = ("regime", "sig", "fwd24", "spread", "taken", "rejected_by")
+
+SPREAD_SQL = """
+    SELECT pair, hour, spread FROM shadow_signals WHERE spread IS NOT NULL
+"""
+SPREAD_COLS = ("pair", "hour", "spread")
+
+
+def fetch(conn, sql, cols):
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def write_spread_json(smap, path):
+    doc = {"_meta": {"generated_ts": time.time(), "min_n": MIN_N_SPREAD,
+                     "units": "fraction of price (0.003 = 0.30%)"}}
+    doc.update(smap)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+# ── report ───────────────────────────────────────────────────────────────────
+def _pct(v):
+    return "      —" if v is None else f"{v*100:+7.3f}%"
+
+
+def run_report(conn, out_path=DEFAULT_OUT):
+    resolved = fetch(conn, RESOLVED_SQL, RESOLVED_COLS)
+    spreads = fetch(conn, SPREAD_SQL, SPREAD_COLS)
+
+    print("=" * 78)
+    print(f"  REGIME x SIDE — {len(resolved)} resolved BUY/SELL shadow rows, "
+          f"net = fwd24 - spread - {HONEST_FEES_RT*100:.2f}% fees")
+    print("=" * 78)
+    rt = regime_table(resolved)
+    if rt:
+        miss = sum(r["n_spread_missing"] for r in rt)
+        print(f"  {'regime':10s} {'sig':4s} {'n':>5s} {'mean net':>9s} "
+              f"{'win%':>6s} {'wilson95':>15s}  verdict")
+        print("  " + "-" * 68)
+        for r in rt:
+            wl = (f"[{r['wilson_lo']*100:4.1f},{r['wilson_hi']*100:5.1f}]%"
+                  if r["wilson_lo"] is not None else "      —")
+            print(f"  {r['regime']:10s} {r['sig']:4s} {r['n']:>5d} "
+                  f"{_pct(r['mean_net']):>9s} {r['win_rate']*100:>5.1f}% "
+                  f"{wl:>15s}  {r['verdict']}")
+        if miss:
+            print(f"  ({miss} rows had no recorded spread — costed at 0.0, "
+                  "so their nets are OPTIMISTIC)")
+        print("  'candidate (rig)' promotes nothing: it earns the rig "
+              "(time split, 2nd timeframe, de-overlap), not a settings change.")
     else:
-        print("  no outcomes yet — rows gain forward returns 49h after logging")
+        print("  no resolved rows yet — rows gain forward returns 49h after "
+              "logging")
 
-    # ── exit lab ─────────────────────────────────────────────────────────────
-    cur.execute("""SELECT reason, act_gross, cost_pct, f24, f48
-                   FROM exit_lab WHERE done=1""")
-    er = cur.fetchall()
-    cur.execute("SELECT COUNT(*) FROM exit_lab WHERE done=0")
-    ep = cur.fetchone()[0]
     print()
-    print("=" * 72)
-    print(f"  EXIT LAB — {len(er)} trades with counterfactuals, {ep} awaiting")
-    print("=" * 72)
-    if er:
-        act = [a - c for _, a, c, _, _ in er]
-        h24 = [f - c for _, _, c, f, _ in er if f is not None]
-        h48 = [f - c for _, _, c, _, f in er if f is not None]
-        print(f"  {'strategy':22s} {'n':>5s} {'net/trade':>10s}")
-        print("  " + "-" * 42)
-        print(f"  {'actual exits':22s} {len(act):>5d} {fmt(statistics.fmean(act)):>10s}")
-        if h24:
-            print(f"  {'hold flat 24h':22s} {len(h24):>5d} {fmt(statistics.fmean(h24)):>10s}")
-        if h48:
-            print(f"  {'hold flat 48h':22s} {len(h48):>5d} {fmt(statistics.fmean(h48)):>10s}")
-        by = {}
-        for reason, a, c, _, _ in er:
-            by.setdefault(reason or "?", []).append(a - c)
-        print()
-        print("  actual exits by reason:")
-        for r, v in sorted(by.items(), key=lambda x: -len(x[1])):
-            print(f"    {r:20s} n={len(v):>4d}  net {fmt(statistics.fmean(v))}")
+    print("=" * 78)
+    print("  GATES — a rejecting gate is vindicated by NEGATIVE net on its row")
+    print("=" * 78)
+    gt = gate_table(resolved)
+    if gt:
+        print(f"  {'group':16s} {'n':>5s} {'mean net':>9s} {'win%':>6s}  note")
+        print("  " + "-" * 52)
+        for r in gt:
+            print(f"  {r['group']:16s} {r['n']:>5d} {_pct(r['mean_net']):>9s} "
+                  f"{r['win_rate']*100:>5.1f}%  {r['verdict']}")
     else:
-        print("  no counterfactuals yet — they fill 49h after each close")
+        print("  nothing resolved yet")
 
+    print()
+    print("=" * 78)
+    print(f"  SPREAD MAP — median/p75 live spread per (pair, hour), "
+          f"cells need n >= {MIN_N_SPREAD}")
+    print("=" * 78)
+    smap = spread_map(spreads)
+    kept = sum(len(h) for h in smap.values())
+    total_cells = len({(r['pair'], int(r['hour']) % 24) for r in spreads
+                       if r.get('pair') is not None and r.get('hour') is not None})
+    print(f"  {len(spreads)} rows with spread -> {kept} cells kept of "
+          f"{total_cells} seen (rest under the n={MIN_N_SPREAD} floor)")
+    for pair in sorted(smap):
+        hours = smap[pair]
+        worst = max(hours.items(), key=lambda kv: kv[1]["p75_pct"])
+        best = min(hours.items(), key=lambda kv: kv[1]["median_pct"])
+        print(f"  {pair:12s} {len(hours):>2d} hours mapped   "
+              f"widest p75 {worst[1]['p75_pct']*100:.3f}% @ {worst[0]:>2s}h   "
+              f"tightest median {best[1]['median_pct']*100:.3f}% @ {best[0]:>2s}h")
+    write_spread_json(smap, out_path)
+    print(f"  -> {out_path}")
     print()
     print("  Small n = hypothesis, not finding. Promote nothing without the rig.")
     return 0
 
 
+def _connect(dsn):
+    if not dsn:
+        print("no dsn: pass --dsn or set DATABASE_URL "
+              "(never hardcoded here on purpose)")
+        return None
+    import psycopg2
+    return psycopg2.connect(dsn)
+
+
+def main(argv):
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    args = list(argv)
+    dsn = os.environ.get("DATABASE_URL")
+    out = DEFAULT_OUT
+    if "--dsn" in args:
+        i = args.index("--dsn")
+        dsn = args[i + 1]
+        del args[i:i + 2]
+    if "--out" in args:
+        i = args.index("--out")
+        out = args[i + 1]
+        del args[i:i + 2]
+    conn = _connect(dsn)
+    if conn is None:
+        return 2
+    try:
+        return run_report(conn, out)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
