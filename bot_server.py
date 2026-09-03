@@ -23,6 +23,7 @@ import urllib.parse
 import random
 import collections
 import xml.etree.ElementTree as ET
+import sizing   # pure functions, no DB/network — shadow sizing + dd circuit
 from datetime import datetime, timedelta
 import matplotlib
 matplotlib.use("Agg")
@@ -516,6 +517,25 @@ _ENTRY_COST_PCT = (KRAKEN_MAKER_FEE if USE_MAKER_ENTRIES and not (USE_BINANCE or
 _EXIT_COST_PCT  = (BINANCE_FEE if USE_BINANCE else
                    KRAKEN_FUTURES_FEE if USE_FUTURES else KRAKEN_FEE) + SLIPPAGE
 ROUND_TRIP_COST_PCT   = _ENTRY_COST_PCT + _EXIT_COST_PCT
+
+# ── Spread gate (2026-09-03, BS2) ────────────────────────────────────────────
+# Block a new ENTRY when the live spread is wider than min(hard cap, 2x this
+# pair+hour's historical median from spread_hours.json). The map is written by
+# learning_report.py ({pair: {"0".."23": {median_pct, p75_pct, n}}}, fractions
+# of price) and only carries cells with n >= 100 — an absent cell means "not
+# enough data", so only the hard cap applies there, never an invented median.
+SPREAD_GATE_ENABLED  = os.environ.get("SPREAD_GATE_ENABLED", "1") == "1"
+SPREAD_GATE_HARD_CAP = float(os.environ.get("SPREAD_GATE_HARD_CAP", "0.0025"))  # 0.25%
+SPREAD_GATE_MIN_N    = 100     # matches learning_report.MIN_N_SPREAD
+SPREAD_HOURS_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "spread_hours.json")
+
+# Stale-tick guard: a price older than 3 scan intervals must not manage exits
+# blind, and must never open an entry. See on_signal.
+STALE_TICK_SECS = int(os.environ.get("STALE_TICK_SECS", str(3 * REFRESH_SEC)))
+
+# Shadow sizing (measure, don't switch): daily vol the sizing module targets.
+SIZING_TARGET_VOL = float(os.environ.get("SIZING_TARGET_VOL", "0.02"))
 
 
 _reach_cache: dict = {}          # pair -> {(bars, side): dist}, expiry
@@ -1098,6 +1118,19 @@ class Database:
             # trade was OPENED. NULL means "before stamping existed" — never
             # backfilled, because guessing a past config would be fiction.
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS cfg_hash TEXT")
+            # Per-trade attribution (2026-09-03): stamped at OPEN. shadow_id
+            # links the trade to the exact shadow_signals row that produced it;
+            # regime/spread_entry/adx/er are the values at the open moment.
+            # mfe_pct/mae_pct = peak favorable/adverse excursion as a signed
+            # fraction of entry, updated every tick while the position is open.
+            # slip_realized = the round-trip slippage fraction actually applied
+            # (modeled in paper, measured against signal price live).
+            # NULL = row predates the migration — never backfilled.
+            for _col, _typ in (("shadow_id", "INT"), ("regime", "TEXT"),
+                               ("spread_entry", "FLOAT"), ("adx", "FLOAT"),
+                               ("er", "FLOAT"), ("mfe_pct", "FLOAT"),
+                               ("mae_pct", "FLOAT"), ("slip_realized", "FLOAT")):
+                cur.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {_col} {_typ}")
             # config_ledger: cfg_hash → the full settings snapshot behind it.
             # A trade stamped a1b2c3 stays explainable after every slider has
             # moved since: the ledger row says exactly what the bot's config
@@ -1167,6 +1200,15 @@ class Database:
                          # a FLOOR on thin pairs. Recorded to make execution
                          # cost a measured number instead of an assumption.
                          "spread"):
+                cur.execute(f"ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS {_col} FLOAT")
+            # 2026-09-03: longer horizon + path extremes. fwd168 = 7-day
+            # forward return. max_up_48/max_dn_48 = the extreme high/low
+            # excursion over the 48h after the signal, from 1h highs/lows,
+            # LONG-signed from the recorded price (analysis flips by side).
+            # conf_post_ob = confidence AFTER the order-book-imbalance nudge
+            # (log_shadow stores the pre-OB value) so the nudge is measurable.
+            # Old rows stay NULL; any scorer must treat NULL as "not ready".
+            for _col in ("fwd168", "max_up_48", "max_dn_48", "conf_post_ob"):
                 cur.execute(f"ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS {_col} FLOAT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS exit_lab (
@@ -1244,6 +1286,54 @@ class Database:
                     PRIMARY KEY (pair, interval_m, ts)
                 )
             """)
+            # funding_rates (2026-09-03): hourly Kraken Futures funding history,
+            # public v4 historicalfundingrates, filled by _funding_history_loop.
+            # ts is epoch SECONDS; rate is the hourly relativeFundingRate
+            # fraction. PK makes the filler's upserts idempotent.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS funding_rates (
+                    venue  TEXT   NOT NULL,
+                    symbol TEXT   NOT NULL,
+                    ts     BIGINT NOT NULL,
+                    rate   FLOAT,
+                    PRIMARY KEY (venue, symbol, ts)
+                )
+            """)
+            # fills_tca (2026-09-03): transaction-cost analysis. One row per
+            # fill: the best bid/ask mid snapshotted at ORDER CREATION
+            # (arrival mid) against the price actually filled. shortfall_bps
+            # is signed adverse-positive. is_paper=TRUE marks a MODELED fill
+            # (paper shortfall is the modeled slip, not a market measurement) —
+            # never average paper and live rows together.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fills_tca (
+                    pair          TEXT,
+                    ts            BIGINT,
+                    side          TEXT,
+                    size_usd      FLOAT,
+                    maker         BOOLEAN,
+                    arrival_mid   FLOAT,
+                    fill_price    FLOAT,
+                    shortfall_bps FLOAT,
+                    is_paper      BOOLEAN
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS tca_pair_ts ON fills_tca(pair, ts)")
+            # engine_rejects (2026-09-03): engine honesty. A row is written
+            # ONLY when SignalEngine.evaluate had a real BUY/SELL and a hard
+            # gate flipped it to HOLD — the first gate to veto is named. conf
+            # is NULL when the veto fired before the confidence score existed
+            # (most gates run first); recording a number that was never
+            # computed would be fiction.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS engine_rejects (
+                    pair TEXT,
+                    ts   BIGINT,
+                    gate TEXT,
+                    conf FLOAT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS er_gate_ts ON engine_rejects(gate, ts)")
 
     def save_candles(self, pair, interval_m, rows):
         """rows: raw Kraken OHLC rows [time, open, high, low, close, vwap, volume, count]"""
@@ -1289,17 +1379,26 @@ class Database:
             # callers do not pass cfg_hash — default it rather than crash a close.
             t = {**t}
             t.setdefault("cfg_hash", "")
+            # Attribution columns (2026-09-03) — older callers don't pass them;
+            # NULL is the honest default, never 0.
+            for _k in ("shadow_id", "regime", "spread_entry", "adx", "er",
+                       "mfe_pct", "mae_pct", "slip_realized"):
+                t.setdefault(_k, None)
             with self.conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO trades
                       (ts, coin, pair, side, entry, exit_price, pnl, held_mins,
                        reason, confidence, nasdaq_mood, news_sent, balance_after,
-                       strategy, timeframe, cfg_hash)
+                       strategy, timeframe, cfg_hash,
+                       shadow_id, regime, spread_entry, adx, er,
+                       mfe_pct, mae_pct, slip_realized)
                     VALUES
                       (%(ts)s,%(coin)s,%(pair)s,%(side)s,%(entry)s,%(exit_price)s,
                        %(pnl)s,%(held_mins)s,%(reason)s,%(confidence)s,
                        %(nasdaq_mood)s,%(news_sent)s,%(balance_after)s,
-                       %(strategy)s,%(timeframe)s,%(cfg_hash)s)
+                       %(strategy)s,%(timeframe)s,%(cfg_hash)s,
+                       %(shadow_id)s,%(regime)s,%(spread_entry)s,%(adx)s,%(er)s,
+                       %(mfe_pct)s,%(mae_pct)s,%(slip_realized)s)
                 """, t)
         except Exception as e:
             log("DB", f"Save error: {e}", "ERR")
@@ -1480,7 +1579,7 @@ class Database:
         except Exception as e:
             log("DB", f"log_shadow: {e}", "ERR"); return None
 
-    def mark_shadow(self, sid, taken=None, rejected=None):
+    def mark_shadow(self, sid, taken=None, rejected=None, conf_post_ob=None):
         if not self.conn or sid is None: return
         try:
             with self.conn.cursor() as cur:
@@ -1490,6 +1589,11 @@ class Database:
                 if rejected is not None:
                     cur.execute("UPDATE shadow_signals SET rejected_by=%s WHERE id=%s",
                                 (rejected, sid))
+                if conf_post_ob is not None:
+                    # confidence AFTER the order-book-imbalance nudge — the
+                    # row's own conf column keeps the pre-OB value untouched
+                    cur.execute("UPDATE shadow_signals SET conf_post_ob=%s WHERE id=%s",
+                                (conf_post_ob, sid))
         except Exception as e:
             log("DB", f"mark_shadow: {e}", "ERR")
 
@@ -1504,15 +1608,85 @@ class Database:
         except Exception as e:
             log("DB", f"shadow_pending: {e}", "ERR"); return []
 
-    def fill_shadow(self, sid, f6, f24, f48):
+    def fill_shadow(self, sid, f6, f24, f48, f168=None, max_up=None, max_dn=None):
         if not self.conn: return
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""UPDATE shadow_signals
-                               SET fwd6=%s, fwd24=%s, fwd48=%s, fwd_done=1
-                               WHERE id=%s""", (f6, f24, f48, sid))
+                               SET fwd6=%s, fwd24=%s, fwd48=%s,
+                                   fwd168=%s, max_up_48=%s, max_dn_48=%s,
+                                   fwd_done=1
+                               WHERE id=%s""",
+                            (f6, f24, f48, f168, max_up, max_dn, sid))
         except Exception as e:
             log("DB", f"fill_shadow: {e}", "ERR")
+
+    def log_engine_reject(self, pair, ts, gate, conf):
+        """One hard veto inside SignalEngine.evaluate, AFTER a real BUY/SELL
+        existed. conf may be None when the veto fired before the confidence
+        score was computed. Must never raise into evaluate."""
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("INSERT INTO engine_rejects (pair, ts, gate, conf) "
+                            "VALUES (%s,%s,%s,%s)", (pair, int(ts), gate, conf))
+        except Exception as e:
+            log("DB", f"log_engine_reject: {e}", "ERR")
+
+    def log_fill_tca(self, r):
+        """One TCA row per fill (open or close side). Paper fills carry
+        is_paper=TRUE — their shortfall is the MODELED slip, not a market
+        measurement. Must never raise into _open/_close."""
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""INSERT INTO fills_tca
+                    (pair, ts, side, size_usd, maker, arrival_mid, fill_price,
+                     shortfall_bps, is_paper)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (r.get("pair"), int(r.get("ts", 0)), r.get("side"),
+                     r.get("size_usd"), r.get("maker"), r.get("arrival_mid"),
+                     r.get("fill_price"), r.get("shortfall_bps"),
+                     r.get("is_paper")))
+        except Exception as e:
+            log("DB", f"log_fill_tca: {e}", "ERR")
+
+    def fills_volume_30d(self):
+        """Trailing-30d PROVEN fill volume in USD: sum of size_usd over
+        fills_tca rows with is_paper=FALSE. Paper fills are modeled, not
+        traded — an exchange fee tier is earned by real volume only. Returns
+        None when the DB is down: unknown is not zero, and the fee-tier job
+        must say 'unproven', never assume."""
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT COALESCE(SUM(size_usd), 0) FROM fills_tca
+                               WHERE is_paper = FALSE AND ts >= %s""",
+                            (int(time.time()) - 30 * 86400,))
+                row = cur.fetchone()
+                return float(row[0]) if row else 0.0
+        except Exception as e:
+            log("DB", f"fills_volume_30d: {e}", "ERR")
+            return None
+
+    def upsert_funding_rates(self, venue, symbol, rows):
+        """rows: iterable of (ts_epoch_s, rate). Idempotent — the PK is
+        (venue, symbol, ts), so re-fetching the same year is a no-op update.
+        Returns the number of rows sent (not the number newly inserted)."""
+        if not self.conn or not rows: return 0
+        n = 0
+        try:
+            with self.conn.cursor() as cur:
+                for ts_s, rate in rows:
+                    cur.execute("""INSERT INTO funding_rates (venue, symbol, ts, rate)
+                                   VALUES (%s,%s,%s,%s)
+                                   ON CONFLICT (venue, symbol, ts)
+                                   DO UPDATE SET rate = EXCLUDED.rate""",
+                                (venue, symbol, int(ts_s), float(rate)))
+                    n += 1
+        except Exception as e:
+            log("DB", f"upsert_funding_rates {symbol}: {e}", "ERR")
+        return n
 
     def log_exit_lab(self, r):
         if not self.conn: return
@@ -2040,6 +2214,7 @@ _klines_cache: dict = {}   # pair → (closes,highs,lows,volumes,opens,raw_rows,
 _KLINES_TTL   = 300        # 5 min; 15-min candles only change every 15 min
 
 _last_scan_ts: float = 0.0  # updated after each trading-loop cycle; watchdog alerts on stall
+_wd_stall_paused: bool = False  # True only while the WATCHDOG (not the owner) holds the pause
 _HEALTHZ_MAX_SCAN_AGE = 180  # /healthz reports unhealthy if the last scan is older than this (s)
 
 _ob_cache: dict = {}       # pair → {"ratio": float, "ts": float} from WS ticker bid/ask qty
@@ -2061,6 +2236,7 @@ _gate_counters = {
     "orderbook_wall": 0, "daily_trend": 0, "pair_profit_cap": 0,
     "ttl_expired": 0, "low_liq_hours": 0, "no_strategy": 0, "cost_floor": 0,
     "strategy_benched": 0, "strategy_conf": 0, "correlated": 0,
+    "spread_gated": 0, "dd_circuit": 0, "stale_tick": 0,
 }
 
 # Trade preview / confirmation state
@@ -2298,16 +2474,25 @@ def get_klines(pair, interval=None, limit=None):
     return closes, highs, lows, volumes, opens
 
 def get_price(pair):
+    # Every successful fetch stamps _price_fresh_ts[pair] — the stale-tick
+    # guard in on_signal reads that stamp to refuse prices older than
+    # STALE_TICK_SECS. Defined later in the module; runtime-only reference.
     if USE_BINANCE:
-        return _bn_get_price(pair)
+        _px = _bn_get_price(pair)
+        _price_fresh_ts[pair] = time.time()
+        return _px
     if USE_FUTURES:
-        return _kf_get_price(pair)
+        _px = _kf_get_price(pair)
+        _price_fresh_ts[pair] = time.time()
+        return _px
     r = requests.get(f"{BASE_URL}/Ticker", params={"pair": pair}, timeout=10)
     payload = r.json()
     if payload.get("error"):
         raise ValueError(f"Kraken Ticker error: {payload['error']}")
     key = list(payload["result"].keys())[0]
-    return float(payload["result"][key]["c"][0])
+    _px = float(payload["result"][key]["c"][0])
+    _price_fresh_ts[pair] = time.time()
+    return _px
 
 # ── Kraken private API (live trading mode) ───────────────────────────────────
 
@@ -3639,6 +3824,7 @@ def _htf_trend(pair, interval=60, limit=50):
 # ── Bid-ask spread filter ─────────────────────────────────────────────────────
 _spread_cache    = {}
 _spread_cache_ts = {}
+_bbo_cache       = {}   # pair → (bid, ask) from the same Ticker fetch (TCA arrival snapshot)
 
 def _spread_pct(pair):
     """Current bid-ask spread as a fraction of bid price. Cached 30 s."""
@@ -3652,10 +3838,127 @@ def _spread_pct(pair):
             bid = float(result[0]["b"][0])
             ask = float(result[0]["a"][0])
             _spread_cache[pair] = (ask - bid) / max(bid, 1e-9)
+            _bbo_cache[pair]    = (bid, ask)
         _spread_cache_ts[pair] = now
     except Exception:
         _spread_cache.setdefault(pair, 0.0)
     return _spread_cache.get(pair, 0.0)
+
+def _arrival_mid(pair):
+    """Best bid/ask midpoint at this moment (≤30 s stale — same cache as
+    _spread_pct, one Ticker fetch feeds both). None when unknown: TCA rows
+    record NULL rather than a made-up arrival price."""
+    try:
+        _spread_pct(pair)               # refresh the shared 30 s cache
+        b, a = _bbo_cache.get(pair, (None, None))
+        if b and a and b > 0 and a > 0:
+            return (b + a) / 2.0
+    except Exception:
+        pass
+    return None
+
+def _tca_shortfall_bps(side_word, arrival_mid, fill_price):
+    """Implementation shortfall in basis points, adverse-positive:
+    buy filled above mid → positive; sell filled below mid → positive.
+    None when the arrival mid is unknown — never invent a benchmark."""
+    if not arrival_mid or not fill_price:
+        return None
+    if str(side_word).lower() in ("buy", "long"):
+        return (fill_price - arrival_mid) / arrival_mid * 1e4
+    return (arrival_mid - fill_price) / arrival_mid * 1e4
+
+# ── Spread gate: pair+hour spread map from learning_report.py ────────────────
+_spread_hours_map: dict = {}     # parsed spread_hours.json (pairs only, no _meta)
+_spread_hours_mtime: float = -1.0
+_spread_hours_checked: float = 0.0
+
+def _load_spread_hours():
+    """Reload spread_hours.json when its mtime changes (checked at most every
+    5 min). Missing/corrupt file -> empty map: the gate then falls back to the
+    hard cap alone, it never invents a median."""
+    global _spread_hours_map, _spread_hours_mtime, _spread_hours_checked
+    now = time.time()
+    if now - _spread_hours_checked < 300:
+        return _spread_hours_map
+    _spread_hours_checked = now
+    try:
+        mt = os.path.getmtime(SPREAD_HOURS_FILE)
+    except OSError:
+        _spread_hours_map, _spread_hours_mtime = {}, -1.0
+        return _spread_hours_map
+    if mt == _spread_hours_mtime:
+        return _spread_hours_map
+    try:
+        with open(SPREAD_HOURS_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+        _spread_hours_map = {k: v for k, v in doc.items()
+                             if k != "_meta" and isinstance(v, dict)}
+        _spread_hours_mtime = mt
+        log("GATE", f"spread_hours.json loaded — {len(_spread_hours_map)} pairs")
+    except Exception as e:
+        log("GATE", f"spread_hours.json unreadable: {e}", "ERR")
+        _spread_hours_map, _spread_hours_mtime = {}, -1.0
+    return _spread_hours_map
+
+def _spread_gate_check(pair, spread_now, hour=None):
+    """-> (blocked, threshold, why).
+
+    Threshold = min(SPREAD_GATE_HARD_CAP, 2 x pair+hour median) when the map
+    has a cell with n >= SPREAD_GATE_MIN_N for this pair and UTC hour;
+    otherwise the hard cap alone. An UNKNOWN spread (None or <= 0 — that is
+    what _spread_pct returns when it cannot know) never blocks: the gate
+    refuses on measured width, not on missing data."""
+    if not SPREAD_GATE_ENABLED:
+        return False, None, "gate disabled"
+    if spread_now is None or spread_now <= 0:
+        return False, None, "spread unknown"
+    thr, why = SPREAD_GATE_HARD_CAP, "hard cap"
+    try:
+        h = datetime.utcnow().hour if hour is None else int(hour) % 24
+        cell = _load_spread_hours().get(pair, {}).get(str(h))
+        if cell and cell.get("median_pct") is not None \
+                and int(cell.get("n", 0)) >= SPREAD_GATE_MIN_N:
+            med2 = 2.0 * float(cell["median_pct"])
+            if med2 < thr:
+                thr, why = med2, f"2x median h{h} (n={int(cell['n'])})"
+    except Exception as e:
+        log("GATE", f"spread map lookup {pair}: {e}", "ERR")
+    return spread_now > thr, thr, why
+
+# ── Stale-tick guard state (watchdog teeth) ──────────────────────────────────
+_price_fresh_ts: dict = {}    # pair → ts of the last SUCCESSFUL direct price fetch
+_stale_warn_ts:  dict = {}    # pair → last Telegram warning ts (once/h, not spam)
+
+def _stale_tick_notice(pair, name, detail):
+    """Loud but not spammy: always log, Telegram at most once per pair-hour."""
+    log("WD", f"{name or pair} STALE TICK — {detail}", "WRN")
+    now = time.time()
+    if now - _stale_warn_ts.get(pair, 0) > 3600:
+        _stale_warn_ts[pair] = now
+        tg(f"⚠️ *Stale price tick — {name or pair}*\n{detail}")
+
+def _realized_vol_20d(pair):
+    """DAILY realized vol of the pair as a fraction, from the cached scan
+    candles (interval {INTERVAL}m, up to ~20d of bars, bar-vol scaled by
+    sqrt(bars/day)). None when unmeasurable — missing data refuses, it never
+    invents a number (sizing.vol_target_scalar sizes 0 on None)."""
+    try:
+        closes, *_ = get_klines(pair)
+    except Exception:
+        return None
+    if not closes:
+        return None
+    bars_per_day = max(1.0, 1440.0 / max(INTERVAL, 1))
+    closes = closes[-(int(bars_per_day * 20) + 1):]
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))
+            if closes[i - 1] > 0 and closes[i] > 0]
+    if len(rets) < 2 * bars_per_day:     # under 2 days of bars is not a vol estimate
+        return None
+    try:
+        sd = statistics.pstdev(rets)
+    except statistics.StatisticsError:
+        return None
+    return sd * math.sqrt(bars_per_day) if sd > 0 else None
 
 # ── Order book wall detector ──────────────────────────────────────────────────
 _ob_cache    = {}   # pair → {"bid_wall": float, "ask_wall": float}
@@ -3772,6 +4075,9 @@ class PaperTrader:
         self._min_size_warn_ts = {}  # pair → last time "order too small" tg() was sent
         self._force_risk_min = None  # when set, overrides global RISK_MIN for this trader
         self._force_risk_max = None  # when set, overrides global RISK_MAX for this trader
+        # Drawdown circuit breaker (sizing.risk_caps): announced once per
+        # open/close transition, never spammed on every refused entry.
+        self._dd_circuit_announced = False
         if not force_paper or state_path:
             self._load()
         if LIVE_MODE and not force_paper:
@@ -4435,12 +4741,45 @@ class PaperTrader:
         if p["side"] == "SHORT": move = -move
         return round(move * p["margin"] * p.get("leverage", LEVERAGE_MIN), 4)
 
-    def on_signal(self, sig, price, stop, target, name, confidence, pair, atr=None, fkey="", pillars=None, signal_ts=None):
+    def on_signal(self, sig, price, stop, target, name, confidence, pair, atr=None, fkey="", pillars=None, signal_ts=None,
+                  shadow_id=None, regime=None, adx=None, er=None):
         with _state_lock:
             paused = _paused
-        if paused or self.balance < PAPER_FLOOR: return
+        # WATCHDOG TEETH (2026-09-03): paused blocks NEW ENTRIES ONLY. It used
+        # to return here, which silently froze stop/target/time management on
+        # every OPEN position for as long as the pause lasted — a pause meant
+        # to reduce risk was abandoning live risk instead. Exits keep managing;
+        # the entry section below checks `paused` before opening anything.
+        if self.balance < PAPER_FLOOR: return
         if not self._is_live() and self.balance >= PAPER_TARGET: return
         if pair in _disabled_pairs: return
+        # Stale-tick guard (real book only — backtests/sim replay historical
+        # prices on purpose): if the last successful direct price fetch for
+        # this pair is older than 3 scan intervals, the price backing this
+        # tick cannot be trusted. With a position open, re-fetch via direct
+        # REST and manage exits on THAT; if the fetch fails, or there is no
+        # position (entry tick), skip loudly — log always, Telegram once/h.
+        if not self._no_persist and not self._force_paper:
+            _pfts = _price_fresh_ts.get(pair)
+            if _pfts is not None and (time.time() - _pfts) > STALE_TICK_SECS:
+                _tick_age = int(time.time() - _pfts)
+                if pair in self.positions:
+                    try:
+                        price = get_price(pair)   # direct REST; stamps freshness
+                        log("WD", f"{name} tick was {_tick_age}s old — exits "
+                                  f"managed on a fresh REST price {price:.6f}")
+                    except Exception as _spe:
+                        with _gate_counter_lock: _gate_counters["stale_tick"] += 1
+                        _stale_tick_notice(pair, name,
+                            f"price {_tick_age}s old (> {STALE_TICK_SECS}s) and REST "
+                            f"refetch failed (`{_spe}`) — position NOT managed this tick.")
+                        return
+                else:
+                    with _gate_counter_lock: _gate_counters["stale_tick"] += 1
+                    _stale_tick_notice(pair, name,
+                        f"price {_tick_age}s old (> {STALE_TICK_SECS}s) — entry skipped, "
+                        f"never traded on a stale tick.")
+                    return
         self._reset_day_if_needed()
         if _daily_limits or self._is_live():
             if self.day_trades >= MAX_TRADES_DAY: return
@@ -4464,6 +4803,12 @@ class PaperTrader:
             side = p["side"]
             move = (price - p["entry"]) / p["entry"]
             if side == "SHORT": move = -move
+            # Peak favorable / adverse excursion, updated every tick. Signed
+            # fractions of entry (mfe ≥ 0 ≥ mae); written to the trades table
+            # at close as mfe_pct/mae_pct. .get() keeps positions opened
+            # before this shipped from crashing the tick.
+            if move > p.get("mfe", 0.0): p["mfe"] = move
+            if move < p.get("mae", 0.0): p["mae"] = move
             mins_open = (time.time() - p.get("opened_at", time.time())) / 60
 
             # Back-compat: positions saved before two-stage partials only have partial_taken
@@ -4635,6 +4980,8 @@ class PaperTrader:
                 self._close(price, name, "signal flip",  pair); closed_this_tick = True
 
         if pair not in self.positions and not closed_this_tick:
+            if paused:
+                return   # entries only — the management block above already ran
             if time.time() < self._cooldown.get(pair, 0):
                 return
             if not self._streak_gate_disabled and time.time() < self._streak_cool_until:
@@ -4740,9 +5087,11 @@ class PaperTrader:
                       {"text": "⏭ Skip",  "callback_data": f"skip_trade:{pid}"}]]
                 )
                 return
-            self._open(_open_side, price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars, signal_ts=signal_ts, strategy=_strat_key)
+            self._open(_open_side, price, name, target, confidence, pair, atr, fkey=fkey, stop=stop, pillars=pillars, signal_ts=signal_ts, strategy=_strat_key,
+                       shadow_id=shadow_id, regime=regime, adx=adx, er=er)
 
-    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None, signal_ts=None, strategy=None, leverage_override=None):
+    def _open(self, side, price, name, target, confidence, pair, atr=None, fkey="", stop=None, pillars=None, signal_ts=None, strategy=None, leverage_override=None,
+              shadow_id=None, regime=None, adx=None, er=None):
         # Order TTL: if the signal is older than ORDER_TTL_SECS don't place the order.
         # Gates and API calls between evaluate() and here can add several seconds of lag;
         # acting on a stale signal risks entering at a price the market has already moved past.
@@ -4754,6 +5103,41 @@ class PaperTrader:
                    f"Signal was `{_age:.0f}s` old (max `{ORDER_TTL_SECS}s`) — order not placed.")
                 with _gate_counter_lock: _gate_counters["ttl_expired"] += 1
                 return
+
+        # ── Drawdown circuit breaker (2026-09-03, BS2) ── pure capital
+        # protection, and the ONE part of the sizing module that gates for
+        # real from day one: at 15% below the high-water mark (self.peak,
+        # persisted) no new position opens. ENTRIES ONLY — nothing here
+        # touches an open position, and exits keep managing elsewhere.
+        # Announced on open AND on recovery, never per refused entry.
+        self.peak = max(self.peak, self.balance)
+        _dd_caps = sizing.risk_caps(self.balance, self.peak)
+        if _dd_caps["dd_circuit_open"]:
+            with _gate_counter_lock: _gate_counters["dd_circuit"] += 1
+            if not self._dd_circuit_announced:
+                self._dd_circuit_announced = True
+                _dd_str = ("unmeasurable" if _dd_caps["drawdown"] is None
+                           else f"{_dd_caps['drawdown']*100:.1f}%")
+                log("RISK", f"DD CIRCUIT OPEN — drawdown {_dd_str} from HWM "
+                            f"${self.peak:.2f}; new entries blocked", "WRN")
+                if not self._force_paper:
+                    tg(f"⛔ *Drawdown circuit OPEN*\n"
+                       f"Balance `${self.balance:.2f}` is `{_dd_str}` below the "
+                       f"high-water mark `${self.peak:.2f}` (circuit: "
+                       f"`{sizing.DD_CIRCUIT*100:.0f}%`).\n"
+                       f"New entries are blocked until equity recovers. Open "
+                       f"positions keep their exits — nothing is auto-flattened.")
+            else:
+                log("RISK", f"{name} entry refused — dd circuit open")
+            return
+        elif self._dd_circuit_announced:
+            self._dd_circuit_announced = False
+            log("RISK", f"DD circuit closed — drawdown "
+                        f"{(_dd_caps['drawdown'] or 0)*100:.1f}% from HWM ${self.peak:.2f}")
+            if not self._force_paper:
+                tg(f"✅ *Drawdown circuit closed* — equity recovered to "
+                   f"`${self.balance:.2f}` (`{(_dd_caps['drawdown'] or 0)*100:.1f}%` "
+                   f"below HWM `${self.peak:.2f}`). Entries allowed again.")
 
         # Per-pair daily profit cap: skip new entry when pair already made ≥4% of balance today
         now_date_str = datetime.utcnow().strftime("%Y-%m-%d")
@@ -4843,6 +5227,16 @@ class PaperTrader:
                         * corr_mult
                         * reentry_mult,
                         _rmax)
+        # ── TCA arrival snapshot ── best bid/ask mid at ORDER CREATION, before
+        # any placement latency. Shared 30 s Ticker cache, so this is almost
+        # always a dict lookup. None = unknown (no fetch in backtests) and the
+        # TCA row records NULL rather than a fabricated benchmark.
+        _arr_mid = None
+        if not self._no_persist:
+            try:
+                _arr_mid = _arrival_mid(pair)
+            except Exception:
+                _arr_mid = None
         if self._is_live():
             margin = round(self.balance * risk, 4)
             fill   = price
@@ -4969,8 +5363,23 @@ class PaperTrader:
             # here already means the order filled.
             if USE_MAKER_ENTRIES and not (USE_BINANCE or USE_FUTURES):
                 fill = price
+                _slip_open, _slip_open_src = 0.0, "maker"
             else:
-                fill = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
+                # Paper fill realism (2026-09-03): a fixed 0.1% slip flattered
+                # every thin pair — crossing the spread costs at least half of
+                # it. Use whichever is WORSE: the fixed floor or half the live
+                # spread (30 s cache), and record which term won so the model's
+                # own honesty is measurable. _spread_pct returns 0.0 when it
+                # cannot know, which degrades to exactly the old behaviour.
+                _half_sp = 0.0
+                if not self._no_persist:
+                    try:
+                        _half_sp = 0.5 * _spread_pct(pair)
+                    except Exception:
+                        _half_sp = 0.0
+                _slip_open     = max(SLIPPAGE, _half_sp)
+                _slip_open_src = "spread" if _half_sp > SLIPPAGE else "fixed"
+                fill = price * (1 + _slip_open) if side == "LONG" else price * (1 - _slip_open)
             margin    = round(self.balance * risk, 4)
             contracts = round((margin * leverage) / fill, 6)
             _sim_fee  = (BINANCE_FEE if USE_BINANCE else
@@ -4994,6 +5403,13 @@ class PaperTrader:
             # with real money.
             fee       = round(margin * leverage * _sim_fee, 4)
             self.balance = round(self.balance - fee, 4)
+
+        if self._is_live():
+            # Live open slip is MEASURED: fill vs signal price, adverse-positive
+            # (negative = price improvement). None when price is unusable.
+            _slip_open = (((fill - price) / price) if side == "LONG"
+                          else ((price - fill) / price)) if price else None
+            _slip_open_src = "live"
 
         self.day_trades += 1
         conf_pct   = int(confidence * 100)
@@ -5061,6 +5477,60 @@ class PaperTrader:
                 target = round(fill + _min_tgt_dist if side == "LONG" else fill - _min_tgt_dist, 8)
         effective_target = float("inf") if (side == "LONG"  and self._trail_only(pair)) else \
                            0.0          if (side == "SHORT" and self._trail_only(pair)) else target
+        # ── SHADOW SIZING (2026-09-03, BS2) ── measure, don't switch. The
+        # sizing module's recommendation is computed HERE, after the existing
+        # multiplier stack has already decided the REAL size, and both are
+        # stamped side by side (engine size, module size, full audit dict,
+        # the engine's multiplier vector). 60 days of paired data decides
+        # which sizes better; nothing about the actual size changes today.
+        # Inputs are honest: win/loss stats come from the ledger's own price
+        # moves, vol comes from measured candles, and anything unmeasurable
+        # goes in as None — the module then sizes 0 and SAYS why in reasons[].
+        _sizing_shadow = None
+        try:
+            _sw_movs, _sl_movs = [], []
+            for _t in self.trades:
+                _te, _tx = _t.get("entry"), _t.get("exit")
+                if not _te or _tx is None:
+                    continue
+                _tm = (_tx - _te) / _te
+                if _t.get("side") == "SHORT":
+                    _tm = -_tm
+                _tp = _t.get("pnl", 0)
+                if   _tp > 0: _sw_movs.append(_tm)
+                elif _tp < 0: _sl_movs.append(abs(_tm))
+            _avg_win  = (sum(_sw_movs) / len(_sw_movs)) if _sw_movs else None
+            _avg_loss = (sum(_sl_movs) / len(_sl_movs)) if _sl_movs else None
+            _vol20 = _realized_vol_20d(pair) if not self._no_persist else None
+            _audit = sizing.size_position(
+                equity=self.balance, hwm=self.peak,
+                wins=len(_sw_movs), losses=len(_sl_movs),
+                avg_win=_avg_win, avg_loss=_avg_loss,
+                realized_vol_20d=_vol20, target_vol=SIZING_TARGET_VOL,
+                price=fill, stop_pct=(_stop_dist / fill) if fill else None)
+            _sizing_shadow = {
+                "engine_risk_frac":   risk,
+                "engine_margin_usd":  margin,
+                "engine_contracts":   contracts,
+                "engine_notional_usd": round(margin * leverage, 4),
+                "module_size_units":  _audit["size_units"],
+                "module_notional_usd": _audit["notional"],
+                "module_risk_frac":   _audit["risk_fraction"],
+                "audit":              _audit,
+                "engine_multipliers": {
+                    "base_risk": base_risk, "kelly_half": kelly,
+                    "risk_mult": self._risk_multiplier(),
+                    "calibration": self._calibration_multiplier(confidence),
+                    "feature": self._feature_multiplier(fkey),
+                    "wr": wr_mult, "vol": vol_mult, "streak": streak_mult,
+                    "session": session_mult, "gain": gain_mult,
+                    "corr": corr_mult, "reentry": reentry_mult,
+                    "cap_risk_max": _rmax,
+                },
+            }
+        except Exception as _sze:
+            log("SIZE", f"shadow sizing {name}: {_sze}", "ERR")
+            _sizing_shadow = {"error": str(_sze)}
         # Config stamp — the gate/risk settings live at THIS moment, so the
         # trade stays attributable after settings change. Real book only: sim
         # and backtest opens must not spam the ledger.
@@ -5071,7 +5541,25 @@ class PaperTrader:
                 db.ensure_config(_cfg_h, json.dumps(_cfg_snapshot(), sort_keys=True))
             except Exception as _ce:
                 log("CFG", f"stamp at open: {_ce}", "ERR")
+        # Per-trade attribution (2026-09-03) — stamped at OPEN, like cfg_hash:
+        # the shadow row / regime / spread / trendiness that DECIDED the trade.
+        # spread_entry reads the already-warm 30 s cache (the arrival snapshot
+        # and slip model both just refreshed it); None = not known, never 0.
+        _sp_entry = None
+        if not self._no_persist:
+            try:
+                _sp_entry = _spread_pct(pair)
+            except Exception:
+                _sp_entry = None
         self.positions[pair] = {"cfg_hash": _cfg_h,
+                                "sizing_shadow": _sizing_shadow,
+                                "shadow_id": shadow_id, "regime": regime,
+                                "adx": adx, "er": er,
+                                "spread_entry": _sp_entry,
+                                "arrival_mid": _arr_mid,
+                                "mfe": 0.0, "mae": 0.0,
+                                "slip_open": _slip_open,
+                                "slip_src": _slip_open_src,
                                 "side": side, "entry": fill,
                                 "contracts": contracts, "margin": margin,
                                 "target": effective_target, "opened_at": time.time(),
@@ -5087,6 +5575,23 @@ class PaperTrader:
                                 "strategy": strategy or "",
                                 "guard_mode": self.consecutive_losses >= 3,
                                 "streak_at_entry": self.consecutive_losses}
+        # ── TCA row for the OPEN fill ── real book only (sim challengers and
+        # backtests would pollute the measurement). Paper rows are labeled
+        # is_paper=TRUE: their shortfall is the MODELED slip, not the market.
+        if not self._no_persist and not self._force_paper:
+            try:
+                db.log_fill_tca({
+                    "pair": pair, "ts": time.time(),
+                    "side": "buy" if side == "LONG" else "sell",
+                    "size_usd": round(margin * leverage, 4),
+                    "maker": bool(USE_MAKER_ENTRIES and not (USE_BINANCE or USE_FUTURES)),
+                    "arrival_mid": _arr_mid, "fill_price": fill,
+                    "shortfall_bps": _tca_shortfall_bps(
+                        "buy" if side == "LONG" else "sell", _arr_mid, fill),
+                    "is_paper": not self._is_live(),
+                })
+            except Exception as _te:
+                log("TCA", f"open fill row: {_te}", "ERR")
         self._save()
         _push_sse("trade_open", {"name": name, "side": side,
                                   "entry": fill, "pair": pair,
@@ -5136,6 +5641,15 @@ class PaperTrader:
         p = self.positions.get(pair)
         if not p: return
 
+        # TCA arrival snapshot for the CLOSE fill — mid at the close decision,
+        # before placement latency. Same 30 s cache as the open-side snapshot.
+        _arr_mid_c = None
+        if not self._no_persist:
+            try:
+                _arr_mid_c = _arrival_mid(pair)
+            except Exception:
+                _arr_mid_c = None
+
         if self._is_live():
             contracts = p.get("contracts", 0.0)
             fill      = price
@@ -5173,8 +5687,24 @@ class PaperTrader:
             # exchange so this is the reported figure rather than the ledger,
             # but a fee shown 5x too small on a 5x trade is still wrong.
             fee = round(p.get("margin", 0) * p.get("leverage", LEVERAGE_MIN) * _live_fee, 4)
+            # Live close slip is measured: fill vs the price the close decision
+            # saw, adverse-positive (a LONG closes by selling, so a fill BELOW
+            # price is the adverse direction).
+            _slip_close = (((price - fill) / price) if p["side"] == "LONG"
+                           else ((fill - price) / price)) if price else None
         else:
-            fill = price * (1 - SLIPPAGE) if p["side"] == "LONG" else price * (1 + SLIPPAGE)
+            # Paper close realism (2026-09-03) — same model as the open side:
+            # worst of the fixed floor and half the live spread, recorded.
+            _half_sp_c = 0.0
+            if not self._no_persist:
+                try:
+                    _half_sp_c = 0.5 * _spread_pct(pair)
+                except Exception:
+                    _half_sp_c = 0.0
+            _slip_close = max(SLIPPAGE, _half_sp_c)
+            if _half_sp_c > SLIPPAGE:
+                p["slip_src"] = f"{p.get('slip_src', 'fixed')}+spread"
+            fill = price * (1 - _slip_close) if p["side"] == "LONG" else price * (1 + _slip_close)
             move = (fill - p["entry"]) / p["entry"]
             if p["side"] == "SHORT": move = -move
             _sim_fee = (BINANCE_FEE if USE_BINANCE else
@@ -5199,7 +5729,26 @@ class PaperTrader:
         fkey       = p.get("fkey", "")
         entry_nasdaq = p.get("entry_nasdaq", market_mood["nasdaq"])
         entry_news   = p.get("entry_news",   news_sentiment.get(pair, {}).get("sentiment", "NEUTRAL"))
+        # Final excursion update — the close tick itself can be the extreme.
+        _final_move = (fill - p["entry"]) / p["entry"] if p.get("entry") else 0.0
+        if p.get("side") == "SHORT": _final_move = -_final_move
+        _mfe = max(p.get("mfe", 0.0) or 0.0, _final_move)
+        _mae = min(p.get("mae", 0.0) or 0.0, _final_move)
+        # Round-trip realized slip: open leg + close leg, as a fraction. None
+        # when the open leg predates the migration — a half-known round trip
+        # reported as a full one would understate costs.
+        _slip_o = p.get("slip_open")
+        _slip_rt = (_slip_o + _slip_close) if (_slip_o is not None and
+                                               _slip_close is not None) else None
         trade_rec = {"side": p["side"], "entry": p["entry"], "exit": fill,
+                     # paired-sizes record: engine size vs sizing-module size
+                     # (stamped at OPEN) — 60 days of these decide the switch
+                     "sizing_shadow": p.get("sizing_shadow"),
+                     "shadow_id": p.get("shadow_id"), "regime": p.get("regime"),
+                     "spread_entry": p.get("spread_entry"),
+                     "adx": p.get("adx"), "er": p.get("er"),
+                     "mfe_pct": _mfe, "mae_pct": _mae,
+                     "slip_realized": _slip_rt,
                      "pnl": pnl, "coin": p.get("name", name), "pair": pair,
                      "confidence": p.get("confidence", 0.0),
                      "held_mins": held_mins, "reason": reason, "ts": time.time(),
@@ -5250,7 +5799,28 @@ class PaperTrader:
                 "strategy": p.get("strategy", "") or "",
                 "timeframe": INTERVAL,
                 "cfg_hash": p.get("cfg_hash", ""),
+                # attribution — stamped at OPEN, carried through the position
+                "shadow_id": p.get("shadow_id"), "regime": p.get("regime"),
+                "spread_entry": p.get("spread_entry"),
+                "adx": p.get("adx"), "er": p.get("er"),
+                "mfe_pct": _mfe, "mae_pct": _mae,
+                "slip_realized": _slip_rt,
             })
+            # TCA row for the CLOSE fill (real book only, like the open side)
+            try:
+                if not self._no_persist:
+                    db.log_fill_tca({
+                        "pair": pair, "ts": time.time(),
+                        "side": "sell" if p["side"] == "LONG" else "buy",
+                        "size_usd": round(p.get("margin", 0.0) * p.get("leverage", LEVERAGE_MIN), 4),
+                        "maker": False,   # closes always cross — market/aggressive
+                        "arrival_mid": _arr_mid_c, "fill_price": fill,
+                        "shortfall_bps": _tca_shortfall_bps(
+                            "sell" if p["side"] == "LONG" else "buy", _arr_mid_c, fill),
+                        "is_paper": not self._is_live(),
+                    })
+            except Exception as _te:
+                log("TCA", f"close fill row: {_te}", "ERR")
             _push_sse("trade_close", {"name": name, "side": p["side"],
                                        "pnl": pnl, "reason": reason,
                                        "balance": self.balance, "win": pnl >= 0})
@@ -5472,7 +6042,7 @@ class SignalEngine:
         self.above_ticks = 0
         self.below_ticks = 0
 
-    def evaluate(self, closes, highs, lows, volumes, price, alert_buffer, pair=None, opens=None):
+    def evaluate(self, closes, highs, lows, volumes, price, alert_buffer, pair=None, opens=None, record_rejects=False):
         ema = calc_ema(closes)
         rsi = calc_rsi(closes)
 
@@ -5536,6 +6106,15 @@ class SignalEngine:
                     "exit":  nearest_s if nearest_s else price*0.970,
                     "stop":  nearest_r if nearest_r else price*1.015}
         _pre_gate_sig = sig  # capture before gates run
+        # Engine honesty (2026-09-03): name the FIRST hard gate that flips a
+        # real BUY/SELL to HOLD. _veto_conf stays None for gates that fire
+        # before the confidence score exists — recording a number that was
+        # never computed would be fiction. Written to engine_rejects at the
+        # bottom of evaluate, only when record_rejects=True (the MAIN scan
+        # loop; the sim engine evaluates the same candles and would double-
+        # count every veto).
+        _veto_gate = None
+        _veto_conf = None
 
         # news gate + news-triggered entry
         current_pair = pair or _current_coin["pair"]
@@ -5547,10 +6126,10 @@ class SignalEngine:
         if n_score >= 2:
             if sig == "BUY"  and n_sent == "BEARISH":
                 with _gate_counter_lock: _gate_counters["news"] += 1
-                sig = "HOLD"
+                sig = "HOLD"; _veto_gate = _veto_gate or "news"
             if sig == "SELL" and n_sent == "BULLISH":
                 with _gate_counter_lock: _gate_counters["news"] += 1
-                sig = "HOLD"
+                sig = "HOLD"; _veto_gate = _veto_gate or "news"
 
         # MACD gate — soft: strong MACD divergence reduces confidence instead of hard-blocking.
         # Hard-blocking caused droughts when market-wide MACD was bearish for extended periods.
@@ -5587,13 +6166,13 @@ class SignalEngine:
         _fg_against = False
         if fg_val > 92 and sig == "BUY":   # only truly parabolic bubble territory
             with _gate_counter_lock: _gate_counters["fear_greed"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "fear_greed"
         elif fg_val > 75 and sig == "BUY":
             with _gate_counter_lock: _gate_counters["fear_greed"] += 1
             _fg_against = True              # soft -0.08 penalty below
         if fg_val < 8 and sig == "SELL":   # only true capitulation
             with _gate_counter_lock: _gate_counters["fear_greed"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "fear_greed"
         elif fg_val < 25 and sig == "SELL":
             with _gate_counter_lock: _gate_counters["fear_greed"] += 1
             _fg_against = True
@@ -5609,25 +6188,25 @@ class SignalEngine:
                 _btc_move = (_hist_30[-1] - _hist_30[0]) / _hist_30[0]
                 if _btc_move <= -0.02:
                     with _gate_counter_lock: _gate_counters["btc_momentum"] += 1
-                    sig = "HOLD"
+                    sig = "HOLD"; _veto_gate = _veto_gate or "btc_momentum"
 
         # Funding rate gate — extreme funding = overcrowded side, flush risk
         fr = funding_rates.get(current_pair, 0.0)
         if fr >  FUNDING_THRESHOLD and sig == "BUY":
             with _gate_counter_lock: _gate_counters["funding"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "funding"
         if fr < -FUNDING_THRESHOLD and sig == "SELL":
             with _gate_counter_lock: _gate_counters["funding"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "funding"
 
         # RSI divergence gate — price and RSI disagreeing = unreliable signal
         divergence = detect_divergence(closes, rsi)
         if divergence == "BEARISH_DIV" and sig == "BUY":
             with _gate_counter_lock: _gate_counters["divergence"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "divergence"
         if divergence == "BULLISH_DIV" and sig == "SELL":
             with _gate_counter_lock: _gate_counters["divergence"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "divergence"
 
         # Market regime — CHOPPY softened: penalise confidence instead of hard-block
         # Hard-blocking CHOPPY eliminated most signals; let the bot trade but smaller
@@ -5637,7 +6216,7 @@ class SignalEngine:
         # Time-of-day filter — avoid extreme low-liquidity overnight hours
         if not _in_active_hours() and sig in ("BUY", "SELL"):
             with _gate_counter_lock: _gate_counters["active_hours"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "active_hours"
 
         # Volume gate — very low volume is a hard block; average volume is allowed.
         # vol_pts pillar already penalises confidence for below-average volume.
@@ -5666,7 +6245,7 @@ class SignalEngine:
             _very_low_vol = False
         if sig in ("BUY", "SELL") and _very_low_vol:
             with _gate_counter_lock: _gate_counters["volume"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "volume"
 
         # VWAP gate — institutions watch this; trading against it means fighting big money
         # Typical price = (H+L+C)/3; VWAP = cumulative(TP×Vol) / cumulative(Vol)
@@ -5696,16 +6275,17 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["adx"] += 1
             if adx < 5:
                 sig = "HOLD"   # hard block only on truly directionless markets
+                _veto_gate = _veto_gate or "adx"
 
         # Kaufman Efficiency Ratio gate — skip entries when price is moving randomly
         if sig in ("BUY", "SELL") and er < ER_MIN:
             with _gate_counter_lock: _gate_counters["efficiency"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "efficiency"
 
         # Economic calendar blackout — skip entries around high-impact events
         if sig in ("BUY", "SELL") and _near_econ_event():
             with _gate_counter_lock: _gate_counters["econ"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "econ"
 
         # Spread gate — block wide spreads; threshold tighter in live mode
         if sig in ("BUY", "SELL"):
@@ -5714,7 +6294,7 @@ class SignalEngine:
                 _sp_limit = 0.003 if is_live() else 0.010
                 if _sp > _sp_limit:
                     with _gate_counter_lock: _gate_counters["spread"] += 1
-                    sig = "HOLD"
+                    sig = "HOLD"; _veto_gate = _veto_gate or "spread"
             except Exception:
                 pass
 
@@ -5751,17 +6331,17 @@ class SignalEngine:
                 _stp = plan.get("stop", 0)
                 if _orderbook_wall(current_pair, price, _tgt, _stp, sig):
                     with _gate_counter_lock: _gate_counters["orderbook_wall"] += 1
-                    sig = "HOLD"
+                    sig = "HOLD"; _veto_gate = _veto_gate or "orderbook_wall"
             except Exception:
                 pass
 
         # MACD divergence gate — divergence signals momentum exhaustion
         if macd_div == "BEARISH_DIV" and sig == "BUY":
             with _gate_counter_lock: _gate_counters["macd_div"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "macd_div"
         if macd_div == "BULLISH_DIV" and sig == "SELL":
             with _gate_counter_lock: _gate_counters["macd_div"] += 1
-            sig = "HOLD"
+            sig = "HOLD"; _veto_gate = _veto_gate or "macd_div"
 
         # Stochastic RSI gate — soft: overbought/oversold stoch trims confidence.
         # Hard-blocking at 92/8 caused droughts when RSI ranged 55-65 (normal consolidation),
@@ -5772,12 +6352,14 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["stoch_rsi"] += 1
             if stoch_k > 98:
                 sig = "HOLD"   # true parabolic exhaustion only
+                _veto_gate = _veto_gate or "stoch_rsi"
             else:
                 _stoch_against = True   # soft penalty below
         if sig == "SELL" and stoch_k < 20:
             with _gate_counter_lock: _gate_counters["stoch_rsi"] += 1
             if stoch_k < 2:
                 sig = "HOLD"
+                _veto_gate = _veto_gate or "stoch_rsi"
             else:
                 _stoch_against = True
 
@@ -5903,6 +6485,10 @@ class SignalEngine:
             with _gate_counter_lock: _gate_counters["choppy"] += 1
             if is_live():
                 sig = "HOLD"
+                if _veto_gate is None:
+                    # only gate that fires AFTER the confidence score exists,
+                    # so this veto can record a real number
+                    _veto_gate, _veto_conf = "choppy", confidence
             else:
                 confidence = max(0.0, round(confidence - 0.08, 2))
 
@@ -6085,6 +6671,15 @@ class SignalEngine:
                         f"adx={adx:.1f} er={er:.3f} stoch={stoch_k:.0f} "
                         f"div={divergence} macd_div={macd_div} "
                         f"vol_low={_very_low_vol} sp={_dbg_sp}")
+            # Engine honesty: persist the veto with the gate's NAME, main scan
+            # loop only (record_rejects). Purely observational — the return
+            # value is untouched, and a DB hiccup can never break evaluate.
+            if record_rejects and _veto_gate:
+                try:
+                    db.log_engine_reject(current_pair, time.time(),
+                                         _veto_gate, _veto_conf)
+                except Exception:
+                    pass
 
         return sig, plan, ema, rsi, confidence
 
@@ -7655,6 +8250,9 @@ def _cmd_why(trader=None):
         "divergence":   "⚡ RSI divergence",
         "active_hours": "🌙 Outside trading hours",
         "econ":         "📅 Economic event blackout",
+        "spread_gated": "↔️ Spread wider than gate",
+        "dd_circuit":   "⛔ Drawdown circuit open",
+        "stale_tick":   "⏳ Stale price tick",
         "fear_greed":   "😱 Extreme fear/greed",
         "btc_dom":      "₿ BTC dominance rising",
         "news":         "📰 News opposing signal",
@@ -8714,7 +9312,10 @@ def trading_loop(trader):
                                              _pp["target"], _pp["name"], _pp["conf"],
                                              _pp_pair, atr=_pp.get("atr"),
                                              fkey=_pp.get("fkey", ""),
-                                             pillars=_pp.get("pillars") or {})
+                                             pillars=_pp.get("pillars") or {},
+                                             shadow_id=_pp.get("sid"),
+                                             regime=_pp.get("regime"),
+                                             adx=_pp.get("adx"), er=_pp.get("er"))
                         elif _pe == "expired":
                             # the signal message promised "told either way" —
                             # an order that dies unnoticed is the old silence
@@ -8882,7 +9483,7 @@ def trading_loop(trader):
                     eng = engine_map[pair]
                     sig, plan, ema, rsi, conf = eng.evaluate(
                         closes, highs, lows, volumes, price, coin["alert_buffer"],
-                        pair=pair, opens=opens)
+                        pair=pair, opens=opens, record_rejects=True)
                     sig_from_eval = sig   # capture before gate filters may change it
                     _signal_ts = time.time()  # stamp immediately after evaluate()
                     try: atr = calc_atr(highs, lows, closes)
@@ -9104,6 +9705,22 @@ def trading_loop(trader):
                         # adjustment. Never allowed to break the scan: log_shadow
                         # swallows its own errors and returns None when no DB.
                         _sid = None
+                        # Hoisted so the taken-trade path can stamp the SAME
+                        # values into the position (attribution) instead of
+                        # recomputing them later from different candles.
+                        # _sp_now hoisted too: the spread GATE below reads it
+                        # even when the shadow-logging try dies early.
+                        _sh_regime = _sh_adx = _sh_er = None
+                        _sp_now = None
+                        try:
+                            _sh_regime = detect_regime(closes, highs, lows) if len(closes) > 25 else None
+                        except Exception:
+                            _sh_regime = None
+                        try:
+                            _sh_adx = calc_adx(highs, lows, closes)
+                            _sh_er  = calc_efficiency_ratio(closes)
+                        except Exception:
+                            pass
                         try:
                             _cv = volumes[:-1] if volumes and len(volumes) > 3 else []
                             # live spread at signal time — cached 30s, so this
@@ -9124,7 +9741,7 @@ def trading_loop(trader):
                                 "rr_net": (_net_reward / _net_risk) if _net_risk > 0 else None,
                                 "vol_ratio": (_cv[-1] / statistics.median(_cv)) if _cv and statistics.median(_cv) > 0 else None,
                                 "funding": funding_rates.get(pair),
-                                "regime": (detect_regime(closes, highs, lows) if len(closes) > 25 else None),
+                                "regime": _sh_regime,
                                 "hour": datetime.utcnow().hour,
                                 "dow": datetime.utcnow().weekday(),
                                 "pillars": json.dumps(pillars or {}),
@@ -9134,8 +9751,8 @@ def trading_loop(trader):
                                 # here rather than plumbed out of the engine;
                                 # cheap, and the audit needs the value the
                                 # LIVE window saw.
-                                "adx": calc_adx(highs, lows, closes),
-                                "er": calc_efficiency_ratio(closes),
+                                "adx": _sh_adx,
+                                "er": _sh_er,
                             })
                         except Exception:
                             pass
@@ -9178,6 +9795,10 @@ def trading_loop(trader):
                                     elif _ob >  1.25: conf = max(round(conf - 0.04, 2), 0.0)
                         except Exception:
                             pass
+                        # Engine honesty: the row's conf column is PRE-orderbook
+                        # by design — record the post-adjustment value beside it
+                        # so the OB nudge itself becomes measurable.
+                        db.mark_shadow(_sid, conf_post_ob=conf)
 
                         risk     = RISK_MIN + (RISK_MAX - RISK_MIN) * conf
                         leverage = round(LEVERAGE_MIN + (LEVERAGE_MAX - LEVERAGE_MIN) * conf)
@@ -9240,6 +9861,32 @@ def trading_loop(trader):
                                 last_sigs[pair] = sig
                                 continue
 
+                            # ── SPREAD GATE (2026-09-03, BS2) ──────────────
+                            # A wide spread is a cost the R:R gates never see:
+                            # the trade pays it whether or not the signal was
+                            # right. Block the ENTRY when the live spread is
+                            # over min(hard cap, 2x this pair+hour's median
+                            # when the map has n>=100 for the cell); absent
+                            # cell -> hard cap only. Unknown spread never
+                            # blocks. Every rejection is written to
+                            # engine_rejects (gate='spread_gated') AND stamped
+                            # on the shadow row, so the gate's own hit rate is
+                            # measurable against forward returns.
+                            _sg_block, _sg_thr, _sg_why = _spread_gate_check(pair, _sp_now)
+                            if _sg_block:
+                                with _gate_counter_lock: _gate_counters["spread_gated"] += 1
+                                db.mark_shadow(_sid, rejected="spread_gated")
+                                db.log_engine_reject(pair, time.time(), "spread_gated", conf)
+                                log("GATE", f"{coin['name']} blocked — spread "
+                                            f"{_sp_now*100:.3f}% > gate {_sg_thr*100:.3f}% "
+                                            f"({_sg_why})")
+                                tg(_sig_msg + f"\n🚫 *Not traded* — live spread "
+                                   f"`{_sp_now*100:.3f}%` is above this hour's gate "
+                                   f"`{_sg_thr*100:.3f}%` ({_sg_why}). Entering here "
+                                   f"pays the spread before the idea gets a vote.")
+                                last_sigs[pair] = sig
+                                continue
+
                             if USE_MAKER_ENTRIES and not (USE_BINANCE or USE_FUTURES):
                                 # Rest the order at the signal price instead of
                                 # crossing the spread. It becomes a position only
@@ -9253,6 +9900,11 @@ def trading_loop(trader):
                                     "conf": conf, "atr": atr, "fkey": fkey,
                                     "pillars": pillars, "scans": 0,
                                     "placed_ts": time.time(),
+                                    # attribution rides along so a maker fill
+                                    # can still stamp the position with the
+                                    # values the SIGNAL saw, not fill-time ones
+                                    "sid": _sid, "regime": _sh_regime,
+                                    "adx": _sh_adx, "er": _sh_er,
                                 }
                                 log("ORDER", f"{coin['name']} passive {sig} limit resting at "
                                              f"{price:.6f} (maker; expires in "
@@ -9267,7 +9919,9 @@ def trading_loop(trader):
                                    "the paper book now (final risk checks can "
                                    "still refuse).")
                                 trader.on_signal(sig, price, stop, target, coin["name"], conf, pair,
-                                                 atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts)
+                                                 atr=atr, fkey=fkey, pillars=pillars, signal_ts=_signal_ts,
+                                                 shadow_id=_sid, regime=_sh_regime,
+                                                 adx=_sh_adx, er=_sh_er)
 
                     last_sigs[pair] = sig
 
@@ -9441,8 +10095,103 @@ def _kraken_ws_loop():
         time.sleep(5)
 
 # ── Watchdog ──────────────────────────────────────────────────────────────────
+# ── Fee tier: proven 30d volume → reported tier (REPORT-ONLY) ────────────────
+# KRAKEN_FEE stays env-authoritative. This job only measures what tier the
+# PROVEN (non-paper) 30d fill volume from fills_tca would earn against the
+# configured ladder, surfaces it in status, and reports a mismatch — it never
+# silently changes the fee the cost model runs on. The ladder itself comes
+# from env KRAKEN_FEE_TIERS_JSON as [[min_30d_usd_volume, taker_fee], ...];
+# with no ladder configured the only "tier" is the env fee itself, so the
+# default is a structural no-op that can never flatter costs.
+_fee_tier_status: dict = {
+    "volume_30d_usd": None, "tier_floor_usd": None, "tier_fee": None,
+    "env_fee": KRAKEN_FEE, "mismatch": False, "checked_ts": None,
+    "note": "not yet checked",
+}
+
+def _fee_tier_ladder():
+    """Sorted [(volume_floor_usd, taker_fee), ...]; always has a base rung at
+    (0, KRAKEN_FEE). A malformed env ladder is dropped loudly, not guessed at."""
+    rungs = [(0.0, KRAKEN_FEE)]
+    raw = os.environ.get("KRAKEN_FEE_TIERS_JSON", "")
+    if raw:
+        try:
+            for r in json.loads(raw):
+                rungs.append((float(r[0]), float(r[1])))
+        except Exception as e:
+            log("FEE", f"KRAKEN_FEE_TIERS_JSON unparseable ({e}) — ladder ignored", "ERR")
+            rungs = [(0.0, KRAKEN_FEE)]
+    rungs.sort(key=lambda r: r[0])
+    return rungs
+
+def _proven_fee_tier(volume_30d):
+    """-> (tier_floor, tier_fee) for the highest rung whose floor the PROVEN
+    volume clears. None volume -> (None, None): an unknown volume proves no
+    tier at all (never optimistic)."""
+    if volume_30d is None:
+        return None, None
+    floor_f, fee_f = 0.0, KRAKEN_FEE
+    for vf, fee in _fee_tier_ladder():
+        if volume_30d >= vf:
+            floor_f, fee_f = vf, fee
+    return floor_f, fee_f
+
+def _fee_tier_check():
+    """One measurement pass; updates and returns _fee_tier_status. Reads only.
+    Never assigns KRAKEN_FEE — a mismatch is REPORTED, the env stays law."""
+    vol = db.fills_volume_30d()
+    floor_f, fee_f = _proven_fee_tier(vol)
+    st = {
+        "volume_30d_usd": round(vol, 2) if vol is not None else None,
+        "tier_floor_usd": floor_f,
+        "tier_fee": fee_f,
+        "env_fee": KRAKEN_FEE,
+        "mismatch": (fee_f is not None and abs(fee_f - KRAKEN_FEE) > 1e-12),
+        "checked_ts": time.time(),
+        "note": ("30d volume unknown (DB down) — tier unproven; env fee "
+                 "authoritative" if vol is None else
+                 "proven tier from real (non-paper) fills_tca volume; "
+                 "KRAKEN_FEE env stays authoritative"),
+    }
+    _fee_tier_status.clear()
+    _fee_tier_status.update(st)
+    return st
+
+def _fee_tier_loop():
+    """Daily fee-tier measurement. Report-only by design."""
+    time.sleep(120)   # let the DB connect first
+    _last_reported = None
+    while True:
+        try:
+            st = _fee_tier_check()
+            if st["volume_30d_usd"] is not None:
+                log("FEE", f"30d proven volume ${st['volume_30d_usd']:,.2f} → tier fee "
+                           f"{st['tier_fee']*100:.3f}% (env {KRAKEN_FEE*100:.3f}%)"
+                           + ("  ← MISMATCH" if st["mismatch"] else ""))
+            if st["mismatch"]:
+                _key = (st["tier_floor_usd"], st["tier_fee"])
+                if _key != _last_reported:
+                    _last_reported = _key
+                    tg(f"🧾 *Fee tier mismatch (report only)*\n"
+                       f"Proven 30d volume: `${st['volume_30d_usd']:,.2f}` → ladder says "
+                       f"taker `{st['tier_fee']*100:.3f}%`, but the bot is running on "
+                       f"env `KRAKEN_FEE={KRAKEN_FEE*100:.3f}%`.\n"
+                       f"_Nothing was changed — update the env if the exchange "
+                       f"really bills the other rate._")
+        except Exception as e:
+            log("FEE", f"fee tier check: {e}", "ERR")
+        time.sleep(86400)
+
 def _watchdog_loop():
-    """Alert via Telegram if scan stalls, DB drops, or WS prices go stale."""
+    """Alert via Telegram if scan stalls, DB drops, or WS prices go stale.
+
+    TEETH (2026-09-03): past 10 minutes of stall the watchdog stops merely
+    describing the problem and pauses NEW ENTRIES (never auto-flattens — a
+    forced liquidation on a hiccup is a worse failure than the stall; exits
+    keep managing, on_signal's pause is entries-only). The pause is lifted
+    automatically when the scan recovers, but ONLY if the watchdog itself set
+    it — a pause the owner set by hand is never overridden."""
+    global _paused, _wd_stall_paused
     _scan_alerted = False
     _db_alerted   = False
     _ws_alerted   = False
@@ -9458,6 +10207,27 @@ def _watchdog_loop():
         elif age <= 300 and _scan_alerted:
             tg("✅ *Scan loop recovered* — bot is active again")
             _scan_alerted = False
+        if age > 600 and not _wd_stall_paused:
+            _we_paused = False
+            with _state_lock:
+                if not _paused:
+                    _paused = True
+                    _we_paused = True
+                    _save_runtime_settings()
+            if _we_paused:
+                _wd_stall_paused = True
+                log("WD", "scan stalled >10m — entries PAUSED by watchdog", "WRN")
+                tg("⛔ *Scan stalled >10m — new entries PAUSED*\n"
+                   "Nothing is auto-flattened; open positions keep their exit "
+                   "management. Auto-resumes when the scan recovers.")
+        elif age <= 300 and _wd_stall_paused:
+            with _state_lock:
+                if _paused:
+                    _paused = False
+                    _save_runtime_settings()
+            _wd_stall_paused = False
+            log("WD", "scan recovered — watchdog pause lifted")
+            tg("▶️ *Scan recovered — entries resumed* (watchdog pause lifted)")
         # DB connectivity
         if not db.connected and not _db_alerted:
             tg("⚠️ *Database disconnected* — learning paused, running on JSON fallback")
@@ -17809,6 +18579,8 @@ def _web_status():
         "db":                    db.connected,
         "ws_live":               bool(_prices_cache and (time.time() - _prices_cache_ts) < 60),
         "scan_age":              round(time.time() - _last_scan_ts, 1) if _last_scan_ts else None,
+        # proven fee tier (report-only; KRAKEN_FEE env stays authoritative)
+        "fee_tier":              dict(_fee_tier_status),
     }
     # Autopilot block — always present so the dashboard/HUD can render ON/OFF.
     if _autopilot is not None:
@@ -20317,6 +21089,92 @@ def _m1_archive_loop():
         time.sleep(240)
 
 
+def _iso_to_epoch(s):
+    """Kraken Futures timestamp ('2025-09-03T16:00:00.000Z') → epoch seconds.
+    None when unparseable — a wrong guess in a PRIMARY KEY column poisons the
+    idempotence the table is built on."""
+    try:
+        s = str(s).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return int(datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return None
+
+
+def _funding_history_loop():
+    """Archive hourly Kraken Futures funding rates into funding_rates.
+
+    Same shape as _m1_archive_loop: a slow public-data filler that only helps
+    FUTURE measurements, so it starts accumulating now. Endpoint is the PUBLIC
+    v4 historicalfundingrates route (no auth, no keys — the same one
+    funding_carry.py measures from), which returns the full ~1 year of hourly
+    relativeFundingRate in one response. That makes the first successful pass
+    the one-time 1yr backfill for free, and every later pass an idempotent
+    re-upsert of the same (venue,symbol,ts) rows plus the newest hour —
+    hours of downtime lose nothing.
+
+    Load: 3 requests/hour. Storage: ~26k rows/symbol/year."""
+    if os.environ.get("FUNDING_HISTORY", "1") in ("0", "false", "False"):
+        log("FUND", "funding history filler disabled by env")
+        return
+    syms = ("PF_XBTUSD", "PF_ETHUSD", "PF_SOLUSD")
+    log("FUND", f"funding history filler started ({len(syms)} symbols, hourly)")
+    while True:
+        try:
+            if db.conn:
+                for sym in syms:
+                    try:
+                        r = requests.get(
+                            "https://futures.kraken.com/derivatives/api/v4/historicalfundingrates",
+                            params={"symbol": sym},
+                            headers={"User-Agent": "cryptobot-research"},
+                            timeout=20)
+                        rows = []
+                        for rec in r.json().get("rates", []):
+                            ts_s = _iso_to_epoch(rec.get("timestamp"))
+                            rate = rec.get("relativeFundingRate")
+                            if ts_s is not None and rate is not None:
+                                rows.append((ts_s, float(rate)))
+                        n = db.upsert_funding_rates("kraken", sym, rows)
+                        if n:
+                            log("FUND", f"{sym}: upserted {n} hourly funding rates")
+                    except Exception as e:
+                        log("FUND", f"{sym}: {e}", "WRN")
+                    time.sleep(2)   # gentle on the public endpoint
+        except Exception as e:
+            log("FUND", f"funding history: {e}", "WRN")
+        time.sleep(3600)
+
+
+def close_at(bars, when):
+    """First close at-or-after `when` in (ts, close, high, low) bars, else None.
+    Module-level (was nested in the filler loop) so the forward-return math
+    is unit-testable against fixture bars."""
+    for row in bars:
+        if row[0] >= when:
+            return row[1]
+    return None
+
+
+def _shadow_forward_calc(bars, ts, base):
+    """Forward returns + 48h path extremes for one shadow row.
+
+    Returns (f6, f24, f48, f168, max_up_48, max_dn_48), all LONG-signed
+    fractions from `base`, or None when the 168h close has not elapsed in the
+    data yet (caller leaves the row pending). max_up_48/max_dn_48 come from
+    the 1h HIGHS/LOWS inside [ts, ts+48h] — what the position COULD have
+    seen, not just where closes landed. Pure function: fixture-testable."""
+    with_c = [close_at(bars, ts + h * 3600) for h in (6, 24, 48, 168)]
+    if with_c[3] is None:
+        return None
+    f6, f24, f48, f168 = [((c - base) / base) if c else None for c in with_c]
+    _win48 = [b for b in bars if ts <= b[0] <= ts + 48 * 3600]
+    max_up = ((max(b[2] for b in _win48) - base) / base) if _win48 else None
+    max_dn = ((min(b[3] for b in _win48) - base) / base) if _win48 else None
+    return f6, f24, f48, f168, max_up, max_dn
+
+
 def _learning_filler_loop():
     """Fill forward returns for shadow signals and exit-lab counterfactuals.
 
@@ -20342,18 +21200,18 @@ def _learning_filler_loop():
         return [(int(c[0]), float(c[4]), float(c[2]), float(c[3]))
                 for c in d["result"][key]]
 
-    def close_at(bars, when):
-        for row in bars:
-            if row[0] >= when:
-                return row[1]
-        return None
-
     log("LAB", "learning filler loop started (30 min cadence)")
     while True:
         time.sleep(1800)
         try:
             cutoff = time.time() - 49 * 3600
-            srows = db.shadow_pending(cutoff)
+            # Shadow rows wait for the FULL 7-day horizon (169h) so fwd168 can
+            # be filled in the same pass as fwd6/24/48 — one row, one write.
+            # The 720-bar 1h fetch covers 30 days, so 169h fits comfortably.
+            # Rows keep fwd_done=0 until then; scorers already treat unfilled
+            # rows as not-ready, so the extra wait costs nothing but patience.
+            scutoff = time.time() - 169 * 3600
+            srows = db.shadow_pending(scutoff)
             erows = db.exit_pending(cutoff)
             mrows = db.manual_pending(cutoff)
             prows = db.manual_plan_pending()
@@ -20376,9 +21234,6 @@ def _learning_filler_loop():
                 if bars and ts + 6 * 3600 < bars[0][0]:
                     db.fill_shadow(sid, None, None, None)   # predates the window
                     continue
-                with_c = [close_at(bars, ts + h * 3600) for h in (6, 24, 48)]
-                if with_c[2] is None:
-                    continue                                 # 48h not elapsed in data yet
                 base = None
                 # price at signal time was recorded; read it back for the base
                 try:
@@ -20391,8 +21246,10 @@ def _learning_filler_loop():
                 if not base:
                     db.fill_shadow(sid, None, None, None)
                     continue
-                f6, f24, f48 = [((c - base) / base) if c else None for c in with_c]
-                db.fill_shadow(sid, f6, f24, f48)
+                fwd = _shadow_forward_calc(bars, ts, base)
+                if fwd is None:
+                    continue                                 # 168h not elapsed in data yet
+                db.fill_shadow(sid, *fwd)
                 filled += 1
             for eid, ts_e, pr, side, entry in erows:
                 bars = books.get(pr) or []
@@ -20663,6 +21520,7 @@ def main():
         ("Funding rates",     _funding_loop,        ()),
         ("Learning filler",   _learning_filler_loop, ()),
         ("1m archive",        _m1_archive_loop,     ()),
+        ("Funding history",   _funding_history_loop, ()),
         ("Trending scanner",  _trending_loop,       ()),
         ("Coin switcher",     _switcher_loop,       (trader,)),
         ("Telegram poll",     _poll_loop,           (trader,)),
@@ -20677,6 +21535,7 @@ def main():
         ("Kraken WS prices",  _kraken_ws_loop,      ()),
         ("Research lab",      _research_loop,       ()),
         ("Watchdog",          _watchdog_loop,       ()),
+        ("Fee tier",          _fee_tier_loop,       ()),
         ("Heartbeat",         _heartbeat_loop,      (trader,)),
         ("Web dashboard",     _start_web_server,    (trader,)),
     ]
