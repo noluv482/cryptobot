@@ -27,3 +27,5 @@ ohlc_cache/
 # Dashboard preview: frozen copies of live API responses (real balances,
 # trades and notes). The repo is public — these stay local.
 design/
+manual_book.json
+tape_cache/

@@ -8,6 +8,7 @@ functions are lifted verbatim out of bot_server.py by AST and the trade records
 are built by copying the literal `trade_rec = {...}` out of PaperTrader.close().
 If close() changes its field names, this test breaks — which is the point.
 """
+import sys; sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import ast
 import sys
 import time
