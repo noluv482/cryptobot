@@ -67,6 +67,7 @@ import os
 import re
 import statistics
 import time
+from datetime import datetime, timezone
 
 import bot_server as bs
 
@@ -88,6 +89,249 @@ _FEE_RATE = (bs.BINANCE_FEE        if bs.USE_BINANCE else
              bs.KRAKEN_FEE)
 
 
+# ── Tournament survival statistics (DSR / PSR / MinTRL) ───────────────────────
+# Bailey & Lopez de Prado's Deflated Sharpe Ratio machinery, applied to each
+# entrant's NET per-decision return stream (per-trade for the intraday books,
+# per-week or per-day for the weekly/carry entrants — the SR is per-decision,
+# never annualized, and is only ever compared against a hurdle built from the
+# SAME per-decision streams).
+#
+# N-TRIALS HONESTY: the SR0 hurdle is the expected max SR of N unskilled
+# trials, where N = every entrant EVER tried, not just the survivors on the
+# board today. trials_count is persisted and ONLY increments — retiring or
+# killing an entrant never lowers the bar its siblings must clear.
+KILL_PSR    = 0.20        # past MinTRL with deflated PSR below this -> KILLED
+MINTRL_CONF = 0.95        # MinTRL target confidence (Phi^-1(0.95) in the formula)
+_EM_GAMMA   = 0.5772156649015329   # Euler-Mascheroni, for the expected-max-SR term
+
+# TRIALS_SEED documents the honest N at the moment this counter shipped
+# (2026-09-03): 13 entrants existed (10 built-in configs — base, selective,
+# high_conviction, momentum, strict_gates, exit_6h, exit_24h, trend_rr,
+# reversion, loose — plus the 3 lab nomination slots), and 3 gap_fade lab
+# entrants had already been tried and died before any counter existed.
+# 13 + 3 = 16. Lab ids seen after the seed each increment the counter; if one
+# of them happens to be a re-nomination of a seeded slot the count OVERSTATES
+# N — which only RAISES the hurdle, the conservative direction.
+TRIALS_SEED = 16
+# Built-in ids already covered by TRIALS_SEED (so re-registering them at every
+# boot does not double-count). Entrants added AFTER the seed are absent here
+# on purpose: their registration increments trials_count exactly once.
+PRE_SEED_IDS = frozenset({
+    "base", "selective", "high_conviction", "momentum", "strict_gates",
+    "exit_6h", "exit_24h", "trend_rr", "reversion", "loose",
+})
+
+# ── Honest cost model for the weekly / carry counterfactual entrants ──────────
+# Spot legs assume TAKER + slippage each way (no maker assumption at weekly
+# cadence — crossing the spread is the honest default), Kraken base tier.
+# Perp legs use the Kraken Futures taker fee + the same slippage.
+CF_SPOT_RT     = 2.0 * (bs.KRAKEN_FEE + bs.SLIPPAGE)          # spot round trip (~1.8%)
+CARRY_SPOT_LEG = bs.KRAKEN_FEE + bs.SLIPPAGE                  # one spot leg
+CARRY_PERP_LEG = bs.KRAKEN_FUTURES_FEE + bs.SLIPPAGE          # one perp leg
+CARRY_RT_4LEG  = 2 * CARRY_SPOT_LEG + 2 * CARRY_PERP_LEG      # open+close the pair (~2.1%)
+# Enter carry only when trailing 7d ANNUALIZED funding clears 4 full 4-leg
+# round trips a year (budget for churn) plus a 10% absolute floor (minimum
+# annualized carry worth the operational/basis risk at all).
+CARRY_HURDLE_ANN = CARRY_RT_4LEG * 4.0 + 0.10
+CARRY_MIN_7D_HOURS = 120   # trailing-7d window must hold >=120 of 168 hourly rates to decide
+
+SECS_PER_WEEK  = 7 * 86400
+SECS_PER_MONTH = 2629800.0   # 1/12 Julian year, for the "verdict in ~N months" estimate
+
+
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_ppf(p):
+    """Inverse standard-normal CDF (Acklam's rational approximation, ~1e-9)."""
+    if not (0.0 < p < 1.0):
+        raise ValueError(f"ppf domain: {p}")
+    a = (-3.969683028665376e+01,  2.209460984245205e+02, -2.759285104469687e+02,
+          1.383577518672690e+02, -3.066479806614716e+01,  2.506628277459239e+00)
+    b = (-5.447609879822406e+01,  1.615858368580409e+02, -1.556989798598866e+02,
+          6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00,  4.374664141464968e+00,  2.938163982698783e+00)
+    d = ( 7.784695709041462e-03,  3.224671290700398e-01,  2.445134137142996e+00,
+          3.754408661907416e+00)
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+
+
+def expected_max_sr(var_sr, n_trials):
+    """E[max SR] of n_trials unskilled strategies with cross-trial Var[SR].
+
+    The DSR hurdle SR0*. Rises with n_trials (more trials tried => the best
+    of them looks better by pure luck) and with cross-entrant SR dispersion.
+    Returns None when it cannot be computed honestly (var unknown, <2 trials).
+    """
+    if var_sr is None or var_sr < 0 or n_trials is None or n_trials < 2:
+        return None
+    sd = math.sqrt(var_sr)
+    return sd * ((1 - _EM_GAMMA) * _norm_ppf(1 - 1.0 / n_trials)
+                 + _EM_GAMMA * _norm_ppf(1 - 1.0 / (n_trials * math.e)))
+
+
+def dsr_stats(nets, sr0, born_ts=None, now=None):
+    """{sr, psr, dsr, min_trl, trades_n, verdict} for one entrant's net stream.
+
+    sr      : per-decision Sharpe (mean/sd of nets — NOT annualized).
+    psr     : Probabilistic SR vs 0 (prob. the true SR is positive).
+    dsr     : PSR evaluated at the N-trials hurdle SR0* — the Deflated SR.
+              The pre-registered kill bar "PSR < 0.20" means THIS number:
+              PSR against the multiple-comparison hurdle, not against zero.
+    min_trl : Minimum Track Record Length vs SR0* at MINTRL_CONF. The formula
+              squares (sr - sr0), so it is finite on BOTH sides of the hurdle:
+              a clearly-bad entrant reaches its (small) MinTRL quickly and can
+              be killed; one hugging the hurdle needs a long record either way.
+    verdict : honest English. Weekly entrants surface "verdict in ~N months at
+              current signal rate" until their track record is long enough —
+              pre-registered: no weekly entrant gets ANY verdict before ~6
+              months of decisions (MinTRL at ~1 decision/week says so itself).
+    Never raises; missing inputs degrade to 'insufficient data'.
+    """
+    n = len(nets)
+    out = {"trades_n": n, "sr": None, "psr": None, "dsr": None,
+           "min_trl": None, "verdict": "insufficient data"}
+    if n < 2:
+        return out
+    mu = statistics.fmean(nets)
+    sd = statistics.pstdev(nets)
+    if sd < 1e-12:
+        out["verdict"] = "degenerate returns (sd=0) — cannot score"
+        return out
+    sr = mu / sd
+    m2 = sd * sd
+    m3 = statistics.fmean([(x - mu) ** 3 for x in nets])
+    m4 = statistics.fmean([(x - mu) ** 4 for x in nets])
+    skew = m3 / (m2 ** 1.5)
+    kurt = m4 / (m2 ** 2)          # normal = 3 (non-excess)
+    denom = 1.0 - skew * sr + ((kurt - 1.0) / 4.0) * sr * sr
+    if denom <= 0:                 # pathological higher moments — fall back to
+        denom = 1.0                # the normal-returns case rather than crash
+    out["sr"] = sr
+    out["psr"] = _norm_cdf(sr * math.sqrt(n - 1) / math.sqrt(denom))
+    if sr0 is None:
+        out["verdict"] = "no cross-entrant hurdle yet (need >=2 scored entrants)"
+        return out
+    out["dsr"] = _norm_cdf((sr - sr0) * math.sqrt(n - 1) / math.sqrt(denom))
+    if abs(sr - sr0) < 1e-12:
+        out["verdict"] = "SR sits exactly on the hurdle — no resolution possible yet"
+        return out
+    min_trl = 1.0 + denom * (_norm_ppf(MINTRL_CONF) / (sr - sr0)) ** 2
+    out["min_trl"] = min_trl
+    if n < min_trl:
+        now = time.time() if now is None else now
+        months = None
+        if born_ts and now > born_ts:
+            rate = n / max((now - born_ts) / SECS_PER_MONTH, 1e-9)  # decisions/month
+            if rate > 0:
+                months = (min_trl - n) / rate
+        if months is not None and math.isfinite(months):
+            out["verdict"] = f"verdict in ~{max(1, math.ceil(months))} months at current signal rate"
+        else:
+            out["verdict"] = f"track record too short (n={n} < MinTRL {min_trl:.0f})"
+        return out
+    out["verdict"] = ("SURVIVES (past MinTRL, DSR>=%.2f)" % KILL_PSR
+                      if out["dsr"] >= KILL_PSR else
+                      "KILL (past MinTRL, DSR<%.2f)" % KILL_PSR)
+    return out
+
+
+# ── Weekly-bar machinery for the trend/switch entrants ────────────────────────
+def _iso_week_key(ts):
+    """(iso_year, iso_week) of an epoch-seconds timestamp, UTC."""
+    d = datetime.fromtimestamp(float(ts), tz=timezone.utc).isocalendar()
+    return (d[0], d[1])
+
+
+def daily_bars_from_hourly(rows):
+    """[(day_start_ts, high, low, close)] from hourly (ts, high, low, close) rows.
+
+    Buckets by UTC day; close = last hourly close of the day. Input need not be
+    contiguous — gaps just mean fewer daily bars (data honesty: no fabrication).
+    """
+    days = {}
+    for ts, hi, lo, cl in rows:
+        try:
+            day = int(float(ts) // 86400) * 86400
+            b = days.get(day)
+            if b is None:
+                days[day] = [day, float(hi), float(lo), float(cl), float(ts)]
+            else:
+                b[1] = max(b[1], float(hi))
+                b[2] = min(b[2], float(lo))
+                if float(ts) >= b[4]:
+                    b[3] = float(cl)
+                    b[4] = float(ts)
+        except Exception:
+            continue
+    return [(d[0], d[1], d[2], d[3]) for d in sorted(days.values())]
+
+
+def weekly_closes_from_daily(daily):
+    """[(week_key, decision_ts, close, daily_index)] — EXACTLY one per ISO week.
+
+    decision_ts is the last daily bar's day-start in that week: the moment the
+    weekly decision is taken. The dict-keyed grouping IS the one-decision-per-
+    ISO-week enforcement — duplicate days in a week collapse to the last one.
+    """
+    weeks = {}
+    for i, (day_ts, _hi, _lo, close) in enumerate(daily):
+        weeks[_iso_week_key(day_ts)] = (day_ts, close, i)
+    out = [(k, v[0], v[1], v[2]) for k, v in weeks.items()]
+    out.sort(key=lambda x: x[1])
+    return out
+
+
+def tsmom_decisions(weekly, sma_weeks=20):
+    """[(decision_ts, pos)] — pos=1 when weekly close > SMA(sma_weeks), else 0.
+
+    One decision per ISO week (weekly is already deduped). The decision at
+    week i governs exposure over week i+1 — the scorer pairs it with the NEXT
+    weekly return, so no decision ever sees the bar it is graded on.
+    """
+    out = []
+    closes = [w[2] for w in weekly]
+    for i in range(len(weekly)):
+        if i + 1 < sma_weeks:
+            continue
+        sma = statistics.fmean(closes[i + 1 - sma_weeks: i + 1])
+        out.append((weekly[i][1], 1 if closes[i] > sma else 0))
+    return out
+
+
+def donchian_decisions(daily, weekly, enter_days=50, exit_days=25):
+    """[(decision_ts, pos)] — enter on close > prior enter_days-day high, exit on
+    close < prior exit_days-day low; evaluated ONCE per ISO week (state machine
+    stepped only at weekly closes). Long-flat, one decision per week."""
+    out = []
+    pos = 0
+    for _key, dts, close, di in weekly:
+        if di < enter_days:            # not enough daily history behind this week
+            continue
+        ch_high = max(d[1] for d in daily[di - enter_days: di])   # prior N days' highs
+        ch_low = min(d[2] for d in daily[max(0, di - exit_days): di])
+        if pos == 0 and close > ch_high:
+            pos = 1
+        elif pos == 1 and close < ch_low:
+            pos = 0
+        out.append((dts, pos))
+    return out
+
+
 # ── Challenger configs (per-instance Tier-A levers ONLY) ──────────────────────
 # Each lever is applied additively to the SHARED SignalEngine's output before the
 # challenger's on_signal runs. No new indicators, no global mutation.
@@ -99,6 +343,12 @@ _FEE_RATE = (bs.BINANCE_FEE        if bs.USE_BINANCE else
 # this epoch (set at feature ship). strict_gates in particular was suggested by
 # an audit OVER the existing rows — grading it on those same rows would be the
 # in-sample sin this whole module exists to prevent. Future rows only.
+#
+# NO AUTO-MUTATION, NO BREEDING. New entrants enter this list ONLY by a
+# written hypothesis with hardcoded born_ts — never by machine-generated
+# parameter sweeps over the survivors. OOS evidence for the rule: the 3
+# gap_fade lab entrants (auto-nominated from historical sweeps) all died
+# out-of-sample; sweep-born configs are the N-trials problem incarnate.
 AP_CF_EPOCH = 1787545000.0    # 2026-08-24, counterfactual scoring shipped
 
 CHALLENGER_CONFIGS = [
@@ -110,13 +360,14 @@ CHALLENGER_CONFIGS = [
         "allowed_strategies": None,
         "risk_min": None, "risk_max": None,
     },
-    {   # more selective: higher confidence + tighter R:R
-        "id": "selective",
+    {   # more selective: higher confidence + tighter R:R.
+        # cf_only since 2026-09-03: the live sandbox books were STRUCTURALLY
+        # STARVED — a challenger only trades when the main pipeline fires
+        # (~1-2 signals/day shared across the whole pool), so none of these
+        # books could mathematically reach MIN_OOS_TRADES on the live path.
+        # The counterfactual stream is the only path that actually feeds them.
+        "id": "selective", "cf_only": True,
         "cf": {"conf": 0.55, "rr": 1.5, "horizon": "fwd48"},
-        "entry_conf_floor": 0.55,
-        "min_rr": 1.5,
-        "allowed_strategies": None,
-        "risk_min": 0.04, "risk_max": 0.10,
     },
     {   # strictest: only the highest-quality named setups
         "id": "high_conviction",
@@ -125,12 +376,17 @@ CHALLENGER_CONFIGS = [
         "allowed_strategies": {"MULTI_SIGNAL", "MOMENTUM_BREAKOUT", "TREND_CONTINUATION"},
         "risk_min": 0.04, "risk_max": 0.08,
     },
-    {   # trend/momentum family only
-        "id": "momentum",
+    {   # trend/momentum family only.
+        # cf_only since 2026-09-03 (structurally starved on the live path — see
+        # "selective"). NO cf spec on purpose: the strategy-family lever is not
+        # expressible from the recorded shadow stream yet (it needs a pillars
+        # replay through _classify_strategy), and pretending a bare conf floor
+        # IS "momentum" would score a different hypothesis under this id.
+        # Parked and honestly unscored until the stream can express it.
+        "id": "momentum", "cf_only": True,
         "entry_conf_floor": 0.50,
         "min_rr": 1.5,
         "allowed_strategies": {"MOMENTUM_BREAKOUT", "TREND_CONTINUATION", "MULTI_SIGNAL"},
-        "risk_min": None, "risk_max": None,
     },
     {   # ORIGINAL gate thresholds, as a tournament entrant instead of a belief.
         # The gate-loosening audit (analyze_gate_loosening.py) could not judge
@@ -161,19 +417,75 @@ CHALLENGER_CONFIGS = [
         "id": "trend_rr", "cf_only": True, "born_ts": 1787875000.0,
         "cf": {"adx": 30.0, "horizon": "fwd48"},
     },
-    {   # mean-reversion / pattern family only
-        "id": "reversion",
+    {   # mean-reversion / pattern family only.
+        # cf_only since 2026-09-03 (structurally starved on the live path — see
+        # "selective"). No cf spec for the same reason as "momentum": the
+        # family lever cannot be expressed from the recorded stream yet.
+        "id": "reversion", "cf_only": True,
         "entry_conf_floor": 0.50,
         "min_rr": 1.5,
         "allowed_strategies": {"RSI_REVERSAL", "PATTERN_BREAKOUT"},
-        "risk_min": None, "risk_max": None,
     },
-    {   # least selective: trades the most, clears the lowest bar
-        "id": "loose",
-        "entry_conf_floor": ATTEMPT_CONF_MIN,
-        "min_rr": None,
-        "allowed_strategies": None,
-        "risk_min": None, "risk_max": None,
+    {   # least selective: trades the most, clears the lowest bar.
+        # cf_only since 2026-09-03 (structurally starved on the live path).
+        # Counterfactually "loose" has NO expressible difference from "base"
+        # (same conf floor, no other stream-expressible lever) — its cf record
+        # will mirror base's, which is itself an honest statement: the lever
+        # set only ever differed on the starved live path.
+        "id": "loose", "cf_only": True,
+        "cf": {"conf": None, "horizon": "fwd48"},
+    },
+    # ── Weekly / carry entrants (2026-09-03 registration) ─────────────────────
+    # All cf_only, all with HARDCODED born_ts = registration time (rounded UP a
+    # few hours so no pre-registration bar can ever slip into the grade).
+    # PRE-REGISTERED EXPECTATION, stated before any data: at ~1 decision per
+    # week, MIN_OOS_TRADES=20 alone takes ~5 months and MinTRL will typically
+    # ask for more — NO verdict on any weekly entrant before ~6+ months. The
+    # scorer surfaces this honestly ("verdict in ~N months at current signal
+    # rate") instead of pretending an early number means anything.
+    # Hypotheses (written, not bred):
+    #   tsmom_*   — time-series momentum: the live intraday books keep showing
+    #               entries are fine and exits bleed (loss decomposition:
+    #               ~0.000% entries, -0.211% exits OOS) — the slow weekly
+    #               trend-following exit is the written alternative.
+    #   donchian  — the same slow-exit hypothesis in breakout form, so the
+    #               two trend expressions can disagree and be told apart.
+    #   carry_*   — funding carry is a DIFFERENT return source than price
+    #               direction; graded only on recorded funding_rates history.
+    {   # long-flat BTC: long when weekly close > 20-week SMA, one decision per
+        # ISO week, graded on the NEXT week's return (fwd168), spot RT costs.
+        "id": "tsmom_btc_20w", "cf_only": True, "kind": "trend",
+        "born_ts": 1788500000.0,   # 2026-09-04 ~05:30 UTC — registration, rounded up
+        "cf": {"rule": "tsmom", "pair": "XBTUSD", "weeks": 20, "horizon": "fwd168"},
+    },
+    {   # Donchian long-flat BTC: enter 50-day-high breakout, exit 25-day low,
+        # state stepped once per ISO week, graded on the next week (fwd168).
+        "id": "donchian_btc", "cf_only": True, "kind": "trend",
+        "born_ts": 1788500000.0,
+        "cf": {"rule": "donchian", "pair": "XBTUSD",
+               "enter_days": 50, "exit_days": 25, "horizon": "fwd168"},
+    },
+    {   # same 20-week TSMOM hypothesis on ETH.
+        "id": "tsmom_eth_20w", "cf_only": True, "kind": "trend",
+        "born_ts": 1788500000.0,
+        "cf": {"rule": "tsmom", "pair": "ETHUSD", "weeks": 20, "horizon": "fwd168"},
+    },
+    {   # counterfactual paired position (long spot + short perp) harvesting
+        # funding. Enters when trailing 7d ANNUALIZED funding > CARRY_HURDLE_ANN
+        # (4x the 4-leg RT cost + 10% floor), exits below hurdle/2 or negative.
+        # Marked daily; graded on accrued funding minus the modeled 4-leg costs.
+        # Reads the funding_rates contract table — empty means the honest
+        # status "waiting on funding history", not a fabricated score.
+        "id": "carry_harvest", "cf_only": True, "kind": "carry",
+        "born_ts": 1788500000.0,
+        "cf": {"symbol": "PF_XBTUSD"},
+    },
+    {   # scores the SWITCH itself: weekly, allocate to carry_harvest's
+        # condition if live, else tsmom_btc_20w's if live, else flat. Costs
+        # charged on every allocation change (each sleeve's own legs).
+        "id": "carry_or_trend", "cf_only": True, "kind": "switch",
+        "born_ts": 1788500000.0,
+        "cf": {"pair": "XBTUSD", "symbol": "PF_XBTUSD", "weeks": 20},
     },
 ]
 
@@ -437,6 +749,10 @@ class Autopilot:
         self.decision_log = []             # rolling list of {ts, champion, allocation, why}
         self.scores = {}                   # id -> last score dict
         self._last_alert_ts = 0.0
+        # N-trials accounting (monotone) + the kill graveyard, both persisted.
+        self.trials_count = TRIALS_SEED    # every entrant EVER tried (see TRIALS_SEED doc)
+        self.trials_ids   = []             # post-seed ids already counted
+        self.killed       = {}             # cid -> {ts, reason, config, final_score}
         # A live instance is by definition enabled; persisted on every _save so the
         # flag survives a redeploy (see autopilot_persisted_enabled / _set...).
         self.enabled = True
@@ -460,6 +776,9 @@ class Autopilot:
             log("AUTOPILOT", f"lab challenger loaded: {cfg['id']}")
 
         self._load()
+        # After restore: count any config id the persisted trials ledger has
+        # never seen (first boot with a new written hypothesis lands here).
+        self._register_trials()
 
     def _add_challenger(self, cfg):
         """Register one config (built-in or lab) with its own sandboxed trader.
@@ -722,13 +1041,38 @@ class Autopilot:
         return n, edge, t, statistics.fmean(gross)
 
     def score_counterfactual(self, cfg):
+        """Score one config against RECORDED history. Dispatches on cfg['kind'].
+
+        kind='price'  (default) — today's path: the shadow_signals stream.
+        kind='trend'  — weekly long-flat rules over stored hourly candles.
+        kind='carry'  — funding-carry over the funding_rates contract table.
+        kind='switch' — weekly allocator between the carry and trend sleeves.
+        The seam exists so multi-leg / weekly entrants never have to fake
+        themselves into the per-signal price path. Every branch returns either
+        None (nothing scorable) or a dict with at least
+        {n_oos, oos_edge, t, gross_edge, clears_cost, via, nets} — nets being
+        the per-decision NET return stream the DSR machinery runs on.
+        """
+        kind = cfg.get("kind", "price")
+        if kind == "price":
+            return self._score_cf_price(cfg)
+        if kind == "trend":
+            return self._score_cf_trend(cfg)
+        if kind == "carry":
+            return self._score_cf_carry(cfg)
+        if kind == "switch":
+            return self._score_cf_switch(cfg)
+        log("AUTOPILOT", f"cf score {cfg.get('id')}: unknown kind {kind!r}", "WRN")
+        return None
+
+    def _score_cf_price(self, cfg):
         """Score one config against the RECORDED signal stream.
 
         The live sandbox books starve: challengers only trade when the main
         pipeline fires (~1-2/day), so MIN_OOS_TRADES took months even before
         deploys wiped the books. But shadow_signals records EVERY evaluated
-        signal with 6/24/48h outcomes — a config with expressible filters can
-        be scored against all of them.
+        signal with 6/24/48h (and, once backfilled, 168h) outcomes — a config
+        with expressible filters can be scored against all of them.
 
         Honesty terms, stated: fills are the recorded signal price (optimistic
         — no queue, no spread), the exit is a FIXED horizon (fwdN), and rows
@@ -736,13 +1080,17 @@ class Autopilot:
         elsewhere in this project). Costs are charged in full. Rows before
         AP_CF_EPOCH (or the config's own birth, if later) never count — a
         config suggested by an audit over past rows is graded only on rows it
-        has never seen.
+        has never seen. fwd168 is in the whitelist but the column ships from
+        another workstream: until it exists, the SELECT fails, is caught, and
+        the config is simply not-ready (None) — never a crash, never a number.
+        spec['weekly']=True additionally enforces at most ONE scored decision
+        per ISO week (across all pairs) for weekly-cadence hypotheses.
         """
         spec = cfg.get("cf")
         if not spec or not bs.db.connected:
             return None
         horizon = spec.get("horizon", "fwd48")
-        if horizon not in ("fwd6", "fwd24", "fwd48"):
+        if horizon not in ("fwd6", "fwd24", "fwd48", "fwd168"):
             return None
         born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
         try:
@@ -756,8 +1104,9 @@ class Autopilot:
         except Exception as e:
             log("AUTOPILOT", f"cf score {cfg['id']}: {e}", "WRN")
             return None
-        hor_s = {"fwd6": 6, "fwd24": 24, "fwd48": 48}[horizon] * 3600
-        nets, last_kept = [], {}
+        hor_s = {"fwd6": 6, "fwd24": 24, "fwd48": 48, "fwd168": 168}[horizon] * 3600
+        weekly = bool(spec.get("weekly"))
+        nets, last_kept, weeks_seen = [], {}, set()
         for ts, pair, sig, conf, adx, er, rr_net, fwd in rows:
             if spec.get("conf") is not None and (conf is None or float(conf) < spec["conf"]):
                 continue
@@ -770,23 +1119,256 @@ class Autopilot:
             lk = last_kept.get(pair)
             if lk is not None and float(ts) - lk < hor_s:
                 continue                       # overlapping forward window
+            if weekly:
+                wk = _iso_week_key(ts)
+                if wk in weeks_seen:
+                    continue                   # max one scored decision per ISO week
+                weeks_seen.add(wk)
             last_kept[pair] = float(ts)
             gross = float(fwd) if sig == "BUY" else -float(fwd)
             nets.append((gross - bs.ROUND_TRIP_COST_PCT, gross))
-        n = len(nets)
+        return self._cf_result(cfg, [x[0] for x in nets], [x[1] for x in nets],
+                               via="cf", gross_bar=bs.ROUND_TRIP_COST_PCT)
+
+    @staticmethod
+    def _cf_result(cfg, net, gross_l, via, gross_bar=None, extra=None):
+        """Common tail for every cf path: edge/t/clears + the nets stream."""
+        n = len(net)
         if n < 2:
-            return {"n_oos": n, "oos_edge": None, "t": None,
-                    "gross_edge": None, "clears_cost": False, "via": "cf"}
-        net = [x[0] for x in nets]
-        gross_l = [x[1] for x in nets]
-        edge = statistics.fmean(net)
-        sd = statistics.pstdev(net)
-        t = (edge / (sd / math.sqrt(n))) if sd > 1e-12 else None
-        g = statistics.fmean(gross_l)
-        clears = (n >= MIN_OOS_TRADES and t is not None and edge > 0
-                  and t >= T_MARGIN and g > bs.ROUND_TRIP_COST_PCT)
-        return {"n_oos": n, "oos_edge": edge, "t": t, "gross_edge": g,
-                "clears_cost": bool(clears), "via": "cf"}
+            out = {"n_oos": n, "oos_edge": None, "t": None, "gross_edge": None,
+                   "clears_cost": False, "via": via, "nets": list(net)}
+        else:
+            edge = statistics.fmean(net)
+            sd = statistics.pstdev(net)
+            t = (edge / (sd / math.sqrt(n))) if sd > 1e-12 else None
+            g = statistics.fmean(gross_l) if gross_l else None
+            clears = (n >= MIN_OOS_TRADES and t is not None and edge > 0
+                      and t >= T_MARGIN
+                      and (gross_bar is None or (g is not None and g > gross_bar)))
+            out = {"n_oos": n, "oos_edge": edge, "t": t, "gross_edge": g,
+                   "clears_cost": bool(clears), "via": via, "nets": list(net)}
+        if extra:
+            out.update(extra)
+        return out
+
+    # ── data pulls for the weekly/carry paths (contract tables; may be empty) ──
+    def _fetch_hourly_candles(self, pair):
+        """[(ts, high, low, close)] hourly bars from the candles table, or None.
+
+        History BEFORE born_ts is deliberately included: indicator warm-up
+        (SMA/channel lookback) is not grading — only decisions after born are
+        ever scored."""
+        if not bs.db.connected:
+            return None
+        try:
+            with bs.db.conn.cursor() as cur:
+                cur.execute("""SELECT ts, high, low, close FROM candles
+                               WHERE pair=%s AND interval_m=60 ORDER BY ts""",
+                            (pair,))
+                return cur.fetchall()
+        except Exception as e:
+            log("AUTOPILOT", f"cf candles {pair}: {e}", "WRN")
+            return None
+
+    def _fetch_funding(self, symbol):
+        """[(ts, rate)] hourly funding from the funding_rates CONTRACT table.
+
+        The table ships from another workstream (venue TEXT, symbol TEXT,
+        ts BIGINT epoch-seconds, rate FLOAT). Missing table or empty history
+        returns None — callers surface 'waiting on funding history', they do
+        not invent a number. Deduped by ts (first venue wins) so a second
+        venue could never silently double-count accrual."""
+        if not bs.db.connected:
+            return None
+        try:
+            with bs.db.conn.cursor() as cur:
+                cur.execute("""SELECT ts, rate FROM funding_rates
+                               WHERE symbol=%s ORDER BY ts""", (symbol,))
+                rows = cur.fetchall()
+        except Exception as e:
+            log("AUTOPILOT", f"cf funding {symbol}: {e}", "WRN")
+            return None
+        out, seen = [], set()
+        for ts, rate in rows:
+            try:
+                ts = int(float(ts))
+                if ts in seen or rate is None:
+                    continue
+                seen.add(ts)
+                out.append((ts, float(rate)))
+            except Exception:
+                continue
+        return out or None
+
+    def _score_cf_trend(self, cfg):
+        """Weekly long-flat rules (tsmom / donchian) over stored hourly candles.
+
+        One decision per ISO week (weekly_closes_from_daily enforces it by
+        construction); the decision at week i is graded on week i+1's close-to-
+        close return — fwd168, never the bar the decision saw. Costs: the
+        honest SPOT round trip (taker + slippage each way, CF_SPOT_RT), half
+        charged on the entry decision's scored week and half on the exit's.
+        Every completed post-birth week is a scored decision (flat weeks score
+        0) — the entrant is graded as an allocation, not on cherry-picked
+        long weeks. Insufficient candle history is reported, not papered over.
+        """
+        spec = cfg.get("cf") or {}
+        hourly = self._fetch_hourly_candles(spec.get("pair"))
+        if not hourly:
+            return self._cf_result(cfg, [], [], via="cf_trend",
+                                   extra={"status": "waiting on price history"})
+        daily = daily_bars_from_hourly(hourly)
+        weekly = weekly_closes_from_daily(daily)
+        rule = spec.get("rule", "tsmom")
+        if rule == "donchian":
+            decisions = donchian_decisions(daily, weekly,
+                                           int(spec.get("enter_days", 50)),
+                                           int(spec.get("exit_days", 25)))
+        else:
+            decisions = tsmom_decisions(weekly, int(spec.get("weeks", 20)))
+        if not decisions:
+            need = (spec.get("enter_days", 50) if rule == "donchian"
+                    else spec.get("weeks", 20))
+            return self._cf_result(cfg, [], [], via="cf_trend",
+                                   extra={"status": f"waiting on price history "
+                                                    f"(warm-up {need} {'days' if rule=='donchian' else 'weeks'} not met)"})
+        born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
+        # weekly close lookup by decision_ts for the forward return pairing
+        wk_by_ts = {w[1]: (i, w[2]) for i, w in enumerate(weekly)}
+        net, gross_l = [], []
+        prev_pos = 0
+        for dts, pos in decisions:
+            idx, close = wk_by_ts[dts]
+            entered = pos == 1 and prev_pos == 0
+            exited = pos == 0 and prev_pos == 1
+            prev_pos = pos
+            if dts <= born:
+                continue                        # pre-registration rule
+            if idx + 1 >= len(weekly):
+                continue                        # forward week not complete yet
+            fwd = weekly[idx + 1][2] / close - 1.0
+            g = fwd if pos == 1 else 0.0
+            cost = (CF_SPOT_RT / 2.0) if (entered or exited) else 0.0
+            net.append(g - cost)
+            gross_l.append(g)
+        return self._cf_result(cfg, net, gross_l, via="cf_trend")
+
+    def _score_cf_carry(self, cfg):
+        """Counterfactual funding-carry pair (long spot + short perp), marked daily.
+
+        Decision each UTC day: enter when trailing 7d ANNUALIZED funding >
+        CARRY_HURDLE_ANN (4x the 4-leg RT cost + 10% floor), exit when it
+        drops below hurdle/2 or turns negative. A day's mark while deployed is
+        that day's summed hourly funding accrual (shorts RECEIVE positive
+        funding); entry charges the two opening legs, exit the two closing
+        legs (CARRY_RT_4LEG/2 each). The trailing window must hold >= 120 of
+        168 hourly rates to decide at all — thin data holds state, it never
+        fabricates a decision. Also tracks the worst consecutive negative-
+        funding streak (days, while deployed). Empty/missing funding_rates ->
+        honest status 'waiting on funding history'.
+        """
+        spec = cfg.get("cf") or {}
+        rates = self._fetch_funding(spec.get("symbol", "PF_XBTUSD"))
+        if not rates:
+            return self._cf_result(cfg, [], [], via="cf_carry",
+                                   extra={"status": "waiting on funding history"})
+        born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
+        by_hour = dict(rates)
+        first_day = (min(by_hour) // 86400) * 86400
+        last_day = (max(by_hour) // 86400) * 86400   # last day may be partial: excluded
+        ts_sorted = sorted(by_hour)
+        net, gross_l = [], []
+        in_pos = False
+        neg_run = worst_neg = 0
+        day = first_day + 86400
+        i_lo = 0
+        while day < last_day:
+            # trailing 7d window [day-7d, day)
+            window = [by_hour[t] for t in ts_sorted
+                      if day - SECS_PER_WEEK <= t < day]
+            entered = exited = False
+            if len(window) >= CARRY_MIN_7D_HOURS:
+                ann = statistics.fmean(window) * 24.0 * 365.0
+                if not in_pos and ann > CARRY_HURDLE_ANN:
+                    in_pos, entered = True, True
+                elif in_pos and (ann < CARRY_HURDLE_ANN / 2.0 or ann < 0.0):
+                    in_pos, exited = False, True
+            if day > born:
+                if exited:
+                    net.append(-CARRY_RT_4LEG / 2.0)
+                    gross_l.append(0.0)
+                elif in_pos:
+                    accr = sum(by_hour[t] for t in ts_sorted if day <= t < day + 86400)
+                    cost = (CARRY_RT_4LEG / 2.0) if entered else 0.0
+                    net.append(accr - cost)
+                    gross_l.append(accr)
+                    if accr < 0:
+                        neg_run += 1
+                        worst_neg = max(worst_neg, neg_run)
+                    else:
+                        neg_run = 0
+            day += 86400
+        return self._cf_result(cfg, net, gross_l, via="cf_carry",
+                               extra={"worst_neg_funding_days": worst_neg,
+                                      "hurdle_ann": CARRY_HURDLE_ANN})
+
+    def _score_cf_switch(self, cfg):
+        """Weekly allocator: carry_harvest's condition if live, else
+        tsmom_btc_20w's if live, else flat — this entrant scores the SWITCH
+        itself, not either sleeve. Costs are charged on every allocation
+        change (each sleeve's own entry/exit legs). Every completed post-birth
+        week is one scored decision; flat weeks score 0. Missing funding
+        history degrades honestly: the carry condition is treated as NOT live
+        (and said so in status); missing price history means nothing is
+        scorable at all.
+        """
+        spec = cfg.get("cf") or {}
+        hourly = self._fetch_hourly_candles(spec.get("pair", "XBTUSD"))
+        if not hourly:
+            return self._cf_result(cfg, [], [], via="cf_switch",
+                                   extra={"status": "waiting on price history"})
+        rates = self._fetch_funding(spec.get("symbol", "PF_XBTUSD"))
+        note = None if rates else "funding history missing — carry leg treated as not live"
+        by_hour = dict(rates) if rates else {}
+        ts_sorted = sorted(by_hour)
+        daily = daily_bars_from_hourly(hourly)
+        weekly = weekly_closes_from_daily(daily)
+        tsm = dict(tsmom_decisions(weekly, int(spec.get("weeks", 20))))  # dts -> pos
+        born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
+        net, gross_l = [], []
+        prev_alloc = "flat"
+        for i, (_key, dts, close, _di) in enumerate(weekly):
+            if i + 1 >= len(weekly):
+                break                          # forward week not complete
+            # carry condition at the decision point: trailing 7d ann funding
+            carry_live = False
+            window = [by_hour[t] for t in ts_sorted if dts - SECS_PER_WEEK <= t < dts]
+            if len(window) >= CARRY_MIN_7D_HOURS:
+                carry_live = statistics.fmean(window) * 24.0 * 365.0 > CARRY_HURDLE_ANN
+            trend_live = bool(tsm.get(dts, 0))
+            alloc = "carry" if carry_live else ("trend" if trend_live else "flat")
+            cost = 0.0
+            if alloc != prev_alloc:
+                # unwind the old sleeve's legs + open the new sleeve's legs
+                for leg in (prev_alloc, alloc):
+                    if leg == "carry":
+                        cost += CARRY_RT_4LEG / 2.0
+                    elif leg == "trend":
+                        cost += CF_SPOT_RT / 2.0
+            prev_alloc = alloc
+            if dts <= born:
+                continue                       # pre-registration rule
+            nxt = weekly[i + 1]
+            if alloc == "carry":
+                g = sum(by_hour[t] for t in ts_sorted if dts <= t < nxt[1])
+            elif alloc == "trend":
+                g = nxt[2] / close - 1.0
+            else:
+                g = 0.0
+            net.append(g - cost)
+            gross_l.append(g)
+        return self._cf_result(cfg, net, gross_l, via="cf_switch",
+                               extra=({"status": note} if note else None))
 
     def score(self):
         """Per-config OOS net-of-cost scoring. Returns {id: {...}}.
@@ -800,14 +1382,17 @@ class Autopilot:
         net-of-fee return already charges the cost that baseline exists to subtract.
         """
         out = {}
+        nets_by_id = {}                # transient per-decision NET streams (never persisted)
         for cid, cfg in self.configs.items():
             t = self.traders.get(cid)
             res = {"id": cid, "n": 0, "n_oos": 0, "oos_edge": None,
                    "t": None, "avg_pnl_net": None, "gross_edge": None,
                    "clears_cost": False, "via": "live",
                    "balance": round(t.balance, 2) if t else None}
+            live_nets = []
             if t is not None:
                 rows = self._trade_returns(t.trades)
+                live_nets = [r[1] for r in rows]
                 n_all = len(rows)
                 res["n"] = n_all
                 if n_all >= MIN_TOTAL_TRADES:
@@ -828,17 +1413,104 @@ class Autopilot:
             # still short of MIN_OOS_TRADES. Once a live book graduates, it
             # speaks for itself and cf becomes a footnote.
             cf = self.score_counterfactual(cfg) if cfg.get("cf") or cfg.get("cf_only") else None
+            cf_nets = None
             if cf is not None:
+                cf_nets = cf.pop("nets", None)
                 res["cf_n_oos"] = cf["n_oos"]
                 res["cf_edge"] = cf["oos_edge"]
                 res["cf_t"] = cf["t"]
+                for k in ("status", "worst_neg_funding_days", "hurdle_ann"):
+                    if k in cf:
+                        res[k] = cf[k]
                 if res["n_oos"] < MIN_OOS_TRADES:
                     res.update({"n_oos": cf["n_oos"], "oos_edge": cf["oos_edge"],
                                 "t": cf["t"], "gross_edge": cf["gross_edge"],
-                                "clears_cost": cf["clears_cost"], "via": "cf"})
+                                "clears_cost": cf["clears_cost"], "via": cf["via"]})
+            # The DSR stats run on whichever stream is driving the record.
+            nets_by_id[cid] = (cf_nets if (cf_nets is not None
+                                           and str(res["via"]).startswith("cf"))
+                               else live_nets)
             out[cid] = res
+        self._attach_survival_stats(out, nets_by_id)
         self.scores = out
         return out
+
+    def _attach_survival_stats(self, out, nets_by_id):
+        """Attach {sr, dsr, psr, min_trl, trades_n, verdict} to every record.
+
+        The SR0 hurdle is the expected max SR of trials_count unskilled tries
+        (N = every entrant EVER registered, monotone — see TRIALS_SEED), with
+        Var[SR] measured ACROSS the current entrants' per-decision SRs. A
+        KILLED entrant keeps its frozen verdict and can never clear the gate.
+        """
+        now = time.time()
+        srs = []
+        for cid, nets in nets_by_id.items():
+            if len(nets) >= 2:
+                sd = statistics.pstdev(nets)
+                if sd > 1e-12:
+                    srs.append(statistics.fmean(nets) / sd)
+        var_sr = statistics.pvariance(srs) if len(srs) >= 2 else None
+        sr0 = expected_max_sr(var_sr, max(int(self.trials_count), 2))
+        for cid, res in out.items():
+            born = max(AP_CF_EPOCH, float(self.configs.get(cid, {}).get("born_ts") or 0))
+            st = dsr_stats(nets_by_id.get(cid, []), sr0, born_ts=born, now=now)
+            res.update(st)
+            res["sr0"] = sr0
+            res["trials_count"] = int(self.trials_count)
+            if cid in self.killed:
+                res["verdict"] = "KILLED"
+                res["killed_reason"] = self.killed[cid].get("reason")
+                res["clears_cost"] = False   # a killed config is never allocatable
+
+    def _register_trials(self):
+        """Monotone N-trials counter. Every config id ever seen counts once —
+        forever. PRE_SEED_IDS are already inside TRIALS_SEED; anything else
+        (new built-ins, lab nominations) increments on first sight. The count
+        NEVER decreases: retirement and death do not un-try a hypothesis."""
+        changed = False
+        for cid in self.configs:
+            if cid in PRE_SEED_IDS or cid in self.trials_ids:
+                continue
+            self.trials_ids.append(cid)
+            self.trials_count += 1
+            changed = True
+            log("AUTOPILOT", f"trials_count -> {self.trials_count} (registered {cid})")
+        return changed
+
+    def _apply_kill_rule(self):
+        """KILL entrants past MinTRL with deflated PSR < KILL_PSR. Fires ONCE
+        per entrant (the killed dict is persisted and checked first), freezes
+        the config + final score with the reason, and is never auto-revived —
+        resurrection requires a human writing a NEW hypothesis with a NEW id
+        and a fresh born_ts."""
+        for cid, s in self.scores.items():
+            if cid in self.killed:
+                continue
+            mt, n, dsr = s.get("min_trl"), s.get("trades_n"), s.get("dsr")
+            if mt is None or n is None or dsr is None or n < mt or dsr >= KILL_PSR:
+                continue
+            cfg = self.configs.get(cid, {})
+            reason = (f"past MinTRL ({n} decisions >= {mt:.0f}) with deflated "
+                      f"PSR {dsr:.3f} < {KILL_PSR} vs SR0 hurdle {s.get('sr0')}")
+            self.killed[cid] = {
+                "ts": time.time(),
+                "reason": reason,
+                "config": {k: (sorted(v) if isinstance(v, set) else v)
+                           for k, v in cfg.items()},
+                "final_score": {k: s.get(k) for k in
+                                ("sr", "dsr", "psr", "min_trl", "trades_n",
+                                 "n_oos", "oos_edge", "t")},
+            }
+            s["verdict"] = "KILLED"
+            s["killed_reason"] = reason
+            s["clears_cost"] = False
+            log("AUTOPILOT", f"KILLED {cid}: {reason}", "WRN")
+            if self.champion_id == cid:
+                self.champion_id = None
+                self.allocation = "FLAT"
+                self.last_switch = {"ts": time.time(), "from": cid, "to": None,
+                                    "why": f"champion {cid} KILLED -> FLAT"}
 
     # ── decision ───────────────────────────────────────────────────────────────
     def decide(self):
@@ -853,9 +1525,14 @@ class Autopilot:
         # score() below then rebuilds self.scores from the surviving traders only,
         # so a dangling lab id can never appear in `eligible`.
         self.refresh_lab_configs()
+        self._register_trials()            # lab hot-swaps may have added ids
 
         scores = self.score()
-        eligible = {cid: s for cid, s in scores.items() if s["clears_cost"]}
+        # Survival first: a KILLED entrant is frozen out BEFORE eligibility, so
+        # the kill and the promotion can never disagree within one decision.
+        self._apply_kill_rule()
+        eligible = {cid: s for cid, s in scores.items()
+                    if s["clears_cost"] and cid not in self.killed}
 
         prev = self.champion_id
         why = None
@@ -926,6 +1603,9 @@ class Autopilot:
             "last_switch": self.last_switch,
             "scores": self.scores,
             "decision_log": self.decision_log,
+            "trials_count": int(self.trials_count),
+            "trials_ids": list(self.trials_ids),
+            "killed": self.killed,
             "updated_at": time.time(),
         }
 
@@ -951,6 +1631,17 @@ class Autopilot:
         self.last_switch  = data.get("last_switch", self.last_switch)
         self.decision_log = data.get("decision_log", [])
         self.scores       = data.get("scores", {})
+        # Trials ledger: monotone by construction — the restored count can only
+        # be raised (never below the documented seed), and the kill graveyard
+        # is restored verbatim: a KILLED entrant stays dead across redeploys.
+        try:
+            self.trials_count = max(int(data.get("trials_count", TRIALS_SEED)), TRIALS_SEED)
+        except Exception:
+            self.trials_count = TRIALS_SEED
+        tids = data.get("trials_ids")
+        self.trials_ids = [str(x) for x in tids] if isinstance(tids, list) else []
+        killed = data.get("killed")
+        self.killed = killed if isinstance(killed, dict) else {}
         # Explicit heal: the persisted champion may be a lab id whose nomination
         # was withdrawn while we were down. A champion outside the current pool
         # can never be allowed to gate the real book — force FLAT immediately
@@ -993,6 +1684,16 @@ class Autopilot:
                 "gross_edge_pct": round(s["gross_edge"] * 100, 4) if s.get("gross_edge") is not None else None,
                 "clears_cost": bool(s.get("clears_cost", False)),
                 "is_champion": cid == self.champion_id,
+                # survival statistics (DSR discipline) — None until computable
+                "sr": round(s["sr"], 4) if s.get("sr") is not None else None,
+                "psr": round(s["psr"], 4) if s.get("psr") is not None else None,
+                "dsr": round(s["dsr"], 4) if s.get("dsr") is not None else None,
+                "min_trl": round(s["min_trl"], 1) if s.get("min_trl") is not None else None,
+                "trades_n": s.get("trades_n"),
+                "verdict": s.get("verdict"),
+                "status_note": s.get("status"),   # e.g. 'waiting on funding history'
+                "worst_neg_funding_days": s.get("worst_neg_funding_days"),
+                "killed": cid in self.killed,
             })
         return {
             "enabled": bool(self.enabled),
@@ -1006,9 +1707,14 @@ class Autopilot:
             "t_margin": T_MARGIN,
             "min_oos_trades": MIN_OOS_TRADES,
             "cf_epoch": AP_CF_EPOCH,
+            "trials_count": int(self.trials_count),
+            "kill_psr": KILL_PSR,
+            "killed": {cid: {"ts": k.get("ts"), "reason": k.get("reason")}
+                       for cid, k in self.killed.items()},
             "standings": [
                 {**{k: (self.scores.get(cid) or {}).get(k) for k in
-                    ("n", "n_oos", "oos_edge", "t", "clears_cost", "via")},
+                    ("n", "n_oos", "oos_edge", "t", "clears_cost", "via",
+                     "sr", "dsr", "psr", "min_trl", "trades_n", "verdict")},
                  "id": cid,
                  "cf_only": bool(self.configs.get(cid, {}).get("cf_only"))}
                 for cid in self.order if cid in self.configs
