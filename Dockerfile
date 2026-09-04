@@ -6,6 +6,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot_server.py .
+# Modules bot_server imports at boot — a missing one is a crash loop
+# (sizing.py was committed but not COPY'd: ModuleNotFoundError on deploy).
+COPY sizing.py .
+COPY meta_lab.py .
+COPY funding_carry.py .
 # Analysis tools that must exist INSIDE the container, where DATABASE_URL
 # lives. Only bot_server.py was shipped before, so learning_report.py was
 # committed to the repo but missing from the image — "run it in the container"
