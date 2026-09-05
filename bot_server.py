@@ -17194,18 +17194,43 @@ function renderAutopilot(d){
   const st=$('ap_standings');
   if(st&&d.standings&&d.standings.length){
     const need=d.min_oos_trades||20;
+    // Tournament statistics (2026-09-04): every row now carries verdict /
+    // dsr / psr / min_trl / trades_n / status_note. KILLED rows stay listed
+    // (the graveyard is a claim the owner should see) but dimmed; survival
+    // stats render ONLY when the server computed them — null stays a dash,
+    // never a fabricated 0.
+    const nKilled=Object.keys(d.killed||{}).length;
+    const viaTag={cf:'rec',cf_trend:'trend',cf_carry:'carry',cf_switch:'switch'};
     st.innerHTML='<div style="font-family:var(--fn);font-size:.5rem;letter-spacing:.12em;'
       +'color:var(--mu);margin-bottom:7px">STANDINGS — first to n'+need
-      +' with t&ge;'+(d.t_margin||2)+' after costs takes the book</div>'
+      +' with t&ge;'+(d.t_margin||2)+' after costs takes the book'
+      +(d.trials_count?' &middot; trials '+d.trials_count:'')
+      +(nKilled?' &middot; <span style="color:var(--r)">'+nKilled+' killed</span>'
+        +' (PSR&lt;'+(d.kill_psr!=null?d.kill_psr:'?')+')':'')
+      +'</div>'
       +d.standings.map(r=>{
         const n=r.n_oos||0;
+        const killed=r.verdict==='KILLED';
         const frac=Math.min(1,n/need);
-        const clr=r.clears_cost?'var(--g)':'var(--bd3)';
+        const clr=r.clears_cost?'var(--g)':(killed?'var(--r)':'var(--bd3)');
         const edge=(r.oos_edge!=null&&n>=need)
           ?((r.oos_edge>=0?'+':'')+(r.oos_edge*100).toFixed(2)+'% t '+(r.t!=null?r.t.toFixed(1):'—'))
           :(n+'/'+need);
-        const via=r.via==='cf'?' <span style="color:var(--mu)">rec</span>':'';
-        return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+        const tag=viaTag[r.via]||'';
+        const via=tag?' <span style="color:var(--mu)">'+tag+'</span>':'';
+        const stat=(r.dsr!=null||r.psr!=null||r.min_trl!=null)
+          ?('DSR '+(r.dsr!=null?r.dsr.toFixed(2):'—')
+            +' &middot; PSR '+(r.psr!=null?r.psr.toFixed(2):'—')
+            +' &middot; MinTRL '+(r.min_trl!=null?r.min_trl.toFixed(1):'—')
+            +(r.trades_n!=null?' &middot; n '+r.trades_n:''))
+          :'';
+        const note=r.status_note?r.status_note
+          :((r.verdict&&!killed&&r.verdict!=='insufficient data')?r.verdict:'');
+        const vbadge=killed
+          ?'<span style="color:var(--r);letter-spacing:.08em">KILLED</span>'
+          :(r.clears_cost?'<span style="color:var(--g);letter-spacing:.08em">CLEARS</span>':'');
+        return '<div style="margin-bottom:7px'+(killed?';opacity:.55':'')+'">'
+          +'<div style="display:flex;align-items:center;gap:8px">'
           +'<span class="mono" style="font-size:.6rem;color:var(--tx);width:92px;'
             +'overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+r.id+via+'</span>'
           +'<div style="flex:1;height:4px;border-radius:99px;background:rgba(255,255,255,.06);'
@@ -17213,12 +17238,21 @@ function renderAutopilot(d){
             +'%;border-radius:99px;background:'+clr+'"></div></div>'
           +'<span class="mono" style="font-size:.56rem;width:88px;text-align:right;'
             +'color:'+(r.clears_cost?'var(--g)':'var(--mu)')+'">'+edge+'</span>'
+          +'</div>'
+          +((stat||note||vbadge)
+            ?('<div class="mono" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;'
+              +'padding-left:100px;margin-top:2px;font-size:.5rem;color:var(--mu)">'
+              +vbadge+(stat?'<span>'+stat+'</span>':'')
+              +(note?'<span style="font-style:italic">'+note+'</span>':'')+'</div>')
+            :'')
         +'</div>';
       }).join('')
       +'<div style="font-size:.56rem;color:var(--mu);line-height:1.5;margin-top:5px">'
       +'&ldquo;rec&rdquo; rows are scored on recorded signals with fixed-horizon exits '
-      +'&mdash; fills simulated, costs charged, future signals only. Real fills '
-      +'outrank them once a book reaches n'+need+'.</div>';
+      +'&mdash; fills simulated, costs charged, future signals only; trend / carry / '
+      +'switch rows are weekly counterfactuals over stored candles. Real fills '
+      +'outrank them once a book reaches n'+need+'. DSR/PSR are deflated for '
+      +'trials; MinTRL is the track length a verdict needs.</div>';
   }
 }
 async function toggleAutopilot(){
@@ -21175,6 +21209,42 @@ def _shadow_forward_calc(bars, ts, base):
     return f6, f24, f48, f168, max_up, max_dn
 
 
+def _spread_map_loop():
+    """Regenerate spread_hours.json from learning_report once a day so the
+    spread gate has its pair+hour map without anyone remembering to run the
+    script in-container. learning_report writes NOTHING to any table (read-
+    only SQL, stdout + one JSON file); the bot picks the file up by mtime in
+    _load_spread_hours. First run 15 minutes after boot so the scan loop and
+    DB pool settle first. Any failure is one ERR line, never a crash — an
+    absent/old map only means the hard cap applies, which is the documented
+    fallback. Cells under learning_report.MIN_N_SPREAD are omitted by the
+    report itself, so an empty map is an honest 'not enough data yet'."""
+    time.sleep(900)
+    while True:
+        try:
+            import learning_report as _lr
+            _dsn = os.environ.get("DATABASE_URL")
+            if not _dsn:
+                log("LAB", "spread map: no DATABASE_URL — skipped", "WRN")
+            else:
+                _conn = _lr._connect(_dsn)
+                try:
+                    _lr.run_report(_conn, SPREAD_HOURS_FILE)
+                finally:
+                    _conn.close()
+                try:
+                    with open(SPREAD_HOURS_FILE, encoding="utf-8") as _f:
+                        _cells = sum(len(v) for k, v in json.load(_f).items()
+                                     if k != "_meta" and isinstance(v, dict))
+                except Exception:
+                    _cells = "?"
+                log("LAB", f"spread map regenerated — {_cells} pair-hour cells "
+                           f"(n>={SPREAD_GATE_MIN_N}) -> {SPREAD_HOURS_FILE}")
+        except Exception as e:
+            log("LAB", f"spread map: {e}", "ERR")
+        time.sleep(86400)
+
+
 def _learning_filler_loop():
     """Fill forward returns for shadow signals and exit-lab counterfactuals.
 
@@ -21519,6 +21589,7 @@ def main():
         ("BTC Dominance",     _btc_dominance_loop,  ()),
         ("Funding rates",     _funding_loop,        ()),
         ("Learning filler",   _learning_filler_loop, ()),
+        ("Spread map",        _spread_map_loop,     ()),
         ("1m archive",        _m1_archive_loop,     ()),
         ("Funding history",   _funding_history_loop, ()),
         ("Trending scanner",  _trending_loop,       ()),

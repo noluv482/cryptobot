@@ -1716,6 +1716,9 @@ class Autopilot:
                     ("n", "n_oos", "oos_edge", "t", "clears_cost", "via",
                      "sr", "dsr", "psr", "min_trl", "trades_n", "verdict")},
                  "id": cid,
+                 # e.g. 'waiting on funding history' — the honest reason a row
+                 # has no number yet, so the dashboard never shows a bare 0/20
+                 "status_note": (self.scores.get(cid) or {}).get("status"),
                  "cf_only": bool(self.configs.get(cid, {}).get("cf_only"))}
                 for cid in self.order if cid in self.configs
             ],
