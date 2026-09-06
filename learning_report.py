@@ -27,6 +27,14 @@ spread_hours.json contract (the bot_server agent codes against this EXACTLY):
       never "spread is fine"
     - top-level "_meta" key carries generated_ts, min_n, units — pairs never
       collide with it because no Kraken pair is named "_meta"
+    - top-level "buckets6h" key (added 2026-09-05, BACKWARD COMPATIBLE — an
+      older reader that skips only "_meta" would see a fake pair named
+      "buckets6h", so bot_server's loader reserves both names):
+          {pair: {"0"|"6"|"12"|"18": {"median_pct", "p75_pct", "n"}}}
+      4 cells/pair keyed by bucket START hour (00-05, 06-11, 12-17, 18-23),
+      same n >= 100 floor, same units. The bot consults a bucket ONLY when
+      the exact (pair, hour) cell is absent — a coarser tier, never an
+      override of a finer one.
 
 Costs: net = signed(fwd24) - recorded spread - HONEST_FEES_RT (0.012 =
 maker 0.4% entry + taker 0.8% exit, base tier; override env LR_FEES_RT).
@@ -143,26 +151,43 @@ def gate_table(rows, fees_rt=HONEST_FEES_RT, min_n=MIN_N_REGIME):
     return out
 
 
-def spread_map(rows, min_n=MIN_N_SPREAD):
-    """rows: dicts with pair, hour, spread (fraction of price).
-    -> {pair: {"0".."23": {median_pct, p75_pct, n}}} — cells under min_n are
-    OMITTED, not zero-filled: absence means 'not enough data'."""
+def _spread_cells(rows, key_fn, min_n):
+    """Shared builder: group spreads by (pair, key_fn(hour)), emit
+    {median_pct, p75_pct, n} per cell, OMIT cells under min_n."""
     cells = {}
     for r in rows:
         pair, hour, sp = r.get("pair"), r.get("hour"), r.get("spread")
         if pair is None or hour is None or sp is None:
             continue
-        cells.setdefault(pair, {}).setdefault(int(hour) % 24, []).append(float(sp))
+        cells.setdefault(pair, {}).setdefault(key_fn(int(hour) % 24), []).append(float(sp))
     out = {}
-    for pair, hours in cells.items():
-        for hour, vals in hours.items():
+    for pair, keys in cells.items():
+        for key, vals in keys.items():
             if len(vals) < min_n:
                 continue
-            out.setdefault(pair, {})[str(hour)] = {
+            out.setdefault(pair, {})[str(key)] = {
                 "median_pct": percentile(vals, 0.50),
                 "p75_pct": percentile(vals, 0.75),
                 "n": len(vals)}
     return out
+
+
+def spread_map(rows, min_n=MIN_N_SPREAD):
+    """rows: dicts with pair, hour, spread (fraction of price).
+    -> {pair: {"0".."23": {median_pct, p75_pct, n}}} — cells under min_n are
+    OMITTED, not zero-filled: absence means 'not enough data'."""
+    return _spread_cells(rows, lambda h: h, min_n)
+
+
+BUCKET6H_STARTS = ("0", "6", "12", "18")
+
+
+def spread_map_6h(rows, min_n=MIN_N_SPREAD):
+    """Coarser tier: -> {pair: {"0"|"6"|"12"|"18": {median_pct, p75_pct, n}}},
+    keyed by 6h-bucket START hour, same floor, same omission rule. Four
+    cells per pair reach n >= 100 six times sooner than 24 hour cells do —
+    the bot uses one only when the exact (pair, hour) cell is absent."""
+    return _spread_cells(rows, lambda h: (h // 6) * 6, min_n)
 
 
 # ── DB glue (read-only) ──────────────────────────────────────────────────────
@@ -185,10 +210,15 @@ def fetch(conn, sql, cols):
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def write_spread_json(smap, path):
+def write_spread_json(smap, path, buckets6h=None):
+    """Contract file. Pair keys at top level (unchanged shape); "_meta" and
+    "buckets6h" are the only reserved top-level names."""
     doc = {"_meta": {"generated_ts": time.time(), "min_n": MIN_N_SPREAD,
-                     "units": "fraction of price (0.003 = 0.30%)"}}
-    doc.update(smap)
+                     "units": "fraction of price (0.003 = 0.30%)",
+                     "buckets6h": "per-pair 6h buckets keyed by start hour; "
+                                  "consulted only when the exact hour cell is absent"},
+           "buckets6h": dict(buckets6h or {})}
+    doc.update({k: v for k, v in smap.items() if k not in ("_meta", "buckets6h")})
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=1, sort_keys=True)
@@ -261,7 +291,12 @@ def run_report(conn, out_path=DEFAULT_OUT):
         print(f"  {pair:12s} {len(hours):>2d} hours mapped   "
               f"widest p75 {worst[1]['p75_pct']*100:.3f}% @ {worst[0]:>2s}h   "
               f"tightest median {best[1]['median_pct']*100:.3f}% @ {best[0]:>2s}h")
-    write_spread_json(smap, out_path)
+    b6 = spread_map_6h(spreads)
+    kept6 = sum(len(h) for h in b6.values())
+    print(f"  6h-bucket tier: {kept6} cells kept across {len(b6)} pairs "
+          f"(4 cells/pair max, same n >= {MIN_N_SPREAD} floor; used only "
+          "where the exact hour cell is absent)")
+    write_spread_json(smap, out_path, buckets6h=b6)
     print(f"  -> {out_path}")
     print()
     print("  Small n = hypothesis, not finding. Promote nothing without the rig.")

@@ -1061,8 +1061,14 @@ def _classify_strategy(sig: str, pillars: dict, confidence: float, pair: str) ->
 
 # ── Database ──────────────────────────────────────────────────────────────────
 class Database:
+    # meta_lab model cache (see _meta_model): re-checked hourly so a newly
+    # trained model is picked up without a restart.
+    _META_RELOAD_S = 3600
+
     def __init__(self):
         self.conn = None
+        self._meta_loaded_ts = 0.0
+        self._meta_model_cache = None
         url = os.environ.get("DATABASE_URL")
         if not url:
             log("DB", "No DATABASE_URL — learning disabled, running on JSON only", "WARN")
@@ -1210,6 +1216,13 @@ class Database:
             # Old rows stay NULL; any scorer must treat NULL as "not ready".
             for _col in ("fwd168", "max_up_48", "max_dn_48", "conf_post_ob"):
                 cur.execute(f"ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS {_col} FLOAT")
+            # 2026-09-05: meta_p = meta_lab.score_signal() at insert time —
+            # P(net-positive | signal fired) from the latest trained model,
+            # stored so the model can be judged against forward returns
+            # offline. NEVER a gate input: no scan/entry path reads it back.
+            # NULL = no model trained yet (meta_lab table absent) or scorer
+            # failed; a guessed probability would be worse than none.
+            cur.execute("ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS meta_p FLOAT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS exit_lab (
                     id SERIAL PRIMARY KEY, ts_entry FLOAT, ts_exit FLOAT,
@@ -1371,6 +1384,69 @@ class Database:
         except Exception as e:
             log("DB", f"load_candles {pair}: {e}", "WRN")
             return None
+
+    def candle_bars(self, pair, interval_m, ts_from, ts_to):
+        """(ts, close, high, low) bars from the candle ARCHIVE, ascending —
+        the same tuple shape the learning filler builds from Kraken OHLC, so
+        _shadow_forward_calc runs on either source. [] when nothing stored."""
+        if not self.conn: return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT ts, close, high, low FROM candles
+                               WHERE pair=%s AND interval_m=%s
+                                 AND ts >= %s AND ts <= %s
+                               ORDER BY ts""",
+                            (pair, int(interval_m), int(ts_from), int(ts_to)))
+                return [(int(r[0]), float(r[1]), float(r[2]), float(r[3]))
+                        for r in cur.fetchall()]
+        except Exception as e:
+            log("DB", f"candle_bars {pair}: {e}", "WRN")
+            return []
+
+    def resample_candles(self, dst_m, since_ts, now=None, src_m=1):
+        """Derive dst_m-minute candles from the src_m archive for EVERY pair
+        that has src rows since `since_ts`, UPSERT them as (pair, dst_m,
+        bucket_ts). The leveraged-book liquidation check reads interval_m=15
+        and the last Kraken-fetched 15m bar dates from 2026-07-27 (the scan
+        moved to 1h) — the 1m archive is the only fresh source, so 15m/5m
+        are re-derived from it every 15 min. The bucket still forming at
+        `now` is skipped; buckets whose 1m minutes are still arriving (the
+        archive fetches each pair every ~2h) get corrected by the next
+        pass's re-upsert — hence the caller's multi-hour lookback.
+        Returns the number of bars upserted."""
+        if not self.conn: return 0
+        now = time.time() if now is None else now
+        bucket_s = int(dst_m) * 60
+        complete_before = (int(now) // bucket_s) * bucket_s
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT pair, ts, open, high, low, close, volume
+                               FROM candles
+                               WHERE interval_m=%s AND ts >= %s
+                               ORDER BY pair, ts""",
+                            (int(src_m), int(since_ts)))
+                src = cur.fetchall()
+            by_pair = {}
+            for r in src:
+                by_pair.setdefault(r[0], []).append(r[1:])
+            n = 0
+            with self.conn.cursor() as cur:
+                for pair, rows in by_pair.items():
+                    for bts, o, h, l, c, v in resample_bars(rows, bucket_s,
+                                                            complete_before):
+                        cur.execute("""
+                            INSERT INTO candles (pair,interval_m,ts,open,high,low,close,volume)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (pair,interval_m,ts) DO UPDATE
+                              SET open=EXCLUDED.open, high=EXCLUDED.high,
+                                  low=EXCLUDED.low,  close=EXCLUDED.close, volume=EXCLUDED.volume
+                        """, (pair, int(dst_m), int(bts), float(o), float(h),
+                              float(l), float(c), float(v)))
+                        n += 1
+            return n
+        except Exception as e:
+            log("DB", f"resample_candles {dst_m}m: {e}", "WRN")
+            return 0
 
     def save_trade(self, t):
         if not self.conn: return
@@ -1559,14 +1635,21 @@ class Database:
         """One signal that reached the entry gates. Returns row id or None.
         Must never raise into the scan loop."""
         if not self.conn: return None
+        # meta_lab score, computed BEFORE the insert so it lands on the same
+        # row. Guarded on its own: a scorer failure must cost the row its
+        # meta_p (NULL), never the row itself.
+        try:
+            meta_p = self.meta_score(r)
+        except Exception:
+            meta_p = None
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""INSERT INTO shadow_signals
                     (ts,pair,sig,price,conf,rsi,atr_pct,reach_pct,stop_pct,tgt_pct,
                      rr_gross,rr_net,vol_ratio,funding,regime,hour,dow,pillars,fkey,
-                     adx,er,spread)
+                     adx,er,spread,meta_p)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                            %s,%s,%s)
+                            %s,%s,%s,%s)
                     RETURNING id""",
                     (r.get("ts"), r.get("pair"), r.get("sig"), r.get("price"),
                      r.get("conf"), r.get("rsi"), r.get("atr_pct"), r.get("reach_pct"),
@@ -1574,10 +1657,53 @@ class Database:
                      r.get("rr_net"), r.get("vol_ratio"), r.get("funding"),
                      r.get("regime"), r.get("hour"), r.get("dow"),
                      r.get("pillars"), r.get("fkey"),
-                     r.get("adx"), r.get("er"), r.get("spread")))
+                     r.get("adx"), r.get("er"), r.get("spread"), meta_p))
                 return cur.fetchone()[0]
         except Exception as e:
             log("DB", f"log_shadow: {e}", "ERR"); return None
+
+    # ── meta_lab shadow wiring (2026-09-05) ─────────────────────────────
+    # The model is loaded LAZILY from the meta_lab table — which exists only
+    # after `python meta_lab.py train` has run — and cached for an hour. No
+    # table, no model row, or any error -> None -> the shadow row stores
+    # NULL. The score is written to shadow_signals.meta_p for OFFLINE
+    # judgement against forward returns; it is never read by any gate.
+    def _meta_model(self):
+        now = time.time()
+        if now - self._meta_loaded_ts < self._META_RELOAD_S:
+            return self._meta_model_cache
+        self._meta_loaded_ts = now
+        self._meta_model_cache = None
+        if not self.conn:
+            return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('meta_lab')")
+                row = cur.fetchone()
+            if not row or not row[0]:
+                return None                       # table absent: nothing trained yet
+            import meta_lab as _ml
+            self._meta_model_cache = _ml.load_latest(self.conn)
+            if self._meta_model_cache:
+                log("DB", "meta_lab model loaded for shadow scoring (meta_p)")
+        except Exception as e:
+            log("DB", f"meta model load: {e}", "WRN")
+            self._meta_model_cache = None
+        return self._meta_model_cache
+
+    def meta_score(self, features):
+        """P(net-positive | signal) for one feature dict, or None. Pure math
+        at score time (meta_lab.score_signal needs no numpy). Never raises."""
+        try:
+            model = self._meta_model()
+            if not model:
+                return None
+            import meta_lab as _ml
+            p = _ml.score_signal(features, model)
+            return None if p is None else float(p)
+        except Exception as e:
+            log("DB", f"meta score: {e}", "WRN")
+            return None
 
     def mark_shadow(self, sid, taken=None, rejected=None, conf_post_ob=None):
         if not self.conn or sid is None: return
@@ -1620,6 +1746,47 @@ class Database:
                             (f6, f24, f48, f168, max_up, max_dn, sid))
         except Exception as e:
             log("DB", f"fill_shadow: {e}", "ERR")
+
+    def shadow_pending_168(self, limit=500):
+        """fwd168 BACKFILL candidates: rows already resolved (fwd_done=1)
+        before the 7-day horizon existed (2026-09-03), so fwd168 IS NULL —
+        7,677 of them on 2026-09-05. Restricted to signals the 1h candle
+        ARCHIVE can actually answer for: ts inside [archive start, archive
+        end - 169h] for that pair, and a usable recorded price. Rows outside
+        the window stay NULL — the archive cannot see them and Kraken's
+        720-bar OHLC call cannot see past 30 days, so a value would be a
+        guess. (id, ts, pair, price), oldest first, bounded by `limit`."""
+        if not self.conn: return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT s.id, s.ts, s.pair, s.price
+                               FROM shadow_signals s
+                               JOIN (SELECT pair, MIN(ts) AS lo, MAX(ts) AS hi
+                                       FROM candles WHERE interval_m=60
+                                       GROUP BY pair) w ON w.pair = s.pair
+                               WHERE s.fwd_done=1 AND s.fwd168 IS NULL
+                                 AND s.price IS NOT NULL AND s.price > 0
+                                 AND s.ts >= w.lo
+                                 AND s.ts + 169*3600 <= w.hi
+                               ORDER BY s.ts LIMIT %s""", (int(limit),))
+                return cur.fetchall()
+        except Exception as e:
+            log("DB", f"shadow_pending_168: {e}", "ERR"); return []
+
+    def fill_shadow_168(self, sid, f168, max_up, max_dn):
+        """Backfill ONLY fwd168 / max_up_48 / max_dn_48. fwd6/24/48 and
+        fwd_done are deliberately absent from this statement: a backfill
+        that rewrote already-resolved 48h columns from a different candle
+        source would silently re-score history."""
+        if not self.conn: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""UPDATE shadow_signals
+                               SET fwd168=%s, max_up_48=%s, max_dn_48=%s
+                               WHERE id=%s""",
+                            (f168, max_up, max_dn, sid))
+        except Exception as e:
+            log("DB", f"fill_shadow_168: {e}", "ERR")
 
     def log_engine_reject(self, pair, ts, gate, conf):
         """One hard veto inside SignalEngine.evaluate, AFTER a real BUY/SELL
@@ -1687,6 +1854,21 @@ class Database:
         except Exception as e:
             log("DB", f"upsert_funding_rates {symbol}: {e}", "ERR")
         return n
+
+    def funding_newest_ts(self, venue, symbol):
+        """MAX(ts) stored for (venue, symbol) as int epoch seconds, or None
+        when the table is empty for that key or unreadable. None is the
+        honest 'unknown': the filler treats it as 'do a full pull'."""
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT MAX(ts) FROM funding_rates WHERE venue=%s AND symbol=%s",
+                            (venue, symbol))
+                row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+        except Exception as e:
+            log("DB", f"funding_newest_ts {symbol}: {e}", "ERR")
+            return None
 
     def log_exit_lab(self, r):
         if not self.conn: return
@@ -2100,6 +2282,29 @@ def _cfg_fingerprint():
     any settings change → new stamp, deterministically (sorted keys)."""
     snap = json.dumps(_cfg_snapshot(), sort_keys=True)
     return hashlib.sha256(snap.encode()).hexdigest()[:10]
+
+def _stamp_config_boot():
+    """Record the boot-time config fingerprint in config_ledger (2026-09-05).
+
+    Until this existed the ledger filled ONLY on the first real-book open, so
+    a paper-only deployment ran with an EMPTY ledger (0 rows measured on
+    2026-09-05) and the cfg_hash on every shadow-derived stat had nothing to
+    resolve against. Idempotent: ensure_config is ON CONFLICT DO NOTHING, so
+    a restart on unchanged settings adds no row and first_seen keeps meaning
+    'first'. Called once from main() AFTER runtime settings and the autopilot
+    champion are restored — the fingerprint includes both, and stamping
+    before they load would record a config the bot never traded with.
+    Returns the hash, or None when there is no DB / on any error."""
+    if not db.conn:
+        return None
+    try:
+        h = _cfg_fingerprint()
+        db.ensure_config(h, json.dumps(_cfg_snapshot(), sort_keys=True))
+        log("CFG", f"config stamp at boot: {h}")
+        return h
+    except Exception as e:
+        log("CFG", f"boot stamp: {e}", "ERR")
+        return None
 
 def _load_runtime_settings():
     """Boot-time restore. Every field is optional and individually guarded so
@@ -3871,12 +4076,20 @@ def _tca_shortfall_bps(side_word, arrival_mid, fill_price):
 _spread_hours_map: dict = {}     # parsed spread_hours.json (pairs only, no _meta)
 _spread_hours_mtime: float = -1.0
 _spread_hours_checked: float = 0.0
+# Coarser tier (2026-09-05): per-pair 6h buckets from the same file's
+# "buckets6h" key — {pair: {"0"|"6"|"12"|"18": {median_pct, p75_pct, n}}}.
+# Consulted ONLY when the exact (pair, hour) cell is absent. Loaded alongside
+# the hour map; an older file without the key simply leaves this empty.
+_spread_buckets6h_map: dict = {}
+_SPREAD_FILE_RESERVED = ("_meta", "buckets6h")   # top-level keys that are not pairs
 
 def _load_spread_hours():
     """Reload spread_hours.json when its mtime changes (checked at most every
     5 min). Missing/corrupt file -> empty map: the gate then falls back to the
-    hard cap alone, it never invents a median."""
+    hard cap alone, it never invents a median. Side effect: refreshes the
+    6h-bucket tier (_spread_buckets6h_map) from the same document."""
     global _spread_hours_map, _spread_hours_mtime, _spread_hours_checked
+    global _spread_buckets6h_map
     now = time.time()
     if now - _spread_hours_checked < 300:
         return _spread_hours_map
@@ -3885,6 +4098,7 @@ def _load_spread_hours():
         mt = os.path.getmtime(SPREAD_HOURS_FILE)
     except OSError:
         _spread_hours_map, _spread_hours_mtime = {}, -1.0
+        _spread_buckets6h_map = {}
         return _spread_hours_map
     if mt == _spread_hours_mtime:
         return _spread_hours_map
@@ -3892,22 +4106,30 @@ def _load_spread_hours():
         with open(SPREAD_HOURS_FILE, encoding="utf-8") as f:
             doc = json.load(f)
         _spread_hours_map = {k: v for k, v in doc.items()
-                             if k != "_meta" and isinstance(v, dict)}
+                             if k not in _SPREAD_FILE_RESERVED and isinstance(v, dict)}
+        _b6 = doc.get("buckets6h")
+        _spread_buckets6h_map = _b6 if isinstance(_b6, dict) else {}
         _spread_hours_mtime = mt
-        log("GATE", f"spread_hours.json loaded — {len(_spread_hours_map)} pairs")
+        log("GATE", f"spread_hours.json loaded — {len(_spread_hours_map)} pairs, "
+                    f"{sum(len(v) for v in _spread_buckets6h_map.values() if isinstance(v, dict))} "
+                    f"6h-bucket cells")
     except Exception as e:
         log("GATE", f"spread_hours.json unreadable: {e}", "ERR")
         _spread_hours_map, _spread_hours_mtime = {}, -1.0
+        _spread_buckets6h_map = {}
     return _spread_hours_map
 
 def _spread_gate_check(pair, spread_now, hour=None):
     """-> (blocked, threshold, why).
 
     Threshold = min(SPREAD_GATE_HARD_CAP, 2 x pair+hour median) when the map
-    has a cell with n >= SPREAD_GATE_MIN_N for this pair and UTC hour;
-    otherwise the hard cap alone. An UNKNOWN spread (None or <= 0 — that is
-    what _spread_pct returns when it cannot know) never blocks: the gate
-    refuses on measured width, not on missing data."""
+    has a cell with n >= SPREAD_GATE_MIN_N for this pair and UTC hour. When
+    that exact cell is ABSENT (or under the floor), the coarser per-pair 6h
+    bucket (n >= SPREAD_GATE_MIN_N over 4 cells/pair) stands in — a pair
+    with 60 signals/hour has no hour cell for months but a usable bucket in
+    weeks. Otherwise the hard cap alone. An UNKNOWN spread (None or <= 0 —
+    that is what _spread_pct returns when it cannot know) never blocks: the
+    gate refuses on measured width, not on missing data."""
     if not SPREAD_GATE_ENABLED:
         return False, None, "gate disabled"
     if spread_now is None or spread_now <= 0:
@@ -3921,6 +4143,15 @@ def _spread_gate_check(pair, spread_now, hour=None):
             med2 = 2.0 * float(cell["median_pct"])
             if med2 < thr:
                 thr, why = med2, f"2x median h{h} (n={int(cell['n'])})"
+        else:
+            b = (h // 6) * 6
+            bcell = _spread_buckets6h_map.get(pair, {}).get(str(b))
+            if bcell and bcell.get("median_pct") is not None \
+                    and int(bcell.get("n", 0)) >= SPREAD_GATE_MIN_N:
+                med2 = 2.0 * float(bcell["median_pct"])
+                if med2 < thr:
+                    thr, why = med2, (f"2x median 6h-bucket {b:02d}-{b + 5:02d}h "
+                                      f"(n={int(bcell['n'])})")
     except Exception as e:
         log("GATE", f"spread map lookup {pair}: {e}", "ERR")
     return spread_now > thr, thr, why
@@ -21123,6 +21354,72 @@ def _m1_archive_loop():
         time.sleep(240)
 
 
+def resample_bars(rows, bucket_s, complete_before=None):
+    """1m (ts, open, high, low, close, volume) rows -> [(bucket_ts, open,
+    high, low, close, volume)] for `bucket_s`-second buckets aligned to
+    ts // bucket_s * bucket_s — the same alignment as Kraken's own 15m/5m
+    bars, so derived rows land on the same (pair, interval_m, ts) keys.
+    open = the earliest bar's open, close = the latest bar's close (by ts,
+    input order irrelevant), high/low = extremes, volume = sum. Buckets
+    whose END is after `complete_before` are dropped (still forming). Pure,
+    fixture-testable; Database.resample_candles is the DB glue around it."""
+    bucket_s = int(bucket_s)
+    if bucket_s <= 0:
+        return []
+    buckets = {}
+    for ts, o, h, l, c, v in rows:
+        ts = int(ts)
+        bts = (ts // bucket_s) * bucket_s
+        if complete_before is not None and bts + bucket_s > complete_before:
+            continue
+        b = buckets.get(bts)
+        if b is None:
+            buckets[bts] = [ts, float(o), float(h), float(l), ts, float(c), float(v or 0.0)]
+        else:
+            if ts < b[0]:
+                b[0], b[1] = ts, float(o)
+            if ts > b[4]:
+                b[4], b[5] = ts, float(c)
+            b[2] = max(b[2], float(h))
+            b[3] = min(b[3], float(l))
+            b[6] += float(v or 0.0)
+    return [(bts, b[1], b[2], b[3], b[5], b[6]) for bts, b in sorted(buckets.items())]
+
+
+RESAMPLE_INTERVALS_M = (15, 5)        # derived from the 1m archive, in this order
+RESAMPLE_LOOKBACK_S  = 6 * 3600       # re-derive this much every pass (self-healing)
+RESAMPLE_PERIOD_S    = 900            # every 15 min
+
+
+def _resample_loop():
+    """Derive 15m and 5m candles from the 1m archive every 15 min.
+
+    The leveraged-book liquidation check (_manual_check_exits) reads
+    candles.interval_m=15 for intrabar wicks, but nothing has WRITTEN a 15m
+    bar since 2026-07-27 (the scan moved to 1h) — measured 2026-09-05: the
+    newest 15m row was 40 days old, so a 10-20x wick between checks was
+    invisible. The 1m archive is fresh for every pair, so 15m/5m are
+    re-derived from it: sibling of _m1_archive_loop, same env gate (no 1m
+    archive, nothing to derive). Lookback is 6h so buckets whose minutes
+    arrived late (each pair is fetched every ~2h) are re-upserted correct."""
+    if os.environ.get("M1_ARCHIVE", "1") in ("0", "false", "False"):
+        log("M1", "resample loop disabled with the 1m archive (env)")
+        return
+    time.sleep(120)      # let the archive's first fetches land
+    log("M1", f"resample loop started ({'/'.join(f'{m}m' for m in RESAMPLE_INTERVALS_M)} "
+              f"from 1m, every {RESAMPLE_PERIOD_S // 60} min)")
+    while True:
+        try:
+            if db.conn:
+                since = int(time.time()) - RESAMPLE_LOOKBACK_S
+                counts = {m: db.resample_candles(m, since) for m in RESAMPLE_INTERVALS_M}
+                log("M1", "resample: " + ", ".join(f"{n} x {m}m" for m, n in counts.items())
+                          + " bars upserted from the 1m archive")
+        except Exception as e:
+            log("M1", f"resample: {e}", "WRN")
+        time.sleep(RESAMPLE_PERIOD_S)
+
+
 def _iso_to_epoch(s):
     """Kraken Futures timestamp ('2025-09-03T16:00:00.000Z') → epoch seconds.
     None when unparseable — a wrong guess in a PRIMARY KEY column poisons the
@@ -21148,7 +21445,16 @@ def _funding_history_loop():
     re-upsert of the same (venue,symbol,ts) rows plus the newest hour —
     hours of downtime lose nothing.
 
-    Load: 3 requests/hour. Storage: ~26k rows/symbol/year."""
+    Load: 3 requests/hour. Storage: ~26k rows/symbol/year.
+
+    2026-09-05, INCREMENTAL: the endpoint has no `since` parameter (it
+    always returns the full year), but the table does not need the full
+    year re-upserted every hour (3 x 8.8k row-writes/hour measured). Each
+    pass now asks the table for MAX(ts) per (venue, symbol) and upserts only
+    rows from MAX(ts) - 48h onward — 48h of overlap so a late revision or a
+    missed hour heals. A FULL upsert happens only when the table is empty for
+    that symbol or its newest row is older than 7 days (a long outage).
+    See _funding_history_pass — the decision is unit-tested on a fake DB."""
     if os.environ.get("FUNDING_HISTORY", "1") in ("0", "false", "False"):
         log("FUND", "funding history filler disabled by env")
         return
@@ -21157,28 +21463,62 @@ def _funding_history_loop():
     while True:
         try:
             if db.conn:
-                for sym in syms:
-                    try:
-                        r = requests.get(
-                            "https://futures.kraken.com/derivatives/api/v4/historicalfundingrates",
-                            params={"symbol": sym},
-                            headers={"User-Agent": "cryptobot-research"},
-                            timeout=20)
-                        rows = []
-                        for rec in r.json().get("rates", []):
-                            ts_s = _iso_to_epoch(rec.get("timestamp"))
-                            rate = rec.get("relativeFundingRate")
-                            if ts_s is not None and rate is not None:
-                                rows.append((ts_s, float(rate)))
-                        n = db.upsert_funding_rates("kraken", sym, rows)
-                        if n:
-                            log("FUND", f"{sym}: upserted {n} hourly funding rates")
-                    except Exception as e:
-                        log("FUND", f"{sym}: {e}", "WRN")
-                    time.sleep(2)   # gentle on the public endpoint
+                _funding_history_pass(syms, _funding_history_fetch)
         except Exception as e:
             log("FUND", f"funding history: {e}", "WRN")
         time.sleep(3600)
+
+
+FUNDING_INCR_WINDOW_S = 48 * 3600     # incremental: re-upsert from MAX(ts) - 48h
+FUNDING_FULL_STALE_S  = 7 * 86400     # newest row older than this -> full pull
+
+
+def _funding_history_fetch(sym):
+    """One PUBLIC v4 historicalfundingrates call -> [(ts_epoch_s, rate)].
+    Rows with an unparseable timestamp or a missing rate are dropped, never
+    guessed (ts is part of the PRIMARY KEY)."""
+    r = requests.get(
+        "https://futures.kraken.com/derivatives/api/v4/historicalfundingrates",
+        params={"symbol": sym},
+        headers={"User-Agent": "cryptobot-research"},
+        timeout=20)
+    rows = []
+    for rec in r.json().get("rates", []):
+        ts_s = _iso_to_epoch(rec.get("timestamp"))
+        rate = rec.get("relativeFundingRate")
+        if ts_s is not None and rate is not None:
+            rows.append((ts_s, float(rate)))
+    return rows
+
+
+def _funding_history_pass(syms, fetch, now=None, pause=2.0):
+    """One filler pass. Per symbol: read MAX(ts) from funding_rates, choose
+    FULL (empty, or newest > FUNDING_FULL_STALE_S old) vs INCREMENTAL (only
+    rows with ts >= newest - FUNDING_INCR_WINDOW_S), fetch, filter, upsert.
+    Returns {sym: (mode, n_sent)} so the decision is testable. Never raises
+    for one symbol into the next."""
+    now = time.time() if now is None else now
+    out = {}
+    for sym in syms:
+        try:
+            newest = db.funding_newest_ts("kraken", sym)
+            if newest is None or now - newest > FUNDING_FULL_STALE_S:
+                mode, since = "full", None
+            else:
+                mode, since = "incremental", newest - FUNDING_INCR_WINDOW_S
+            rows = fetch(sym)
+            if since is not None:
+                rows = [(t, rt) for t, rt in rows if t >= since]
+            n = db.upsert_funding_rates("kraken", sym, rows)
+            out[sym] = (mode, n)
+            if n:
+                log("FUND", f"{sym}: {mode} — upserted {n} hourly funding rates")
+        except Exception as e:
+            log("FUND", f"{sym}: {e}", "WRN")
+            out[sym] = ("error", 0)
+        if pause:
+            time.sleep(pause)   # gentle on the public endpoint
+    return out
 
 
 def close_at(bars, when):
@@ -21207,6 +21547,52 @@ def _shadow_forward_calc(bars, ts, base):
     max_up = ((max(b[2] for b in _win48) - base) / base) if _win48 else None
     max_dn = ((min(b[3] for b in _win48) - base) / base) if _win48 else None
     return f6, f24, f48, f168, max_up, max_dn
+
+
+FWD168_BACKFILL_BATCH = 500
+
+
+def _fwd168_backfill_pass(limit=FWD168_BACKFILL_BATCH):
+    """One bounded batch of the fwd168 / max_up_48 / max_dn_48 backfill for
+    shadow rows resolved BEFORE the 7-day horizon existed (2026-09-03).
+
+    Reads the 1h candle ARCHIVE (candles.interval_m=60) — never Kraken's
+    720-bar OHLC call, which cannot see past 30 days and the oldest
+    candidates are from 2026-08-10. Bars are pulled once per pair per pass
+    and pushed through the same _shadow_forward_calc the live filler uses;
+    only the last three outputs are written (fill_shadow_168 cannot touch
+    fwd6/24/48 by construction). Rows the archive cannot answer for are never
+    selected (shadow_pending_168 windows on the archive), so they stay NULL
+    honestly. Runs at the top of every learning-filler pass: 7.7k rows at
+    500/pass drains in ~8h of the 30-min cadence. Returns rows filled; never
+    raises."""
+    filled = 0
+    try:
+        rows = db.shadow_pending_168(limit)
+        if not rows:
+            return 0
+        by_pair = {}
+        for sid, ts, pair, price in rows:
+            by_pair.setdefault(pair, []).append((sid, float(ts), price))
+        for pair, prs in by_pair.items():
+            lo = min(t for _, t, _ in prs) - 3600
+            hi = max(t for _, t, _ in prs) + 170 * 3600
+            bars = db.candle_bars(pair, 60, int(lo), int(hi))
+            if not bars:
+                continue
+            for sid, ts, price in prs:
+                if not price:
+                    continue
+                fwd = _shadow_forward_calc(bars, ts, price)
+                if fwd is None:
+                    continue                    # archive gap: leave NULL, retry later
+                _f6, _f24, _f48, f168, max_up, max_dn = fwd
+                db.fill_shadow_168(sid, f168, max_up, max_dn)
+                filled += 1
+        log("LAB", f"fwd168 backfill: {filled}/{len(rows)} row(s) filled from the 1h archive")
+    except Exception as e:
+        log("LAB", f"fwd168 backfill: {e}", "ERR")
+    return filled
 
 
 def _spread_map_loop():
@@ -21274,6 +21660,11 @@ def _learning_filler_loop():
     while True:
         time.sleep(1800)
         try:
+            # 7-day-horizon backfill for rows resolved before fwd168 existed:
+            # one bounded batch per pass from the 1h ARCHIVE, three columns
+            # only. Runs before the pending check so it drains even on
+            # passes with nothing new to fill. Own try/except inside.
+            _fwd168_backfill_pass()
             cutoff = time.time() - 49 * 3600
             # Shadow rows wait for the FULL 7-day horizon (169h) so fwd168 can
             # be filled in the same pass as fwd6/24/48 — one row, one write.
@@ -21531,6 +21922,11 @@ def main():
     threading.Thread(target=_autopilot_retry_loop, daemon=True,
                      name="autopilot-retry").start()
 
+    # ── Config ledger boot stamp (2026-09-05) ─────────────────────────────────
+    # After runtime settings AND the autopilot champion are restored — both are
+    # part of the fingerprint. Idempotent (ON CONFLICT DO NOTHING).
+    _stamp_config_boot()
+
     # ── Research lab (nightly paper-only strategy sweeps, subprocess) ─────────
     # State only in the log line — the scheduler thread itself re-reads the env
     # gate every iteration, so flipping RESEARCH_LAB in compose needs no restart
@@ -21591,6 +21987,7 @@ def main():
         ("Learning filler",   _learning_filler_loop, ()),
         ("Spread map",        _spread_map_loop,     ()),
         ("1m archive",        _m1_archive_loop,     ()),
+        ("Candle resample",   _resample_loop,       ()),
         ("Funding history",   _funding_history_loop, ()),
         ("Trending scanner",  _trending_loop,       ()),
         ("Coin switcher",     _switcher_loop,       (trader,)),

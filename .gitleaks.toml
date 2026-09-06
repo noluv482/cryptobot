@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "documented placeholders only"
+regexes = ['''sk-ant-api03-\*{4,}''', '''<your[-_ ]?key>''']
+paths = ['''\.env\.example$''']
