@@ -274,6 +274,9 @@ TG_TOKEN        = _clean_env(os.environ.get("TG_TOKEN",        ""))
 TG_CHAT_ID      = _clean_env(os.environ.get("TG_CHAT_ID",      ""))
 TG_URL          = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 DISCORD_WEBHOOK   = _clean_env(os.environ.get("DISCORD_WEBHOOK",    ""))
+# Assistant event spine (noluv-assistant /api/event). Empty = disabled. Every
+# emit is best-effort, off-thread, bounded — it can never stall the trading loop.
+ASSISTANT_EVENT_URL = _clean_env(os.environ.get("ASSISTANT_EVENT_URL", ""))
 ANTHROPIC_API_KEY = _clean_env(os.environ.get("ANTHROPIC_API_KEY",  ""))
 BASE_URL         = "https://api.kraken.com/0/public"
 BINANCE_BASE_URL = "https://api.binance.com"
@@ -2546,6 +2549,180 @@ def _md_balanced(text):
     return True
 
 
+# ── Assistant event sink ──────────────────────────────────────────────────────
+# Best-effort POSTs to the noluv-assistant event spine (ASSISTANT_EVENT_URL).
+# Contract: body = {"system","kind","text","data","ref"} (server fills id/ts/iso).
+# Rules that hold no matter what the assistant does:
+#   * never blocks the caller — a bounded queue drained by ONE daemon thread;
+#     when the queue is full the event is dropped and counted, not waited on;
+#   * never raises — every failure is swallowed (2 s timeout on the POST);
+#   * typed events win: a typed emit (trade/control/watchdog/dd_circuit/kill)
+#     is de-duped per kind inside a 1 s window, and the plain tg() mirror
+#     (kind cryptobot.tg) is HELD for that same window and dropped when a typed
+#     event described the same moment — so one moment never lands twice.
+import queue as _evq
+
+_EVT_HOLD_S    = 1.0
+_EVT_QUEUE_MAX = 256
+_evt_q: "_evq.Queue" = _evq.Queue(maxsize=_EVT_QUEUE_MAX)
+_evt_lock = threading.Lock()
+_evt_state: dict = {"last_kind": {}, "last_typed_ts": -1e9, "last_mirror": ("", -1e9),
+                    "dropped": 0, "posted": 0, "failed": 0, "worker": None}
+
+
+def _evt_enabled():
+    return bool(ASSISTANT_EVENT_URL)
+
+
+def _evt_payload(kind, text, data=None, ref=""):
+    try:
+        data = dict(data or {})
+    except Exception:
+        data = {}
+    return {"system": "cryptobot", "kind": str(kind), "text": str(text)[:300],
+            "data": data, "ref": str(ref or "")}
+
+
+def _evt_enqueue(payload, ts, typed):
+    try:
+        _evt_q.put_nowait((ts, typed, payload))
+    except _evq.Full:
+        with _evt_lock:
+            _evt_state["dropped"] += 1
+        return False
+    _evt_start_worker()
+    return True
+
+
+def _evt_start_worker():
+    with _evt_lock:
+        w = _evt_state["worker"]
+        if w is not None and w.is_alive():
+            return
+        w = threading.Thread(target=_evt_worker, name="assistant-events", daemon=True)
+        _evt_state["worker"] = w
+    w.start()
+
+
+def _evt_worker():
+    while True:
+        item = _evt_q.get()
+        try:
+            _evt_send(item)
+        except Exception:
+            pass
+        finally:
+            try: _evt_q.task_done()
+            except Exception: pass
+
+
+def _evt_send(item, post=None, now=None, sleep=None):
+    """Deliver one queued item. Runs on the sink thread only (it may sleep).
+    Injectable post/now/sleep exist so the contract test can drive it inline."""
+    post  = post  or requests.post
+    now   = now   or time.time
+    sleep = sleep or time.sleep
+    ts, typed, payload = item
+    if not typed:
+        # Mirror lines wait out the hold window, then yield to a typed event
+        # that landed on the same moment (either side of the mirror).
+        wait = _EVT_HOLD_S - (now() - ts)
+        if wait > 0:
+            sleep(wait)
+        with _evt_lock:
+            if abs(_evt_state["last_typed_ts"] - ts) < _EVT_HOLD_S:
+                return False
+    url = ASSISTANT_EVENT_URL
+    if not url:
+        return False
+    try:
+        r = post(url, json=payload, timeout=2)
+        ok = bool(getattr(r, "ok", True))
+    except Exception:
+        ok = False
+    with _evt_lock:
+        _evt_state["posted" if ok else "failed"] += 1
+    return ok
+
+
+def emit_event(kind, text, data=None, ref=""):
+    """Typed event -> assistant spine. Per-kind 1 s de-dupe. Never blocks/raises."""
+    try:
+        if not _evt_enabled():
+            return False
+        now = time.time()
+        with _evt_lock:
+            if now - _evt_state["last_kind"].get(kind, -1e9) < _EVT_HOLD_S:
+                return False
+            _evt_state["last_kind"][kind] = now
+            _evt_state["last_typed_ts"] = now
+        return _evt_enqueue(_evt_payload(kind, text, data, ref), now, True)
+    except Exception:
+        return False
+
+
+def _evt_mirror_tg(msg):
+    """tg() mirror -> cryptobot.tg. Held 1 s so a typed event can claim the
+    moment; identical text inside the window is sent once."""
+    try:
+        if not _evt_enabled():
+            return False
+        now = time.time()
+        clean = str(msg).replace("*", "").replace("`", "")
+        with _evt_lock:
+            if now - _evt_state["last_typed_ts"] < _EVT_HOLD_S:
+                return False
+            lt, lts = _evt_state["last_mirror"]
+            if lt == clean and now - lts < _EVT_HOLD_S:
+                return False
+            _evt_state["last_mirror"] = (clean, now)
+        return _evt_enqueue(_evt_payload("cryptobot.tg", clean.strip()[:300]), now, False)
+    except Exception:
+        return False
+
+
+def _sse_to_event(event_type, data):
+    """Map a dashboard SSE payload to (kind, text, data) for the spine, or None.
+    Pure: no I/O, no globals — so the mapping is testable by itself."""
+    d = data if isinstance(data, dict) else {}
+    if event_type == "trade_open":
+        pair = d.get("pair") or d.get("name")
+        ev = {"pair": pair, "side": d.get("side"), "size": d.get("size"),
+              "price": d.get("entry"), "conf": d.get("confidence")}
+        return ("cryptobot.trade.open",
+                f"Opened {ev['side']} {d.get('name') or pair} @ {ev['price']} "
+                f"(size ${ev['size']}, conf {ev['conf']}%)", ev)
+    if event_type == "trade_close":
+        pair = d.get("pair") or d.get("name")
+        pnl = d.get("pnl")
+        ev = {"pair": pair, "pnl": pnl, "reason": d.get("reason"),
+              "side": d.get("side"), "balance": d.get("balance")}
+        try: pnl_s = f"{'+' if pnl >= 0 else '-'}${abs(pnl):.2f}"
+        except Exception: pnl_s = str(pnl)
+        return ("cryptobot.trade.close",
+                f"Closed {ev['side']} {d.get('name') or pair} {pnl_s} · {ev['reason']}", ev)
+    if event_type == "autopilot_kill":
+        ev = {"entrant": d.get("entrant"), "reason": d.get("reason"),
+              "was_champion": bool(d.get("was_champion"))}
+        return ("cryptobot.tournament.kill",
+                f"Tournament KILLED {ev['entrant']}: {ev['reason']}", ev)
+    if event_type == "autopilot":
+        en = bool(d.get("enabled"))
+        return ("cryptobot.control",
+                f"Autopilot {'ENABLED' if en else 'DISABLED'} (paper allocator)",
+                {"autopilot": en, "allocation": d.get("allocation")})
+    if event_type == "control":
+        ev = {"paused": bool(d.get("paused")), "paper_mode": bool(d.get("paper_mode")),
+              "sim_enabled": bool(d.get("sim_enabled"))}
+        if "why" in d: ev["why"] = d.get("why")
+        return ("cryptobot.control",
+                f"Control: {'PAUSED' if ev['paused'] else 'ACTIVE'} · "
+                f"{'paper' if ev['paper_mode'] else 'live-capable'} · "
+                f"sim {'on' if ev['sim_enabled'] else 'off'}"
+                + (f" ({d.get('why')})" if d.get("why") else ""), ev)
+    return None
+
+
 def tg(msg, plain=False):
     global _tg_log
     # Keep a rolling log of the last 15 messages for the dashboard panel
@@ -2562,6 +2739,8 @@ def tg(msg, plain=False):
             requests.post(DISCORD_WEBHOOK, json={"content": discord_text[:2000]}, timeout=5)
         except Exception:
             pass
+    # Assistant spine mirror (best-effort, off-thread, never raises)
+    _evt_mirror_tg(msg)
     if not TG_TOKEN or not TG_CHAT_ID:
         return False
     try:
@@ -5352,6 +5531,11 @@ class PaperTrader:
                 log("RISK", f"DD CIRCUIT OPEN — drawdown {_dd_str} from HWM "
                             f"${self.peak:.2f}; new entries blocked", "WRN")
                 if not self._force_paper:
+                    emit_event("cryptobot.dd_circuit.open",
+                               f"Drawdown circuit OPEN: balance ${self.balance:.2f} is {_dd_str} "
+                               f"below HWM ${self.peak:.2f}; new entries blocked",
+                               {"balance": round(self.balance, 2), "peak": round(self.peak, 2),
+                                "drawdown": _dd_caps["drawdown"], "circuit": sizing.DD_CIRCUIT})
                     tg(f"⛔ *Drawdown circuit OPEN*\n"
                        f"Balance `${self.balance:.2f}` is `{_dd_str}` below the "
                        f"high-water mark `${self.peak:.2f}` (circuit: "
@@ -5366,6 +5550,11 @@ class PaperTrader:
             log("RISK", f"DD circuit closed — drawdown "
                         f"{(_dd_caps['drawdown'] or 0)*100:.1f}% from HWM ${self.peak:.2f}")
             if not self._force_paper:
+                emit_event("cryptobot.dd_circuit.close",
+                           f"Drawdown circuit closed: equity recovered to ${self.balance:.2f} "
+                           f"({(_dd_caps['drawdown'] or 0)*100:.1f}% below HWM ${self.peak:.2f})",
+                           {"balance": round(self.balance, 2), "peak": round(self.peak, 2),
+                            "drawdown": _dd_caps["drawdown"], "circuit": sizing.DD_CIRCUIT})
                 tg(f"✅ *Drawdown circuit closed* — equity recovered to "
                    f"`${self.balance:.2f}` (`{(_dd_caps['drawdown'] or 0)*100:.1f}%` "
                    f"below HWM `${self.peak:.2f}`). Entries allowed again.")
@@ -5826,6 +6015,7 @@ class PaperTrader:
         self._save()
         _push_sse("trade_open", {"name": name, "side": side,
                                   "entry": fill, "pair": pair,
+                                  "size": round(margin * leverage, 4),
                                   "confidence": int(confidence * 100)})
         _send_web_push(f"Trade Opened ⚡", f"{side} {name} @ ${fill:.4f} ({int(confidence*100)}% conf)")
         mul = self._risk_multiplier()
@@ -6052,7 +6242,7 @@ class PaperTrader:
                     })
             except Exception as _te:
                 log("TCA", f"close fill row: {_te}", "ERR")
-            _push_sse("trade_close", {"name": name, "side": p["side"],
+            _push_sse("trade_close", {"name": name, "side": p["side"], "pair": pair,
                                        "pnl": pnl, "reason": reason,
                                        "balance": self.balance, "win": pnl >= 0})
             _send_web_push(
@@ -6065,6 +6255,10 @@ class PaperTrader:
                 _paused = True
                 _save_runtime_settings()
             dd_pct = (self.peak - self.balance) / self.peak * 100
+            emit_event("cryptobot.control",
+                       f"Control: PAUSED (max session drawdown {dd_pct:.1f}% from peak ${self.peak:.2f})",
+                       {"paused": True, "why": "max_session_dd", "dd_pct": round(dd_pct, 2),
+                        "balance": round(self.balance, 2), "peak": round(self.peak, 2)})
             tg(f"⚠️ *Max drawdown hit — trading PAUSED*\n"
                f"Balance dropped `{dd_pct:.1f}%` from peak `${self.peak:.2f}`\n"
                f"Current: `${self.balance:.2f}` | Tap ▶ Resume to continue")
@@ -10448,6 +10642,10 @@ def _watchdog_loop():
             if _we_paused:
                 _wd_stall_paused = True
                 log("WD", "scan stalled >10m — entries PAUSED by watchdog", "WRN")
+                emit_event("cryptobot.watchdog.pause",
+                           f"Watchdog: scan stalled {int(age)}s (>10m) — new entries PAUSED; "
+                           f"open positions keep their exits",
+                           {"age_s": int(age), "paused": True})
                 tg("⛔ *Scan stalled >10m — new entries PAUSED*\n"
                    "Nothing is auto-flattened; open positions keep their exit "
                    "management. Auto-resumes when the scan recovers.")
@@ -10458,6 +10656,9 @@ def _watchdog_loop():
                     _save_runtime_settings()
             _wd_stall_paused = False
             log("WD", "scan recovered — watchdog pause lifted")
+            emit_event("cryptobot.watchdog.resume",
+                       f"Watchdog: scan recovered (age {int(age)}s) — entries resumed",
+                       {"age_s": int(age), "paused": False})
             tg("▶️ *Scan recovered — entries resumed* (watchdog pause lifted)")
         # DB connectivity
         if not db.connected and not _db_alerted:
@@ -10511,7 +10712,15 @@ _sse_clients: list = []      # list of queue.Queue, one per connected SSE client
 _sse_lock = threading.Lock()
 
 def _push_sse(event_type: str, data: dict):
-    """Broadcast a server-sent event to every connected dashboard tab."""
+    """Broadcast a server-sent event to every connected dashboard tab.
+    Typed payloads are ALSO forwarded to the assistant spine (see _sse_to_event);
+    that forward is best-effort and can never break the broadcast."""
+    try:
+        _mapped = _sse_to_event(event_type, data)
+        if _mapped:
+            emit_event(*_mapped)
+    except Exception:
+        pass
     msg = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
     with _sse_lock:
         dead = [q for q in _sse_clients if q.full()]

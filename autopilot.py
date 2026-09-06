@@ -1506,6 +1506,13 @@ class Autopilot:
             s["killed_reason"] = reason
             s["clears_cost"] = False
             log("AUTOPILOT", f"KILLED {cid}: {reason}", "WRN")
+            # Kill -> dashboard SSE + assistant spine (cryptobot.tournament.kill via
+            # bs._sse_to_event). Best-effort: a sink hiccup must never touch the kill.
+            try:
+                bs._push_sse("autopilot_kill", {"entrant": cid, "reason": reason,
+                                                "was_champion": self.champion_id == cid})
+            except Exception:
+                pass
             if self.champion_id == cid:
                 self.champion_id = None
                 self.allocation = "FLAT"
