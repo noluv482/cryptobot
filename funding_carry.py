@@ -17,9 +17,10 @@ Measured per symbol, and honestly:
   - gross carry: sum of hourly rates received by the short leg (negative
     hours SUBTRACT — always-on means eating them)
   - time-positive %, worst 30-day stretch, longest negative run
-  - net of costs, two scenarios (both legs, round trip):
-      maker: spot 0.16%x2 + perp 0.02%x2 = 0.36%
-      taker: spot 0.26%x2 + perp 0.05%x2 = 0.62%
+  - net of costs, two scenarios (all four legs, round trip). The fee numbers
+    are IMPORTED from bot_server (KRAKEN_FEE / KRAKEN_MAKER_FEE /
+    KRAKEN_FUTURES_FEE / SLIPPAGE), not hardcoded here, and the exact values
+    used are printed in the output header.
   - a NAIVE FILTER (hold only while trailing 7-day mean funding > 0),
     charged full round-trip costs on every flip — judged on the SECOND
     half of the year only, with the filter's one parameter (7d) fixed in
@@ -39,8 +40,32 @@ import urllib.request
 
 SYMS = ["PF_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_XRPUSD",
         "PF_DOGEUSD", "PF_LINKUSD"]
-COST_MAKER = 0.0036          # both legs, round trip
-COST_TAKER = 0.0062
+# ── Costs: ONE source of truth, the bot's own fee constants ─────────────────
+# These used to be hardcoded (0.36% maker / 0.62% taker round trip) from
+# Kraken's advertised low-tier schedule, while the live container models
+# KRAKEN_FEE=0.8%/side taker and KRAKEN_MAKER_FEE=0.4%/side maker plus
+# SLIPPAGE. The two disagreed by ~2x, which meant this script's "net" and the
+# bot's "net" were not the same number and nobody could tell which one a
+# decision came from. It now IMPORTS the bot's constants, so a fee change in
+# one place moves both. The fallback (running this file with no bot_server on
+# the path) uses bot_server's own documented DEFAULTS, never the old cheaper
+# numbers, and the header below always prints which set was used.
+FEE_SOURCE = "bot_server (live constants)"
+try:
+    import bot_server as _bs
+    KRAKEN_FEE       = float(_bs.KRAKEN_FEE)            # spot taker, per side
+    KRAKEN_MAKER_FEE = float(_bs.KRAKEN_MAKER_FEE)      # spot maker, per side
+    FUTURES_FEE      = float(_bs.KRAKEN_FUTURES_FEE)    # perp taker, per side
+    SLIPPAGE         = float(_bs.SLIPPAGE)
+except Exception as _e:                                  # standalone fallback
+    FEE_SOURCE = f"standalone fallback defaults ({type(_e).__name__})"
+    KRAKEN_FEE, KRAKEN_MAKER_FEE, FUTURES_FEE, SLIPPAGE = 0.008, 0.004, 0.0005, 0.001
+
+# Four legs: open spot + open perp, close spot + close perp. The perp leg is
+# charged the TAKER futures fee in both scenarios (no maker assumption is
+# defensible for the hedge leg), so "maker" only changes the spot side.
+COST_MAKER = 2 * (KRAKEN_MAKER_FEE + SLIPPAGE) + 2 * (FUTURES_FEE + SLIPPAGE)
+COST_TAKER = 2 * (KRAKEN_FEE + SLIPPAGE) + 2 * (FUTURES_FEE + SLIPPAGE)
 MARGIN_MULT = 1.5            # capital = 1.5x notional (spot + margin buffer)
 
 
@@ -75,7 +100,18 @@ def stretch_stats(vals):
     return worst30, longest
 
 
+def cost_header():
+    """The exact fee numbers this run used, and where they came from. Printed
+    first so no output of this script is ever ambiguous about its cost model."""
+    return (f"costs: source={FEE_SOURCE} | spot taker {KRAKEN_FEE*100:.3f}%/side, "
+            f"spot maker {KRAKEN_MAKER_FEE*100:.3f}%/side, perp taker "
+            f"{FUTURES_FEE*100:.3f}%/side, slippage {SLIPPAGE*100:.3f}%/side "
+            f"-> 4-leg round trip: maker {COST_MAKER*100:.2f}%, "
+            f"taker {COST_TAKER*100:.2f}%")
+
+
 def main():
+    print(cost_header())
     print(f"{'symbol':12s} {'hours':>6s} {'gross APR':>9s} {'pos%':>5s} "
           f"{'worst 30d':>9s} {'neg-run':>8s} {'net mkr':>8s} {'net tkr':>8s} "
           f"{'on capital':>10s}")

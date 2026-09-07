@@ -18,6 +18,12 @@ artifact the bot already produces and prints them as ONE JSON document:
     shadow_counts        shadow_signals readiness per forward horizon
     graveyard            KILLED entrants from the autopilot's persisted state
     funding_summary      per-symbol 30d mean hourly funding + sign
+    breadth              what the rig can SEE: funding symbols archived (n +
+                         earliest/latest per symbol), the funding correlation
+                         summary measured from our OWN funding_rates table
+                         (mean off-diagonal + n_eff), candle coverage by
+                         interval_m, and a 'blockers' list naming every family
+                         with zero decisions and its DETECTED cause
     tca_summary          fills_tca 30d, paper and live NEVER averaged together
     goal                 the [G] block from the running bot's GET /api/goal
     errors               one line per section that could not be measured
@@ -303,6 +309,421 @@ def sec_goal(_conn=None):
     return goal
 
 
+# ── breadth: what the rig can SEE (archived symbols, candle coverage, blockers) ─
+# Every number below is measured from our OWN contract tables (funding_rates,
+# candles) and from the entrants' own recorded scores. Nothing is pulled from a
+# venue here, nothing is re-derived from prose, and no threshold is invented:
+# the carry hurdle used in hurdle_check is the value the ENTRANT recorded
+# (score["hurdle_ann"]), never a constant retyped in this file.
+CARRY_MIN_7D_HOURS = 120       # window-completeness floor the scorer records
+SECS_PER_WEEK = 7 * 86400
+COVERAGE_INTERVALS = (60, 1440, 10080)   # hourly / daily / weekly
+
+
+def _q(vals, p):
+    """Linear-interpolated quantile of a non-empty list, else None."""
+    s = sorted(v for v in vals if v is not None)
+    if not s:
+        return None
+    k = (len(s) - 1) * float(p)
+    lo, hi = int(math.floor(k)), int(math.ceil(k))
+    return s[lo] if lo == hi else s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _funding_rows(conn):
+    """{symbol: {venue, hours: {ts: rate}}} — deduped by ts, first venue wins,
+    exactly like the scorer's own _fetch_funding. Garbage rows are skipped,
+    never guessed at."""
+    rows = fetch(conn, "SELECT venue, symbol, ts, rate FROM funding_rates "
+                       "WHERE rate IS NOT NULL ORDER BY symbol, ts",
+                 ("venue", "symbol", "ts", "rate"))
+    out = {}
+    for r in rows:
+        try:
+            sym = str(r["symbol"])
+            ts = int(float(r["ts"]))
+            rate = float(r["rate"])
+            if not math.isfinite(rate):
+                continue
+        except Exception:
+            continue
+        e = out.setdefault(sym, {"venue": r.get("venue"), "hours": {}})
+        e["hours"].setdefault(ts, rate)
+    return out
+
+
+def _trailing7d_ann(hours):
+    """[(day_ts, annualized trailing-7d mean)] replaying the scorer's own loop:
+    one UTC day, window [day-7d, day), >= CARRY_MIN_7D_HOURS of 168 rates."""
+    ts_sorted = sorted(hours)
+    if len(ts_sorted) < 2:
+        return []
+    first_day = (ts_sorted[0] // 86400) * 86400
+    last_day = (ts_sorted[-1] // 86400) * 86400
+    out = []
+    day = first_day + 86400
+    while day < last_day:
+        w = [hours[t] for t in ts_sorted if day - SECS_PER_WEEK <= t < day]
+        if len(w) >= CARRY_MIN_7D_HOURS:
+            out.append((day, statistics.fmean(w) * 24.0 * 365.0))
+        day += 86400
+    return out
+
+
+def _funding_breadth(funding):
+    """(per-symbol summary, {symbol: [trailing-7d annualized, ...]}) — the raw
+    series rides along so hurdle_check counts DAYS above a hurdle instead of
+    re-deriving the window a second time."""
+    per, series = {}, {}
+    for sym, e in sorted(funding.items()):
+        hours = e["hours"]
+        if not hours:
+            continue
+        lo, hi = min(hours), max(hours)
+        span_h = (hi - lo) / 3600.0
+        expected = int(span_h) + 1
+        vals = list(hours.values())
+        t7 = [a for _, a in _trailing7d_ann(hours)]
+        series[sym] = t7
+        mean_h = statistics.fmean(vals)
+        per[sym] = {
+            "venue": e["venue"],
+            "n_hours": len(hours),
+            "earliest_ts": float(lo), "latest_ts": float(hi),
+            "earliest_iso": datetime.fromtimestamp(lo, tz=timezone.utc).isoformat(),
+            "latest_iso": datetime.fromtimestamp(hi, tz=timezone.utc).isoformat(),
+            "span_days": span_h / 24.0,
+            "expected_hours": expected,
+            "gap_share": (1.0 - len(hours) / expected) if expected > 0 else None,
+            "mean_hourly": _fnum(mean_h),
+            "mean_annualized": _fnum(mean_h * 24 * 365),
+            "share_positive_hours": sum(1 for v in vals if v > 0) / len(vals),
+            "trailing7d_ann": {
+                "n_days": len(t7),
+                "min": _fnum(min(t7)) if t7 else None,
+                "p25": _fnum(_q(t7, .25)), "median": _fnum(_q(t7, .50)),
+                "p75": _fnum(_q(t7, .75)), "p95": _fnum(_q(t7, .95)),
+                "max": _fnum(max(t7)) if t7 else None,
+                "min_window_hours": CARRY_MIN_7D_HOURS,
+            },
+        }
+    return per, series
+
+
+def _funding_correlation(funding):
+    """Mean off-diagonal Pearson correlation of HOURLY funding over the
+    timestamps every archived symbol shares, and the effective number of
+    independent streams n_eff = k / (1 + (k-1)*rbar). Fewer than 2 symbols or
+    fewer than 2 aligned hours -> nulls with a reason, never a made-up 1.0."""
+    syms = sorted(funding)
+    k = len(syms)
+    base = {"n_symbols": k, "n_aligned_hours": 0, "mean_offdiag": None,
+            "n_eff": None, "pairs": {}, "reason": None}
+    if k < 2:
+        base["reason"] = "fewer than 2 symbols archived"
+        return base
+    common = set(funding[syms[0]]["hours"])
+    for s in syms[1:]:
+        common &= set(funding[s]["hours"])
+    common = sorted(common)
+    base["n_aligned_hours"] = len(common)
+    if len(common) < 2:
+        base["reason"] = "fewer than 2 timestamps shared by every symbol"
+        return base
+    off = []
+    for i, a in enumerate(syms):
+        for b in syms[i + 1:]:
+            xa = [funding[a]["hours"][t] for t in common]
+            xb = [funding[b]["hours"][t] for t in common]
+            try:
+                c = _fnum(statistics.correlation(xa, xb))
+            except Exception:
+                c = None
+            base["pairs"][f"{a}|{b}"] = c
+            if c is not None:
+                off.append(c)
+    if not off:
+        base["reason"] = "no pair had a defined correlation (constant series?)"
+        return base
+    rbar = statistics.fmean(off)
+    base["mean_offdiag"] = _fnum(rbar)
+    denom = 1.0 + (k - 1) * rbar
+    base["n_eff"] = _fnum(k / denom) if denom > 0 else None
+    if base["n_eff"] is None:
+        base["reason"] = "1 + (k-1)*rbar <= 0 — n_eff undefined"
+    return base
+
+
+def _candle_coverage(conn):
+    rows = fetch(conn, "SELECT interval_m, COUNT(DISTINCT pair), COUNT(*), "
+                       "MIN(ts), MAX(ts) FROM candles GROUP BY interval_m",
+                 ("interval_m", "pairs", "rows", "min_ts", "max_ts"))
+    by_interval = {}
+    for r in rows:
+        try:
+            iv = str(int(r["interval_m"]))
+        except Exception:
+            continue
+        lo, hi = _fnum(r.get("min_ts")), _fnum(r.get("max_ts"))
+        by_interval[iv] = {
+            "pairs": int(r["pairs"] or 0), "rows": int(r["rows"] or 0),
+            "earliest_ts": lo, "latest_ts": hi,
+            "span_days": ((hi - lo) / 86400.0) if (lo is not None and hi is not None) else None,
+        }
+    per_pair = {}
+    prows = fetch(conn, "SELECT pair, interval_m, COUNT(*), MIN(ts), MAX(ts) "
+                        "FROM candles WHERE interval_m IN (60, 1440, 10080) "
+                        "GROUP BY pair, interval_m",
+                  ("pair", "interval_m", "n", "min_ts", "max_ts"))
+    for r in prows:
+        try:
+            iv = str(int(r["interval_m"]))
+            pair = str(r["pair"])
+        except Exception:
+            continue
+        lo, hi = _fnum(r.get("min_ts")), _fnum(r.get("max_ts"))
+        per_pair.setdefault(iv, {})[pair] = {
+            "n": int(r["n"] or 0), "earliest_ts": lo, "latest_ts": hi,
+            "span_days": ((hi - lo) / 86400.0) if (lo is not None and hi is not None) else None,
+        }
+    return {"by_interval": by_interval,
+            "intervals_reported_per_pair": [str(i) for i in COVERAGE_INTERVALS],
+            "by_pair": per_pair}
+
+
+def _hurdle_check(funding_per_symbol, series, hurdles):
+    """For every DISTINCT hurdle the entrants recorded, how the realized
+    trailing-7d annualized funding of each archived symbol sits against it —
+    including HOW MANY of its decision days actually cleared it. This
+    DESCRIBES a hurdle against measured history; it never proposes changing
+    one, and a hurdle is never re-derived here from a constant."""
+    out = {}
+    for h in sorted(set(hurdles)):
+        per = {}
+        for sym, f in funding_per_symbol.items():
+            t7 = f.get("trailing7d_ann") or {}
+            mx, med = t7.get("max"), t7.get("median")
+            vals = series.get(sym) or []
+            above = sum(1 for v in vals if v > h)
+            per[sym] = {
+                "n_days": int(t7.get("n_days") or 0),
+                "max_trailing7d_ann": mx,
+                "median_trailing7d_ann": med,
+                "days_above_hurdle": above if vals else None,
+                "share_days_above_hurdle": (above / len(vals)) if vals else None,
+                "max_clears_hurdle": (mx > h) if (mx is not None) else None,
+                "median_clears_hurdle": (med > h) if (med is not None) else None,
+            }
+        mx_c = [v["max_clears_hurdle"] for v in per.values() if v["max_clears_hurdle"] is not None]
+        md_c = [v["median_clears_hurdle"] for v in per.values() if v["median_clears_hurdle"] is not None]
+        out["%.6g" % h] = {"hurdle_ann": h, "symbols": per,
+                           "any_symbol_max_clears": (any(mx_c) if mx_c else None),
+                           "any_symbol_median_clears": (any(md_c) if md_c else None)}
+    return out
+
+
+def _detect_cause(status, vias, hurdle, funding_per_symbol, coverage, hurdle_check):
+    """(cause_code, cause, evidence, would_unblock) from MEASURED inputs only.
+
+    The order is: what the scorer itself said, then its own recorded hurdle
+    against realized funding, then the shape of the entrant. Nothing here
+    proposes loosening a gate — 'would_unblock' always asks for more evidence.
+    """
+    low = str(status or "").lower()
+    if "funding history" in low:
+        return ("no_funding_history",
+                "the scorer reports it is waiting on funding history",
+                {"symbols_archived": len(funding_per_symbol)},
+                "funding_rates rows for the symbol the entrant reads")
+    if "price history" in low:
+        hourly = (coverage.get("by_pair") or {}).get("60") or {}
+        spans = [v.get("span_days") for v in hourly.values()
+                 if isinstance(v, dict) and v.get("span_days") is not None]
+        wk = (coverage.get("by_pair") or {}).get("10080") or {}
+        dl = (coverage.get("by_pair") or {}).get("1440") or {}
+        ev = {
+            "hourly_60_pairs": len(hourly),
+            "hourly_60_max_span_days": max(spans) if spans else None,
+            "daily_1440_pairs": ((coverage.get("by_interval") or {}).get("1440") or {}).get("pairs"),
+            "daily_1440_max_rows_per_pair":
+                max([v.get("n") or 0 for v in dl.values() if isinstance(v, dict)] or [0]),
+            "weekly_10080_pairs": ((coverage.get("by_interval") or {}).get("10080") or {}).get("pairs"),
+            "weekly_10080_max_rows_per_pair":
+                max([v.get("n") or 0 for v in wk.values() if isinstance(v, dict)] or [0]),
+        }
+        return ("price_history_warm_up_not_met",
+                "the scorer reports its warm-up is not met from the candle history it reads",
+                ev,
+                "longer stored history at the interval the scorer reads, or a scorer that "
+                "reads the coarser intervals already archived")
+    if hurdle is not None:
+        hc = hurdle_check.get("%.6g" % hurdle) or {}
+        syms = hc.get("symbols") or {}
+        mx_c, md_c = hc.get("any_symbol_max_clears"), hc.get("any_symbol_median_clears")
+        ev = {"hurdle_ann": hurdle, "symbols": syms,
+              "note": "the scores do not record which symbol this entrant reads, so the "
+                      "comparison is against EVERY archived symbol"}
+        if mx_c is None:
+            return ("hurdle_vs_funding_unmeasurable",
+                    "no archived symbol had enough history to compare against the hurdle",
+                    ev, "funding history long enough to form a trailing-7d window")
+        if mx_c is False:
+            return ("hurdle_above_realized_funding",
+                    f"the entrant's own recorded hurdle ({hurdle:.4g} annualized) is above the "
+                    f"highest trailing-7d funding ever realized by any archived symbol, so the "
+                    f"entry condition can never fire on this universe",
+                    ev,
+                    "archiving symbols whose realized funding actually reaches the existing "
+                    "hurdle — the hurdle itself is not to be lowered")
+        best = max(((v.get("days_above_hurdle") or 0), s) for s, v in syms.items()) \
+            if syms else (0, None)
+        if md_c is not True:
+            return ("hurdle_rarely_cleared",
+                    f"the recorded hurdle ({hurdle:.4g} annualized) is above the MEDIAN "
+                    f"trailing-7d funding of every archived symbol; the best any symbol managed "
+                    f"is {best[0]} day(s) above it ({best[1]})",
+                    ev,
+                    "archiving symbols that clear the existing hurdle on more than a handful "
+                    "of days — the hurdle itself is not to be lowered")
+        return ("hurdle_cleared_but_no_decision_recorded",
+                "the recorded hurdle is cleared on at least one archived symbol, yet no "
+                "decision was recorded — this evidence does not name the cause",
+                ev, None)
+    if vias and set(vias) <= {"live"}:
+        return ("live_entrant_never_fired",
+                "a live-book entrant with no recorded status: its gates produced no signal "
+                "in the window measured", {}, None)
+    return ("unknown", None, {}, None)
+
+
+def _blockers(scores, funding_per_symbol, coverage, hurdle_check):
+    """(family rows, idle-entrant rows).
+
+    A FAMILY row is emitted only when the family's entrants have produced zero
+    decisions between them. That alone would hide the real situation whenever
+    one member has decisions and the rest have never run, so every entrant with
+    zero decisions ALSO gets its own row with its own detected cause. 'unknown'
+    when nothing in the evidence names one — never a guess.
+    """
+    idle, fams = [], {}
+    for cid, s in sorted((scores or {}).items()):
+        if not isinstance(s, dict):
+            continue
+        fam = str(s.get("family") or "unknown")
+        try:
+            n = int(s.get("trades_n") or 0)
+        except Exception:
+            n = 0
+        via = str(s.get("via")) if s.get("via") else None
+        hv = _fnum(s.get("hurdle_ann"))
+        st = str(s.get("status"))[:200] if s.get("status") else None
+        e = fams.setdefault(fam, {"entrants": [], "decisions": 0, "idle": []})
+        e["entrants"].append(str(cid))
+        e["decisions"] += n
+        if n > 0:
+            continue
+        code, cause, ev, unblock = _detect_cause(st, [via] if via else [], hv,
+                                                 funding_per_symbol, coverage, hurdle_check)
+        row = {"id": str(cid), "family": fam, "decisions": 0, "via": via,
+               "cause_code": code, "cause": cause, "reported_status": st,
+               "would_unblock": unblock, "evidence": ev}
+        idle.append(row)
+        e["idle"].append(row)
+
+    out = []
+    for fam, e in sorted(fams.items()):
+        if e["decisions"] > 0:
+            continue
+        codes = sorted({r["cause_code"] for r in e["idle"]})
+        if len(codes) == 1:
+            r0 = e["idle"][0]
+            code, cause = r0["cause_code"], r0["cause"]
+            evidence, unblock = r0["evidence"], r0["would_unblock"]
+        elif codes:
+            code, cause = "multiple_causes", "its idle entrants are blocked for different reasons"
+            evidence = {"per_entrant": {r["id"]: r["cause_code"] for r in e["idle"]}}
+            unblock = None
+        else:
+            code, cause, evidence, unblock = "unknown", None, {}, None
+        status = " ; ".join(f"{r['id']}: {r['reported_status']}"
+                            for r in e["idle"] if r["reported_status"])
+        out.append({"family": fam, "entrants": sorted(e["entrants"]),
+                    "idle_entrants": sorted(r["id"] for r in e["idle"]),
+                    "decisions": 0, "cause_code": code, "cause": cause,
+                    "reported_status": status or None,
+                    "via": sorted({r["via"] for r in e["idle"] if r["via"]}),
+                    "would_unblock": unblock, "evidence": evidence})
+    return out, idle
+
+
+def sec_breadth(conn):
+    """What the rig can SEE, and what is stopping each idle family.
+
+    Sub-steps are guarded one by one: a failure inside becomes null/empty with a
+    line in breadth["errors"], so partial breadth still ships. Nothing here
+    proposes loosening a gate — a blocker row states the measured cause and what
+    NEW EVIDENCE would clear it.
+    """
+    out = {"errors": []}
+
+    failed = set()
+
+    def _step(name, fn, default=None):
+        try:
+            return fn()
+        except Exception as e:                      # noqa: BLE001
+            failed.add(name)
+            out["errors"].append(f"{name}: {type(e).__name__}: {_scrub(e)}")
+            return default
+
+    funding = _step("funding_rows", lambda: _funding_rows(conn), {}) or {}
+    per_sym, t7_series = _step("funding_symbols", lambda: _funding_breadth(funding),
+                               ({}, {})) or ({}, {})
+    # A count is only a MEASUREMENT when the read behind it succeeded: if the
+    # query failed, "0 symbols archived" would read as a measured zero. It is
+    # null instead, and the reason is already in errors.
+    out["funding"] = {
+        "symbols_archived": (None if ("funding_rows" in failed or "funding_symbols" in failed)
+                             else len(per_sym)),
+        "per_symbol": per_sym,
+    }
+    out["funding_correlation"] = _step("funding_correlation",
+                                       lambda: _funding_correlation(funding))
+    empty_cov = {"by_interval": {}, "by_pair": {}}
+    coverage = _step("candle_coverage", lambda: _candle_coverage(conn), empty_cov) or empty_cov
+    # same rule: a coverage read that failed is null, not "no candles exist".
+    out["candles"] = (dict(coverage, by_interval=None, by_pair=None,
+                           measured=False)
+                      if "candle_coverage" in failed
+                      else dict(coverage, measured=True))
+
+    def _scores():
+        state, src = _read_autopilot_state(conn)
+        out["scores_source"] = src
+        s = state.get("scores") if isinstance(state, dict) else None
+        return s if isinstance(s, dict) else {}
+
+    scores = _step("scores", _scores, {}) or {}
+    hurdles = [h for h in (_fnum(s.get("hurdle_ann")) for s in scores.values()
+                           if isinstance(s, dict)) if h is not None]
+    out["hurdle_check"] = _step("hurdle_check",
+                                lambda: _hurdle_check(per_sym, t7_series, hurdles), {}) or {}
+    fam_rows, idle_rows = _step("blockers",
+                                lambda: _blockers(scores, per_sym, coverage,
+                                                  out["hurdle_check"]), ([], [])) or ([], [])
+    out["blockers"] = fam_rows
+    out["idle_entrants"] = idle_rows
+    out["families_scored"] = (None if "scores" in failed else
+                              sorted({str(s.get("family") or "unknown")
+                                      for s in scores.values() if isinstance(s, dict)}))
+    out["blockers_measured"] = "scores" not in failed
+    if "scores" in failed:
+        # not "no blockers": the scores were unreadable, so nothing is known
+        out["blockers"] = None
+        out["idle_entrants"] = None
+    return out
+
+
 SECTIONS = (
     ("regime_table", sec_regime_table),
     ("gate_table", sec_gate_table),
@@ -311,6 +732,7 @@ SECTIONS = (
     ("shadow_counts", sec_shadow_counts),
     ("graveyard", sec_graveyard),
     ("funding_summary", sec_funding_summary),
+    ("breadth", sec_breadth),
     ("tca_summary", sec_tca_summary),
     ("goal", sec_goal),
 )

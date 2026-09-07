@@ -448,7 +448,10 @@ if rev is not None:
 
     SECTION_KEYS = ("regime_table", "gate_table", "spread_map_summary",
                     "rejects_by_gate_week", "shadow_counts", "graveyard",
-                    "funding_summary", "tca_summary", "goal")
+                    "funding_summary", "breadth", "tca_summary", "goal")
+    # breadth guards its sub-steps individually, so a dead database leaves it a
+    # dict of NULLS with reasons rather than one null section — checked below.
+    NULL_UNDER_BOOM = tuple(k for k in SECTION_KEYS if k not in ("goal", "breadth"))
 
     # the goal section must never touch the network from a test
     _saved_urlopen = _urlreq.urlopen
@@ -504,9 +507,15 @@ if rev is not None:
                   [s[:60] for s in EXECUTED if not s.strip().upper().startswith("SELECT")])
 
         check("a database that raises on every statement -> null sections + one error each",
-              all(docs["boom"].get(k) is None for k in SECTION_KEYS if k != "goal")
-              and len(docs["boom"]["errors"]) >= len(SECTION_KEYS) - 1,
+              all(docs["boom"].get(k) is None for k in NULL_UNDER_BOOM)
+              and len(docs["boom"]["errors"]) >= len(NULL_UNDER_BOOM),
               docs["boom"]["errors"][:2])
+        _bb = docs["boom"].get("breadth") or {}
+        check("a dead database leaves breadth's counts NULL, never a measured-looking 0",
+              (_bb.get("funding") or {}).get("symbols_archived") is None
+              and (_bb.get("candles") or {}).get("by_interval") is None
+              and _bb.get("blockers") is None and bool(_bb.get("errors")),
+              {k: _bb.get(k) for k in ("funding", "blockers")})
         check("the live goal block is passed through verbatim when the bot answers",
               docs["empty"].get("goal") == GOAL_BODY["goal"], docs["empty"].get("goal"))
 

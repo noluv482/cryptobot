@@ -116,6 +116,26 @@ PROVEN_DSR  = 0.95        # past MinTRL with deflated PSR at/above this -> PROVE
 MINTRL_CONF = 0.95        # MinTRL target confidence (Phi^-1(0.95) in the formula)
 _EM_GAMMA   = 0.5772156649015329   # Euler-Mascheroni, for the expected-max-SR term
 
+# ── sd_SR DIAGNOSTIC (report only — changes NO gate) ──────────────────────────
+# MEASURED off the live persisted state (bot_state id=2) on 2026-09-07:
+# sd_SR = 0.6290 is a population variance over 10 Sharpes, EVERY ONE of them
+# from a KILLED entrant, and one of them ("selective", sr -2.14 on a
+# 4-decision record) supplies 68.7% of it. At trials_count 24 that puts SR0 at
+# 1.245 — ~7x the plausible per-decision SR (0.17) — so
+# research_loop.budget_remaining returns 0 and every new hypothesis is refused
+# as "budget exhausted". The refusal is real; the STATED cause was wrong. This
+# module now measures it: driving trials_count to its floor (2) still leaves
+# the budget at 0, while driving sd_SR to 0 reopens it — sd_SR is binding, and
+# no amount of breadth changes that. budget_status() reports exactly this.
+#
+# MIN_SR_CONTRIB_DECISIONS is a PROPOSAL the diagnostic prices out. It is NOT
+# applied anywhere: _current_var_sr, SR0, the DSR gate, the kill rule and the
+# registration budget all still see every scored entrant's SR exactly as
+# before. Adopting it would be an owner decision, made after reading the
+# report — and it would RAISE the evidence bar for an SR to count, never lower
+# any hurdle.
+MIN_SR_CONTRIB_DECISIONS = 20     # proposed minimum decisions before an SR counts (UNAPPLIED)
+
 # TRIALS_SEED documents the honest N at the moment this counter shipped
 # (2026-09-03): 13 entrants existed (10 built-in configs — base, selective,
 # high_conviction, momentum, strict_gates, exit_6h, exit_24h, trend_rr,
@@ -294,6 +314,108 @@ def daily_bars_from_hourly(rows):
     return [(d[0], d[1], d[2], d[3]) for d in sorted(days.values())]
 
 
+# ── Coarse-bar seeding (interval_m 10080 / 1440) ──────────────────────────────
+# ROOT CAUSE, 2026-09-07: _fetch_hourly_candles read ONLY interval_m=60. The
+# 60m archive is a rolling ~45-day window, so a 20-week SMA or a 50-day
+# Donchian channel could NEVER be assembled — tsmom_btc_20w, tsmom_eth_20w and
+# donchian_btc sat at trades_n=0 forever, not because the rules were flat but
+# because the lookback was structurally unreachable. The candles table already
+# holds the history at coarser intervals (measured on the live DB 2026-09-07:
+# XBTUSD 32 weekly bars back to 2026-01-29 and 50 daily bars back to
+# 2026-07-12, against 1068 hourly bars back to 2026-07-24). These helpers seed
+# the deep lookback from those bars and keep the 60m read for the recent tail.
+#
+# NOTHING HERE LOOSENS A GATE. The pre-registration rule (decisions at or
+# before born_ts are never graded), the one-decision-per-ISO-week rule, the
+# forward-week pairing and the cost model are all untouched — this only makes
+# the warm-up assemblable, which is the difference between "the rule says
+# flat" and "the rule was never evaluated".
+DAILY_INTERVAL_M  = 1440
+WEEKLY_INTERVAL_M = 10080
+
+
+def merge_daily_bars(native_daily, hourly_rows):
+    """[(day_start_ts, high, low, close)] — native daily bars, extended by the
+    60m tail for every UTC day the native series does not cover.
+
+    `native_daily` is raw interval_m=1440 rows (ts = the venue's day bucket
+    START, so it already IS the day key); `hourly_rows` are interval_m=60 rows
+    resampled by daily_bars_from_hourly. A day present in BOTH keeps the
+    NATIVE bar — it is the venue's published full-day OHLC, while the 60m
+    reconstruction can be missing hours. With no native bars this returns
+    exactly daily_bars_from_hourly(hourly_rows): the pre-fix behaviour, bar
+    for bar.
+    """
+    days = {}
+    for ts, hi, lo, cl in daily_bars_from_hourly(hourly_rows or []):
+        days[int(ts)] = (int(ts), float(hi), float(lo), float(cl))
+    for row in (native_daily or []):
+        try:
+            ts, hi, lo, cl = row[0], row[1], row[2], row[3]
+            day = int(float(ts) // 86400) * 86400
+            days[day] = (day, float(hi), float(lo), float(cl))   # native wins
+        except Exception:
+            continue
+    return [days[k] for k in sorted(days)]
+
+
+def weekly_rows_from_native(rows, interval_m=WEEKLY_INTERVAL_M):
+    """[(week_key, decision_ts, close, None)] from native weekly bars.
+
+    A native weekly bar's ts is the bucket START (bot_server.resample_bars and
+    Kraken's own OHLC both align to ts // bucket * bucket), so the bar's CLOSE
+    lands on the bucket's LAST day: decision_ts is that day's UTC start and the
+    row's ISO week is the week that day falls in. Epoch-aligned 604800s buckets
+    start on a Thursday, so these rows are Wednesday closes while daily-derived
+    rows are (usually) Sunday closes — see weekly_series() for how the two are
+    joined and why the seam is disclosed rather than smoothed.
+
+    daily_index is None on purpose: there are no daily bars this far back, so
+    no Donchian channel can be computed here and donchian_decisions skips these
+    rows instead of inventing a channel.
+    """
+    span = int(interval_m) * 60
+    last_day_offset = max(0, span - 86400)
+    out = {}
+    for row in (rows or []):
+        try:
+            ts = int(float(row[0]))
+            close = float(row[3])
+        except Exception:
+            continue
+        dts = (ts // 86400) * 86400 + last_day_offset
+        out[_iso_week_key(dts)] = (dts, close)
+    return [(k, v[0], v[1], None) for k, v in out.items()]
+
+
+def weekly_series(daily, native_weekly=None):
+    """[(week_key, decision_ts, close, daily_index|None)] — ONE row per ISO
+    week, sorted by decision_ts.
+
+    The daily spine supplies every week it covers (weekly_closes_from_daily,
+    unchanged — same closes, same decision timestamps, same daily_index). Native
+    weekly bars supply ONLY the weeks the spine cannot reach; where both cover a
+    week the DAILY-derived row wins, because it carries the daily_index the
+    Donchian channel needs and it is built from finer data.
+
+    HONESTY NOTE — THE SEAM: the two sources close on different weekdays, so the
+    single return spanning the last native week to the first daily-derived week
+    covers ~11 days rather than 7. It is real price data (nothing is fabricated
+    or interpolated), it occurs at most once per series, and it sits deep in the
+    SMA warm-up rather than in a graded decision. `trend_bars_source()` reports
+    how many weeks came from each source so the seam is visible in status()
+    rather than hidden.
+    """
+    rows = {}
+    for wk in weekly_rows_from_native(native_weekly):
+        rows[wk[0]] = wk
+    for wk in weekly_closes_from_daily(daily):
+        rows[wk[0]] = wk                      # daily-derived wins on collision
+    out = list(rows.values())
+    out.sort(key=lambda x: x[1])
+    return out
+
+
 def weekly_closes_from_daily(daily):
     """[(week_key, decision_ts, close, daily_index)] — EXACTLY one per ISO week.
 
@@ -307,6 +429,45 @@ def weekly_closes_from_daily(daily):
     out = [(k, v[0], v[1], v[2]) for k, v in weeks.items()]
     out.sort(key=lambda x: x[1])
     return out
+
+
+def trend_bars_source(pair, hourly, native_daily, native_weekly, daily, weekly):
+    """Provenance of the assembled lookback — a REPORT, never an input.
+
+    {pair, hourly_rows, native_daily_rows, native_weekly_rows, days, weeks,
+     weeks_from_daily, weeks_from_native, seam_ts, note}. `seam_ts` is the
+     decision_ts of the first daily-derived week when native weeks precede it
+     (the one ~11-day return described in weekly_series), else None.
+    """
+    from_daily = sum(1 for w in weekly if w[3] is not None)
+    from_native = len(weekly) - from_daily
+    seam_ts = None
+    if from_native and from_daily:
+        for w in weekly:
+            if w[3] is not None:
+                seam_ts = w[1]
+                break
+    if not weekly:
+        note = "no stored bars at 10080m / 1440m / 60m"
+    elif from_native:
+        note = (f"{from_native} week(s) seeded from native {WEEKLY_INTERVAL_M}m bars, "
+                f"{from_daily} from the daily spine")
+    elif native_daily:
+        note = f"weeks derived from the daily spine ({len(native_daily or [])} native {DAILY_INTERVAL_M}m bars + 60m tail)"
+    else:
+        note = "60m only — no coarse bars stored for this pair"
+    return {
+        "pair": pair,
+        "hourly_rows": len(hourly or []),
+        "native_daily_rows": len(native_daily or []),
+        "native_weekly_rows": len(native_weekly or []),
+        "days": len(daily or []),
+        "weeks": len(weekly or []),
+        "weeks_from_daily": from_daily,
+        "weeks_from_native": from_native,
+        "seam_ts": seam_ts,
+        "note": note,
+    }
 
 
 def tsmom_decisions(weekly, sma_weeks=20):
@@ -329,11 +490,16 @@ def tsmom_decisions(weekly, sma_weeks=20):
 def donchian_decisions(daily, weekly, enter_days=50, exit_days=25):
     """[(decision_ts, pos)] — enter on close > prior enter_days-day high, exit on
     close < prior exit_days-day low; evaluated ONCE per ISO week (state machine
-    stepped only at weekly closes). Long-flat, one decision per week."""
+    stepped only at weekly closes). Long-flat, one decision per week.
+
+    A weekly row with daily_index None came from a NATIVE weekly bar
+    (weekly_rows_from_native): there are no daily bars behind it, so no channel
+    exists and the week is skipped — the same skip an under-warmed week already
+    got, never a channel invented from coarser data."""
     out = []
     pos = 0
     for _key, dts, close, di in weekly:
-        if di < enter_days:            # not enough daily history behind this week
+        if di is None or di < enter_days:   # no daily history behind this week
             continue
         ch_high = max(d[1] for d in daily[di - enter_days: di])   # prior N days' highs
         ch_low = min(d[2] for d in daily[max(0, di - exit_days): di])
@@ -1131,6 +1297,38 @@ class Autopilot:
         # never seen (first boot with a new written hypothesis lands here).
         self._register_trials()
 
+        # Boot-time honesty line: WHY the registration budget is where it is,
+        # and which entrant is carrying sd_SR. Report only - it reads state and
+        # changes none of it, and it must never be able to stop a boot.
+        self._log_sd_sr_diagnostic()
+
+    def _log_sd_sr_diagnostic(self):
+        """Log the sd_SR decomposition + the honest budget reason. Read-only;
+        every failure is swallowed (a diagnostic never blocks a boot)."""
+        try:
+            d = self.sd_sr_diagnostic()
+            m, b = d["measured"], d["budget"]
+            sd_txt = f"{m['sd_sr']:.4f}" if m["sd_sr"] is not None else "unknown"
+            log("AUTOPILOT", f"sd_SR diagnostic (REPORT ONLY, no gate changed): "
+                             f"sd_SR {sd_txt} over {m['n_contributors']} entrant(s) "
+                             f"({m['n_killed_contributors']} killed) - {b['reason']}")
+            top = d.get("top_contributor")
+            if top and top.get("variance_share") is not None:
+                log("AUTOPILOT", f"  top sd_SR contributor: {top['id']} "
+                                 f"{top['variance_share'] * 100:.1f}% of the variance "
+                                 f"on n={top['decisions_n']} decisions"
+                                 + (" (KILLED)" if top.get("killed") else ""))
+            for key in ("a_min_decisions", "b_rescaled"):
+                a = d["alternatives"][key]
+                a_sd = f"{a['sd_sr']:.4f}" if a["sd_sr"] is not None else "unmeasurable"
+                a_sr0 = f"{a['sr0']:.4f}" if a["sr0"] is not None else "unknown"
+                log("AUTOPILOT", f"  WOULD-BE [{key}] {a['label']}: "
+                                 f"sd_SR {a_sd} - SR0 {a_sr0} - "
+                                 f"budget {a['budget_remaining']} "
+                                 f"(n={a['n_contributors']}) - NOT APPLIED")
+        except Exception as ex:                     # pragma: no cover - never fatal
+            log("AUTOPILOT", f"sd_SR diagnostic unavailable: {ex}", "WRN")
+
     def _add_challenger(self, cfg):
         """Register one config (built-in or lab) with its own sandboxed trader.
 
@@ -1246,6 +1444,15 @@ class Autopilot:
                if isinstance(s, dict) and s.get("sr") is not None]
         return statistics.pvariance(srs) if len(srs) >= 2 else None
 
+    def _budget_dpy(self):
+        """The decisions/year budget_remaining() defaults to: the SLOWEST
+        cadence among live families (conservative). Extracted verbatim from
+        budget_remaining so the diagnostic prices its alternatives against the
+        SAME cadence the real budget uses."""
+        rates = [decisions_per_year_of(c) for cid, c in self.configs.items()
+                 if cid not in self.killed]
+        return min(rates) if rates else 52
+
     def budget_remaining(self, decisions_per_year=None):
         """Contract [G] budget_remaining: how many more families are honestly
         registrable (research_loop.budget_remaining). decisions_per_year
@@ -1254,11 +1461,273 @@ class Autopilot:
         if rl is None:
             return None
         if decisions_per_year is None:
-            rates = [decisions_per_year_of(c) for cid, c in self.configs.items()
-                     if cid not in self.killed]
-            decisions_per_year = min(rates) if rates else 52
+            decisions_per_year = self._budget_dpy()
         return rl.budget_remaining(self._current_var_sr(), self.trials_count,
                                    decisions_per_year)
+
+    def budget_status(self, decisions_per_year=None):
+        """budget_remaining WITH the reason attached, in one structure.
+
+        A bare 0 reads as "we have run out of ideas"; the truth is that the
+        SR0 hurdle built from sd_SR has climbed past what BUDGET_MONTHS of
+        decisions can resolve against a plausible edge. This returns
+
+            {"budget_remaining": k|None, "binding_constraint": str,
+             "sd_sr":, "sr0":, "plausible_sr":, "threshold":,
+             "decisions_per_year":, "trials_count":, "sr0_basis":,
+             "would_be_budget_if_sd_sr_halved":,
+             "would_be_budget_if_sd_sr_zero":,
+             "would_be_budget_if_trials_at_seed":,
+             "would_be_budget_if_trials_at_floor":,
+             "sd_sr_for_budget_1":, "reason": str}
+
+        so the Sunday pass and the vault index can state the REAL reason
+        instead of 'exhausted'. The counterfactual k's are LABELLED, never
+        applied: nothing here registers an entrant the real budget refused,
+        and budget_remaining() itself still returns exactly what it did.
+        """
+        dpy = self._budget_dpy() if decisions_per_year is None else decisions_per_year
+        var = self._current_var_sr()
+        sd = math.sqrt(var) if var is not None else None
+        out = {"budget_remaining": None, "binding_constraint": "unknown",
+               "sd_sr": sd, "sr0": None, "plausible_sr": None, "threshold": None,
+               "decisions_per_year": dpy, "trials_count": int(self.trials_count),
+               "would_be_budget_if_sd_sr_halved": None,
+               "would_be_budget_if_trials_at_seed": None,
+               "reason": "research_loop unavailable - budget unknown"}
+        if rl is None:
+            return out
+        out["plausible_sr"] = rl.PLAUSIBLE_SR
+        out["threshold"] = rl.resolution_threshold(dpy)
+        if var is None:
+            out["binding_constraint"] = "no cross-entrant SR variance yet"
+            out["reason"] = ("budget unknown: fewer than 2 scored entrants carry an SR, "
+                             "so Var[SR] - and therefore SR0 - cannot be measured")
+            return out
+        k = rl.budget_remaining(var, self.trials_count, dpy)
+        out["budget_remaining"] = k
+        # SR0 here is built on trials_count because THAT is what
+        # research_loop.budget_remaining counts against. The tournament's
+        # displayed SR0 uses N_eff (trials minus demonstrated redundancy), so
+        # the two differ slightly on purpose — sr0_basis says which is which.
+        out["sr0"] = expected_max_sr(var, max(int(self.trials_count), 2))
+        out["sr0_basis"] = "trials_count (the budget's own N); status()'s SR0 uses N_eff"
+        # Labelled counterfactuals. NONE of them is applied: they exist so a 0
+        # can name the lever that would move it instead of saying 'exhausted'.
+        k_half = rl.budget_remaining(var / 4.0, self.trials_count, dpy)   # sd/2 => var/4
+        k_seed = rl.budget_remaining(var, TRIALS_SEED, dpy)
+        k_sd0 = rl.budget_remaining(0.0, self.trials_count, dpy)          # sd -> 0
+        k_tr0 = rl.budget_remaining(var, 2, dpy)                          # trials -> the floor
+        out["would_be_budget_if_sd_sr_halved"] = k_half
+        out["would_be_budget_if_trials_at_seed"] = k_seed
+        out["would_be_budget_if_sd_sr_zero"] = k_sd0
+        out["would_be_budget_if_trials_at_floor"] = k_tr0
+        out["sd_sr_for_budget_1"] = self._sd_sr_for_budget(
+            var, dpy, trials=self.trials_count)
+        if k is None:
+            return out
+        if k > 0:
+            out["binding_constraint"] = "none"
+            out["reason"] = f"budget ok: {k} more registrable at {dpy:g} decisions/year"
+            return out
+        # A lever is "binding" when driving it to its FLOOR reopens the budget.
+        # Halving is reported too, but it is a weak test: sd_SR can be the whole
+        # story and still need to fall by more than half.
+        opens_on_sd = bool(k_sd0 and k_sd0 > 0)
+        opens_on_trials = bool(k_tr0 and k_tr0 > 0)
+        out["binding_constraint"] = ("sd_sr" if opens_on_sd and not opens_on_trials else
+                                     "trials_count" if opens_on_trials and not opens_on_sd else
+                                     "sd_sr+trials_count" if opens_on_sd and opens_on_trials else
+                                     "resolution_horizon")
+        sd_txt = f"{sd:.4f}" if sd is not None else "unknown"
+        sr0_txt = f"{out['sr0']:.4f}" if out["sr0"] is not None else "unknown"
+        thr_txt = f"{out['threshold']:.4f}" if out["threshold"] is not None else "unknown"
+        need = out["sd_sr_for_budget_1"]
+        need_txt = (f"sd_SR would have to fall to {need:.4f} (from {sd_txt}) to make "
+                    f"ONE more registration honest" if need is not None else
+                    "no sd_SR, however small, reopens it at this cadence — the "
+                    f"{rl.BUDGET_MONTHS}-month resolution horizon is the wall")
+        out["reason"] = (
+            f"budget 0 - binding constraint {out['binding_constraint']}: "
+            f"sd_SR {sd_txt} puts SR0({int(self.trials_count)}) at {sr0_txt}, "
+            f"leaving less than the {thr_txt} that {rl.BUDGET_MONTHS} months at "
+            f"{dpy:g} decisions/year can resolve against a plausible SR "
+            f"{rl.PLAUSIBLE_SR:.2f}/decision. {need_txt}. "
+            f"Halving sd_SR would give {k_half}; resetting trials to the seed "
+            f"({TRIALS_SEED}) would give {k_seed}, and to the floor (2) {k_tr0} "
+            f"- so breadth is NOT what is binding when that number is 0.")
+        return out
+
+    @staticmethod
+    def _sd_sr_for_budget(var_sr, dpy, target=1, trials=None, iters=60):
+        """The sd_SR at which budget_remaining would reach `target` — REPORT ONLY.
+
+        budget_remaining is monotone non-increasing in sd_SR, so this bisects
+        the shrink factor on [0, 1] and returns sd_SR * factor. None when even
+        sd_SR = 0 cannot reach the target (then the resolution horizon, not the
+        variance, is the wall). Computes a number; changes nothing.
+        """
+        if rl is None or var_sr is None or var_sr < 0:
+            return None
+        n = 2 if trials is None else int(trials)
+        n = max(int(n), 2)
+
+        def k_at(f):
+            return rl.budget_remaining(var_sr * f * f, n, dpy) or 0
+
+        if k_at(0.0) < target:
+            return None
+        if k_at(1.0) >= target:
+            return math.sqrt(var_sr)
+        lo, hi = 0.0, 1.0                       # k_at(lo) ok, k_at(hi) too small
+        for _ in range(iters):
+            mid = (lo + hi) / 2.0
+            if k_at(mid) >= target:
+                lo = mid
+            else:
+                hi = mid
+        return math.sqrt(var_sr) * lo
+
+    def sd_sr_diagnostic(self, decisions_per_year=None):
+        """REPORT ONLY - where sd_SR comes from, and what it WOULD be otherwise.
+
+        THIS FUNCTION CHANGES NOTHING. _current_var_sr, SR0, N_eff, the DSR
+        gate, the kill rule and the registration budget are all untouched and
+        keep using the measured variance over EVERY scored entrant's SR. The
+        two alternatives below are priced out so the OWNER can read them and
+        decide; neither is applied anywhere in this module, and a test pins
+        that (see test_autopilot_trend_family.py).
+
+        measured      : the live numbers - var_sr exactly as _current_var_sr()
+                        computes it, sd_sr, sr0, n_eff, budget_remaining.
+        contributors  : per entrant that supplies an SR - id, family, sr,
+                        decisions_n, decisions_per_year, deviation from the
+                        mean SR, variance_share (shares sum to 1.0), whether
+                        it is killed, and whether alternative (a) counts it.
+        alternatives  :
+          a_min_decisions  - require decisions_n to reach at least
+                             MIN_SR_CONTRIB_DECISIONS before that SR enters
+                             the variance at all.
+          b_rescaled       - divide each SR by sqrt(decisions_per_year) before
+                             taking the variance, per the owner's written
+                             formula. NOTE, stated plainly because it matters:
+                             the CONVENTIONAL annualization MULTIPLIES
+                             (sr * sqrt(dpy)); dividing rescales toward the
+                             slow entrants instead. The formula actually used
+                             is carried in the payload's "formula" field so
+                             the report can never be misread.
+        Never raises: an unreadable score row is skipped, not fatal.
+        """
+        dpy_default = self._budget_dpy() if decisions_per_year is None else decisions_per_year
+        rows = []
+        for cid, sc in (self.scores or {}).items():
+            if not isinstance(sc, dict) or sc.get("sr") is None:
+                continue
+            cfg = self.configs.get(cid)
+            if cfg is None:
+                cfg = (self.killed.get(cid) or {}).get("config") or {}
+            try:
+                sr = float(sc["sr"])
+            except Exception:
+                continue
+            if not math.isfinite(sr):
+                continue
+            n = sc.get("trades_n")
+            n = int(n) if isinstance(n, (int, float)) and not isinstance(n, bool) else 0
+            rows.append({
+                "id": cid,
+                "family": family_of(cfg),
+                "sr": sr,
+                "decisions_n": n,
+                "decisions_per_year": decisions_per_year_of(cfg),
+                "killed": cid in self.killed,
+            })
+        rows.sort(key=lambda r: r["id"])
+
+        def _decompose(items, key="sr"):
+            """(var, sd, [share per item]) for pvariance over items[key].
+
+            var is the population variance - IDENTICAL to the
+            statistics.pvariance _current_var_sr uses - and the shares are
+            each item's squared deviation over the total, so they sum to 1."""
+            vals = [it[key] for it in items]
+            if len(vals) < 2:
+                return None, None, [None] * len(vals)
+            mean = statistics.fmean(vals)
+            sq = [(v - mean) ** 2 for v in vals]
+            tot = sum(sq)
+            var = tot / len(vals)
+            shares = [(q / tot if tot > 0 else None) for q in sq]
+            return var, math.sqrt(var), shares
+
+        var, sd, shares = _decompose(rows)
+        mean_sr = statistics.fmean([r["sr"] for r in rows]) if rows else None
+        for r, sh in zip(rows, shares):
+            r["deviation"] = (r["sr"] - mean_sr) if mean_sr is not None else None
+            r["variance_share"] = sh
+            r["counted_in_a"] = r["decisions_n"] >= MIN_SR_CONTRIB_DECISIONS
+        top = max(rows, key=lambda r: (r["variance_share"] or -1.0)) if rows else None
+
+        def _alt(items, label, key="sr", formula=None, note=None):
+            v, s, sh = _decompose(items, key)
+            n_eff = max(int(getattr(self, "n_eff", None) or self.trials_count), 2)
+            return {
+                "label": label,
+                "formula": formula,
+                "contributors": [it["id"] for it in items],
+                "n_contributors": len(items),
+                "var_sr": v, "sd_sr": s,
+                "sr0": expected_max_sr(v, n_eff) if v is not None else None,
+                "n_eff_used": n_eff,
+                "budget_remaining": (rl.budget_remaining(v, self.trials_count, dpy_default)
+                                     if (rl is not None and v is not None) else None),
+                "variance_shares": {it["id"]: x for it, x in zip(items, sh)},
+                "note": note,
+            }
+
+        kept_a = [r for r in rows if r["counted_in_a"]]
+        rescaled = []
+        for r in rows:
+            dpy = float(r["decisions_per_year"] or 0.0)
+            if dpy <= 0:
+                continue
+            rescaled.append({**r, "sr_rescaled": r["sr"] / math.sqrt(dpy)})
+        alt_a = _alt(kept_a, f"require decisions_n >= {MIN_SR_CONTRIB_DECISIONS}",
+                     note=("UNAPPLIED proposal. Drops every SR earned on a record too "
+                           "short to mean anything; with fewer than 2 survivors the "
+                           "variance becomes unmeasurable (None), which is the honest "
+                           "answer and NOT a free pass - an unknown hurdle already "
+                           "stops any entrant from clearing."))
+        alt_b = _alt(rescaled, "rescale each SR by 1/sqrt(decisions_per_year)",
+                     key="sr_rescaled", formula="sr / sqrt(decisions_per_year)",
+                     note=("UNAPPLIED proposal, computed exactly as written. The "
+                           "CONVENTIONAL annualization is sr * sqrt(decisions_per_year); "
+                           "dividing shrinks the fast (365/yr) entrants toward zero "
+                           "instead of growing them, so this sd_SR is comparable only "
+                           "to itself, never to the measured one."))
+        measured = {
+            "var_sr": var, "sd_sr": sd,
+            "sr0": self.sr0, "n_eff": self.n_eff,
+            "trials_count": int(self.trials_count),
+            "n_contributors": len(rows),
+            "n_killed_contributors": sum(1 for r in rows if r["killed"]),
+            "decisions_per_year_used": dpy_default,
+            "budget_remaining": self.budget_remaining(),
+        }
+        return {
+            "measured": measured,
+            "contributors": rows,
+            "top_contributor": ({"id": top["id"],
+                                 "variance_share": top["variance_share"],
+                                 "decisions_n": top["decisions_n"],
+                                 "killed": top["killed"]} if top else None),
+            "alternatives": {"a_min_decisions": alt_a, "b_rescaled": alt_b},
+            "budget": self.budget_status(dpy_default),
+            "applied": False,
+            "note": ("REPORT ONLY - _current_var_sr and every gate are unchanged. "
+                     "The alternatives are priced out for the owner to read; "
+                     "adopting one is a human decision, not a runtime effect."),
+        }
 
     def _hyp_apply(self, cfgs, mtime, boot=False):
         """Diff sanitized hypothesis configs against the pool (lab-style):
@@ -1621,8 +2090,12 @@ class Autopilot:
         return out
 
     # ── data pulls for the weekly/carry paths (contract tables; may be empty) ──
-    def _fetch_hourly_candles(self, pair):
-        """[(ts, high, low, close)] hourly bars from the candles table, or None.
+    def _fetch_bars(self, pair, interval_m):
+        """[(ts, high, low, close)] bars at ONE interval from the candles table.
+
+        None means "could not read" (no DB / query failed); [] means "read fine,
+        nothing stored at this interval" — callers must be able to tell those
+        apart to degrade honestly.
 
         History BEFORE born_ts is deliberately included: indicator warm-up
         (SMA/channel lookback) is not grading — only decisions after born are
@@ -1632,12 +2105,49 @@ class Autopilot:
         try:
             with bs.db.conn.cursor() as cur:
                 cur.execute("""SELECT ts, high, low, close FROM candles
-                               WHERE pair=%s AND interval_m=60 ORDER BY ts""",
-                            (pair,))
+                               WHERE pair=%s AND interval_m=%s ORDER BY ts""",
+                            (pair, int(interval_m)))
                 return cur.fetchall()
         except Exception as e:
-            log("AUTOPILOT", f"cf candles {pair}: {e}", "WRN")
+            log("AUTOPILOT", f"cf candles {pair}@{interval_m}m: {e}", "WRN")
             return None
+
+    def _fetch_hourly_candles(self, pair):
+        """[(ts, high, low, close)] hourly (interval_m=60) bars, or None.
+
+        Kept as the recent-tail read. It is NO LONGER the only read: the long
+        lookback comes from _fetch_trend_bars, which seeds from the coarser
+        intervals this window cannot reach.
+        """
+        return self._fetch_bars(pair, 60)
+
+    def _fetch_trend_bars(self, pair):
+        """(daily, weekly, source) for the weekly rules — coarse bars first.
+
+        daily  : merge_daily_bars(interval_m=1440 bars, 60m tail) — native day
+                 bars where they exist, 60m resampling only for the days they
+                 do not cover.
+        weekly : weekly_series(daily, interval_m=10080 bars) — one row per ISO
+                 week, native weekly bars seeding only the weeks the daily
+                 spine cannot reach.
+        source : the honest provenance dict (see trend_bars_source).
+
+        DEGRADE LADDER, all honest, none of them fabricating a bar:
+          weekly + daily + 60m -> full lookback
+          daily + 60m only     -> weekly derived from the daily spine (deeper
+                                  than 60m alone, still short of 20 weeks
+                                  unless the daily archive is long)
+          60m only             -> EXACTLY the pre-fix behaviour
+          nothing readable     -> ([], [], source) and the caller says
+                                  'waiting on price history'
+        """
+        hourly = self._fetch_bars(pair, 60)
+        native_daily = self._fetch_bars(pair, DAILY_INTERVAL_M)
+        native_weekly = self._fetch_bars(pair, WEEKLY_INTERVAL_M)
+        daily = merge_daily_bars(native_daily, hourly)
+        weekly = weekly_series(daily, native_weekly)
+        return daily, weekly, trend_bars_source(pair, hourly, native_daily,
+                                                native_weekly, daily, weekly)
 
     def _fetch_funding(self, symbol):
         """[(ts, rate)] hourly funding from the funding_rates CONTRACT table.
@@ -1682,12 +2192,11 @@ class Autopilot:
         long weeks. Insufficient candle history is reported, not papered over.
         """
         spec = cfg.get("cf") or {}
-        hourly = self._fetch_hourly_candles(spec.get("pair"))
-        if not hourly:
+        daily, weekly, src = self._fetch_trend_bars(spec.get("pair"))
+        if not weekly:
             return self._cf_result(cfg, [], [], via="cf_trend",
-                                   extra={"status": "waiting on price history"})
-        daily = daily_bars_from_hourly(hourly)
-        weekly = weekly_closes_from_daily(daily)
+                                   extra={"status": "waiting on price history",
+                                          "bars_source": src})
         rule = spec.get("rule", "tsmom")
         if rule == "donchian":
             decisions = donchian_decisions(daily, weekly,
@@ -1698,9 +2207,12 @@ class Autopilot:
         if not decisions:
             need = (spec.get("enter_days", 50) if rule == "donchian"
                     else spec.get("weeks", 20))
+            have = (src.get("days") if rule == "donchian" else src.get("weeks"))
             return self._cf_result(cfg, [], [], via="cf_trend",
                                    extra={"status": f"waiting on price history "
-                                                    f"(warm-up {need} {'days' if rule=='donchian' else 'weeks'} not met)"})
+                                                    f"(warm-up {need} {'days' if rule=='donchian' else 'weeks'} not met; "
+                                                    f"have {have}) — {src.get('note')}",
+                                          "bars_source": src})
         born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
         # weekly close lookup by decision_ts for the forward return pairing
         wk_by_ts = {w[1]: (i, w[2]) for i, w in enumerate(weekly)}
@@ -1721,7 +2233,8 @@ class Autopilot:
             net.append(g - cost)
             gross_l.append(g)
             tss.append(float(dts))
-        return self._cf_result(cfg, net, gross_l, via="cf_trend", ts=tss)
+        return self._cf_result(cfg, net, gross_l, via="cf_trend", ts=tss,
+                               extra={"bars_source": src})
 
     def _score_cf_carry(self, cfg):
         """Counterfactual funding-carry pair (long spot + short perp), marked daily.
@@ -1798,16 +2311,15 @@ class Autopilot:
         scorable at all.
         """
         spec = cfg.get("cf") or {}
-        hourly = self._fetch_hourly_candles(spec.get("pair", "XBTUSD"))
-        if not hourly:
+        daily, weekly, src = self._fetch_trend_bars(spec.get("pair", "XBTUSD"))
+        if not weekly:
             return self._cf_result(cfg, [], [], via="cf_switch",
-                                   extra={"status": "waiting on price history"})
+                                   extra={"status": "waiting on price history",
+                                          "bars_source": src})
         rates = self._fetch_funding(spec.get("symbol", "PF_XBTUSD"))
         note = None if rates else "funding history missing — carry leg treated as not live"
         by_hour = dict(rates) if rates else {}
         ts_sorted = sorted(by_hour)
-        daily = daily_bars_from_hourly(hourly)
-        weekly = weekly_closes_from_daily(daily)
         tsm = dict(tsmom_decisions(weekly, int(spec.get("weeks", 20))))  # dts -> pos
         born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
         net, gross_l, tss = [], [], []
@@ -1843,8 +2355,11 @@ class Autopilot:
             net.append(g - cost)
             gross_l.append(g)
             tss.append(float(dts))
+        extra = {"bars_source": src}
+        if note:
+            extra["status"] = note
         return self._cf_result(cfg, net, gross_l, via="cf_switch", ts=tss,
-                               extra=({"status": note} if note else None))
+                               extra=extra)
 
     def score(self):
         """Per-config OOS net-of-cost scoring. Returns {id: {...}}.
@@ -1898,7 +2413,8 @@ class Autopilot:
                 res["cf_n_oos"] = cf["n_oos"]
                 res["cf_edge"] = cf["oos_edge"]
                 res["cf_t"] = cf["t"]
-                for k in ("status", "worst_neg_funding_days", "hurdle_ann"):
+                for k in ("status", "worst_neg_funding_days", "hurdle_ann",
+                          "bars_source"):
                     if k in cf:
                         res[k] = cf[k]
                 if res["n_oos"] < MIN_OOS_TRADES:
@@ -2303,6 +2819,9 @@ class Autopilot:
             "nearest_verdict": nearest,
             "families": families,
             "budget_remaining": self.budget_remaining(),
+            # the SAME number with its reason attached, so a 0 can say
+            # "sd_sr" instead of the misleading "exhausted".
+            "budget_status": self.budget_status(),
             "book_state": "flat" if self.champion_id is None else f"champion:{self.champion_id}",
             "hyp_slots": [cid for cid in self.order if cid.startswith("hyp_")],
             "hyp_max_slots": HYP_MAX_SLOTS,
@@ -2349,6 +2868,10 @@ class Autopilot:
                 "verdict": s.get("verdict"),
                 "sd_sr": s.get("sd_sr"), "sr0": s.get("sr0"), "n_eff": s.get("n_eff"),
                 "status_note": s.get("status"),   # e.g. 'waiting on funding history'
+                # where the weekly lookback actually came from (10080m / 1440m /
+                # 60m) — so a trend entrant at 0 decisions says WHICH it is:
+                # "the rule stayed flat" or "the bars do not exist yet".
+                "bars_source": s.get("bars_source"),
                 "worst_neg_funding_days": s.get("worst_neg_funding_days"),
                 "killed": cid in self.killed,
                 "proven": cid in self.proven,
@@ -2369,6 +2892,11 @@ class Autopilot:
             "n_eff": self.n_eff, "sd_sr": self.sd_sr, "sr0": self.sr0,
             "kill_psr": KILL_PSR,
             "proven_dsr": PROVEN_DSR,
+            # REPORT ONLY (see sd_sr_diagnostic): the variance decomposition
+            # behind sd_SR and what SR0/budget WOULD be under two labelled
+            # alternatives. Nothing here feeds a gate.
+            "sd_sr_diagnostic": self.sd_sr_diagnostic(),
+            "budget_status": self.budget_status(),
             # A malformed kill record (corrupted state file, hand-edit) is
             # rendered as 'unknown', never allowed to raise: graveyard() already
             # skips non-dicts, and status() feeds the dashboard AND /api/goal.
@@ -2391,6 +2919,7 @@ class Autopilot:
                  # e.g. 'waiting on funding history' — the honest reason a row
                  # has no number yet, so the dashboard never shows a bare 0/20
                  "status_note": (self.scores.get(cid) or {}).get("status"),
+                 "bars_source": (self.scores.get(cid) or {}).get("bars_source"),
                  "cf_only": bool(self.configs.get(cid, {}).get("cf_only"))}
                 for cid in self.order if cid in self.configs
             ],

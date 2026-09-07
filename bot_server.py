@@ -1873,6 +1873,28 @@ class Database:
             log("DB", f"funding_newest_ts {symbol}: {e}", "ERR")
             return None
 
+    def funding_rows(self, venue, symbol, since=None):
+        """[(ts, rate)] ascending for (venue, symbol), optionally ts >= since.
+        READ-ONLY, used by the carry gate DIAGNOSTIC. Empty list on any error
+        or missing table — the diagnostic then says 'not enough history',
+        which is the honest answer, instead of inventing a distribution."""
+        if not self.conn: return []
+        try:
+            with self.conn.cursor() as cur:
+                if since is None:
+                    cur.execute("""SELECT ts, rate FROM funding_rates
+                                   WHERE venue=%s AND symbol=%s ORDER BY ts""",
+                                (venue, symbol))
+                else:
+                    cur.execute("""SELECT ts, rate FROM funding_rates
+                                   WHERE venue=%s AND symbol=%s AND ts >= %s
+                                   ORDER BY ts""", (venue, symbol, int(since)))
+                return [(int(t), float(r)) for t, r in (cur.fetchall() or [])
+                        if r is not None]
+        except Exception as e:
+            log("DB", f"funding_rows {symbol}: {e}", "ERR")
+            return []
+
     def log_exit_lab(self, r):
         if not self.conn: return
         try:
@@ -21768,6 +21790,93 @@ def _iso_to_epoch(s):
         return None
 
 
+# ── Funding archive universe (ARCHIVING IS NOT TRADING) ──────────────────────
+# What lives here is a PUBLIC-DATA ARCHIVE list, nothing else. No symbol in
+# FUNDING_SYMBOLS is ever passed to an order path, a position sizer or a
+# scoring universe: _funding_history_loop's only sink is
+# db.upsert_funding_rates(...) into the funding_rates table. Widening it costs
+# one public GET per symbol per hour and ZERO tournament trials — it buys
+# future measurability, never a live position. The endpoint's history is a
+# HARD ROLLING ~369-day window (every symbol measured 2026-09-07 starts
+# 2025-09-03T08:00:00Z with ~8,848 hourly rows): whatever is not archived
+# before it rolls off is destroyed permanently, which is why breadth here is
+# time-critical and deliberately generous.
+#
+# Trading/scoring breadth is a SEPARATE, frozen, much smaller list —
+# CARRY_SCORING_SYMBOLS below. Do not conflate the two.
+FUNDING_SYMBOLS_DEFAULT = (
+    # already archived since 2026-09-05
+    "PF_XBTUSD", "PF_ETHUSD", "PF_SOLUSD",
+    # tier 1 — deep, liquid perps with a real funding history
+    "PF_XRPUSD", "PF_DOGEUSD", "PF_LINKUSD", "PF_HYPEUSD", "PF_XMRUSD",
+    "PF_XAUTUSD", "PF_SUIUSD", "PF_BNBUSD",
+    # tier 2 — high-funding names, thinner books
+    "PF_FARTCOINUSD", "PF_TIAUSD", "PF_FETUSD", "PF_RENDERUSD", "PF_PUMPUSD",
+    # tier 3 — negative/low-carry names. Archived ON PURPOSE: a cross-sectional
+    # carry ranker is only credible if its BOTTOM half is measured too. These
+    # are ranking inputs, not candidates.
+    "PF_ADAUSD", "PF_DOTUSD", "PF_AVAXUSD", "PF_LTCUSD", "PF_ARBUSD",
+    "PF_NEARUSD", "PF_ZECUSD",
+)
+# DELIBERATELY EXCLUDED, and it stays that way until someone re-argues it in
+# writing: PF_RAYUSD supplied roughly HALF the headline out-of-sample carry in
+# the survey while carrying 57.7 bps of spread and 30.4% funding vol — a
+# single illiquid name that flatters every basket average it touches.
+# PF_TRUMPUSD is excluded on the same grounds (event-driven, unmodellable
+# funding regime). Both ARE archivable public data; the point is that they
+# must not sneak into a universe by default and get counted as breadth.
+FUNDING_SYMBOL_RE = re.compile(r"^P[FI]_[A-Z0-9]{2,20}$")
+
+
+def _parse_symbol_list(raw, default):
+    """'a,b,c' -> validated, de-duped, order-preserving tuple of symbols.
+
+    Empty/blank env -> `default` unchanged. Entries are upper-cased and
+    stripped; anything that is not a Kraken-Futures-shaped symbol
+    (FUNDING_SYMBOL_RE) is DROPPED with a log line rather than passed to the
+    fetcher — a typo must not become an hourly 404 loop, and must never be
+    interpolated anywhere. Returns () only if every entry was junk, which the
+    caller treats as 'archive nothing'."""
+    if raw is None or not str(raw).strip():
+        return tuple(default)
+    out, seen, bad = [], set(), []
+    for part in str(raw).split(","):
+        s = part.strip().upper()
+        if not s:
+            continue
+        if not FUNDING_SYMBOL_RE.match(s):
+            bad.append(part.strip()[:24])
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    if bad:
+        log("FUND", f"dropped {len(bad)} malformed symbol(s) from env: {bad}", "WRN")
+    return tuple(out)
+
+
+# Archive universe: env FUNDING_SYMBOLS overrides the default entirely.
+FUNDING_SYMBOLS = _parse_symbol_list(os.environ.get("FUNDING_SYMBOLS"),
+                                     FUNDING_SYMBOLS_DEFAULT)
+
+# ── Frozen carry SCORING universe ────────────────────────────────────────────
+# FROZEN BEFORE SCORING. This is the list a carry entrant is allowed to be
+# measured on, and it is capped at CARRY_SCORING_MAX (8) so the multiple-
+# comparisons budget stays interpretable. Changing it — adding, removing or
+# reordering a symbol — is a PRE-REGISTRATION EVENT: it must be written down
+# with a date and a reason BEFORE the next scoring pass, never edited quietly
+# between passes, and never widened because a symbol looks good in hindsight.
+# It is deliberately NOT derived from FUNDING_SYMBOLS: archiving 23 symbols
+# must not silently become scoring 23 symbols (that is how a 23-way search
+# gets reported as one result). Env CARRY_SCORING_SYMBOLS exists for
+# pre-registered changes only, and is truncated to the cap.
+CARRY_SCORING_MAX = 8
+CARRY_SCORING_SYMBOLS = _parse_symbol_list(
+    os.environ.get("CARRY_SCORING_SYMBOLS"),
+    ("PF_XBTUSD", "PF_ETHUSD", "PF_SOLUSD"),
+)[:CARRY_SCORING_MAX]
+
 def _funding_history_loop():
     """Archive hourly Kraken Futures funding rates into funding_rates.
 
@@ -21780,7 +21889,14 @@ def _funding_history_loop():
     re-upsert of the same (venue,symbol,ts) rows plus the newest hour —
     hours of downtime lose nothing.
 
-    Load: 3 requests/hour. Storage: ~26k rows/symbol/year.
+    ARCHIVING IS NOT TRADING. This loop's ONLY sink is
+    db.upsert_funding_rates() into the funding_rates table. It never calls an
+    order path, never sizes a position, never touches paper or live state, and
+    the list it iterates (FUNDING_SYMBOLS) is NOT the scoring universe — that
+    is the separate, frozen, capped CARRY_SCORING_SYMBOLS. Widening the
+    archive therefore costs public GETs and disk, and zero tournament trials.
+
+    Load: 1 request/symbol/hour. Storage: ~8.8k rows/symbol/year.
 
     2026-09-05, INCREMENTAL: the endpoint has no `since` parameter (it
     always returns the full year), but the table does not need the full
@@ -21793,12 +21909,20 @@ def _funding_history_loop():
     if os.environ.get("FUNDING_HISTORY", "1") in ("0", "false", "False"):
         log("FUND", "funding history filler disabled by env")
         return
-    syms = ("PF_XBTUSD", "PF_ETHUSD", "PF_SOLUSD")
-    log("FUND", f"funding history filler started ({len(syms)} symbols, hourly)")
+    syms = FUNDING_SYMBOLS
+    if not syms:
+        log("FUND", "funding history filler: symbol list is empty — nothing to archive", "WRN")
+        return
+    log("FUND", f"funding history filler started ({len(syms)} symbols, hourly): "
+                + ", ".join(syms))
+    _next_diag = 0.0            # carry gate diagnostic: at boot, then daily
     while True:
         try:
             if db.conn:
                 _funding_history_pass(syms, _funding_history_fetch)
+                if time.time() >= _next_diag:
+                    _carry_gate_diag_pass()
+                    _next_diag = time.time() + 86400
         except Exception as e:
             log("FUND", f"funding history: {e}", "WRN")
         time.sleep(3600)
@@ -21853,6 +21977,106 @@ def _funding_history_pass(syms, fetch, now=None, pause=2.0):
             out[sym] = ("error", 0)
         if pause:
             time.sleep(pause)   # gentle on the public endpoint
+    return out
+
+
+# ── Carry gate diagnostic (REPORT ONLY — never moves the hurdle) ─────────────
+# The carry entrant enters only when trailing-7d ANNUALIZED funding clears
+# autopilot.CARRY_HURDLE_ANN. If that hurdle sits above the entire realized
+# distribution of that same statistic, the entrant's net stream is all zeros
+# and it scores 'degenerate returns (sd=0) — cannot score' forever, which
+# reads like a data problem and is actually a gate-placement fact. This job
+# MEASURES and SAYS that. It does not — and must not — lower the hurdle: the
+# honest fixes are a different instrument, a different cost model, or
+# abandoning the hypothesis, never a looser gate.
+CARRY_DIAG_MIN_HOURS = 120     # same 120-of-168 rule the entrant decides under
+
+
+def _carry_hurdle_ann():
+    """(hurdle, source) — the LIVE hurdle the entrant actually uses.
+
+    Imported from autopilot so the diagnostic can never drift from the thing
+    it is diagnosing. The fallback recomputes the documented formula from this
+    module's own fee constants and says so, so a number is never silently
+    invented."""
+    try:
+        import autopilot as _ap
+        return float(_ap.CARRY_HURDLE_ANN), "autopilot.CARRY_HURDLE_ANN"
+    except Exception:
+        rt4 = 2 * (KRAKEN_FEE + SLIPPAGE) + 2 * (KRAKEN_FUTURES_FEE + SLIPPAGE)
+        return rt4 * 4.0 + 0.10, "local fallback (autopilot unimportable)"
+
+
+def _carry_gate_diag_row(sym, rows, hurdle, min_hours=CARRY_DIAG_MIN_HOURS):
+    """One honest comparison line. PURE — fixture-testable, no I/O.
+
+    `rows` is [(ts_epoch_s, hourly_rate)]. Rebuilds exactly the statistic the
+    entrant decides on (trailing 7d mean hourly rate, annualized x24x365,
+    evaluated once per UTC day, window must hold >= min_hours of 168 rates)
+    and compares its MAX and MEAN against the entry hurdle. Returns
+    (text, dict) or (text, None) when there is not enough history to say
+    anything — in which case it says THAT, it does not guess."""
+    pairs = sorted((int(t), float(r)) for t, r in rows if r is not None)
+    obs = []
+    if pairs:
+        by_hour = dict(pairs)
+        ts_sorted = sorted(by_hour)
+        day = ((ts_sorted[0] // 86400) * 86400) + 86400
+        last_day = (ts_sorted[-1] // 86400) * 86400
+        while day < last_day:
+            win = [by_hour[t] for t in ts_sorted if day - 7 * 86400 <= t < day]
+            if len(win) >= min_hours:
+                obs.append(sum(win) / len(win) * 24.0 * 365.0)
+            day += 86400
+    if not obs:
+        return (f"CARRY {sym}: hurdle {hurdle*100:.2f}%/yr vs realized trailing-7d "
+                f"funding — 0 decidable obs (need {min_hours} of 168 hourly rates "
+                f"in a window) -> not enough history to say"), None
+    mx, mean = max(obs), sum(obs) / len(obs)
+    above = mx <= hurdle          # hurdle sits above EVERY realized observation
+    verdict = "gate ABOVE data" if above else "gate within data"
+    n_clear = sum(1 for v in obs if v > hurdle)
+    text = (f"CARRY {sym}: hurdle {hurdle*100:.2f}%/yr vs realized trailing-7d "
+            f"funding max {mx*100:.2f}%/yr mean {mean*100:.2f}%/yr over {len(obs)} "
+            f"obs -> {verdict}")
+    return text, {"symbol": sym, "hurdle_ann": hurdle, "max_ann": mx,
+                  "mean_ann": mean, "n_obs": len(obs), "n_clearing": n_clear,
+                  "gate_above_data": above}
+
+
+def _carry_gate_diag_pass(syms=None, fetch_rows=None, emit=None):
+    """Log one CARRY line per FROZEN SCORING symbol; emit one spine event when
+    any of them reads 'gate ABOVE data'. Read-only: touches no state, changes
+    no threshold, places no order. Returns the per-symbol dicts so it is
+    testable without a database."""
+    syms = CARRY_SCORING_SYMBOLS if syms is None else syms
+    fetch_rows = (lambda s: db.funding_rows("kraken", s)) if fetch_rows is None else fetch_rows
+    emit = emit_event if emit is None else emit
+    hurdle, src = _carry_hurdle_ann()
+    out, blocked = [], []
+    for sym in syms:
+        try:
+            text, d = _carry_gate_diag_row(sym, fetch_rows(sym) or [], hurdle)
+        except Exception as e:
+            log("FUND", f"carry gate diag {sym}: {e}", "WRN")
+            continue
+        log("FUND", text + f"  [hurdle from {src}]")
+        if d:
+            out.append(d)
+            if d["gate_above_data"]:
+                blocked.append(d)
+    if blocked:
+        names = ", ".join(d["symbol"] for d in blocked)
+        best = max(d["max_ann"] for d in blocked)
+        emit("cryptobot.carry.gate_diag",
+             f"carry entry hurdle {hurdle*100:.2f}%/yr sits ABOVE the entire realized "
+             f"trailing-7d funding distribution on {len(blocked)}/{len(out)} scored "
+             f"symbol(s) ({names}); best realized reading {best*100:.2f}%/yr. "
+             f"The entrant cannot produce a decision — this is gate PLACEMENT, "
+             f"not missing data. Reported, not fixed: the hurdle is unchanged.",
+             {"hurdle_ann": hurdle, "hurdle_source": src,
+              "symbols_above": [d["symbol"] for d in blocked],
+              "scored": [d["symbol"] for d in out], "rows": out})
     return out
 
 
