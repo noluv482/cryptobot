@@ -2706,6 +2706,34 @@ def _sse_to_event(event_type, data):
               "was_champion": bool(d.get("was_champion"))}
         return ("cryptobot.tournament.kill",
                 f"Tournament KILLED {ev['entrant']}: {ev['reason']}", ev)
+    # Tournament + goal seams (2026-09-06). One honest sentence per kind: a
+    # "clears" is NOT a "proven", a register is a trial (it raises the bar),
+    # and a switch names both sides. Payload keys pass through as data.
+    if event_type == "autopilot_register":
+        ev = {"entrant": d.get("entrant"), "origin": d.get("origin"),
+              "family": d.get("family"), "born_ts": d.get("born_ts"),
+              "trials_count": d.get("trials_count"), "n_eff": d.get("n_eff")}
+        return ("cryptobot.lab.registered",
+                f"Lab registered {ev['entrant']} ({ev['origin'] or 'unknown'} origin, "
+                f"{ev['family'] or 'unknown'} family) — trial #{ev['trials_count']}, "
+                f"N_eff {ev['n_eff']}; the hurdle only rises", ev)
+    if event_type == "autopilot_switch":
+        ev = {"from": d.get("from"), "to": d.get("to"), "why": d.get("why")}
+        return ("cryptobot.tournament.switch",
+                f"Tournament switch {ev['from'] or 'FLAT'} -> {ev['to'] or 'FLAT'}: "
+                f"{ev['why'] or 'no reason given'} (paper book only)", ev)
+    if event_type == "autopilot_clears":
+        ev = {"entrant": d.get("entrant"), "n": d.get("n"), "sr": d.get("sr"),
+              "sr0": d.get("sr0")}
+        return ("cryptobot.tournament.clears",
+                f"{ev['entrant']} clears the cost gate at n={ev['n']} "
+                f"(SR {ev['sr']} vs hurdle SR0 {ev['sr0']}) — clears is not proven", ev)
+    if event_type == "autopilot_proven":
+        ev = {"entrant": d.get("entrant"), "dsr": d.get("dsr"), "n": d.get("n"),
+              "min_trl": d.get("min_trl")}
+        return ("cryptobot.goal.proven",
+                f"{ev['entrant']} PROVEN: DSR {ev['dsr']} at n={ev['n']} past "
+                f"MinTRL {ev['min_trl']} (paper record, not a profit claim)", ev)
     if event_type == "autopilot":
         en = bool(d.get("enabled"))
         return ("cryptobot.control",
@@ -12705,6 +12733,13 @@ body{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(41,121,255,0.0
              moment you can see nobody has earned the crown yet. -->
         <div id="ap_standings" style="margin-top:11px"></div>
       </div>
+      <!-- GOAL block (2026-09-06): the tournament's stated objective and where
+           it stands — proven / alive / killed / trials / N_eff / SR0 / nearest
+           verdict / budget / book state — plus the GRAVEYARD and the trials
+           count, which stay visible even when the autopilot is off, and a
+           reality strip carrying the standing expectations sentence. Every
+           unknown prints as "unknown", never as 0. -->
+      <div id="ap_goal" style="margin-top:11px"></div>
     </div>
 
     <div class="sh"><span>Research Lab</span><span style="font-size:.55rem;color:var(--mu);font-weight:400">nightly strategy sweeps - paper only</span></div>
@@ -17606,6 +17641,67 @@ async function fetchAutopilot(){
     renderAutopilot(d);
   }catch(e){console.warn('autopilot',e);}
 }
+// ANTI-FOOLING RULE (2026-09-06): a cell that prints sr / edge / psr must also
+// print its n and exactly one of the five fixed labels below. apLabel maps the
+// server's verdict vocabulary onto those labels; apCell is the ONLY way the
+// standings renderer prints such a number. test_tournament_render.py executes
+// this renderer under node and asserts the rule row by row.
+const AP_LABELS=['insufficient data','n&lt;MinTRL','survives','KILLED','PROVEN'];
+function apN(r){return (r.trades_n!=null)?r.trades_n:(r.n_oos!=null?r.n_oos:0);}
+function apLabel(r){
+  const v=String(r.verdict||'');
+  if(r.killed||v==='KILLED'||v.indexOf('KILL')===0)return 'KILLED';
+  if(r.proven||v==='PROVEN')return 'PROVEN';
+  if(v.indexOf('SURVIVES')===0)return 'survives';
+  const n=apN(r);
+  if(r.min_trl!=null&&n<r.min_trl){
+    const m=/~([0-9]+) month/.exec(v);
+    return 'n&lt;MinTRL (verdict ~'+(m?m[1]:'?')+' mo)';
+  }
+  return 'insufficient data';
+}
+function apCell(parts,r){
+  // parts: already-formatted 'SR 0.12' strings. The n + label suffix is not optional.
+  return parts.concat(['n '+apN(r), apLabel(r)]).join(' &middot; ');
+}
+function apFx(v,dp,suffix){return v==null?'—':(Number(v).toFixed(dp)+(suffix||''));}
+function apU(v){return (v==null||v==='')?'unknown':v;}
+function renderGoal(d){
+  const el=$('ap_goal');if(!el)return;
+  const g=(d&&d.goal&&typeof d.goal==='object')?d.goal:null;
+  const trials=(g&&g.trials_count!=null)?g.trials_count:(d&&d.trials_count!=null?d.trials_count:null);
+  const km=(d&&d.killed&&typeof d.killed==='object')?d.killed:{};
+  const kids=Object.keys(km);
+  const killedN=(g&&g.killed!=null)?g.killed:(d&&d.enabled?kids.length:null);
+  const proven=(g&&Array.isArray(g.proven))?g.proven:[];
+  const nv=(g&&g.nearest_verdict&&typeof g.nearest_verdict==='object')?g.nearest_verdict:null;
+  const tile=(k,v,clr)=>'<div><div class="sim-stat-lbl">'+k+'</div><div class="sim-stat-val" style="font-size:.72rem'+(clr?';color:'+clr:'')+'">'+v+'</div></div>';
+  const provenTxt=g?(proven.length?proven.join(', '):'none yet'):'unknown';
+  el.innerHTML='<div style="font-family:var(--fn);font-size:.5rem;letter-spacing:.12em;color:var(--mu);margin-bottom:7px">GOAL &mdash; one PROVEN entrant (deflated for every trial, past MinTRL)'
+    +(g?'':' &middot; <span style="color:var(--r)">goal block unavailable'+(d&&d.enabled?'':' (autopilot off)')+'</span>')+'</div>'
+    +'<div class="sim-grid" style="grid-template-columns:repeat(3,1fr)">'
+    +tile('Proven',provenTxt,proven.length?'var(--g)':null)
+    +tile('Alive',apU(g?g.alive:null))
+    +tile('Killed',apU(killedN))
+    +tile('Trials',apU(trials))
+    +tile('N_eff',apU(g?g.n_eff:null))
+    +tile('SR0 hurdle',g&&g.sr0!=null?apFx(g.sr0,3):'unknown')
+    +tile('Nearest verdict',nv?(apU(nv.id)+' ~'+(nv.months!=null?apFx(nv.months,1):'?')+' mo'):'unknown')
+    +tile('Budget left',apU(g?g.budget_remaining:null))
+    +tile('Book',apU(g?g.book_state:(d&&d.enabled?(d.champion?'champion:'+d.champion:'flat'):null)))
+    +'</div>'
+    +'<div id="ap_graveyard" class="mono" style="margin-top:8px;font-size:.52rem;color:var(--mu);line-height:1.5">'
+    +'GRAVEYARD ('+apU(killedN)+') &middot; trials '+apU(trials)+': '
+    +(kids.length?kids.map(k=>'<span style="color:var(--r)">'+k+'</span> KILLED &mdash; '+((km[k]&&km[k].reason)||'reason unknown')).join('; ')
+      :(g||(d&&d.enabled)?'empty &mdash; no entrant has yet reached MinTRL with DSR below the kill bar':'unknown'))
+    +'</div>'
+    +'<div id="ap_reality" style="margin-top:8px;padding:6px 8px;border-left:2px solid var(--bd3);font-size:.56rem;color:var(--mu);line-height:1.5">'
+    +'REALITY: most hypotheses die. '+apU(trials)+' trials so far set the hurdle SR0 at '+(g&&g.sr0!=null?apFx(g.sr0,3):'unknown')
+    +'; proven '+(g?proven.length:'unknown')+', killed '+apU(killedN)+', alive '+apU(g?g.alive:null)
+    +'; nearest verdict '+(nv?(apU(nv.id)+' in ~'+(nv.months!=null?apFx(nv.months,1):'?')+' months'):'unknown')
+    +'. Every SR/edge/PSR on this page carries its n and a label; a number without one is a bug, not a finding. Paper only &mdash; no profit claim.'
+    +'</div>';
+}
 function renderAutopilot(d){
   _apEnabled=!!(d&&d.enabled);
   const btn=$('ap_toggle_btn'),off=$('ap_off_msg'),wrap=$('ap_stats_wrap');
@@ -17620,6 +17716,7 @@ function renderAutopilot(d){
     }
   }
   if(wrap)wrap.style.display=_apEnabled?'':'none';
+  renderGoal(d);   // goal / graveyard / trials render even when the allocator is off
   if(!_apEnabled)return;
   const alloc=d.allocation||'FLAT';
   const aEl=$('ap_alloc');
@@ -17650,25 +17747,29 @@ function renderAutopilot(d){
       +'</div>'
       +d.standings.map(r=>{
         const n=r.n_oos||0;
-        const killed=r.verdict==='KILLED';
+        const label=apLabel(r);
+        const killed=label==='KILLED';
         const frac=Math.min(1,n/need);
         const clr=r.clears_cost?'var(--g)':(killed?'var(--r)':'var(--bd3)');
+        // edge cell: a number ONLY through apCell (n + label attached);
+        // below the bar it prints the count toward the bar and the label.
         const edge=(r.oos_edge!=null&&n>=need)
-          ?((r.oos_edge>=0?'+':'')+(r.oos_edge*100).toFixed(2)+'% t '+(r.t!=null?r.t.toFixed(1):'—'))
-          :(n+'/'+need);
+          ?apCell([(r.oos_edge>=0?'+':'')+(r.oos_edge*100).toFixed(2)+'% t '+(r.t!=null?r.t.toFixed(1):'—')],r)
+          :(n+'/'+need+' &middot; '+label);
         const tag=viaTag[r.via]||'';
         const via=tag?' <span style="color:var(--mu)">'+tag+'</span>':'';
-        const stat=(r.dsr!=null||r.psr!=null||r.min_trl!=null)
-          ?('DSR '+(r.dsr!=null?r.dsr.toFixed(2):'—')
-            +' &middot; PSR '+(r.psr!=null?r.psr.toFixed(2):'—')
-            +' &middot; MinTRL '+(r.min_trl!=null?r.min_trl.toFixed(1):'—')
-            +(r.trades_n!=null?' &middot; n '+r.trades_n:''))
+        const stat=(r.sr!=null||r.dsr!=null||r.psr!=null||r.min_trl!=null)
+          ?apCell(['SR '+(r.sr!=null?r.sr.toFixed(2):'—'),
+                   'DSR '+(r.dsr!=null?r.dsr.toFixed(2):'—'),
+                   'PSR '+(r.psr!=null?r.psr.toFixed(2):'—'),
+                   'MinTRL '+(r.min_trl!=null?r.min_trl.toFixed(1):'—')],r)
           :'';
         const note=r.status_note?r.status_note
           :((r.verdict&&!killed&&r.verdict!=='insufficient data')?r.verdict:'');
         const vbadge=killed
           ?'<span style="color:var(--r);letter-spacing:.08em">KILLED</span>'
-          :(r.clears_cost?'<span style="color:var(--g);letter-spacing:.08em">CLEARS</span>':'');
+          :(label==='PROVEN'?'<span style="color:var(--g);letter-spacing:.08em">PROVEN</span>'
+          :(r.clears_cost?'<span style="color:var(--g);letter-spacing:.08em">CLEARS (not proven)</span>':''));
         return '<div style="margin-bottom:7px'+(killed?';opacity:.55':'')+'">'
           +'<div style="display:flex;align-items:center;gap:8px">'
           +'<span class="mono" style="font-size:.6rem;color:var(--tx);width:92px;'
@@ -17676,7 +17777,7 @@ function renderAutopilot(d){
           +'<div style="flex:1;height:4px;border-radius:99px;background:rgba(255,255,255,.06);'
             +'overflow:hidden"><div style="height:100%;width:'+(frac*100).toFixed(0)
             +'%;border-radius:99px;background:'+clr+'"></div></div>'
-          +'<span class="mono" style="font-size:.56rem;width:88px;text-align:right;'
+          +'<span class="mono" style="font-size:.56rem;min-width:88px;text-align:right;'
             +'color:'+(r.clears_cost?'var(--g)':'var(--mu)')+'">'+edge+'</span>'
           +'</div>'
           +((stat||note||vbadge)
@@ -19544,6 +19645,31 @@ def _web_autopilot():
     except Exception as e:
         return _Response(json.dumps({"enabled": True, "error": str(e)}),
                          mimetype="application/json")
+
+@_flask_app.route("/api/goal")
+def _web_api_goal():
+    """The GOAL block [G] of autopilot.status() — proven/alive/killed/trials/
+    N_eff/SR0/nearest verdict/families/budget/book state. Read-only.
+
+    404-safe: with the autopilot disabled (or the block not computed yet) the
+    body is {"goal": null, "reason": ...} — never an exception, never a
+    fabricated block. Served with no-store so the HUD never caches a verdict."""
+    hdr = {"Cache-Control": "no-store"}
+    if _autopilot is None:
+        return _Response(json.dumps({"goal": None, "reason": "autopilot disabled",
+                                     "boot_error": _autopilot_boot_error}),
+                         status=404, mimetype="application/json", headers=hdr)
+    try:
+        st = _autopilot.status()
+        goal = st.get("goal") if isinstance(st, dict) else None
+    except Exception as e:
+        return _Response(json.dumps({"goal": None, "reason": f"status() failed: {e}"}),
+                         status=404, mimetype="application/json", headers=hdr)
+    if not isinstance(goal, dict):
+        return _Response(json.dumps({"goal": None,
+                                     "reason": "goal block not computed by this autopilot build"}),
+                         status=404, mimetype="application/json", headers=hdr)
+    return _Response(json.dumps({"goal": goal}), mimetype="application/json", headers=hdr)
 
 def _research_compact():
     """Three-key research summary for /status and /healthz — the Noluv HUD polls

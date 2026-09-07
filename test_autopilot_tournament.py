@@ -543,6 +543,550 @@ except Exception as e:
 finally:
     ap._state_path = _orig_sp
 
+# ── 5. HYPOTHESIS INTAKE, GOAL BLOCK, SSE CONTRACT ────────────────────────────
+# Contracts [H] (hypotheses file), [G] (goal block), [S] (SSE types), [E]
+# (graveyard). Every check below RUNS the real autopilot code on a temp DATA_DIR
+# with a captured SSE sink; nothing here is asserted in prose.
+import shutil
+import time as _t
+try:
+    import research_loop as _rl
+except Exception:                                   # pragma: no cover
+    _rl = None
+
+INTAKE = 1_800_000_000.0          # fixed intake clock so born_ts math is exact
+
+
+def hyp(**over):
+    """A minimal VALID hypothesis entry ([H]); `over` breaks one thing at a time."""
+    e = {
+        "kind": "price",
+        "family": "regime_gate",
+        "cf": {"conf": 0.60, "adx": 25.0, "horizon": "fwd48"},
+        "born_ts": INTAKE - 30 * 86400,             # backdated on purpose
+        "origin": "llm_prereg",
+        "note": "HYPOTHESIS: entries taken only when confidence and trend strength "
+                "are both high should survive the round-trip cost the middle "
+                "band cannot pay.",
+        "prereg": {
+            "mechanism": "cost per decision is fixed, so only the high-conviction "
+                         "subset can clear it",
+            "expected_decisions_per_month": 10,
+            "mintrl_estimate_months": 9.0,
+            "kill_bar": "deflated PSR < 0.20 once n >= MinTRL",
+            "cost_model": "ROUND_TRIP_COST_PCT charged on every counterfactual fill",
+        },
+    }
+    e.update(over)
+    return e
+
+
+def san(d, ts=INTAKE):
+    return ap.sanitize_hypotheses(d, ts)
+
+
+# 5a. sanitizer: the good case ------------------------------------------------
+ok = san({"hyp_conf60_adx25": hyp()})
+check("sanitize accepts a well-formed hypothesis", len(ok) == 1, ok)
+if ok:
+    o = ok[0]
+    check("sanitized hypothesis is cf_only (never a live book)", o["cf_only"] is True)
+    check("sanitized hypothesis keeps its id/kind/family/origin",
+          (o["id"], o["kind"], o["family"], o["origin"])
+          == ("hyp_conf60_adx25", "price", "regime_gate", "llm_prereg"))
+    check("backdated born_ts is re-stamped to intake time (never earlier)",
+          o["born_ts"] == INTAKE, o["born_ts"])
+    check("cf is the scorer's whitelist only",
+          set(o["cf"]) <= set(ap.HYP_CF_KEYS["price"]), o["cf"])
+    check("prereg block survives with all five keys",
+          all(k in o["prereg"] for k in ap.HYP_PREREG_KEYS), sorted(o["prereg"]))
+    check("note keeps the HYPOTHESIS: mechanism", o["note"].startswith("HYPOTHESIS:"))
+
+fut = san({"hyp_future": hyp(born_ts=INTAKE + 5000)})
+check("a FUTURE born_ts is re-stamped too (no unkillable slot squatter)",
+      len(fut) == 1 and fut[0]["born_ts"] == INTAKE, fut)
+check("a missing born_ts becomes intake time, not 0",
+      san({"hyp_nb": hyp(born_ts=None)})[0]["born_ts"] == INTAKE)
+check("a garbage born_ts becomes intake time, not 0 or a crash",
+      san({"hyp_gb": hyp(born_ts="last tuesday")})[0]["born_ts"] == INTAKE)
+
+# 5b. sanitizer: every rejection path ------------------------------------------
+BAD = {
+    "bad id (no hyp_ prefix)":        {"conf60": hyp()},
+    "bad id (uppercase)":             {"hyp_Conf60": hyp()},
+    "bad id (too long)":              {"hyp_" + "a" * 25: hyp()},
+    "id shadowing a built-in":        {"base": hyp()},
+    "bad kind":                       {"hyp_k": hyp(kind="oracle")},
+    "bad family":                     {"hyp_f": hyp(family="vibes")},
+    "bad origin":                     {"hyp_o": hyp(origin="anonymous")},
+    "cf key outside the scorer whitelist":
+        {"hyp_cf": hyp(cf={"conf": 0.6, "secret_knob": 3, "horizon": "fwd48"})},
+    "cf value out of range":          {"hyp_r": hyp(cf={"conf": 4.2, "horizon": "fwd48"})},
+    "cf horizon not a recorded column":
+        {"hyp_h": hyp(cf={"conf": 0.6, "horizon": "fwd999"})},
+    "note missing the HYPOTHESIS: prefix":
+        {"hyp_n": hyp(note="conf 0.6 and adx 25 should work nicely")},
+    "note with no mechanism after the prefix":
+        {"hyp_n2": hyp(note="HYPOTHESIS: x")},
+    "prereg block missing":           {"hyp_p": hyp(prereg=None)},
+    "entry is not an object":         {"hyp_x": 5},
+    "cf is not an object":            {"hyp_c": hyp(cf="conf>0.6")},
+}
+for _name, _raw in BAD.items():
+    check("sanitize drops: " + _name, san(_raw) == [], san(_raw))
+
+for miss in ap.HYP_PREREG_KEYS:
+    pre = dict(hyp()["prereg"])
+    pre.pop(miss)
+    check("sanitize drops a prereg missing '" + miss + "'",
+          san({"hyp_pm": hyp(prereg=pre)}) == [])
+
+# per-kind cf rules that exist so a hypothesis can never LOOSEN a bar
+check("trend hypothesis must be graded on the next week (fwd168 only)",
+      san({"hyp_t": hyp(kind="trend", family="trend",
+                        cf={"rule": "tsmom", "pair": "XBTUSD", "weeks": 26,
+                            "horizon": "fwd48"})}) == [])
+check("carry hypothesis may only RAISE the hurdle (mult < 1 dropped)",
+      san({"hyp_cy": hyp(kind="carry", family="carry",
+                         cf={"symbol": "PF_XBTUSD", "hurdle_mult": 0.5})}) == [])
+check("carry hypothesis with a 2x hurdle is accepted",
+      len(san({"hyp_cy2": hyp(kind="carry", family="carry",
+                              cf={"symbol": "PF_XBTUSD", "hurdle_mult": 2.0})})) == 1)
+
+# 5c. slot cap + one bad entry never poisons the good ones ---------------------
+many = {("hyp_slot%d" % i): hyp() for i in range(ap.HYP_MAX_SLOTS + 3)}
+capped = san(many)
+check("slot cap holds at HYP_MAX_SLOTS (%d)" % ap.HYP_MAX_SLOTS,
+      len(capped) == ap.HYP_MAX_SLOTS, len(capped))
+mixed = san({"hyp_good1": hyp(), "nope": hyp(), "hyp_good2": hyp(kind="oracle"),
+             "hyp_good3": hyp()})
+check("a bad sibling never drops the good entries",
+      sorted(e["id"] for e in mixed) == ["hyp_good1", "hyp_good3"], mixed)
+
+# 5d. garbage never raises -----------------------------------------------------
+for junk in (None, [], "hyp_x", 7, {"hyp_x": None}, {"hyp_x": []},
+             {"hyp_x": {"kind": "price"}},
+             {"hyp_x": {"cf": {"conf": float("nan")}}},
+             {"hyp_x": hyp(cf={"conf": None, "horizon": None})}):
+    try:
+        r = san(junk)
+        check("garbage input %r returns a list, never raises" % (junk,),
+              isinstance(r, list))
+    except Exception as ex:
+        check("garbage input %r returns a list, never raises" % (junk,), False, ex)
+
+# 5e. kill reason codes ([E] graveyard) ---------------------------------------
+check("reason_code 'cost': gross edge positive, net eaten",
+      ap.kill_reason_code({"gross_edge": 0.004, "oos_edge": -0.001, "sr": 0.1}) == "cost")
+check("reason_code 'regime_flip': first half up, second half down",
+      ap.kill_reason_code({"gross_edge": 0.004, "oos_edge": 0.001, "sr": 0.1},
+                          nets=[0.01] * 5 + [-0.01] * 5) == "regime_flip")
+check("reason_code 'no_signal': nothing there before costs",
+      ap.kill_reason_code({"gross_edge": -0.002, "oos_edge": -0.003, "sr": -0.1}) == "no_signal")
+check("reason_code 'overlap_artifact': edge exists but the entrant is a near-copy",
+      ap.kill_reason_code({"gross_edge": 0.004, "oos_edge": 0.002, "sr": 0.3},
+                          nets=None, cluster_size=3) == "overlap_artifact")
+check("reason_code 'unknown' when nothing can be established",
+      ap.kill_reason_code({}) == "unknown")
+check("reason_code never invents a code outside the contract set",
+      all(ap.kill_reason_code(s) in ap.KILL_REASON_CODES
+          for s in ({}, {"sr": None}, {"gross_edge": None, "oos_edge": None})))
+check("a short nets stream cannot trigger regime_flip (needs >= 8)",
+      ap.kill_reason_code({"gross_edge": 0.004, "oos_edge": 0.002, "sr": 0.3},
+                          nets=[0.01, 0.01, -0.01, -0.01]) != "regime_flip")
+
+# 5f. instance-level: SSE contract, budget refusal, goal block, graveyard ------
+PUSHED = []
+_orig_push_sse = bs._push_sse
+_orig_state_path = ap._state_path
+_orig_data_dir = bs._DATA_DIR
+_tmp5 = tempfile.mkdtemp()
+try:
+    bs._push_sse = lambda t, d=None: PUSHED.append((t, d))
+    bs._DATA_DIR = _tmp5
+    ap._state_path = lambda: os.path.join(_tmp5, "autopilot_state.json")
+
+    # two hypotheses on disk before boot: intake must register them exactly once
+    with io.open(os.path.join(_tmp5, "hypotheses.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "hyp_conf60_adx25": hyp(),
+            "hyp_tsmom_btc_52w": hyp(
+                kind="trend", family="trend",
+                cf={"rule": "tsmom", "pair": "XBTUSD", "weeks": 52, "horizon": "fwd168"},
+                note="HYPOTHESIS: a 52-week lookback holds trends the 20-week rule "
+                     "exits early; one decision per ISO week."),
+        }, f)
+
+    inst = ap.Autopilot()
+
+    regs = [d for t, d in PUSHED if t == "autopilot_register"]
+    reg_ids = [d["entrant"] for d in regs]
+    check("[S] autopilot_register fires for a newly registered hypothesis",
+          "hyp_conf60_adx25" in reg_ids and "hyp_tsmom_btc_52w" in reg_ids, reg_ids)
+    check("[S] autopilot_register payload carries entrant/origin/family/born_ts/"
+          "trials_count/n_eff",
+          all(set(d) >= {"entrant", "origin", "family", "born_ts",
+                         "trials_count", "n_eff"} for d in regs),
+          [sorted(d) for d in regs[:1]])
+    r0 = next(d for d in regs if d["entrant"] == "hyp_conf60_adx25")
+    check("[S] register payload reports the hypothesis's real origin/family",
+          (r0["origin"], r0["family"]) == ("llm_prereg", "regime_gate"), r0)
+    check("[S] register payload's born_ts is the intake stamp, not the file's value",
+          abs(float(r0["born_ts"]) - _t.time()) < 120
+          and float(r0["born_ts"]) != INTAKE - 30 * 86400, r0["born_ts"])
+    check("built-in entrants report origin 'builtin'",
+          all(d["origin"] == "builtin" for d in regs
+              if not d["entrant"].startswith(("hyp_", "lab_"))))
+
+    n_before = len(regs)
+    tc_before = inst.trials_count
+    inst._register_trials()
+    inst._register_trials()
+    regs2 = [d for t, d in PUSHED if t == "autopilot_register"]
+    check("[S] autopilot_register fires ONCE per id (re-registering is a no-op)",
+          len(regs2) == n_before and inst.trials_count == tc_before,
+          (len(regs2), n_before, inst.trials_count, tc_before))
+    check("trials_count counted both hypotheses into the monotone ledger",
+          {"hyp_conf60_adx25", "hyp_tsmom_btc_52w"} <= set(inst.trials_ids))
+    check("registered hypotheses are cf_only entrants in the pool",
+          all(inst.configs[c].get("cf_only") is True
+              for c in ("hyp_conf60_adx25", "hyp_tsmom_btc_52w")))
+    check("a hypothesis never gets a live sandbox trader",
+          not any(c.startswith("hyp_") for c in inst.traders))
+
+    # --- budget refusal ([G] budget_remaining 0 -> [S] autopilot_budget_exhausted)
+    PUSHED.clear()
+    inst._current_var_sr = lambda: 0.09        # sd_SR 0.30 -> SR0 far above 0.17
+    check("budget_remaining is 0 when the hurdle out-climbs what 24m can resolve",
+          inst.budget_remaining(52) == 0, inst.budget_remaining(52))
+    new_cfg = san({"hyp_extra_gate": hyp(cf={"conf": 0.7, "horizon": "fwd24"})})
+    inst._hyp_apply(new_cfg, mtime=_t.time())
+    exh = [d for t, d in PUSHED if t == "autopilot_budget_exhausted"]
+    check("[S] a refused registration pushes autopilot_budget_exhausted",
+          len(exh) == 1 and set(exh[0]) >= {"trials_count", "sr0"}, exh)
+    check("a budget-refused hypothesis never enters the pool",
+          "hyp_extra_gate" not in inst.configs)
+    inst._hyp_apply(new_cfg, mtime=_t.time())
+    check("a budget refusal is announced once, not on every refresh",
+          len([d for t, d in PUSHED if t == "autopilot_budget_exhausted"]) == 1)
+    check("a refused hypothesis never bumps the trials ledger",
+          "hyp_extra_gate" not in inst.trials_ids)
+
+    inst._current_var_sr = lambda: None
+    check("budget_remaining is None (unknown) when cross-entrant variance is unknown",
+          inst.budget_remaining(52) is None)
+    inst._current_var_sr = lambda: 1e-6        # tiny variance -> room again
+    b_small = inst.budget_remaining(52)
+    check("a small cross-entrant variance leaves budget", bool(b_small) and b_small > 0,
+          b_small)
+    check("budget is monotone non-increasing in trials_count",
+          _rl is None or
+          _rl.budget_remaining(1e-6, 5, 52) >= _rl.budget_remaining(1e-6, 500, 52))
+    check("budget is non-decreasing in decisions per year",
+          _rl is None or
+          _rl.budget_remaining(1e-6, 20, 365) >= _rl.budget_remaining(1e-6, 20, 52))
+
+    # --- proven rule ([G] proven + [S] autopilot_proven) ---------------------
+    PUSHED.clear()
+    inst.scores = {
+        "p_yes":   {"id": "p_yes", "min_trl": 10, "trades_n": 22, "dsr": 0.97,
+                    "family": "trend", "clears_cost": True},
+        "p_thin":  {"id": "p_thin", "min_trl": 40, "trades_n": 22, "dsr": 0.99,
+                    "family": "trend", "clears_cost": True},
+        "p_weak":  {"id": "p_weak", "min_trl": 10, "trades_n": 22, "dsr": 0.90,
+                    "family": "carry", "clears_cost": True},
+        "p_dead":  {"id": "p_dead", "min_trl": 10, "trades_n": 22, "dsr": 0.99,
+                    "family": "carry", "clears_cost": True},
+        "p_blank": {"id": "p_blank", "min_trl": None, "trades_n": None, "dsr": None,
+                    "family": "trend", "clears_cost": False},
+    }
+    inst.killed["p_dead"] = {"ts": _t.time(), "reason": "killed earlier"}
+    inst._apply_proven_rule()
+    prov = [d for t, d in PUSHED if t == "autopilot_proven"]
+    check("PROVEN requires trades_n >= MinTRL AND DSR >= PROVEN_DSR",
+          inst.proven == ["p_yes"], inst.proven)
+    check("an entrant short of MinTRL is not proven", "p_thin" not in inst.proven)
+    check("an entrant below DSR %.2f is not proven" % ap.PROVEN_DSR,
+          "p_weak" not in inst.proven)
+    check("a KILLED entrant can never be proven", "p_dead" not in inst.proven)
+    check("an unmeasured entrant is not proven (None is not a pass)",
+          "p_blank" not in inst.proven)
+    check("[S] autopilot_proven payload = {entrant, dsr, n, min_trl}",
+          len(prov) == 1 and set(prov[0]) >= {"entrant", "dsr", "n", "min_trl"}, prov)
+    inst._apply_proven_rule()
+    check("[S] autopilot_proven fires ONCE per entrant",
+          len([d for t, d in PUSHED if t == "autopilot_proven"]) == 1)
+
+    # --- clears ([S] autopilot_clears on the FIRST cost-gate flip) -----------
+    PUSHED.clear()
+    inst.scores = {
+        "c_a":    {"id": "c_a", "clears_cost": True, "n_oos": 31, "sr": 0.42, "sr0": 0.30},
+        "c_no":   {"id": "c_no", "clears_cost": False, "n_oos": 25, "sr": 0.05, "sr0": 0.30},
+        "p_dead": {"id": "p_dead", "clears_cost": True, "n_oos": 25, "sr": 0.4, "sr0": 0.3},
+    }
+    inst._announce_clears()
+    clr = [d for t, d in PUSHED if t == "autopilot_clears"]
+    check("[S] autopilot_clears fires on the first clears_cost flip",
+          [d["entrant"] for d in clr] == ["c_a"], clr)
+    check("[S] autopilot_clears payload = {entrant, n, sr, sr0}",
+          bool(clr) and set(clr[0]) >= {"entrant", "n", "sr", "sr0"}, clr)
+    check("a KILLED entrant is never announced as clearing",
+          "p_dead" not in inst.cleared_ids)
+    inst._announce_clears()
+    check("[S] autopilot_clears fires ONCE per entrant",
+          len([d for t, d in PUSHED if t == "autopilot_clears"]) == 1)
+
+    # --- switch ([S] autopilot_switch on a champion change) -------------------
+    PUSHED.clear()
+    inst.killed.pop("p_dead", None)
+    fake_scores = {
+        "sw_a": {"id": "sw_a", "clears_cost": True, "oos_edge": 0.004, "t": 3.1,
+                 "n_oos": 60, "min_trl": None, "trades_n": None, "dsr": None},
+        "sw_b": {"id": "sw_b", "clears_cost": True, "oos_edge": 0.001, "t": 2.2,
+                 "n_oos": 60, "min_trl": None, "trades_n": None, "dsr": None},
+    }
+
+    def _fake_score():
+        inst.scores = {k: dict(v) for k, v in fake_scores.items()}
+        return inst.scores
+
+    inst.score = _fake_score
+    inst.refresh_lab_configs = lambda: None
+    inst.refresh_hypotheses = lambda: None
+    inst.champion_id = None
+    d1 = inst.decide()
+    sw = [d for t, d in PUSHED if t == "autopilot_switch"]
+    check("FLAT -> champion pushes [S] autopilot_switch {from,to,why}",
+          len(sw) == 1 and sw[0]["from"] is None and sw[0]["to"] == "sw_a"
+          and isinstance(sw[0].get("why"), str) and bool(sw[0]["why"]), sw)
+    check("decide() crowned the higher-edge entrant", d1["champion"] == "sw_a")
+    inst.decide()
+    check("holding the same champion pushes NO switch event",
+          len([d for t, d in PUSHED if t == "autopilot_switch"]) == 1)
+    fake_scores["sw_a"]["clears_cost"] = False
+    fake_scores["sw_b"]["clears_cost"] = False
+    d2 = inst.decide()
+    sw2 = [d for t, d in PUSHED if t == "autopilot_switch"]
+    check("losing every eligible entrant switches back to FLAT and says so",
+          d2["allocation"] == "FLAT" and len(sw2) == 2
+          and sw2[-1]["from"] == "sw_a" and sw2[-1]["to"] is None, sw2[-1:])
+
+    # --- graveyard ([E]) ------------------------------------------------------
+    inst.scores = {
+        "g_kill": {"id": "g_kill", "min_trl": 10, "trades_n": 30, "dsr": 0.05,
+                   "sr": 0.02, "sr0": 0.31, "gross_edge": 0.003, "oos_edge": -0.0005,
+                   "n_oos": 30, "t": 0.3, "psr": 0.1, "clears_cost": True},
+    }
+    inst.configs["g_kill"] = {"id": "g_kill", "cf_only": True, "kind": "price",
+                              "family": "exit_rule", "cf": {"horizon": "fwd24"},
+                              "born_ts": ap.AP_CF_EPOCH + 1}
+    inst._last_nets = {"g_kill": [0.001] * 15}
+    inst._apply_kill_rule()
+    check("the kill rule fired on a past-MinTRL, deflated-PSR entrant",
+          "g_kill" in inst.killed)
+    k = inst.killed["g_kill"]
+    check("the kill record PRESERVES the original shape",
+          all(kk in k for kk in ("ts", "reason", "config", "final_score")), sorted(k))
+    check("[E] the kill record ADDS family/horizon/cost_model/reason_code/killed_ts",
+          all(kk in k for kk in ("id", "family", "horizon", "cost_model",
+                                 "reason_code", "sr", "sr0", "dsr", "n", "killed_ts")),
+          sorted(k))
+    check("[E] the reason_code is measured ('cost': gross positive, net negative)",
+          k["reason_code"] == "cost", k["reason_code"])
+
+    # an OLD-shape kill (pre-graveyard) normalizes without inventing anything
+    inst.killed["g_legacy"] = {"ts": 1_700_000_000.0,
+                               "reason": "killed before the graveyard existed",
+                               "config": {"id": "g_legacy", "kind": "carry"},
+                               "final_score": {"sr": 0.01, "dsr": 0.02, "trades_n": 44}}
+    inst.killed["g_junk"] = "not a dict"
+    gy = inst.graveyard()
+    by_id = {g["id"]: g for g in gy}
+    check("[E] graveyard returns one structured record per kill (junk skipped)",
+          set(by_id) == {"g_kill", "g_legacy"}, sorted(by_id))
+    lg = by_id["g_legacy"]
+    check("[E] a legacy kill gets reason_code 'unknown', never a guessed one",
+          lg["reason_code"] == "unknown", lg["reason_code"])
+    check("[E] a legacy kill keeps its measured numbers from final_score",
+          (lg["sr"], lg["dsr"], lg["n"]) == (0.01, 0.02, 44), lg)
+    check("[E] a legacy kill's sr0 is None (never back-filled with today's hurdle)",
+          lg["sr0"] is None, lg["sr0"])
+    check("[E] a legacy kill's family comes from its config kind, not invention",
+          lg["family"] == "carry", lg["family"])
+    check("[E] every graveyard reason_code is inside the contract set",
+          all(g["reason_code"] in ap.KILL_REASON_CODES for g in gy))
+    check("[E] every graveyard record carries the full key set",
+          all(set(g) >= {"id", "family", "horizon", "cost_model", "reason_code",
+                         "sr", "sr0", "dsr", "n", "killed_ts"} for g in gy))
+
+    # --- goal block ([G]) -----------------------------------------------------
+    g = inst.goal()
+    REQUIRED_GOAL = ("proven", "alive", "killed", "trials_count", "n_eff", "sd_sr",
+                     "sr0", "nearest_verdict", "families", "budget_remaining",
+                     "book_state")
+    check("[G] goal block carries every contract key",
+          all(kk in g for kk in REQUIRED_GOAL),
+          [kk for kk in REQUIRED_GOAL if kk not in g])
+    check("[G] goal.proven is the persisted proven list", g["proven"] == inst.proven)
+    check("[G] goal.killed counts the graveyard, goal.alive the survivors",
+          g["killed"] == len(inst.killed) and isinstance(g["alive"], int) and g["alive"] > 0,
+          (g["killed"], g["alive"]))
+    check("[G] goal.trials_count is the monotone ledger",
+          g["trials_count"] == inst.trials_count)
+    check("[G] nearest_verdict = {id, months}",
+          set(g["nearest_verdict"]) == {"id", "months"}, g["nearest_verdict"])
+    check("[G] families entries carry decisions_per_year/alive/killed/posterior{s,f}",
+          all(set(v) >= {"decisions_per_year", "alive", "killed", "posterior"}
+              and set(v["posterior"]) >= {"s", "f"} for v in g["families"].values()),
+          {k2: sorted(v) for k2, v in list(g["families"].items())[:1]})
+    check("[G] every contract family is present in the goal block",
+          (set(ap.HYP_FAMILIES) | {"switch"}) <= set(g["families"]),
+          sorted((set(ap.HYP_FAMILIES) | {"switch"}) - set(g["families"])))
+    check("[G] weekly families report 52 decisions/year, carry 365",
+          g["families"]["trend"]["decisions_per_year"] == 52
+          and g["families"]["carry"]["decisions_per_year"] == 365,
+          (g["families"]["trend"]["decisions_per_year"],
+           g["families"]["carry"]["decisions_per_year"]))
+    check("[G] the killed entrant shows up as a failure in its family's posterior",
+          g["families"]["exit_rule"]["posterior"]["f"] >= 1
+          and "g_kill" in g["families"]["exit_rule"]["killed"],
+          g["families"]["exit_rule"])
+    inst.champion_id = "sw_a"
+    check("[G] book_state names the champion when one is crowned",
+          inst.goal()["book_state"] == "champion:sw_a", inst.goal()["book_state"])
+    inst.champion_id = None
+    check("[G] book_state is 'flat' when nothing is crowned",
+          inst.goal()["book_state"] == "flat")
+    check("[G] budget_remaining is an int or an honest None, never a guess",
+          g["budget_remaining"] is None or isinstance(g["budget_remaining"], int),
+          g["budget_remaining"])
+    check("[G] goal block is JSON-serializable (it ships over /api/goal)",
+          isinstance(json.dumps(inst.goal()), str))
+
+    # nearest_verdict picks the SOONEST pending verdict, and only a pending one
+    inst.configs["nv_soon"] = {"id": "nv_soon", "cf_only": True, "kind": "price",
+                               "family": "regime_gate", "cf": {"horizon": "fwd48"},
+                               "born_ts": ap.AP_CF_EPOCH + 1}
+    inst.configs["nv_late"] = {"id": "nv_late", "cf_only": True, "kind": "price",
+                               "family": "regime_gate", "cf": {"horizon": "fwd48"},
+                               "born_ts": ap.AP_CF_EPOCH + 1}
+    inst.order.extend(["nv_soon", "nv_late"])
+    inst.scores = {"nv_soon": {"id": "nv_soon", "months_to_verdict": 7.25},
+                   "nv_late": {"id": "nv_late", "months_to_verdict": 31.0}}
+    check("[G] nearest_verdict names the soonest pending verdict, with months",
+          inst.goal()["nearest_verdict"] == {"id": "nv_soon", "months": 7.25},
+          inst.goal()["nearest_verdict"])
+    inst.proven.append("nv_soon")
+    check("[G] an already-proven entrant is not the 'nearest verdict'",
+          inst.goal()["nearest_verdict"]["id"] == "nv_late",
+          inst.goal()["nearest_verdict"])
+    inst.scores = {"nv_late": {"id": "nv_late", "months_to_verdict": None}}
+    check("[G] nearest_verdict is {None, None} when nothing has a projection",
+          inst.goal()["nearest_verdict"] == {"id": None, "months": None},
+          inst.goal()["nearest_verdict"])
+    inst.proven.remove("nv_soon")
+
+    st5 = inst.status()          # self.killed still holds the 'g_junk' string
+    check("a malformed kill record renders as 'unknown' instead of crashing status()",
+          st5["killed"]["g_junk"]["reason_code"] == "unknown", st5["killed"].get("g_junk"))
+    check("[G] the goal block is served inside status()",
+          isinstance(st5.get("goal"), dict) and "trials_count" in st5["goal"])
+    check("status() surfaces sd_sr / sr0 / n_eff next to the ledger",
+          all(kk in st5 for kk in ("sd_sr", "sr0", "n_eff", "trials_count")),
+          sorted(k2 for k2 in ("sd_sr", "sr0", "n_eff", "trials_count") if k2 not in st5))
+    check("status() ships the structured graveyard",
+          isinstance(st5.get("graveyard"), list)
+          and all("reason_code" in r for r in st5["graveyard"]), st5.get("graveyard"))
+
+    sd5 = inst._state_dict()
+    check("state persists proven / cleared_ids / hyp_seen",
+          all(kk in sd5 for kk in ("proven", "cleared_ids", "hyp_seen")), sorted(sd5))
+    check("state is JSON-serializable with the graveyard records",
+          isinstance(json.dumps(sd5), str))
+except Exception as _e5:
+    import traceback; traceback.print_exc()
+    check("hypothesis/goal/SSE instance flow", False, _e5)
+finally:
+    bs._push_sse = _orig_push_sse
+    bs._DATA_DIR = _orig_data_dir
+    ap._state_path = _orig_state_path
+    shutil.rmtree(_tmp5, ignore_errors=True)
+
+# 5f2. N_eff / sd_SR / SR0 reach every verdict (requirement 1, end to end) ----
+_a7 = ap.Autopilot.__new__(ap.Autopilot)
+_a7.trials_count = 20
+_a7.killed = {}
+_a7.configs = {}
+_a7.n_eff = _a7.n_clusters = _a7.sd_sr = _a7.sr0 = None
+# two near-copies (same decision clock, rho > 0.7) + one independent stream
+_base = [0.004, -0.002, 0.006, -0.001, 0.003, -0.004, 0.005, 0.001,
+         -0.003, 0.002, 0.004, -0.005]
+_twin = [x + (0.0002 if i % 2 else -0.0002) for i, x in enumerate(_base)]
+_indep = [-0.003, 0.005, -0.006, 0.002, -0.001, 0.004, -0.005, 0.003,
+          0.006, -0.002, -0.004, 0.001]
+_clock = [1_780_000_000.0 + i * 86400 for i in range(12)]
+_nets = {"n_a": _base, "n_b": _twin, "n_c": _indep}
+_tss = {"n_a": list(_clock), "n_b": list(_clock), "n_c": list(_clock)}
+_out7 = {cid: {"id": cid, "n_oos": 12, "oos_edge": 0.001, "t": 1.0,
+               "clears_cost": False, "via": "cf_price", "family": "regime_gate"}
+         for cid in _nets}
+_a7._attach_survival_stats(_out7, _nets, _tss)
+check("N_eff collapses two near-copy streams into one cluster (3 scored -> 2)",
+      _a7.n_clusters == 2, (_a7.n_clusters, _rl and _rl.cluster_streams(
+          {k: dict(zip(_tss[k], v)) for k, v in _nets.items()})))
+check("N_eff = trials_count minus the DEMONSTRATED redundancy (20 - 1 = 19)",
+      _a7.n_eff == 19, _a7.n_eff)
+check("trials_count itself never moves when entrants cluster",
+      _a7.trials_count == 20)
+check("sd_SR is measured across the entrants' per-decision SRs",
+      _a7.sd_sr is not None and _a7.sd_sr > 0, _a7.sd_sr)
+check("SR0 is the expected max SR of N_eff unskilled tries",
+      _a7.sr0 is not None
+      and abs(_a7.sr0 - ap.expected_max_sr(_a7.sd_sr ** 2, _a7.n_eff)) < 1e-12,
+      (_a7.sr0, _a7.n_eff))
+check("requirement 1: sd_SR, SR0 and N_eff are printed next to EVERY verdict",
+      all(("sd_SR" in r["verdict"] and "SR0" in r["verdict"]
+           and "N_eff" in r["verdict"]) for r in _out7.values()),
+      [r["verdict"] for r in _out7.values()][:1])
+check("every score row exposes sd_sr / sr0 / n_eff as numbers, not just prose",
+      all(all(kk in r for kk in ("sd_sr", "sr0", "n_eff")) for r in _out7.values()),
+      sorted(list(_out7.values())[0]))
+check("a clustered entrant records its cluster size (feeds 'overlap_artifact')",
+      _out7["n_a"].get("cluster_size") == 2 and _out7["n_c"].get("cluster_size") == 1,
+      {k: v.get("cluster_size") for k, v in _out7.items()})
+# an unmeasurable pool degrades to 'unknown', never to a flattering hurdle
+_a8 = ap.Autopilot.__new__(ap.Autopilot)
+_a8.trials_count = 20
+_a8.killed = {}
+_a8.configs = {}
+_a8.n_eff = _a8.n_clusters = _a8.sd_sr = _a8.sr0 = None
+_out8 = {"solo": {"id": "solo", "n_oos": 0, "oos_edge": None, "t": None,
+                  "clears_cost": False, "via": "cf_price", "family": "trend"}}
+_a8._attach_survival_stats(_out8, {"solo": []}, {"solo": None})
+check("with no measurable variance sd_SR/SR0 say 'unknown' (never 0)",
+      _a8.sd_sr is None and _a8.sr0 is None, (_a8.sd_sr, _a8.sr0))
+check("an unknown hurdle never lets an entrant clear the gate",
+      _out8["solo"]["clears_cost"] is False)
+check("N_eff falls back to the full monotone ledger when nothing can cluster",
+      _a8.n_eff == 20, _a8.n_eff)
+
+# 5g. the templates the research pass may write all pass THIS sanitizer --------
+if _rl is not None:
+    for fam in _rl.EXPRESSIBLE_FAMILIES:
+        tpl = _rl.family_templates(fam)
+        check("every '%s' template passes the real sanitizer" % fam,
+              len(tpl) > 0 and len(san(tpl)) == min(len(tpl), ap.HYP_MAX_SLOTS),
+              (fam, len(tpl), len(san(tpl))))
+    check("templates are cf_only and stamped at intake, like any hypothesis",
+          all(e["cf_only"] is True and e["born_ts"] == INTAKE
+              for e in san(_rl.family_templates("trend"))))
+    check("the sanitizer and research_loop agree on the slot cap",
+          ap.HYP_MAX_SLOTS == _rl.HYP_MAX_SLOTS)
+    check("the sanitizer and research_loop agree on the family list",
+          tuple(ap.HYP_FAMILIES) == tuple(_rl.FAMILIES))
+    check("the sanitizer and research_loop agree on the origin allowlist",
+          tuple(ap.HYP_ORIGINS) == tuple(_rl.ORIGINS))
+
 SRC_BS = bs._DASHBOARD_HTML
 check("standings render in the dashboard", 'ap_standings' in SRC_BS)
 check("standings colour only on CLEARS, not on a nice middle number",

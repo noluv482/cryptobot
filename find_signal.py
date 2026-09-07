@@ -44,6 +44,9 @@ Usage:
     python find_signal.py --history --venue perp   # scored at the perp floor
 """
 import argparse
+import importlib
+import inspect
+import json
 import math
 import os
 import statistics
@@ -276,6 +279,44 @@ CANDIDATES = {
     "gap_fade":           sig_gap_fade,
     "three_in_a_row":     sig_three_down,
 }
+
+
+def load_candidates(spec):
+    """--candidate mod:fn[,mod:fn...] -> {name: fn} for THIS run only.
+
+    Each fn is importlib-loaded and must take the same (c, h, l, v, i)
+    positional signature as the built-ins (checked by inspect, so a wrong
+    closure fails at the CLI, not 20 minutes into a sweep). The module-level
+    CANDIDATES dict is never mutated: main() merges the result into a local
+    copy, so a research pass can score one hypothesis against the battery
+    without re-registering it as a permanent candidate. Names: the function
+    name, or mod.fn when that would shadow a built-in.
+    """
+    out = {}
+    for item in [s.strip() for s in str(spec or "").split(",") if s.strip()]:
+        if ":" not in item:
+            raise ValueError(f"--candidate {item!r}: expected mod:fn")
+        mod, _, fn_name = item.rpartition(":")
+        if not mod or not fn_name:
+            raise ValueError(f"--candidate {item!r}: expected mod:fn")
+        try:
+            module = importlib.import_module(mod)
+        except Exception as e:
+            raise ValueError(f"--candidate {item!r}: import failed: {e}")
+        fn = getattr(module, fn_name, None)
+        if not callable(fn):
+            raise ValueError(f"--candidate {item!r}: {fn_name} is not a callable in {mod}")
+        try:
+            params = [p for p in inspect.signature(fn).parameters.values()
+                      if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+            required = [p for p in params if p.default is p.empty]
+        except (TypeError, ValueError):
+            params, required = [None] * 5, [None] * 5   # builtins/C callables: trust the call
+        if len(params) < 5 or len(required) > 5:
+            raise ValueError(f"--candidate {item!r}: {fn_name} must accept (c, h, l, v, i)")
+        name = fn_name if (fn_name not in CANDIDATES and fn_name not in out) else f"{mod}.{fn_name}"
+        out[name] = fn
+    return out
 
 
 # ── evaluation ───────────────────────────────────────────────────────────────
@@ -584,14 +625,48 @@ def build_parser():
                     help="CPCV: number of contiguous time groups (default 6)")
     ap.add_argument("--cpcv-test", type=int, default=2,
                     help="CPCV: groups held out per split (default 2 -> 15 splits)")
+    ap.add_argument("--json", default=None, metavar="PATH",
+                    help="also dump results/cpcv_stats/pbo/survivors/cost_for/args "
+                         "(the same numbers printed) as one JSON document")
+    ap.add_argument("--candidate", default="", metavar="MOD:FN[,MOD:FN]",
+                    help="extra candidate closures with the (c,h,l,v,i) signature, "
+                         "loaded by importlib for this run only")
     ap.add_argument("--embargo", type=int, default=None,
                     help="CPCV embargo in bars after each test block; default "
                          "= the horizon, and it is clamped to >= the horizon")
     return ap
 
 
+def _write_json(path, doc):
+    """Atomic dump of the run document. Never raises into main(): a bad path
+    costs the JSON, not the printed verdict."""
+    if not path:
+        return False
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=1, sort_keys=True, default=str)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        print(f"  (could not write --json {path}: {e})")
+        return False
+
+
+def _result_dict(r):
+    name, hz, n_i, e_i, t_i, n_o, e_o, t_o = r
+    return {"candidate": name, "horizon": hz, "is_n": n_i, "is_edge": e_i,
+            "is_t": t_i, "oos_n": n_o, "oos_edge": e_o, "oos_t": t_o}
+
+
 def main():
     args = build_parser().parse_args()
+    try:
+        cands = dict(CANDIDATES)
+        cands.update(load_candidates(args.candidate))
+    except ValueError as e:
+        print(str(e))
+        return 2
     if args.venue == "perp":
         funding_h, funding_src = perp_funding_hourly()
     else:
@@ -615,6 +690,7 @@ def main():
                 series.append(got)
         if not series:
             print("no history files — run fetch_history.py first")
+            _write_json(args.json, {"error": "no history files", "args": vars(args)})
             return 1
         spans = [len(c) for c, _, _, _ in series]
         print(f"{len(series)} pairs, {min(spans):,}–{max(spans):,} bars "
@@ -631,6 +707,7 @@ def main():
             time.sleep(1.1)
         if not series:
             print("no data")
+            _write_json(args.json, {"error": "no data", "args": vars(args)})
             return 1
     print("split: first half of EACH pair ranks, second half judges")
     print("candidates are RANKED in-sample and JUDGED out-of-sample")
@@ -648,7 +725,7 @@ def main():
         # splits (signals never depend on the horizon) — no O(n^2) re-runs.
         print("precomputing candidate signals for CPCV ...")
         sig_cache = {name: precompute_signals(fn, series)
-                     for name, fn in CANDIDATES.items()}
+                     for name, fn in cands.items()}
 
     results = []
     cpcv_stats, pbo_by_hz = {}, {}
@@ -659,7 +736,7 @@ def main():
         print(f"  {'candidate':20s} {'IS n':>6s} {'IS edge':>9s} {'IS t':>7s} "
               f"{'OOS n':>6s} {'OOS edge':>9s} {'OOS t':>7s}")
         print("  " + "-" * 72)
-        for name, fn in CANDIDATES.items():
+        for name, fn in cands.items():
             bi, si, base_i = evaluate(fn, series, hz, 0.0, 0.5)
             n_i, e_i, t_i = score(bi, si, base_i)
             bo, so, base_o = evaluate(fn, series, hz, 0.5, 1.0)
@@ -684,7 +761,7 @@ def main():
             print(f"  {'candidate':20s} {'splits':>6s} {'mean':>9s} "
                   f"{'p5':>9s} {'p95':>9s}   (OOS edge/trade across splits)")
             print("  " + "-" * 62)
-            for name in CANDIDATES:
+            for name in cands:
                 st = stats_h.get(name)
                 if st:
                     print(f"  {name:20s} {st['n_splits']:>6d} "
@@ -770,6 +847,27 @@ def main():
         print("  and simple price-derived rules are the most-mined ideas there are.")
         print("  An edge, if one exists here, will come from information the price")
         print("  series does not contain — not from another arrangement of it.")
+    # --json: the SAME numbers printed above, as one document (results,
+    # cpcv_stats, pbo, survivors, cost_for, args). Read by the research pass;
+    # nothing here is recomputed, so the file can never disagree with stdout.
+    if args.json:
+        doc = {
+            "generated": time.time(),
+            "args": vars(args),
+            "candidates": list(cands),
+            "n_pairs": len(series),
+            "bars_per_pair": [len(c) for c, _, _, _ in series],
+            "funding": {"hourly": funding_h, "source": funding_src},
+            "results": [_result_dict(r) for r in results],
+            "cpcv_stats": {str(hz): st for hz, st in cpcv_stats.items()},
+            "pbo": {str(hz): p for hz, p in pbo_by_hz.items()},
+            "pbo_dead_line": PBO_DEAD_LINE,
+            "survivors": [_result_dict(r) for r in survivors],
+            "survivor_bar_oos_t": bar,
+            "cost_for": {str(hz): cost_for(hz) for hz in horizons},
+        }
+        if _write_json(args.json, doc):
+            print(f"  -> {args.json}")
     return 0
 
 

@@ -23,6 +23,11 @@ COPY manual_report.py .
 # to the repo but, like learning_report.py above, it MUST be copied in explicitly
 # or `import autopilot` raises ModuleNotFoundError and autopilot silently disables.
 COPY autopilot.py .
+# research_loop.py (2026-09-06): the PURE research-side helpers autopilot.py
+# imports (registration budget, N_eff clustering, family posteriors, the
+# template fallback). The import is guarded — a missing file degrades every
+# consumer to 'unknown' — but the image must carry the real thing.
+COPY research_loop.py .
 # Nightly research lab (paper-only sweeps): bot_server spawns it as a subprocess,
 # so a missing file fails the cycle at spawn time — same footgun, new victim.
 COPY research_lab.py .
@@ -32,6 +37,14 @@ COPY find_signal.py .
 # Imported by research_lab.py to top up {DATA_DIR}/history CSVs — same story:
 # committed to the repo is not the same as present in the image.
 COPY fetch_history.py .
+# Evidence pack (2026-09-06): read-only SQL over DATABASE_URL, printed as one
+# JSON document for the PC-side research pass. Only useful INSIDE the
+# container (that is where the DSN lives) — so it has to be in the image.
+COPY research_evidence.py .
+# Point-in-time leakage check (2026-09-06): `docker exec <bot> python
+# test_leakage.py --live 50` rebuilds shadow_signals features from archived
+# bars strictly before each row's ts. Same reason: DB-only, so ship it.
+COPY test_leakage.py .
 
 RUN useradd -r -u 1001 -s /bin/false bot && mkdir -p /data && chown bot:bot /data
 

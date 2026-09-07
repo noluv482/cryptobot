@@ -320,6 +320,234 @@ except SystemExit:
 check("--venue rejects anything but spot/perp", bad_ok)
 
 
+# ── 8. --candidate: closures loaded for THIS run only ────────────────────────
+# The research pass scores one pre-registered hypothesis against the standing
+# battery. That must NOT mutate the module's CANDIDATES dict (the next run
+# would silently inherit it), and a closure with the wrong signature must fail
+# at the CLI rather than 20 minutes into a sweep.
+import importlib
+import io
+import re
+import json
+import shutil
+import subprocess
+import tempfile
+
+_TMP = tempfile.mkdtemp(prefix="fs_cand_")
+_MODNAME = f"fs_probe_{os.getpid()}"
+with io.open(os.path.join(_TMP, _MODNAME + ".py"), "w", encoding="utf-8") as f:
+    f.write(
+        "def probe(c, h, l, v, i):\n"
+        "    # deterministic, price-only, uses nothing after i\n"
+        "    if i < 3:\n"
+        "        return None\n"
+        "    return 'BUY' if c[i] > c[i - 3] else 'SELL'\n"
+        "\n"
+        "def too_few(c, h, l):\n"
+        "    return None\n"
+        "\n"
+        "def kwargs_ok(c, h, l, v, i, extra=1):\n"
+        "    return None\n"
+        "\n"
+        "NOT_A_FUNCTION = 42\n"
+        "\n"
+        "def momentum_24(c, h, l, v, i):\n"    # collides with a built-in name
+        "    return None\n"
+    )
+sys.path.insert(0, _TMP)
+
+_BUILTINS_BEFORE = dict(fs.CANDIDATES)
+
+loaded = fs.load_candidates(f"{_MODNAME}:probe")
+check("--candidate mod:fn loads the closure", list(loaded) == ["probe"], list(loaded))
+check("the loaded object is the real function",
+      loaded.get("probe") is importlib.import_module(_MODNAME).probe)
+check("it has the (c,h,l,v,i) signature and returns a side",
+      loaded["probe"]([1, 2, 3, 4, 9], [], [], [], 4) == "BUY")
+check("CANDIDATES is NOT mutated by loading (run-local only)",
+      fs.CANDIDATES == _BUILTINS_BEFORE)
+
+multi = fs.load_candidates(f"{_MODNAME}:probe,{_MODNAME}:kwargs_ok")
+check("comma-separated specs load together", sorted(multi) == ["kwargs_ok", "probe"], sorted(multi))
+check("extra defaulted args are allowed (>=5 positional, <=5 required)",
+      "kwargs_ok" in multi)
+
+# a name that would shadow a built-in candidate is namespaced, never silently
+# replacing the battery entry it collides with
+_COLLIDE = "momentum_24"
+check(f"the collision fixture names a REAL built-in ({_COLLIDE})", _COLLIDE in fs.CANDIDATES)
+coll = fs.load_candidates(f"{_MODNAME}:{_COLLIDE}")
+check("a name colliding with a built-in is namespaced mod.fn, never shadowing it",
+      list(coll) == [f"{_MODNAME}.{_COLLIDE}"], list(coll))
+check("the built-in of that name is untouched",
+      fs.CANDIDATES[_COLLIDE] is _BUILTINS_BEFORE[_COLLIDE])
+
+for spec, why in ((f"{_MODNAME}:too_few", "wrong arity"),
+                  (f"{_MODNAME}:NOT_A_FUNCTION", "not callable"),
+                  (f"{_MODNAME}:nope", "missing attribute"),
+                  ("no_such_module_xyz:probe", "unimportable module"),
+                  ("bare_name", "no colon")):
+    raised = None
+    try:
+        fs.load_candidates(spec)
+    except ValueError as e:
+        raised = str(e)
+    except Exception as e:                       # any other exception is a bug
+        raised = None
+        check(f"--candidate rejects {why} with ValueError", False, type(e).__name__)
+        continue
+    check(f"--candidate rejects {why} at the CLI (ValueError)", bool(raised), spec)
+
+check("empty --candidate is a no-op", fs.load_candidates("") == {}
+      and fs.load_candidates(None) == {})
+
+
+# ── 9. --json: the SAME numbers main() prints, as one document ───────────────
+# Not a shape check. main() is RUN end to end over a synthetic history file
+# with the probe candidate injected, stdout is captured, and every row of the
+# printed table is matched against the JSON document byte-for-byte at the
+# printed precision. A JSON that can drift from stdout is a fabrication
+# channel; this test closes it.
+_HIST = tempfile.mkdtemp(prefix="fs_hist_")
+random.seed(20260906)
+_px, _rows = 100.0, []
+for k in range(3000):
+    _px *= math.exp(random.gauss(0, 0.004))
+    _hi, _lo = _px * 1.002, _px * 0.998
+    _rows.append(f"{1600000000 + k * 3600},{_px:.4f},{_hi:.4f},{_lo:.4f},{_px:.4f},{100 + k % 7}")
+with io.open(os.path.join(_HIST, "FAKEUSD_60.csv"), "w", encoding="utf-8") as f:
+    f.write("time,open,high,low,close,volume\n" + "\n".join(_rows) + "\n")
+
+_JSON_PATH = os.path.join(_HIST, "run.json")
+_saved_hist, _saved_argv = fs.HISTORY_DIR, sys.argv
+_buf = io.StringIO()
+_rc = None
+try:
+    fs.HISTORY_DIR = _HIST
+    sys.argv = ["find_signal.py", "--history", "--pairs", "FAKEUSD",
+                "--horizons", "6,24", "--no-cpcv",
+                "--candidate", f"{_MODNAME}:probe", "--json", _JSON_PATH]
+    _stdout_saved = sys.stdout
+    sys.stdout = _buf
+    try:
+        _rc = fs.main()
+    finally:
+        sys.stdout = _stdout_saved
+finally:
+    fs.HISTORY_DIR, sys.argv = _saved_hist, _saved_argv
+_out = _buf.getvalue()
+
+check("main() with --history --json ran to completion", _rc == 0, f"rc={_rc}")
+check("--json wrote the document", os.path.exists(_JSON_PATH))
+check("no .tmp file is left behind (atomic replace)",
+      not os.path.exists(_JSON_PATH + ".tmp"))
+
+doc = {}
+if os.path.exists(_JSON_PATH):
+    with io.open(_JSON_PATH, encoding="utf-8") as f:
+        doc = json.load(f)
+
+check("document carries every contracted key",
+      all(k in doc for k in ("results", "cpcv_stats", "pbo", "survivors",
+                             "cost_for", "args")),
+      sorted(doc))
+check("args echoes the invocation (a reader can reproduce the run)",
+      (doc.get("args") or {}).get("candidate") == f"{_MODNAME}:probe"
+      and (doc["args"]).get("horizons") == "6,24"
+      and (doc["args"]).get("no_cpcv") is True)
+check("the injected candidate was scored, not ignored",
+      "probe" in (doc.get("candidates") or []))
+check("the built-in battery is still there alongside it",
+      set(_BUILTINS_BEFORE) <= set(doc.get("candidates") or []), doc.get("candidates"))
+
+# every printed table row must appear in the JSON with the SAME numbers
+ROW_RE = re.compile(
+    r"^  (\S+)\s+(\d+)\s+([+-][\d.]+)%\s+([+-][\d.]+)\s+(\d+)\s+([+-][\d.]+)%\s+([+-][\d.]+)\s*$")
+by_key = {(r["candidate"], r["horizon"]): r for r in (doc.get("results") or [])}
+printed, mismatched, hz_now = 0, [], None
+for line in _out.splitlines():
+    m = re.match(r"^  HORIZON (\d+) bars$", line)
+    if m:
+        hz_now = int(m.group(1))
+        continue
+    m = ROW_RE.match(line)
+    if not m or hz_now is None:
+        continue
+    name, n_i, e_i, t_i, n_o, e_o, t_o = m.groups()
+    printed += 1
+    r = by_key.get((name, hz_now))
+    if r is None:
+        mismatched.append((name, hz_now, "absent from JSON"))
+        continue
+    same = (r["is_n"] == int(n_i) and r["oos_n"] == int(n_o)
+            and f"{r['is_edge']*100:+.3f}" == e_i and f"{r['oos_edge']*100:+.3f}" == e_o
+            and f"{r['is_t']:+.2f}" == t_i and f"{r['oos_t']:+.2f}" == t_o)
+    if not same:
+        mismatched.append((name, hz_now, e_o, t_o, r["oos_edge"], r["oos_t"]))
+check("the printed table had rows to compare", printed >= 4, printed)
+check("EVERY printed row appears in --json with identical numbers",
+      not mismatched, mismatched[:3])
+
+check("cost_for in the JSON equals the printed round trip",
+      all(abs(float(v) - fs.venue_cost("spot", int(hz), 60, base_rt=None,
+                                       maker=False, funding_hourly=0.0)) < 1e-12
+          for hz, v in (doc.get("cost_for") or {}).items()),
+      doc.get("cost_for"))
+check("survivors are a SUBSET of results (never invented)",
+      all((s["candidate"], s["horizon"]) in by_key for s in (doc.get("survivors") or [])))
+check("--no-cpcv leaves cpcv_stats/pbo empty rather than fabricating them",
+      doc.get("cpcv_stats") == {} and doc.get("pbo") == {},
+      (doc.get("cpcv_stats"), doc.get("pbo")))
+check("the PBO house line rides along with the document",
+      doc.get("pbo_dead_line") == fs.PBO_DEAD_LINE)
+
+# the failure paths still leave a document (a reader must never see a stale one)
+_JSON2 = os.path.join(_HIST, "empty.json")
+_saved_hist, _saved_argv = fs.HISTORY_DIR, sys.argv
+_buf2 = io.StringIO()
+try:
+    fs.HISTORY_DIR = tempfile.mkdtemp(prefix="fs_none_")
+    sys.argv = ["find_signal.py", "--history", "--pairs", "NOPEUSD", "--json", _JSON2]
+    _stdout_saved = sys.stdout
+    sys.stdout = _buf2
+    try:
+        _rc2 = fs.main()
+    finally:
+        sys.stdout = _stdout_saved
+finally:
+    fs.HISTORY_DIR, sys.argv = _saved_hist, _saved_argv
+check("a run with no data returns 1", _rc2 == 1, _rc2)
+if os.path.exists(_JSON2):
+    with io.open(_JSON2, encoding="utf-8") as f:
+        d2 = json.load(f)
+    check("the no-data run writes an ERROR document, not a fake result",
+          d2.get("error") and "results" not in d2, sorted(d2))
+else:
+    check("the no-data run writes an error document", False, "no file")
+
+# an unwritable --json path costs the JSON, never the verdict
+_buf3 = io.StringIO()
+_stdout_saved = sys.stdout
+sys.stdout = _buf3
+try:
+    ok_bad_path = fs._write_json(os.path.join(_HIST, "no", "such", "dir", "x.json"),
+                                 {"a": 1}) is False
+finally:
+    sys.stdout = _stdout_saved
+check("an unwritable --json path is reported and swallowed, never raised", ok_bad_path)
+
+check("--candidate / --json parse with the rest of the CLI",
+      (lambda a: a.json == "/tmp/x.json" and a.candidate == "m:f")(
+          fs.build_parser().parse_args(["--json", "/tmp/x.json", "--candidate", "m:f"])))
+check("both default to off (identical behaviour for every old invocation)",
+      fs.build_parser().parse_args([]).json is None
+      and fs.build_parser().parse_args([]).candidate == "")
+
+for _d in (_TMP, _HIST):
+    shutil.rmtree(_d, ignore_errors=True)
+
+
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES")

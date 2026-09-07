@@ -23,8 +23,9 @@ not needed to prove the code compiles and its imports are structurally sound.
      file fails the gate. This is the primary, fully-reliable check and is exactly
      the class of bug that produces the silent crash-loop above.
 
-  2. GUARDED IMPORT SMOKE of the three modules the bot cannot boot without:
-     bot_server, autopilot, research_lab. Because project deps are absent, a real
+  2. GUARDED IMPORT SMOKE of the modules the bot cannot boot without:
+     bot_server, autopilot, research_lab — plus research_evidence, which the
+     research pass runs in-container and which must import cleanly there. Because project deps are absent, a real
      import stops at the first third-party module (e.g. `requests`) raising
      ModuleNotFoundError — that is EXPECTED and reported as SKIPPED, never a failure.
      Any OTHER exception raised while importing (a SyntaxError, or a genuine
@@ -45,7 +46,7 @@ import warnings
 SKIP_DIRS = {"__pycache__", ".git", "pgdata", ".venv", "venv", "node_modules", ".mypy_cache"}
 
 # The modules the bot process cannot start without.
-CRITICAL_MODULES = ["bot_server", "autopilot", "research_lab"]
+CRITICAL_MODULES = ["bot_server", "autopilot", "research_lab", "research_evidence"]
 
 
 def compile_all(root):

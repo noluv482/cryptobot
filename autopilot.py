@@ -73,6 +73,17 @@ import bot_server as bs
 
 log = bs.log
 
+# research_loop.py is the PURE research-side module (budget, N_eff clustering,
+# family posteriors, templates). It ships alongside this file, but a boot must
+# never depend on it: if it is missing, every consumer below degrades to the
+# honest 'unknown' (budget None, N_eff = trials_count, empty posteriors) and
+# says so in the log — it never guesses and never crashes the allocator.
+try:
+    import research_loop as rl
+except Exception as _rl_err:          # pragma: no cover — deploy footgun guard
+    rl = None
+    log("AUTOPILOT", f"research_loop unavailable ({_rl_err}) — budget/N_eff/posteriors report unknown", "WRN")
+
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 CHALLENGER_START      = 2000.0   # virtual bankroll per challenger (mirrors _sim_trader)
@@ -101,6 +112,7 @@ _FEE_RATE = (bs.BINANCE_FEE        if bs.USE_BINANCE else
 # board today. trials_count is persisted and ONLY increments — retiring or
 # killing an entrant never lowers the bar its siblings must clear.
 KILL_PSR    = 0.20        # past MinTRL with deflated PSR below this -> KILLED
+PROVEN_DSR  = 0.95        # past MinTRL with deflated PSR at/above this -> PROVEN (goal)
 MINTRL_CONF = 0.95        # MinTRL target confidence (Phi^-1(0.95) in the formula)
 _EM_GAMMA   = 0.5772156649015329   # Euler-Mascheroni, for the expected-max-SR term
 
@@ -204,7 +216,7 @@ def dsr_stats(nets, sr0, born_ts=None, now=None):
     """
     n = len(nets)
     out = {"trades_n": n, "sr": None, "psr": None, "dsr": None,
-           "min_trl": None, "verdict": "insufficient data"}
+           "min_trl": None, "months_to_verdict": None, "verdict": "insufficient data"}
     if n < 2:
         return out
     mu = statistics.fmean(nets)
@@ -240,6 +252,7 @@ def dsr_stats(nets, sr0, born_ts=None, now=None):
             if rate > 0:
                 months = (min_trl - n) / rate
         if months is not None and math.isfinite(months):
+            out["months_to_verdict"] = months
             out["verdict"] = f"verdict in ~{max(1, math.ceil(months))} months at current signal rate"
         else:
             out["verdict"] = f"track record too short (n={n} < MinTRL {min_trl:.0f})"
@@ -344,6 +357,13 @@ def donchian_decisions(daily, weekly, enter_days=50, exit_days=25):
 # an audit OVER the existing rows — grading it on those same rows would be the
 # in-sample sin this whole module exists to prevent. Future rows only.
 #
+# FAMILY TAGS (2026-09-06): every entrant carries a hypothesis family so the
+# goal block can keep per-family evidence (kills = f, survivors past 4 weeks
+# = s). Legacy price entrants are tagged by what their lever actually varies:
+# gate floors -> regime_gate, fixed-horizon exits -> exit_rule, strategy
+# subsets -> trend / reversion_pattern. carry_or_trend scores the allocator
+# itself and gets the built-in-only family "switch".
+#
 # NO AUTO-MUTATION, NO BREEDING. New entrants enter this list ONLY by a
 # written hypothesis with hardcoded born_ts — never by machine-generated
 # parameter sweeps over the survivors. OOS evidence for the rule: the 3
@@ -353,7 +373,7 @@ AP_CF_EPOCH = 1787545000.0    # 2026-08-24, counterfactual scoring shipped
 
 CHALLENGER_CONFIGS = [
     {   # CHAMPION starts here — mirrors the default paper book / _sim_trader
-        "id": "base",
+        "id": "base", "family": "regime_gate",
         "cf": {"conf": None, "horizon": "fwd48"},
         "entry_conf_floor": ATTEMPT_CONF_MIN,
         "min_rr": None,
@@ -366,11 +386,11 @@ CHALLENGER_CONFIGS = [
         # (~1-2 signals/day shared across the whole pool), so none of these
         # books could mathematically reach MIN_OOS_TRADES on the live path.
         # The counterfactual stream is the only path that actually feeds them.
-        "id": "selective", "cf_only": True,
+        "id": "selective", "family": "regime_gate", "cf_only": True,
         "cf": {"conf": 0.55, "rr": 1.5, "horizon": "fwd48"},
     },
     {   # strictest: only the highest-quality named setups
-        "id": "high_conviction",
+        "id": "high_conviction", "family": "trend",
         "entry_conf_floor": 0.65,
         "min_rr": 2.0,
         "allowed_strategies": {"MULTI_SIGNAL", "MOMENTUM_BREAKOUT", "TREND_CONTINUATION"},
@@ -383,7 +403,7 @@ CHALLENGER_CONFIGS = [
         # replay through _classify_strategy), and pretending a bare conf floor
         # IS "momentum" would score a different hypothesis under this id.
         # Parked and honestly unscored until the stream can express it.
-        "id": "momentum", "cf_only": True,
+        "id": "momentum", "family": "trend", "cf_only": True,
         "entry_conf_floor": 0.50,
         "min_rr": 1.5,
         "allowed_strategies": {"MOMENTUM_BREAKOUT", "TREND_CONTINUATION", "MULTI_SIGNAL"},
@@ -393,17 +413,17 @@ CHALLENGER_CONFIGS = [
         # these at n_indep=22; here they compete on every future signal and get
         # crowned only by the same bars as everyone else. cf_only: the live
         # challenger path cannot filter on ADX/ER — shadow rows now record both.
-        "id": "strict_gates", "cf_only": True,
+        "id": "strict_gates", "family": "regime_gate", "cf_only": True,
         "cf": {"conf": 0.50, "adx": 18.0, "er": 0.15, "horizon": "fwd48"},
     },
     {   # EXIT family: the measured loss decomposition put 0.000% in entries and
         # -0.211% in exits, yet every other challenger varies entries. These two
         # hold the same entries and vary only how long the trade lives.
-        "id": "exit_6h", "cf_only": True,
+        "id": "exit_6h", "family": "exit_rule", "cf_only": True,
         "cf": {"conf": None, "horizon": "fwd6"},
     },
     {
-        "id": "exit_24h", "cf_only": True,
+        "id": "exit_24h", "family": "exit_rule", "cf_only": True,
         "cf": {"conf": None, "horizon": "fwd24"},
     },
     {   # TREND-LOOSENING hypothesis (the owner's, 2026-08-27): "take the
@@ -414,14 +434,14 @@ CHALLENGER_CONFIGS = [
         # No conf/er/rr floors on purpose: this IS the loosening, isolated.
         # born_ts is HARDCODED to the registration moment: the rows that
         # generated the hypothesis must never be the rows that grade it.
-        "id": "trend_rr", "cf_only": True, "born_ts": 1787875000.0,
+        "id": "trend_rr", "family": "regime_gate", "cf_only": True, "born_ts": 1787875000.0,
         "cf": {"adx": 30.0, "horizon": "fwd48"},
     },
     {   # mean-reversion / pattern family only.
         # cf_only since 2026-09-03 (structurally starved on the live path — see
         # "selective"). No cf spec for the same reason as "momentum": the
         # family lever cannot be expressed from the recorded stream yet.
-        "id": "reversion", "cf_only": True,
+        "id": "reversion", "family": "reversion_pattern", "cf_only": True,
         "entry_conf_floor": 0.50,
         "min_rr": 1.5,
         "allowed_strategies": {"RSI_REVERSAL", "PATTERN_BREAKOUT"},
@@ -432,7 +452,7 @@ CHALLENGER_CONFIGS = [
         # (same conf floor, no other stream-expressible lever) — its cf record
         # will mirror base's, which is itself an honest statement: the lever
         # set only ever differed on the starved live path.
-        "id": "loose", "cf_only": True,
+        "id": "loose", "family": "regime_gate", "cf_only": True,
         "cf": {"conf": None, "horizon": "fwd48"},
     },
     # ── Weekly / carry entrants (2026-09-03 registration) ─────────────────────
@@ -454,19 +474,19 @@ CHALLENGER_CONFIGS = [
     #               direction; graded only on recorded funding_rates history.
     {   # long-flat BTC: long when weekly close > 20-week SMA, one decision per
         # ISO week, graded on the NEXT week's return (fwd168), spot RT costs.
-        "id": "tsmom_btc_20w", "cf_only": True, "kind": "trend",
+        "id": "tsmom_btc_20w", "family": "trend", "cf_only": True, "kind": "trend",
         "born_ts": 1788500000.0,   # 2026-09-04 ~05:30 UTC — registration, rounded up
         "cf": {"rule": "tsmom", "pair": "XBTUSD", "weeks": 20, "horizon": "fwd168"},
     },
     {   # Donchian long-flat BTC: enter 50-day-high breakout, exit 25-day low,
         # state stepped once per ISO week, graded on the next week (fwd168).
-        "id": "donchian_btc", "cf_only": True, "kind": "trend",
+        "id": "donchian_btc", "family": "trend", "cf_only": True, "kind": "trend",
         "born_ts": 1788500000.0,
         "cf": {"rule": "donchian", "pair": "XBTUSD",
                "enter_days": 50, "exit_days": 25, "horizon": "fwd168"},
     },
     {   # same 20-week TSMOM hypothesis on ETH.
-        "id": "tsmom_eth_20w", "cf_only": True, "kind": "trend",
+        "id": "tsmom_eth_20w", "family": "trend", "cf_only": True, "kind": "trend",
         "born_ts": 1788500000.0,
         "cf": {"rule": "tsmom", "pair": "ETHUSD", "weeks": 20, "horizon": "fwd168"},
     },
@@ -476,14 +496,14 @@ CHALLENGER_CONFIGS = [
         # Marked daily; graded on accrued funding minus the modeled 4-leg costs.
         # Reads the funding_rates contract table — empty means the honest
         # status "waiting on funding history", not a fabricated score.
-        "id": "carry_harvest", "cf_only": True, "kind": "carry",
+        "id": "carry_harvest", "family": "carry", "cf_only": True, "kind": "carry",
         "born_ts": 1788500000.0,
         "cf": {"symbol": "PF_XBTUSD"},
     },
     {   # scores the SWITCH itself: weekly, allocate to carry_harvest's
         # condition if live, else tsmom_btc_20w's if live, else flat. Costs
         # charged on every allocation change (each sleeve's own legs).
-        "id": "carry_or_trend", "cf_only": True, "kind": "switch",
+        "id": "carry_or_trend", "family": "switch", "cf_only": True, "kind": "switch",
         "born_ts": 1788500000.0,
         "cf": {"pair": "XBTUSD", "symbol": "PF_XBTUSD", "weeks": 20},
     },
@@ -632,6 +652,315 @@ def _read_lab_file():
     return sanitize_lab_configs(raw), mtime
 
 
+# ── Hypothesis intake ({DATA_DIR}/hypotheses.json — contract [H]) ─────────────
+# Written by the PC-side research pass (LLM pre-registration, owner ideas,
+# human, or the deterministic template fallback); read ONLY here, trusted
+# NOWHERE. Mirrors the lab sanitizer: own id namespace (hyp_), per-kind cf
+# whitelist COPIED from the scorer's own keys (a key the scorer ignores would
+# score a different hypothesis under that id — dropped, never tolerated),
+# mandatory 'HYPOTHESIS:' note + full pre-registration block, born_ts forced
+# to >= intake time so no pre-registration bar can ever be graded, hard cap
+# HYP_MAX_SLOTS, cf_only FORCED (a hypothesis never gets a live sandbox
+# book, let alone the real one). A bad file yields [] with a log line.
+HYP_MAX_SLOTS  = rl.HYP_MAX_SLOTS if rl else 5
+_HYP_ID_RE     = re.compile(r"^hyp_[a-z0-9_]{1,24}\Z")
+HYP_KINDS      = ("price", "trend", "carry", "switch")
+HYP_FAMILIES   = (rl.FAMILIES if rl else
+                  ("trend", "carry", "reversion_pattern", "exit_rule", "regime_gate",
+                   "cross_section", "lead_lag"))
+HYP_ORIGINS    = (rl.ORIGINS if rl else ("llm_prereg", "owner_idea", "human", "template"))
+HYP_PREREG_KEYS = ("mechanism", "expected_decisions_per_month",
+                   "mintrl_estimate_months", "kill_bar", "cost_model")
+_HYP_HORIZONS  = ("fwd6", "fwd24", "fwd48", "fwd168")
+_HYP_PAIR_RE   = re.compile(r"^[A-Z0-9]{2,10}USD\Z")
+_HYP_SYMBOL_RE = re.compile(r"^PF_[A-Z0-9]{2,10}USD\Z")
+# Per-kind cf whitelist — EXACTLY the keys each _score_cf_* branch reads.
+HYP_CF_KEYS = {
+    "price":  ("conf", "adx", "er", "rr", "horizon", "weekly"),
+    "trend":  ("rule", "pair", "weeks", "enter_days", "exit_days", "horizon"),
+    "carry":  ("symbol", "hurdle_mult"),
+    "switch": ("pair", "symbol", "weeks"),
+}
+_HYP_NOTE_MAX  = 600
+KILL_REASON_CODES = ("cost", "overlap_artifact", "no_signal", "regime_flip", "unknown")
+
+
+def family_of(cfg):
+    """The entrant's hypothesis family (explicit tag, else derived from kind)."""
+    fam = cfg.get("family") if isinstance(cfg, dict) else None
+    if fam:
+        return str(fam)
+    kind = cfg.get("kind", "price") if isinstance(cfg, dict) else "price"
+    return {"trend": "trend", "carry": "carry", "switch": "switch"}.get(kind, "regime_gate")
+
+
+def origin_of(cid, cfg=None):
+    if isinstance(cid, str) and cid.startswith("hyp_"):
+        return str((cfg or {}).get("origin") or "unknown")
+    if isinstance(cid, str) and cid.startswith("lab_"):
+        return "lab"
+    return "builtin"
+
+
+def decisions_per_year_of(cfg):
+    """Decision cadence implied by kind (+weekly flag): weekly=52, daily=365."""
+    kind = cfg.get("kind", "price") if isinstance(cfg, dict) else "price"
+    cf = (cfg.get("cf") if isinstance(cfg, dict) else None) or {}
+    if rl:
+        return rl.kind_cadence(kind, cf)
+    if kind in ("trend", "switch"):
+        return 52
+    if kind == "carry":
+        return 365
+    return 52 if cf.get("weekly") else 365
+
+
+def horizon_of(cfg):
+    kind = cfg.get("kind", "price")
+    cf = cfg.get("cf") or {}
+    if kind == "carry":
+        return "daily"
+    if kind in ("trend", "switch"):
+        return "fwd168"
+    return str(cf.get("horizon", "fwd48")) if cfg.get("cf") or cfg.get("cf_only") else "live"
+
+
+def cost_model_of(cfg):
+    """The cost model the SCORER actually charged (not the prereg's prose)."""
+    kind = cfg.get("kind", "price")
+    if kind == "trend":
+        return f"spot_rt {CF_SPOT_RT:.4f} (half at entry/exit week)"
+    if kind == "carry":
+        return f"4leg_rt {CARRY_RT_4LEG:.4f} (half at entry/exit day)"
+    if kind == "switch":
+        return f"sleeve legs: spot_rt {CF_SPOT_RT:.4f} / 4leg_rt {CARRY_RT_4LEG:.4f}"
+    if cfg.get("cf") or cfg.get("cf_only"):
+        return f"round_trip {bs.ROUND_TRIP_COST_PCT:.4f} per cf fill"
+    return f"live paper fee {_FEE_RATE:.4f} + slippage in fills"
+
+
+def _hyp_cf(kind, raw_cf):
+    """Validate one hypothesis cf spec against the scorer's whitelist. Raises."""
+    if not isinstance(raw_cf, dict):
+        raise ValueError("cf is not an object")
+    allowed = HYP_CF_KEYS[kind]
+    extra = sorted(set(raw_cf) - set(allowed))
+    if extra:
+        raise ValueError(f"cf keys {extra} not in the {kind} scorer whitelist {list(allowed)}")
+    cf = {}
+    if kind == "price":
+        for k, hi in (("conf", 1.0), ("adx", 100.0), ("er", 1.0), ("rr", 10.0)):
+            if k in raw_cf:
+                v = raw_cf[k]
+                if v is not None:
+                    v = _num(v)
+                    if v is None or not (0.0 <= v <= hi):
+                        raise ValueError(f"cf.{k} {raw_cf[k]!r} not a number in [0,{hi}]")
+                cf[k] = v
+        hz = raw_cf.get("horizon", "fwd48")
+        if hz not in _HYP_HORIZONS:
+            raise ValueError(f"cf.horizon {hz!r} not in {_HYP_HORIZONS}")
+        cf["horizon"] = hz
+        if "weekly" in raw_cf:
+            if not isinstance(raw_cf["weekly"], bool):
+                raise ValueError("cf.weekly must be a boolean")
+            cf["weekly"] = raw_cf["weekly"]
+        if "conf" not in cf:
+            cf["conf"] = None
+    elif kind == "trend":
+        rule = raw_cf.get("rule", "tsmom")
+        if rule not in ("tsmom", "donchian"):
+            raise ValueError(f"cf.rule {rule!r} not tsmom|donchian")
+        pair = raw_cf.get("pair")
+        if not isinstance(pair, str) or not _HYP_PAIR_RE.match(pair):
+            raise ValueError(f"cf.pair {pair!r} fails ^[A-Z0-9]{{2,10}}USD$")
+        cf["rule"], cf["pair"] = rule, pair
+        if rule == "tsmom":
+            w = _num(raw_cf.get("weeks", 20))
+            if w is None or w != int(w) or not (4 <= w <= 104):
+                raise ValueError(f"cf.weeks {raw_cf.get('weeks')!r} not an int in [4,104]")
+            cf["weeks"] = int(w)
+        else:
+            e = _num(raw_cf.get("enter_days", 50))
+            x = _num(raw_cf.get("exit_days", 25))
+            if e is None or e != int(e) or not (5 <= e <= 400):
+                raise ValueError(f"cf.enter_days {raw_cf.get('enter_days')!r} not an int in [5,400]")
+            if x is None or x != int(x) or not (2 <= x <= e):
+                raise ValueError(f"cf.exit_days {raw_cf.get('exit_days')!r} not an int in [2,enter_days]")
+            cf["enter_days"], cf["exit_days"] = int(e), int(x)
+        hz = raw_cf.get("horizon", "fwd168")
+        if hz != "fwd168":
+            raise ValueError("trend entrants are graded on the next week: horizon must be fwd168")
+        cf["horizon"] = "fwd168"
+    elif kind == "carry":
+        sym = raw_cf.get("symbol")
+        if not isinstance(sym, str) or not _HYP_SYMBOL_RE.match(sym):
+            raise ValueError(f"cf.symbol {sym!r} fails ^PF_[A-Z0-9]{{2,10}}USD$")
+        cf["symbol"] = sym
+        if "hurdle_mult" in raw_cf:
+            m = _num(raw_cf["hurdle_mult"])
+            # >= 1.0 by construction: a hypothesis may only RAISE the carry hurdle
+            if m is None or not (1.0 <= m <= 4.0):
+                raise ValueError(f"cf.hurdle_mult {raw_cf['hurdle_mult']!r} not in [1.0,4.0]")
+            cf["hurdle_mult"] = m
+    elif kind == "switch":
+        pair = raw_cf.get("pair", "XBTUSD")
+        sym = raw_cf.get("symbol", "PF_XBTUSD")
+        if not isinstance(pair, str) or not _HYP_PAIR_RE.match(pair):
+            raise ValueError(f"cf.pair {pair!r} fails ^[A-Z0-9]{{2,10}}USD$")
+        if not isinstance(sym, str) or not _HYP_SYMBOL_RE.match(sym):
+            raise ValueError(f"cf.symbol {sym!r} fails ^PF_[A-Z0-9]{{2,10}}USD$")
+        w = _num(raw_cf.get("weeks", 20))
+        if w is None or w != int(w) or not (4 <= w <= 104):
+            raise ValueError(f"cf.weeks {raw_cf.get('weeks')!r} not an int in [4,104]")
+        cf["pair"], cf["symbol"], cf["weeks"] = pair, sym, int(w)
+    return cf
+
+
+def sanitize_hypotheses(raw, intake_ts=None):
+    """Validate raw hypotheses-file content into at most HYP_MAX_SLOTS configs.
+
+    raw is the parsed file: {"hyp_<id>": {kind, family, cf, born_ts, origin,
+    note, prereg}}. NEVER raises. Each survivor is an ORDINARY cf_only
+    entrant: {id, cf_only=True, kind, family, cf, born_ts, origin, note,
+    prereg}. born_ts is ALWAYS the intake time: an earlier value would let
+    the rows that generated a hypothesis be the rows that grade it, and a
+    later one would make the entrant unkillable (empty window, undefined
+    rate). The file's value is only logged when it disagrees. Entries beyond
+    the cap are dropped in file order with a log line.
+    """
+    out = []
+    intake_ts = time.time() if intake_ts is None else float(intake_ts)
+    try:
+        if not isinstance(raw, dict):
+            return out
+        builtin_ids = {c["id"] for c in CHALLENGER_CONFIGS}
+        for hid, e in raw.items():
+            try:
+                if not isinstance(hid, str) or not _HYP_ID_RE.match(hid):
+                    raise ValueError(f"id {hid!r} fails ^hyp_[a-z0-9_]{{1,24}}$")
+                if hid in builtin_ids:
+                    raise ValueError(f"id {hid!r} shadows a built-in config")
+                if not isinstance(e, dict):
+                    raise ValueError("entry is not an object")
+                kind = e.get("kind", "price")
+                if kind not in HYP_KINDS:
+                    raise ValueError(f"kind {kind!r} not in {HYP_KINDS}")
+                fam = e.get("family")
+                if fam not in HYP_FAMILIES:
+                    raise ValueError(f"family {fam!r} not in {HYP_FAMILIES}")
+                origin = e.get("origin")
+                if origin not in HYP_ORIGINS:
+                    raise ValueError(f"origin {origin!r} not in {HYP_ORIGINS}")
+                note = e.get("note")
+                if not isinstance(note, str) or not note.startswith("HYPOTHESIS:") \
+                        or len(note.replace("HYPOTHESIS:", "", 1).strip()) < 10:
+                    raise ValueError("note must start with 'HYPOTHESIS:' and state a mechanism")
+                pre = e.get("prereg")
+                if not isinstance(pre, dict):
+                    raise ValueError("prereg block missing")
+                missing = [k for k in HYP_PREREG_KEYS if k not in pre]
+                if missing:
+                    raise ValueError(f"prereg missing {missing}")
+                for k in ("mechanism", "kill_bar", "cost_model"):
+                    if not isinstance(pre[k], str) or not pre[k].strip():
+                        raise ValueError(f"prereg.{k} must be a non-empty string")
+                for k in ("expected_decisions_per_month", "mintrl_estimate_months"):
+                    v = _num(pre[k])
+                    if v is None or v <= 0:
+                        raise ValueError(f"prereg.{k} must be a positive number")
+                cf = _hyp_cf(kind, e.get("cf"))
+                # BIRTH IS INTAKE TIME, clamped in BOTH directions.
+                # Earlier is the obvious cheat: the rows that generated a
+                # hypothesis would then also grade it. LATER is the quieter
+                # one — a born_ts in the future leaves the scorer's
+                # `bars since born` window empty and its decisions/month rate
+                # undefined, so the entrant can never reach MinTRL and can
+                # never be killed: an immortal slot squatter. The file's value
+                # is therefore never adopted, only logged when it disagrees.
+                born_raw = _num(e.get("born_ts"))
+                born = intake_ts
+                if born_raw is not None and abs(born_raw - intake_ts) > 1.0:
+                    log("AUTOPILOT",
+                        f"hypothesis {hid!r} born_ts {born_raw:.0f} ignored — "
+                        f"re-stamped to intake {intake_ts:.0f}", "WRN")
+                if len(out) >= HYP_MAX_SLOTS:
+                    raise ValueError(f"slot cap {HYP_MAX_SLOTS} reached — dropped")
+                out.append({
+                    "id": hid, "cf_only": True, "kind": kind, "family": fam, "cf": cf,
+                    "born_ts": float(born), "origin": origin,
+                    "note": note[:_HYP_NOTE_MAX],
+                    "prereg": {
+                        "mechanism": str(pre["mechanism"])[:_HYP_NOTE_MAX],
+                        "expected_decisions_per_month": _num(pre["expected_decisions_per_month"]),
+                        "mintrl_estimate_months": _num(pre["mintrl_estimate_months"]),
+                        "kill_bar": str(pre["kill_bar"])[:300],
+                        "cost_model": str(pre["cost_model"])[:300],
+                    },
+                })
+            except Exception as ex:
+                log("AUTOPILOT", f"hypothesis {hid!r} dropped: {ex}", "WRN")
+    except Exception as ex:
+        log("AUTOPILOT", f"hypotheses sanitize failed: {ex}", "WRN")
+        out = []
+    return out
+
+
+def _hyp_path():
+    """The hypotheses handoff file — written by the PC research pass, read ONLY here."""
+    return os.path.join(bs._DATA_DIR, "hypotheses.json")
+
+
+def _read_hyp_file(intake_ts=None):
+    """(sanitized configs, mtime) — ([], None) when absent. mtime captured before the read."""
+    path = _hyp_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return [], None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as ex:
+        log("AUTOPILOT", f"hypotheses file unreadable: {ex}", "WRN")
+        return [], mtime
+    return sanitize_hypotheses(raw, intake_ts), mtime
+
+
+def _hyp_sig(cfg):
+    """Identity of a hypothesis's SCORED content — a change means a new trial."""
+    return json.dumps({"kind": cfg.get("kind"), "cf": cfg.get("cf")}, sort_keys=True)
+
+
+def kill_reason_code(score, nets=None, cluster_size=1):
+    """Structured reason for a kill, from MEASURED numbers by fixed rules:
+      cost             gross edge positive, net edge <= 0 (costs ate it)
+      regime_flip      first half of the stream positive, second half negative
+      no_signal        gross edge <= 0 / SR <= 0 (nothing there before costs)
+      overlap_artifact edge exists but the entrant is a near-copy of a
+                       sibling (cluster_size >= 2) — died to deflation only
+      unknown          none of the above could be established
+    Heuristic labels over measured artifacts; never LLM prose."""
+    try:
+        g = score.get("gross_edge")
+        e = score.get("oos_edge")
+        sr = score.get("sr")
+        if g is not None and e is not None and g > 0 and e <= 0:
+            return "cost"
+        if nets and len(nets) >= 8:
+            h = len(nets) // 2
+            a, b = statistics.fmean(nets[:h]), statistics.fmean(nets[h:])
+            if a > 0 and b < 0:
+                return "regime_flip"
+        if (g is not None and g <= 0) or (sr is not None and sr <= 0):
+            return "no_signal"
+        if cluster_size >= 2:
+            return "overlap_artifact"
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _state_path():
     return os.path.join(bs._DATA_DIR, "autopilot_state.json")
 
@@ -752,7 +1081,19 @@ class Autopilot:
         # N-trials accounting (monotone) + the kill graveyard, both persisted.
         self.trials_count = TRIALS_SEED    # every entrant EVER tried (see TRIALS_SEED doc)
         self.trials_ids   = []             # post-seed ids already counted
-        self.killed       = {}             # cid -> {ts, reason, config, final_score}
+        self.killed       = {}             # cid -> {ts, reason, config, final_score, +graveyard keys}
+        # Goal ledgers (persisted): proven ids, ids that ever cleared the cost
+        # gate (autopilot_clears fires once), hypothesis intake memory
+        # (born_ts + scored-content signature per hyp id), last measured
+        # hurdle numbers so goal() can answer before the first score().
+        self.proven       = []
+        self.cleared_ids  = []
+        self.hyp_seen     = {}             # hyp id -> {"born_ts", "sig"}
+        self.n_eff = self.n_clusters = None
+        self.sd_sr = self.sr0 = None
+        self._last_nets = {}               # transient: id -> nets (for kill reason codes)
+        self._last_clusters = []           # transient: [[ids]] from the last score()
+        self._hyp_refused = set()          # budget refusals already announced this process
         # A live instance is by definition enabled; persisted on every _save so the
         # flag survives a redeploy (see autopilot_persisted_enabled / _set...).
         self.enabled = True
@@ -765,6 +1106,11 @@ class Autopilot:
         for cfg in CHALLENGER_CONFIGS:
             self._add_challenger(cfg)
 
+        # Restore the decision pointer + ledgers FIRST: hypothesis intake below
+        # needs hyp_seen (born_ts memory) and the persisted scores (var_sr for
+        # the budget check). The champion heal runs after the full pool exists.
+        self._load()
+
         # Lab intake: append this cycle's nominations AFTER the 6 built-ins so the
         # built-ins keep their identities/positions no matter what the lab wrote.
         # _lab_check_ts=0 lets the first decide() re-stat the file immediately (a
@@ -775,7 +1121,12 @@ class Autopilot:
             self._add_challenger(cfg)
             log("AUTOPILOT", f"lab challenger loaded: {cfg['id']}")
 
-        self._load()
+        # Hypothesis intake (contract [H]) — same cadence + diff logic as the lab.
+        self._hyp_check_ts = 0.0
+        self._hyp_mtime = None
+        self._hyp_apply(*_read_hyp_file(time.time()), boot=True)
+
+        self._heal_champion()
         # After restore: count any config id the persisted trials ledger has
         # never seen (first boot with a new written hypothesis lands here).
         self._register_trials()
@@ -880,6 +1231,120 @@ class Autopilot:
             if cid not in self.configs:
                 self._add_challenger(cfg)
                 log("AUTOPILOT", f"lab challenger added: {cid}")
+
+    def _heal_champion(self):
+        """A persisted champion outside the current pool can never gate the
+        real book — force FLAT now rather than at the next decide()."""
+        if self.champion_id is not None and self.champion_id not in self.configs:
+            log("AUTOPILOT", f"restored champion {self.champion_id} not in pool -> FLAT", "WRN")
+            self.champion_id = None
+            self.allocation  = "FLAT"
+
+    def _current_var_sr(self):
+        """Cross-entrant Var[SR] from the last scores (persisted) — None if <2."""
+        srs = [s.get("sr") for s in (self.scores or {}).values()
+               if isinstance(s, dict) and s.get("sr") is not None]
+        return statistics.pvariance(srs) if len(srs) >= 2 else None
+
+    def budget_remaining(self, decisions_per_year=None):
+        """Contract [G] budget_remaining: how many more families are honestly
+        registrable (research_loop.budget_remaining). decisions_per_year
+        defaults to the SLOWEST cadence among live families (conservative).
+        None = unknown (no cross-entrant variance yet, or research_loop missing)."""
+        if rl is None:
+            return None
+        if decisions_per_year is None:
+            rates = [decisions_per_year_of(c) for cid, c in self.configs.items()
+                     if cid not in self.killed]
+            decisions_per_year = min(rates) if rates else 52
+        return rl.budget_remaining(self._current_var_sr(), self.trials_count,
+                                   decisions_per_year)
+
+    def _hyp_apply(self, cfgs, mtime, boot=False):
+        """Diff sanitized hypothesis configs against the pool (lab-style):
+        removed ids retire; a changed scored-content signature retires +
+        re-adds with a fresh born_ts (a new trial under the same name is
+        re-counted in the ledger); NEW ids pass the registration budget or
+        are refused (logged + SSE autopilot_budget_exhausted). Known ids keep
+        their persisted born_ts — the file can never move a birth earlier."""
+        self._hyp_mtime = mtime
+        now = time.time()
+        want = {c["id"]: c for c in cfgs}
+        have = [cid for cid in self.order if cid.startswith("hyp_")]
+        for cid in have:
+            if cid not in want:
+                self._retire_challenger(cid)
+                log("AUTOPILOT", f"hypothesis retired (gone from file): {cid}")
+        for cid, cfg in want.items():
+            sig = _hyp_sig(cfg)
+            seen = self.hyp_seen.get(cid) if isinstance(self.hyp_seen, dict) else None
+            if seen and seen.get("sig") == sig:
+                # known, unchanged: the persisted birth wins — the file can
+                # never move it earlier, and a reload never moves it later
+                # (that would keep erasing the record the entrant has earned).
+                try:
+                    cfg["born_ts"] = float(seen.get("born_ts") or cfg["born_ts"])
+                except Exception:
+                    pass
+                if cid in self.configs:
+                    self.configs[cid] = cfg          # refresh note/prereg only
+                else:
+                    self._add_challenger(cfg)        # restart: re-enter the pool
+                continue
+            if seen and seen.get("sig") != sig:
+                # changed hypothesis under the same id = a NEW trial: fresh
+                # start, fresh birth, re-counted in the monotone ledger.
+                if cid in self.configs:
+                    self._retire_challenger(cid)
+                if cid in self.trials_ids:
+                    self.trials_ids.remove(cid)
+                cfg["born_ts"] = max(float(cfg["born_ts"]), now)
+                self.hyp_seen[cid] = {"born_ts": cfg["born_ts"], "sig": sig}
+                self._add_challenger(cfg)
+                log("AUTOPILOT", f"hypothesis re-registered with new content — fresh start: {cid}")
+                continue
+            # brand new id: budget gate
+            dpy = decisions_per_year_of(cfg)
+            pre = cfg.get("prereg") or {}
+            if pre.get("expected_decisions_per_month"):
+                dpy = min(dpy, float(pre["expected_decisions_per_month"]) * 12.0)
+            chk = (rl.registration_check(self._current_var_sr(), self.trials_count, dpy)
+                   if rl else {"allowed": True, "budget_remaining": None, "sr0": None,
+                               "reason": "research_loop missing — budget unknown"})
+            if not chk.get("allowed", True):
+                if cid not in self._hyp_refused:
+                    self._hyp_refused.add(cid)
+                    log("AUTOPILOT", f"hypothesis {cid} REFUSED: {chk.get('reason')}", "WRN")
+                    self._push("autopilot_budget_exhausted",
+                               {"entrant": cid, "trials_count": int(self.trials_count),
+                                "sr0": chk.get("sr0"), "reason": chk.get("reason")})
+                continue
+            self.hyp_seen[cid] = {"born_ts": cfg["born_ts"], "sig": sig}
+            self._add_challenger(cfg)
+            log("AUTOPILOT", f"hypothesis registered: {cid} ({cfg.get('family')}, "
+                             f"{cfg.get('origin')}) — {chk.get('reason')}")
+
+    def refresh_hypotheses(self):
+        """Hot-swap hypothesis slots from hypotheses.json — the lab's cadence
+        (LAB_REFRESH_SECS throttle) and its mtime gate."""
+        now = time.time()
+        if now - self._hyp_check_ts < LAB_REFRESH_SECS:
+            return
+        self._hyp_check_ts = now
+        try:
+            mtime = os.path.getmtime(_hyp_path())
+        except OSError:
+            mtime = None
+        if mtime == self._hyp_mtime:
+            return
+        self._hyp_apply(*_read_hyp_file(now))
+
+    def _push(self, event_type, payload):
+        """SSE + assistant spine, best-effort: a sink hiccup never touches state."""
+        try:
+            bs._push_sse(event_type, payload)
+        except Exception:
+            pass
 
     # ── introspection ─────────────────────────────────────────────────────────
     def n_configs(self):
@@ -1126,13 +1591,16 @@ class Autopilot:
                 weeks_seen.add(wk)
             last_kept[pair] = float(ts)
             gross = float(fwd) if sig == "BUY" else -float(fwd)
-            nets.append((gross - bs.ROUND_TRIP_COST_PCT, gross))
+            nets.append((gross - bs.ROUND_TRIP_COST_PCT, gross, float(ts)))
         return self._cf_result(cfg, [x[0] for x in nets], [x[1] for x in nets],
-                               via="cf", gross_bar=bs.ROUND_TRIP_COST_PCT)
+                               via="cf", gross_bar=bs.ROUND_TRIP_COST_PCT,
+                               ts=[x[2] for x in nets])
 
     @staticmethod
-    def _cf_result(cfg, net, gross_l, via, gross_bar=None, extra=None):
-        """Common tail for every cf path: edge/t/clears + the nets stream."""
+    def _cf_result(cfg, net, gross_l, via, gross_bar=None, extra=None, ts=None):
+        """Common tail for every cf path: edge/t/clears + the nets stream.
+        `ts` (optional, same length as net) = the decision timestamps, so
+        streams of different entrants can be ALIGNED for N_eff clustering."""
         n = len(net)
         if n < 2:
             out = {"n_oos": n, "oos_edge": None, "t": None, "gross_edge": None,
@@ -1147,6 +1615,7 @@ class Autopilot:
                       and (gross_bar is None or (g is not None and g > gross_bar)))
             out = {"n_oos": n, "oos_edge": edge, "t": t, "gross_edge": g,
                    "clears_cost": bool(clears), "via": via, "nets": list(net)}
+        out["net_ts"] = list(ts) if (ts is not None and len(ts) == n) else None
         if extra:
             out.update(extra)
         return out
@@ -1235,7 +1704,7 @@ class Autopilot:
         born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
         # weekly close lookup by decision_ts for the forward return pairing
         wk_by_ts = {w[1]: (i, w[2]) for i, w in enumerate(weekly)}
-        net, gross_l = [], []
+        net, gross_l, tss = [], [], []
         prev_pos = 0
         for dts, pos in decisions:
             idx, close = wk_by_ts[dts]
@@ -1251,7 +1720,8 @@ class Autopilot:
             cost = (CF_SPOT_RT / 2.0) if (entered or exited) else 0.0
             net.append(g - cost)
             gross_l.append(g)
-        return self._cf_result(cfg, net, gross_l, via="cf_trend")
+            tss.append(float(dts))
+        return self._cf_result(cfg, net, gross_l, via="cf_trend", ts=tss)
 
     def _score_cf_carry(self, cfg):
         """Counterfactual funding-carry pair (long spot + short perp), marked daily.
@@ -1273,11 +1743,14 @@ class Autopilot:
             return self._cf_result(cfg, [], [], via="cf_carry",
                                    extra={"status": "waiting on funding history"})
         born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
+        # hurdle_mult (hypothesis lever, sanitizer-clamped to [1,4]) can only
+        # RAISE the entry hurdle above the built-in CARRY_HURDLE_ANN.
+        hurdle = CARRY_HURDLE_ANN * max(1.0, float(spec.get("hurdle_mult", 1.0) or 1.0))
         by_hour = dict(rates)
         first_day = (min(by_hour) // 86400) * 86400
         last_day = (max(by_hour) // 86400) * 86400   # last day may be partial: excluded
         ts_sorted = sorted(by_hour)
-        net, gross_l = [], []
+        net, gross_l, tss = [], [], []
         in_pos = False
         neg_run = worst_neg = 0
         day = first_day + 86400
@@ -1289,28 +1762,30 @@ class Autopilot:
             entered = exited = False
             if len(window) >= CARRY_MIN_7D_HOURS:
                 ann = statistics.fmean(window) * 24.0 * 365.0
-                if not in_pos and ann > CARRY_HURDLE_ANN:
+                if not in_pos and ann > hurdle:
                     in_pos, entered = True, True
-                elif in_pos and (ann < CARRY_HURDLE_ANN / 2.0 or ann < 0.0):
+                elif in_pos and (ann < hurdle / 2.0 or ann < 0.0):
                     in_pos, exited = False, True
             if day > born:
                 if exited:
                     net.append(-CARRY_RT_4LEG / 2.0)
                     gross_l.append(0.0)
+                    tss.append(float(day))
                 elif in_pos:
                     accr = sum(by_hour[t] for t in ts_sorted if day <= t < day + 86400)
                     cost = (CARRY_RT_4LEG / 2.0) if entered else 0.0
                     net.append(accr - cost)
                     gross_l.append(accr)
+                    tss.append(float(day))
                     if accr < 0:
                         neg_run += 1
                         worst_neg = max(worst_neg, neg_run)
                     else:
                         neg_run = 0
             day += 86400
-        return self._cf_result(cfg, net, gross_l, via="cf_carry",
+        return self._cf_result(cfg, net, gross_l, via="cf_carry", ts=tss,
                                extra={"worst_neg_funding_days": worst_neg,
-                                      "hurdle_ann": CARRY_HURDLE_ANN})
+                                      "hurdle_ann": hurdle})
 
     def _score_cf_switch(self, cfg):
         """Weekly allocator: carry_harvest's condition if live, else
@@ -1335,7 +1810,7 @@ class Autopilot:
         weekly = weekly_closes_from_daily(daily)
         tsm = dict(tsmom_decisions(weekly, int(spec.get("weeks", 20))))  # dts -> pos
         born = max(AP_CF_EPOCH, float(cfg.get("born_ts") or 0))
-        net, gross_l = [], []
+        net, gross_l, tss = [], [], []
         prev_alloc = "flat"
         for i, (_key, dts, close, _di) in enumerate(weekly):
             if i + 1 >= len(weekly):
@@ -1367,7 +1842,8 @@ class Autopilot:
                 g = 0.0
             net.append(g - cost)
             gross_l.append(g)
-        return self._cf_result(cfg, net, gross_l, via="cf_switch",
+            tss.append(float(dts))
+        return self._cf_result(cfg, net, gross_l, via="cf_switch", ts=tss,
                                extra=({"status": note} if note else None))
 
     def score(self):
@@ -1383,16 +1859,18 @@ class Autopilot:
         """
         out = {}
         nets_by_id = {}                # transient per-decision NET streams (never persisted)
+        ts_by_id = {}                  # transient decision timestamps (for N_eff alignment)
         for cid, cfg in self.configs.items():
             t = self.traders.get(cid)
             res = {"id": cid, "n": 0, "n_oos": 0, "oos_edge": None,
                    "t": None, "avg_pnl_net": None, "gross_edge": None,
                    "clears_cost": False, "via": "live",
                    "balance": round(t.balance, 2) if t else None}
-            live_nets = []
+            live_nets, live_ts = [], []
             if t is not None:
                 rows = self._trade_returns(t.trades)
                 live_nets = [r[1] for r in rows]
+                live_ts = [r[0] for r in rows]
                 n_all = len(rows)
                 res["n"] = n_all
                 if n_all >= MIN_TOTAL_TRADES:
@@ -1413,9 +1891,10 @@ class Autopilot:
             # still short of MIN_OOS_TRADES. Once a live book graduates, it
             # speaks for itself and cf becomes a footnote.
             cf = self.score_counterfactual(cfg) if cfg.get("cf") or cfg.get("cf_only") else None
-            cf_nets = None
+            cf_nets = cf_ts = None
             if cf is not None:
                 cf_nets = cf.pop("nets", None)
+                cf_ts = cf.pop("net_ts", None)
                 res["cf_n_oos"] = cf["n_oos"]
                 res["cf_edge"] = cf["oos_edge"]
                 res["cf_t"] = cf["t"]
@@ -1427,37 +1906,72 @@ class Autopilot:
                                 "t": cf["t"], "gross_edge": cf["gross_edge"],
                                 "clears_cost": cf["clears_cost"], "via": cf["via"]})
             # The DSR stats run on whichever stream is driving the record.
-            nets_by_id[cid] = (cf_nets if (cf_nets is not None
-                                           and str(res["via"]).startswith("cf"))
-                               else live_nets)
+            use_cf = cf_nets is not None and str(res["via"]).startswith("cf")
+            nets_by_id[cid] = cf_nets if use_cf else live_nets
+            ts_by_id[cid] = (cf_ts if use_cf else live_ts) or None
+            res["family"] = family_of(cfg)
             out[cid] = res
-        self._attach_survival_stats(out, nets_by_id)
+        self._attach_survival_stats(out, nets_by_id, ts_by_id)
+        self._last_nets = nets_by_id          # transient (kill reason codes)
         self.scores = out
         return out
 
-    def _attach_survival_stats(self, out, nets_by_id):
-        """Attach {sr, dsr, psr, min_trl, trades_n, verdict} to every record.
+    def _attach_survival_stats(self, out, nets_by_id, ts_by_id=None):
+        """Attach {sr, dsr, psr, min_trl, trades_n, verdict, sd_sr, sr0, n_eff}.
 
-        The SR0 hurdle is the expected max SR of trials_count unskilled tries
-        (N = every entrant EVER registered, monotone — see TRIALS_SEED), with
-        Var[SR] measured ACROSS the current entrants' per-decision SRs. A
-        KILLED entrant keeps its frozen verdict and can never clear the gate.
+        The SR0 hurdle is the expected max SR of N_eff unskilled tries, with
+        Var[SR] measured ACROSS the current entrants' per-decision SRs.
+        N_eff = trials_count (every entrant EVER registered, monotone — see
+        TRIALS_SEED) MINUS the redundancy the correlation clustering can
+        DEMONSTRATE: entrants whose net per-decision streams correlate > 0.7
+        on >= 8 shared decisions collapse into one cluster; anything with
+        too little overlap, no timestamps, or no stream stays a full trial.
+        trials_count itself never moves. sd_SR and SR0 are printed next to
+        every verdict. A KILLED entrant keeps its frozen verdict and can
+        never clear the gate.
         """
         now = time.time()
         srs = []
+        streams = {}
         for cid, nets in nets_by_id.items():
             if len(nets) >= 2:
                 sd = statistics.pstdev(nets)
                 if sd > 1e-12:
                     srs.append(statistics.fmean(nets) / sd)
+            tss = (ts_by_id or {}).get(cid)
+            if tss and len(tss) == len(nets) and len(nets) >= 2:
+                streams[cid] = {float(t): float(x) for t, x in zip(tss, nets)}
         var_sr = statistics.pvariance(srs) if len(srs) >= 2 else None
-        sr0 = expected_max_sr(var_sr, max(int(self.trials_count), 2))
+        sd_sr = math.sqrt(var_sr) if var_sr is not None else None
+        if rl is not None and streams:
+            clusters = rl.cluster_streams(streams)
+            n_scored = len(streams)
+            n_clusters = len(clusters)
+            n_eff = rl.n_eff_from_clusters(self.trials_count, n_scored, n_clusters)
+        else:
+            clusters = [[cid] for cid in streams]
+            n_clusters = len(clusters)
+            n_eff = max(int(self.trials_count), 2)
+        sr0 = expected_max_sr(var_sr, max(int(n_eff), 2))
+        self.n_eff, self.n_clusters, self.sd_sr, self.sr0 = int(n_eff), int(n_clusters), sd_sr, sr0
+        self._last_clusters = clusters
+        cluster_of = {}
+        for cl in clusters:
+            for cid in cl:
+                cluster_of[cid] = len(cl)
+        hurdle_txt = (f"sd_SR {sd_sr:.4f} · SR0 {sr0:.4f} · N_eff {int(n_eff)}/{int(self.trials_count)}"
+                      if sr0 is not None else
+                      f"sd_SR unknown · SR0 unknown · N_eff {int(n_eff)}/{int(self.trials_count)}")
         for cid, res in out.items():
             born = max(AP_CF_EPOCH, float(self.configs.get(cid, {}).get("born_ts") or 0))
             st = dsr_stats(nets_by_id.get(cid, []), sr0, born_ts=born, now=now)
             res.update(st)
             res["sr0"] = sr0
+            res["sd_sr"] = sd_sr
+            res["n_eff"] = int(n_eff)
+            res["cluster_size"] = cluster_of.get(cid, 1)
             res["trials_count"] = int(self.trials_count)
+            res["verdict"] = f"{res['verdict']} [{hurdle_txt}]"
             if cid in self.killed:
                 res["verdict"] = "KILLED"
                 res["killed_reason"] = self.killed[cid].get("reason")
@@ -1476,6 +1990,14 @@ class Autopilot:
             self.trials_count += 1
             changed = True
             log("AUTOPILOT", f"trials_count -> {self.trials_count} (registered {cid})")
+            cfg = self.configs.get(cid) or {}
+            # Contract [S]: autopilot_register once per new id (trials_ids is
+            # persisted, so a redeploy never re-announces).
+            self._push("autopilot_register", {
+                "entrant": cid, "origin": origin_of(cid, cfg), "family": family_of(cfg),
+                "born_ts": cfg.get("born_ts"), "trials_count": int(self.trials_count),
+                "n_eff": getattr(self, "n_eff", None),
+            })
         return changed
 
     def _apply_kill_rule(self):
@@ -1493,14 +2015,23 @@ class Autopilot:
             cfg = self.configs.get(cid, {})
             reason = (f"past MinTRL ({n} decisions >= {mt:.0f}) with deflated "
                       f"PSR {dsr:.3f} < {KILL_PSR} vs SR0 hurdle {s.get('sr0')}")
+            code = kill_reason_code(s, getattr(self, "_last_nets", {}).get(cid),
+                                    int(s.get("cluster_size") or 1))
+            kts = time.time()
             self.killed[cid] = {
-                "ts": time.time(),
+                # original shape (unchanged)
+                "ts": kts,
                 "reason": reason,
                 "config": {k: (sorted(v) if isinstance(v, set) else v)
                            for k, v in cfg.items()},
                 "final_score": {k: s.get(k) for k in
                                 ("sr", "dsr", "psr", "min_trl", "trades_n",
                                  "n_oos", "oos_edge", "t")},
+                # graveyard record (additive — contract [E])
+                "id": cid, "family": family_of(cfg), "horizon": horizon_of(cfg),
+                "cost_model": cost_model_of(cfg), "reason_code": code,
+                "sr": s.get("sr"), "sr0": s.get("sr0"), "dsr": dsr, "n": n,
+                "killed_ts": kts,
             }
             s["verdict"] = "KILLED"
             s["killed_reason"] = reason
@@ -1510,6 +2041,7 @@ class Autopilot:
             # bs._sse_to_event). Best-effort: a sink hiccup must never touch the kill.
             try:
                 bs._push_sse("autopilot_kill", {"entrant": cid, "reason": reason,
+                                                "reason_code": code, "family": family_of(cfg),
                                                 "was_champion": self.champion_id == cid})
             except Exception:
                 pass
@@ -1518,6 +2050,30 @@ class Autopilot:
                 self.allocation = "FLAT"
                 self.last_switch = {"ts": time.time(), "from": cid, "to": None,
                                     "why": f"champion {cid} KILLED -> FLAT"}
+
+    def _apply_proven_rule(self):
+        """PROVEN = past MinTRL (trades_n >= min_trl) AND deflated PSR >= PROVEN_DSR.
+        Fires ONCE per entrant (persisted list), pushes autopilot_proven. A
+        killed entrant can never be proven; a proven one is never un-proven
+        here (the goal block keeps the record)."""
+        for cid, s in self.scores.items():
+            if cid in self.killed or cid in self.proven:
+                continue
+            mt, n, dsr = s.get("min_trl"), s.get("trades_n"), s.get("dsr")
+            if mt is None or n is None or dsr is None or n < mt or dsr < PROVEN_DSR:
+                continue
+            self.proven.append(cid)
+            log("AUTOPILOT", f"PROVEN {cid}: n={n} >= MinTRL {mt:.0f}, DSR {dsr:.3f} >= {PROVEN_DSR}")
+            self._push("autopilot_proven", {"entrant": cid, "dsr": dsr, "n": n,
+                                            "min_trl": mt, "family": s.get("family")})
+
+    def _announce_clears(self):
+        """autopilot_clears once per entrant on its FIRST clears_cost flip."""
+        for cid, s in self.scores.items():
+            if s.get("clears_cost") and cid not in self.cleared_ids and cid not in self.killed:
+                self.cleared_ids.append(cid)
+                self._push("autopilot_clears", {"entrant": cid, "n": s.get("n_oos"),
+                                                "sr": s.get("sr"), "sr0": s.get("sr0")})
 
     # ── decision ───────────────────────────────────────────────────────────────
     def decide(self):
@@ -1532,12 +2088,15 @@ class Autopilot:
         # score() below then rebuilds self.scores from the surviving traders only,
         # so a dangling lab id can never appear in `eligible`.
         self.refresh_lab_configs()
-        self._register_trials()            # lab hot-swaps may have added ids
+        self.refresh_hypotheses()          # same cadence, same diff logic
+        self._register_trials()            # lab/hypothesis hot-swaps may have added ids
 
         scores = self.score()
         # Survival first: a KILLED entrant is frozen out BEFORE eligibility, so
         # the kill and the promotion can never disagree within one decision.
         self._apply_kill_rule()
+        self._apply_proven_rule()
+        self._announce_clears()
         eligible = {cid: s for cid, s in scores.items()
                     if s["clears_cost"] and cid not in self.killed}
 
@@ -1573,6 +2132,7 @@ class Autopilot:
             self.last_switch = {"ts": time.time(), "from": prev, "to": new,
                                 "why": why or "switch"}
             log("AUTOPILOT", f"champion {prev or 'FLAT'} -> {new or 'FLAT'} :: {why}")
+            self._push("autopilot_switch", {"from": prev, "to": new, "why": why or "switch"})
 
         self.champion_id = new
         self.allocation = "FLAT" if new is None else new
@@ -1613,6 +2173,11 @@ class Autopilot:
             "trials_count": int(self.trials_count),
             "trials_ids": list(self.trials_ids),
             "killed": self.killed,
+            "proven": list(self.proven),
+            "cleared_ids": list(self.cleared_ids),
+            "hyp_seen": dict(self.hyp_seen),
+            "n_eff": self.n_eff, "n_clusters": self.n_clusters,
+            "sd_sr": self.sd_sr, "sr0": self.sr0,
             "updated_at": time.time(),
         }
 
@@ -1649,17 +2214,100 @@ class Autopilot:
         self.trials_ids = [str(x) for x in tids] if isinstance(tids, list) else []
         killed = data.get("killed")
         self.killed = killed if isinstance(killed, dict) else {}
-        # Explicit heal: the persisted champion may be a lab id whose nomination
-        # was withdrawn while we were down. A champion outside the current pool
-        # can never be allowed to gate the real book — force FLAT immediately
-        # instead of waiting for the next decide() to notice.
-        if self.champion_id is not None and self.champion_id not in self.configs:
-            log("AUTOPILOT", f"restored champion {self.champion_id} not in pool -> FLAT", "WRN")
-            self.champion_id = None
-            self.allocation  = "FLAT"
+        pv = data.get("proven")
+        self.proven = [str(x) for x in pv] if isinstance(pv, list) else []
+        cl = data.get("cleared_ids")
+        self.cleared_ids = [str(x) for x in cl] if isinstance(cl, list) else []
+        hs = data.get("hyp_seen")
+        self.hyp_seen = {str(k): v for k, v in hs.items() if isinstance(v, dict)} \
+            if isinstance(hs, dict) else {}
+        for k in ("n_eff", "n_clusters", "sd_sr", "sr0"):
+            v = data.get(k)
+            setattr(self, k, v if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+        # The champion heal (persisted champion outside the pool -> FLAT) runs
+        # in _heal_champion() once the FULL pool (built-ins + lab + hypotheses)
+        # exists — see __init__.
         log("AUTOPILOT", f"state restored — champion={self.champion_id or 'FLAT'}")
 
     # ── surfacing ──────────────────────────────────────────────────────────────
+    def graveyard(self):
+        """Contract [E]: structured kill records, old entries normalized
+        (missing keys -> 'unknown'/None, never invented)."""
+        out = []
+        for cid, k in self.killed.items():
+            if not isinstance(k, dict):
+                continue
+            cfg = k.get("config") if isinstance(k.get("config"), dict) else {}
+            fs = k.get("final_score") if isinstance(k.get("final_score"), dict) else {}
+            out.append({
+                "id": k.get("id", cid),
+                "family": k.get("family") or (family_of(cfg) if cfg else "unknown"),
+                "horizon": k.get("horizon") or (horizon_of(cfg) if cfg else "unknown"),
+                "cost_model": k.get("cost_model") or "unknown",
+                "reason_code": k.get("reason_code") if k.get("reason_code") in KILL_REASON_CODES else "unknown",
+                "sr": k.get("sr", fs.get("sr")), "sr0": k.get("sr0"),
+                "dsr": k.get("dsr", fs.get("dsr")), "n": k.get("n", fs.get("trades_n")),
+                "killed_ts": k.get("killed_ts", k.get("ts")),
+            })
+        return out
+
+    def goal(self, now=None):
+        """Contract [G]: the goal block. Numbers come from the last score()
+        (persisted across restarts); None means 'not measured yet'."""
+        now = time.time() if now is None else now
+        alive_ids = [cid for cid in self.order if cid in self.configs and cid not in self.killed]
+        alive_recs = [{"id": cid, "family": family_of(self.configs[cid]),
+                       "born_ts": max(AP_CF_EPOCH, float(self.configs[cid].get("born_ts") or 0))}
+                      for cid in alive_ids]
+        grave = self.graveyard()
+        if rl is not None:
+            post = rl.family_posteriors(grave, alive_recs, now=now)
+        else:
+            post = {}
+        fam_names = list(HYP_FAMILIES) + ["switch"]
+        for r in alive_recs + grave:
+            if r["family"] not in fam_names:
+                fam_names.append(r["family"])
+        families = {}
+        for fam in fam_names:
+            members = [cid for cid in alive_ids if family_of(self.configs[cid]) == fam]
+            rates = [decisions_per_year_of(self.configs[cid]) for cid in members]
+            default = (rl.FAMILY_CADENCE_DEFAULT.get(fam, 52) if rl else 52)
+            p = post.get(fam) or {"s": 0, "f": 0, "alive": members,
+                                  "killed": [g["id"] for g in grave if g["family"] == fam]}
+            families[fam] = {
+                "decisions_per_year": min(rates) if rates else default,
+                "alive": list(p.get("alive", members)),
+                "killed": list(p.get("killed", [])),
+                "posterior": {"s": int(p.get("s", 0)), "f": int(p.get("f", 0))},
+            }
+        # nearest pending verdict from the MinTRL projections
+        nearest = {"id": None, "months": None}
+        for cid in alive_ids:
+            s = self.scores.get(cid) or {}
+            m = s.get("months_to_verdict")
+            if isinstance(m, (int, float)) and math.isfinite(m) and m > 0 \
+                    and cid not in self.proven:
+                if nearest["months"] is None or m < nearest["months"]:
+                    nearest = {"id": cid, "months": round(float(m), 2)}
+        return {
+            "proven": list(self.proven),
+            "alive": len(alive_ids),
+            "killed": len(self.killed),
+            "trials_count": int(self.trials_count),
+            "n_eff": self.n_eff,
+            "n_clusters": self.n_clusters,
+            "sd_sr": self.sd_sr,
+            "sr0": self.sr0,
+            "proven_dsr": PROVEN_DSR,
+            "nearest_verdict": nearest,
+            "families": families,
+            "budget_remaining": self.budget_remaining(),
+            "book_state": "flat" if self.champion_id is None else f"champion:{self.champion_id}",
+            "hyp_slots": [cid for cid in self.order if cid.startswith("hyp_")],
+            "hyp_max_slots": HYP_MAX_SLOTS,
+        }
+
     def status(self):
         """The dict the web routes render."""
         challengers = []
@@ -1671,10 +2319,11 @@ class Autopilot:
             s = self.scores.get(cid, {})
             n = len(t.trades) if t else 0
             wins = sum(1 for tr in t.trades if tr.get("pnl", 0) >= 0) if t else 0
-            is_lab = cid.startswith("lab_")   # sanitizer guarantees the namespace
+            is_lab = cid.startswith("lab_") or cid.startswith("hyp_")   # sanitizers guarantee the namespaces
             challengers.append({
                 "id": cid,
-                "origin": "lab" if is_lab else "builtin",
+                "origin": origin_of(cid, self.configs[cid]),
+                "family": family_of(self.configs[cid]),
                 "born_ts": self.configs[cid].get("born_ts") if is_lab else None,
                 "config": {k: (list(v) if isinstance(v, set) else v)
                            for k, v in self.configs[cid].items() if k != "id"},
@@ -1698,9 +2347,11 @@ class Autopilot:
                 "min_trl": round(s["min_trl"], 1) if s.get("min_trl") is not None else None,
                 "trades_n": s.get("trades_n"),
                 "verdict": s.get("verdict"),
+                "sd_sr": s.get("sd_sr"), "sr0": s.get("sr0"), "n_eff": s.get("n_eff"),
                 "status_note": s.get("status"),   # e.g. 'waiting on funding history'
                 "worst_neg_funding_days": s.get("worst_neg_funding_days"),
                 "killed": cid in self.killed,
+                "proven": cid in self.proven,
             })
         return {
             "enabled": bool(self.enabled),
@@ -1715,14 +2366,28 @@ class Autopilot:
             "min_oos_trades": MIN_OOS_TRADES,
             "cf_epoch": AP_CF_EPOCH,
             "trials_count": int(self.trials_count),
+            "n_eff": self.n_eff, "sd_sr": self.sd_sr, "sr0": self.sr0,
             "kill_psr": KILL_PSR,
-            "killed": {cid: {"ts": k.get("ts"), "reason": k.get("reason")}
+            "proven_dsr": PROVEN_DSR,
+            # A malformed kill record (corrupted state file, hand-edit) is
+            # rendered as 'unknown', never allowed to raise: graveyard() already
+            # skips non-dicts, and status() feeds the dashboard AND /api/goal.
+            "killed": {cid: ({"ts": k.get("ts"), "reason": k.get("reason"),
+                              "reason_code": k.get("reason_code", "unknown"),
+                              "family": k.get("family")}
+                             if isinstance(k, dict) else
+                             {"ts": None, "reason": "malformed kill record",
+                              "reason_code": "unknown", "family": "unknown"})
                        for cid, k in self.killed.items()},
+            "graveyard": self.graveyard(),
+            "goal": self.goal(),
             "standings": [
                 {**{k: (self.scores.get(cid) or {}).get(k) for k in
                     ("n", "n_oos", "oos_edge", "t", "clears_cost", "via",
-                     "sr", "dsr", "psr", "min_trl", "trades_n", "verdict")},
+                     "sr", "dsr", "psr", "min_trl", "trades_n", "verdict",
+                     "sd_sr", "sr0", "n_eff")},
                  "id": cid,
+                 "family": family_of(self.configs.get(cid, {})),
                  # e.g. 'waiting on funding history' — the honest reason a row
                  # has no number yet, so the dashboard never shows a bare 0/20
                  "status_note": (self.scores.get(cid) or {}).get("status"),
@@ -1730,6 +2395,7 @@ class Autopilot:
                 for cid in self.order if cid in self.configs
             ],
             "lab_slots": [cid for cid in self.order if cid.startswith("lab_")],
+            "hyp_slots": [cid for cid in self.order if cid.startswith("hyp_")],
             "challengers": challengers,
             "decision_log": self.decision_log[-15:],
         }
