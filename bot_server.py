@@ -10311,7 +10311,17 @@ def trading_loop(trader):
                             # when the champion is the config this book represents.
                             # Otherwise stay flat — the shadow row above already
                             # recorded the signal. No-op when AUTOPILOT is off.
-                            if _autopilot is not None and not _autopilot.allows(pair, "base"):
+                            # Fails CLOSED when the autopilot was meant to be
+                            # running and crashed. _autopilot is None in two very
+                            # different cases: deliberately OFF (a designed no-op,
+                            # the book trades on the other gates) and init FAILED
+                            # (_autopilot_boot_error set, "will keep retrying").
+                            # Only the second is a bug, and it silently DELETED
+                            # this gate -- the book would trade unallocated on
+                            # net_rr/min_conf/spread alone until a retry landed.
+                            _ap_broken = _autopilot is None and bool(_autopilot_boot_error)
+                            if _ap_broken or (_autopilot is not None
+                                              and not _autopilot.allows(pair, "base")):
                                 db.mark_shadow(_sid, taken=False, rejected="autopilot_flat")
                                 tg(_sig_msg + "\n🚫 *Not traded* — autopilot is "
                                    "FLAT: no config has proven a real edge yet, "

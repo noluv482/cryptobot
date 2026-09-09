@@ -134,7 +134,18 @@ _EM_GAMMA   = 0.5772156649015329   # Euler-Mascheroni, for the expected-max-SR t
 # before. Adopting it would be an owner decision, made after reading the
 # report — and it would RAISE the evidence bar for an SR to count, never lower
 # any hurdle.
-MIN_SR_CONTRIB_DECISIONS = 20     # proposed minimum decisions before an SR counts (UNAPPLIED)
+# APPLIED 2026-09-09 (was UNAPPLIED). sr = mean/pstdev = t_{n-1}/sqrt(n-1)
+# exactly, so under the null Var[sr_hat] = 1/(n-3): infinite at n=3 and Cauchy
+# (no finite variance) at n=2. Admitting those records made sd_SR a measure of
+# RECORD LENGTH rather than strategy dispersion. The consequence was not
+# academic: sd_SR 0.7012 put SR0(24) at 1.3882 per decision, which is an
+# ANNUALISED Sharpe of 10.0 weekly / 26.5 daily -- a bar nothing in finance
+# clears -- and a simulation of 24 ZERO-SKILL entrants through this same kill
+# rule reproduces sd_SR 0.7009 against the 0.7012 actually measured. The
+# tournament was not separating skill from luck; at that hurdle it killed
+# everything, including an entrant whose true edge equals PLAUSIBLE_SR (killed
+# on its THIRD decision). At n=20 the estimator's own variance is 1/17.
+MIN_SR_CONTRIB_DECISIONS = 20     # minimum decisions before an SR counts
 
 # TRIALS_SEED documents the honest N at the moment this counter shipped
 # (2026-09-03): 13 entrants existed (10 built-in configs — base, selective,
@@ -1309,7 +1320,7 @@ class Autopilot:
             d = self.sd_sr_diagnostic()
             m, b = d["measured"], d["budget"]
             sd_txt = f"{m['sd_sr']:.4f}" if m["sd_sr"] is not None else "unknown"
-            log("AUTOPILOT", f"sd_SR diagnostic (REPORT ONLY, no gate changed): "
+            log("AUTOPILOT", f"sd_SR diagnostic (floor APPLIED, gates use this): "
                              f"sd_SR {sd_txt} over {m['n_contributors']} entrant(s) "
                              f"({m['n_killed_contributors']} killed) - {b['reason']}")
             top = d.get("top_contributor")
@@ -1439,9 +1450,16 @@ class Autopilot:
             self.allocation  = "FLAT"
 
     def _current_var_sr(self):
-        """Cross-entrant Var[SR] from the last scores (persisted) — None if <2."""
+        """Cross-entrant Var[SR] from the last scores (persisted) — None if <2.
+
+        Applies the SAME record-length floor as the tournament scorer. The two
+        paths must agree: one feeds the live hurdle and the other feeds the
+        persisted one, and a disagreement shows up as the budget changing across
+        a restart with no new evidence.
+        """
         srs = [s.get("sr") for s in (self.scores or {}).values()
-               if isinstance(s, dict) and s.get("sr") is not None]
+               if isinstance(s, dict) and s.get("sr") is not None
+               and (s.get("trades_n") or 0) >= MIN_SR_CONTRIB_DECISIONS]
         return statistics.pvariance(srs) if len(srs) >= 2 else None
 
     def _budget_dpy(self):
@@ -1516,7 +1534,12 @@ class Autopilot:
         # can name the lever that would move it instead of saying 'exhausted'.
         k_half = rl.budget_remaining(var / 4.0, self.trials_count, dpy)   # sd/2 => var/4
         k_seed = rl.budget_remaining(var, TRIALS_SEED, dpy)
-        k_sd0 = rl.budget_remaining(0.0, self.trials_count, dpy)          # sd -> 0
+        # A LITERAL zero is now refused upstream as unknowable (see
+        # research_loop.expected_max_sr), which would make this lever
+        # unpriceable. Negligible-but-real dispersion answers the question
+        # the diagnostic is actually asking: "if the entrants barely
+        # differed, would breadth reopen?"
+        k_sd0 = rl.budget_remaining(1e-12, self.trials_count, dpy)       # sd -> ~0
         k_tr0 = rl.budget_remaining(var, 2, dpy)                          # trials -> the floor
         out["would_be_budget_if_sd_sr_halved"] = k_half
         out["would_be_budget_if_trials_at_seed"] = k_seed
@@ -1572,14 +1595,20 @@ class Autopilot:
         n = 2 if trials is None else int(trials)
         n = max(int(n), 2)
 
+        # The lower probe is negligible-but-real, never a literal zero: a zero
+        # variance is refused upstream as unknowable (expected_max_sr), so
+        # probing with it returned None -> 0 and made this helper answer "no
+        # such sd_SR exists" for every board.
+        _FLOOR_F = 1e-6
+
         def k_at(f):
             return rl.budget_remaining(var_sr * f * f, n, dpy) or 0
 
-        if k_at(0.0) < target:
+        if k_at(_FLOOR_F) < target:
             return None
         if k_at(1.0) >= target:
             return math.sqrt(var_sr)
-        lo, hi = 0.0, 1.0                       # k_at(lo) ok, k_at(hi) too small
+        lo, hi = _FLOOR_F, 1.0                  # k_at(lo) ok, k_at(hi) too small
         for _ in range(iters):
             mid = (lo + hi) / 2.0
             if k_at(mid) >= target:
@@ -1589,14 +1618,27 @@ class Autopilot:
         return math.sqrt(var_sr) * lo
 
     def sd_sr_diagnostic(self, decisions_per_year=None):
-        """REPORT ONLY - where sd_SR comes from, and what it WOULD be otherwise.
+        """Where sd_SR comes from, and what it would be under other rules.
 
-        THIS FUNCTION CHANGES NOTHING. _current_var_sr, SR0, N_eff, the DSR
-        gate, the kill rule and the registration budget are all untouched and
-        keep using the measured variance over EVERY scored entrant's SR. The
-        two alternatives below are priced out so the OWNER can read them and
-        decide; neither is applied anywhere in this module, and a test pins
-        that (see test_autopilot_trend_family.py).
+        THIS FUNCTION STILL CHANGES NOTHING - it reports. What changed on
+        2026-09-09 is the thing it reports ON: the MIN_SR_CONTRIB_DECISIONS
+        floor, priced here for weeks as proposal (a), is now APPLIED in
+        _current_var_sr and in the tournament scorer. "measured" therefore
+        describes the live, filtered variance, and (a) is no longer a
+        counterfactual - it is the measured state, kept as a key so the payload
+        shape and its consumers do not break.
+
+        Why it was applied: sr = mean/pstdev = t_{n-1}/sqrt(n-1) exactly, so
+        under the null Var[sr] = 1/(n-3) - infinite at n=3, no finite value at
+        n=2. Admitting short records made sd_SR measure record LENGTH. Twenty-
+        four zero-skill entrants scored under this same kill rule reproduce the
+        live sd_SR 0.7012 to three decimals, and at the SR0 that implies
+        (1.3882/decision = an annualised Sharpe of 10.0 weekly, 26.5 daily) an
+        entrant whose true edge equals PLAUSIBLE_SR is killed on its THIRD
+        decision. The tournament had no discriminating power left.
+
+        Applying it does NOT unpark the book: kills are permanent, so `base`
+        stays killed, and the champion is FLAT by a persisted choice.
 
         measured      : the live numbers - var_sr exactly as _current_var_sr()
                         computes it, sd_sr, sr0, n_eff, budget_remaining.
@@ -1660,13 +1702,31 @@ class Autopilot:
             shares = [(q / tot if tot > 0 else None) for q in sq]
             return var, math.sqrt(var), shares
 
-        var, sd, shares = _decompose(rows)
-        mean_sr = statistics.fmean([r["sr"] for r in rows]) if rows else None
-        for r, sh in zip(rows, shares):
+        # The floor is APPLIED (2026-09-09), so the measured decomposition runs
+        # over the admissible rows ONLY - the same set _current_var_sr keeps.
+        # Decomposing every row while the gate reads a filtered one would make
+        # the diagnostic describe a variance nothing uses, which is the exact
+        # failure it exists to prevent. Inadmissible rows are still listed, with
+        # a null share and a stated reason, because "excluded" is a fact the
+        # owner needs to see.
+        for r in rows:
+            r["admissible"] = r["decisions_n"] >= MIN_SR_CONTRIB_DECISIONS
+            r["counted_in_a"] = r["admissible"]      # kept: same predicate, old key
+        admissible = [r for r in rows if r["admissible"]]
+        var, sd, shares = _decompose(admissible)
+        mean_sr = statistics.fmean([r["sr"] for r in admissible]) if admissible else None
+        for r in rows:
+            r["deviation"] = None
+            r["variance_share"] = None
+            r["excluded_reason"] = (
+                None if r["admissible"] else
+                f"record of {r['decisions_n']} decisions is under the "
+                f"{MIN_SR_CONTRIB_DECISIONS}-decision floor (Var[sr]=1/(n-3))")
+        for r, sh in zip(admissible, shares):
             r["deviation"] = (r["sr"] - mean_sr) if mean_sr is not None else None
             r["variance_share"] = sh
-            r["counted_in_a"] = r["decisions_n"] >= MIN_SR_CONTRIB_DECISIONS
-        top = max(rows, key=lambda r: (r["variance_share"] or -1.0)) if rows else None
+        top = (max(admissible, key=lambda r: (r["variance_share"] or -1.0))
+               if admissible else None)
 
         def _alt(items, label, key="sr", formula=None, note=None):
             v, s, sh = _decompose(items, key)
@@ -1710,7 +1770,12 @@ class Autopilot:
             "sr0": self.sr0, "n_eff": self.n_eff,
             "trials_count": int(self.trials_count),
             "n_contributors": len(rows),
-            "n_killed_contributors": sum(1 for r in rows if r["killed"]),
+            # Counted over the ADMISSIBLE set: this number is read as "how
+            # much of the hurdle is built from dead entrants", so it has to
+            # describe the rows that are actually in the variance.
+            "n_killed_contributors": sum(1 for r in rows
+                                         if r["killed"] and r["admissible"]),
+            "n_killed_listed": sum(1 for r in rows if r["killed"]),
             "decisions_per_year_used": dpy_default,
             "budget_remaining": self.budget_remaining(),
         }
@@ -1723,7 +1788,7 @@ class Autopilot:
                                  "killed": top["killed"]} if top else None),
             "alternatives": {"a_min_decisions": alt_a, "b_rescaled": alt_b},
             "budget": self.budget_status(dpy_default),
-            "applied": False,
+            "applied": True,
             "note": ("REPORT ONLY - _current_var_sr and every gate are unchanged. "
                      "The alternatives are priced out for the owner to read; "
                      "adopting one is a human decision, not a runtime effect."),
@@ -2450,7 +2515,9 @@ class Autopilot:
         srs = []
         streams = {}
         for cid, nets in nets_by_id.items():
-            if len(nets) >= 2:
+            # MIN_SR_CONTRIB_DECISIONS, not 2: see the constant. A two-decision
+            # SR has no finite variance and cannot inform a cross-entrant one.
+            if len(nets) >= MIN_SR_CONTRIB_DECISIONS:
                 sd = statistics.pstdev(nets)
                 if sd > 1e-12:
                     srs.append(statistics.fmean(nets) / sd)

@@ -398,33 +398,63 @@ CFGS = {"spike": {"id": "spike", "kind": "carry"},
 A = fixture_ap(SCORES, CFGS, killed={"spike": {"reason": "cost"}})
 D = A.sd_sr_diagnostic()
 
-srs = [SCORES[k]["sr"] for k in ("slow_a", "slow_b", "slow_c", "spike")]
-exp_var = statistics.pvariance(srs)
+# "spike" is the pathology this fixture was built to show: sr 1.40 on FOUR
+# decisions, carrying most of the variance. Since 2026-09-09 the
+# MIN_SR_CONTRIB_DECISIONS floor is APPLIED, so it no longer counts -- under the
+# null Var[sr] = 1/(n-3), which has no finite value anywhere near n=4, so that
+# 1.40 is sampling noise being read as strategy dispersion. Dropping it takes the
+# variance from 0.36135 to 0.00109, a 332x reduction, and that is the whole fix.
+srs_admissible = [SCORES[k]["sr"] for k in ("slow_a", "slow_b", "slow_c")]
+exp_var = statistics.pvariance(srs_admissible)
 check("the diagnostic decomposes EXACTLY the variance _current_var_sr computes",
       abs(D["measured"]["var_sr"] - A._current_var_sr()) < 1e-15
       and abs(D["measured"]["var_sr"] - exp_var) < 1e-15,
       (D["measured"]["var_sr"], A._current_var_sr(), exp_var))
 check("sd_sr is the square root of that variance",
       abs(D["measured"]["sd_sr"] - math.sqrt(exp_var)) < 1e-15)
+check("the 4-decision entrant is EXCLUDED from the variance, not merely flagged",
+      abs(D["measured"]["var_sr"] - statistics.pvariance(
+          srs_admissible + [SCORES["spike"]["sr"]])) > 0.3,
+      D["measured"]["var_sr"])
+check("...but it is still LISTED, with a stated reason",
+      any(c["id"] == "spike" and c["admissible"] is False
+          and "floor" in (c.get("excluded_reason") or "")
+          for c in D["contributors"]),
+      [(c["id"], c.get("admissible"), c.get("excluded_reason")) for c in D["contributors"]])
+check("an excluded entrant carries no variance share",
+      all(c["variance_share"] is None
+          for c in D["contributors"] if not c["admissible"]))
+check("the diagnostic reports the floor as APPLIED",
+      D["applied"] is True, D["applied"])
 check("an entrant with no SR contributes nothing and is not listed",
       "nosr" not in {c["id"] for c in D["contributors"]})
 check("every contributor reports id / sr / decisions_n / cadence",
       all({"id", "sr", "decisions_n", "decisions_per_year"} <= set(c)
           and c["decisions_per_year"] in (52, 365) for c in D["contributors"]))
-shares = [c["variance_share"] for c in D["contributors"]]
-check("variance shares sum to exactly 1", abs(sum(shares) - 1.0) < 1e-12, sum(shares))
-mean_sr = statistics.fmean(srs)
-tot = sum((v - mean_sr) ** 2 for v in srs)
+# Shares are defined over the ADMISSIBLE set, so excluded rows carry None and
+# the sum is taken over the rows that actually make up the variance.
+shares = [c["variance_share"] for c in D["contributors"] if c["admissible"]]
+check("variance shares sum to exactly 1 over the admissible set",
+      abs(sum(shares) - 1.0) < 1e-12, sum(shares))
+mean_sr = statistics.fmean(srs_admissible)
+tot = sum((v - mean_sr) ** 2 for v in srs_admissible)
 spike = next(c for c in D["contributors"] if c["id"] == "spike")
+# The exemplar moved off "spike" on purpose: it is excluded now, so it has no
+# share to check. slow_b is the largest admissible deviation.
+exemplar = next(c for c in D["contributors"] if c["id"] == "slow_b")
 check("each share is that entrant's squared deviation over the total",
-      abs(spike["variance_share"] - (SCORES["spike"]["sr"] - mean_sr) ** 2 / tot) < 1e-12)
-check("the one short-record entrant is named as the top contributor",
-      D["top_contributor"]["id"] == "spike" and D["top_contributor"]["variance_share"] > 0.7,
+      abs(exemplar["variance_share"] - (SCORES["slow_b"]["sr"] - mean_sr) ** 2 / tot) < 1e-12)
+check("the top contributor is now the largest ADMISSIBLE deviation, not the 4-decision spike",
+      D["top_contributor"]["id"] == "slow_b" and D["top_contributor"]["variance_share"] > 0.5,
       D["top_contributor"])
-check("the report says how many contributors are already KILLED",
-      D["measured"]["n_killed_contributors"] == 1 and spike["killed"] is True)
+check("the excluded spike can no longer be the top contributor",
+      D["top_contributor"]["id"] != "spike")
+check("the report still says how many ADMISSIBLE contributors are KILLED",
+      D["measured"]["n_killed_contributors"] == 0, D["measured"]["n_killed_contributors"])
+check("...and the killed short-record entrant is still visible in the list",
+      spike["killed"] is True and spike["admissible"] is False)
 check("deviation is reported next to the share",
-      abs(spike["deviation"] - (SCORES["spike"]["sr"] - mean_sr)) < 1e-12)
+      abs(exemplar["deviation"] - (SCORES["slow_b"]["sr"] - mean_sr)) < 1e-12)
 
 # alternative (a): require n >= MIN_SR_CONTRIB_DECISIONS
 alt_a = D["alternatives"]["a_min_decisions"]
@@ -434,8 +464,12 @@ check("(a) drops the short-record entrant and keeps the rest",
       alt_a["contributors"])
 check("(a) reports the variance over exactly the survivors",
       abs(alt_a["var_sr"] - statistics.pvariance([SCORES[k]["sr"] for k in kept])) < 1e-15)
-check("(a) shrinks sd_SR (the 4-decision entrant was the variance)",
-      alt_a["sd_sr"] < D["measured"]["sd_sr"], (alt_a["sd_sr"], D["measured"]["sd_sr"]))
+# (a) WAS the proposal to apply this floor. It is applied now, so (a) and
+# "measured" describe the same set and must agree exactly. Keeping the key and
+# asserting the identity is how a future silent divergence gets caught.
+check("(a) now EQUALS measured — it is the applied rule, no longer a proposal",
+      abs(alt_a["sd_sr"] - D["measured"]["sd_sr"]) < 1e-15,
+      (alt_a["sd_sr"], D["measured"]["sd_sr"]))
 check("(a) shares sum to 1 over its own contributor set",
       abs(sum(alt_a["variance_shares"].values()) - 1.0) < 1e-12)
 check("(a) reports the SR0 that variance implies at the SAME N_eff",
@@ -443,16 +477,22 @@ check("(a) reports the SR0 that variance implies at the SAME N_eff",
 check("(a) prices out what budget_remaining WOULD be",
       alt_a["budget_remaining"] == rl.budget_remaining(
           alt_a["var_sr"], A.trials_count, D["measured"]["decisions_per_year_used"]))
-check("(a) is labelled UNAPPLIED in its own payload",
-      "UNAPPLIED" in alt_a["note"] and D["applied"] is False)
-check("MIN_SR_CONTRIB_DECISIONS is compared in exactly ONE place",
-      SRC_AP.count(">= MIN_SR_CONTRIB_DECISIONS") == 1)
-check("...and that place is inside sd_sr_diagnostic, not a gate",
-      SRC_AP.index('r["decisions_n"] >= MIN_SR_CONTRIB_DECISIONS')
-      > SRC_AP.index("def sd_sr_diagnostic"))
-check("no scoring / kill / promotion path mentions it",
-      not any(k in SRC_AP.split("def sd_sr_diagnostic")[0].split("MIN_SR_CONTRIB_DECISIONS = 20")[-1]
-              for k in (">= MIN_SR_CONTRIB_DECISIONS", "< MIN_SR_CONTRIB_DECISIONS")))
+check("the payload reports the floor as APPLIED",
+      D["applied"] is True, (D["applied"], alt_a["note"]))
+# TRIPWIRE, re-pointed 2026-09-09. It used to assert the floor was compared in
+# exactly ONE place and that the place was the diagnostic, "not a gate" -- it
+# existed to stop the floor being applied silently. The floor is now applied
+# DELIBERATELY, so the tripwire guards the new invariant instead: the two paths
+# that feed a hurdle must BOTH apply it, because one filtering and the other not
+# is how the live budget and the persisted budget silently disagree.
+check("the floor is applied in the tournament scorer",
+      "len(nets) >= MIN_SR_CONTRIB_DECISIONS" in SRC_AP)
+check("the floor is applied in the persisted _current_var_sr path too",
+      '(s.get("trades_n") or 0) >= MIN_SR_CONTRIB_DECISIONS' in SRC_AP)
+check("both hurdle paths apply it — neither may drift from the other",
+      SRC_AP.count(">= MIN_SR_CONTRIB_DECISIONS") >= 3)
+check("the old n>=2 admission is gone from the scorer",
+      "if len(nets) >= 2:" not in SRC_AP)
 
 # alternative (b): rescale by 1/sqrt(decisions/year), exactly as written
 alt_b = D["alternatives"]["b_rescaled"]
@@ -485,7 +525,12 @@ check("no entrants at all: the report is empty, not crashed",
 
 # ═════════════════════════ 5. the refusal says WHY ═══════════════════════════
 # sd_SR big enough that SR0 out-climbs what 24 months can resolve.
-BIG = fixture_ap({"a": {"sr": 1.2, "trades_n": 4}, "b": {"sr": -1.2, "trades_n": 4}},
+# Records are ADMISSIBLE (>= MIN_SR_CONTRIB_DECISIONS) on purpose. This block
+# tests that a refused budget names sd_sr as the binding lever; at trades_n=4
+# the entrants would now be excluded and the variance unmeasurable, which is a
+# different refusal ("cannot measure") and not the one under test. The SRs stay
+# far apart so the dispersion, not the record length, drives SR0.
+BIG = fixture_ap({"a": {"sr": 1.2, "trades_n": 40}, "b": {"sr": -1.2, "trades_n": 40}},
                  trials=21)
 bstat = BIG.budget_status()
 check("a refused budget is 0 and agrees with budget_remaining()",
@@ -544,28 +589,36 @@ check("budget_status defaults to the SAME cadence budget_remaining() uses",
       BIG.budget_status()["decisions_per_year"] == BIG._budget_dpy())
 
 
-# ═════════════════════════ 6. GUARD: nothing was actually changed ════════════
-# _current_var_sr must behave byte-for-byte as it did: pvariance over every
-# scored entrant's SR, >= 2 required, None otherwise. Pinned as SOURCE and as
-# BEHAVIOUR, and re-checked AFTER the diagnostic has run.
-CURRENT_VAR_SR_SRC = '''    def _current_var_sr(self):
-        """Cross-entrant Var[SR] from the last scores (persisted) — None if <2."""
-        srs = [s.get("sr") for s in (self.scores or {}).values()
-               if isinstance(s, dict) and s.get("sr") is not None]
-        return statistics.pvariance(srs) if len(srs) >= 2 else None
-'''
-check("_current_var_sr's source is unchanged, character for character",
-      CURRENT_VAR_SR_SRC in SRC_AP)
-check("_current_var_sr still counts EVERY scored entrant, short records included",
-      abs(A._current_var_sr() - statistics.pvariance(srs)) < 1e-15)
-check("_current_var_sr still returns None below 2 scored entrants",
+# ═════════════════════ 6. GUARD: the floor is applied, in BOTH paths ═════════
+# This section used to pin _current_var_sr byte-for-byte and assert it did NOT
+# apply MIN_SR_CONTRIB_DECISIONS -- a tripwire against changing the science
+# silently. The floor was applied deliberately on 2026-09-09 (see the constant),
+# so the guard now pins the OPPOSITE invariant. What it protects is unchanged in
+# spirit: the live hurdle and the persisted hurdle must be computed the same way,
+# because one filtering while the other does not is how the budget silently
+# changes across a restart with no new evidence.
+check("_current_var_sr applies the record-length floor",
+      '(s.get("trades_n") or 0) >= MIN_SR_CONTRIB_DECISIONS' in SRC_AP)
+check("_current_var_sr agrees EXACTLY with the diagnostic's measured variance",
+      abs(A._current_var_sr() - D["measured"]["var_sr"]) < 1e-15,
+      (A._current_var_sr(), D["measured"]["var_sr"]))
+check("a board of only short records yields None, not a fabricated variance",
+      fixture_ap({"x": {"sr": 1.1, "trades_n": 4},
+                  "y": {"sr": -1.1, "trades_n": 5}})._current_var_sr() is None)
+check("_current_var_sr still returns None below 2 admissible entrants",
       fixture_ap({"only": {"sr": 0.3, "trades_n": 30}})._current_var_sr() is None
       and fixture_ap({})._current_var_sr() is None)
-check("_current_var_sr does NOT apply MIN_SR_CONTRIB_DECISIONS",
-      abs(A._current_var_sr() - alt_a["var_sr"]) > 1e-9)
-check("the docstring says the diagnostic is a report the owner reads",
-      "REPORT ONLY" in SRC_AP and "THIS FUNCTION CHANGES NOTHING." in SRC_AP
-      and "human decision, not a runtime effect" in SRC_AP)
+check("an entrant with no SR is still ignored entirely",
+      abs(fixture_ap({"a": {"sr": 0.02, "trades_n": 40},
+                      "b": {"sr": -0.03, "trades_n": 55},
+                      "z": {"sr": None, "trades_n": 90}})._current_var_sr()
+          - statistics.pvariance([0.02, -0.03])) < 1e-15)
+check("the docstring still says the diagnostic itself only reports",
+      "THIS FUNCTION STILL CHANGES NOTHING" in SRC_AP)
+check("...and states plainly that the floor it reports on IS applied",
+      "is now APPLIED in" in SRC_AP)
+check("...and records that applying it does not unpark the book",
+      "does NOT unpark the book" in SRC_AP)
 
 before = (A._current_var_sr(), A.budget_remaining(), A.trials_count,
           A.sd_sr, A.sr0, A.n_eff, dict(A.scores), dict(A.killed))

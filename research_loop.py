@@ -107,8 +107,18 @@ def _norm_ppf(p):
 
 
 def expected_max_sr(var_sr, n_trials):
-    """E[max SR] of n_trials unskilled tries (the DSR hurdle). None if unknowable."""
-    if var_sr is None or var_sr < 0 or n_trials is None or n_trials < 2:
+    """E[max SR] of n_trials unskilled tries (the DSR hurdle). None if unknowable.
+
+    var_sr == 0 is refused, not answered. Algebraically E[max] of a zero-variance
+    field IS 0, but this estimator sees two to four entrants: a measured zero is
+    overwhelmingly "not enough dispersion to see" rather than "no dispersion
+    exists", and the two answers are opposites downstream. Returning 0.0 set the
+    hurdle to zero -- which quietly turns the Deflated Sharpe into a plain t-test
+    against zero while still being reported as a DSR -- and made
+    budget_remaining(0.0, 24, 52) return 500, i.e. the intake gate wide open.
+    None says "unknowable", which every caller already handles.
+    """
+    if var_sr is None or var_sr <= 0 or n_trials is None or n_trials < 2:
         return None
     sd = math.sqrt(var_sr)
     return sd * ((1 - _EM_GAMMA) * _norm_ppf(1 - 1.0 / n_trials)
@@ -141,7 +151,11 @@ def budget_remaining(var_sr, trials_count, expected_decisions_per_year,
     Returns None (unknown) when var_sr is unknown — never a guess.
     """
     thr = resolution_threshold(expected_decisions_per_year, months, z)
-    if thr is None or var_sr is None or var_sr < 0 or trials_count is None:
+    # var_sr <= 0, not < 0: a measured zero is unknowable at these sample
+    # sizes (see expected_max_sr), and 'unknowable' must propagate as None.
+    # Falling through instead made the loop break at k=0 and report the
+    # budget EXHAUSTED -- the opposite conclusion from the same evidence.
+    if thr is None or var_sr is None or var_sr <= 0 or trials_count is None:
         return None
     base = max(int(trials_count), 1)
     k = 0
@@ -172,9 +186,13 @@ def registration_check(var_sr, trials_count, expected_decisions_per_year,
                 "reason": "budget unknown (no cross-entrant SR variance yet) — admitted, DSR gate still applies"}
     if k <= 0:
         nxt = expected_max_sr(var_sr, n + 1)
+        # nxt can be None (unknowable variance); formatting it crashed the
+        # intake path outright, so the refusal could not even be reported.
+        nxt_txt = f"{nxt:.4f}" if nxt is not None else "unknown"
+        thr_txt = f"{thr:.4f}" if thr is not None else "unknown"
         return {"allowed": False, "budget_remaining": 0, "sr0": sr0, "threshold": thr,
-                "reason": (f"budget exhausted: SR0({n + 1})={nxt:.4f} leaves "
-                           f"< {thr:.4f} of resolvable gap to a plausible SR {plausible_sr_text()}")}
+                "reason": (f"budget exhausted: SR0({n + 1})={nxt_txt} leaves "
+                           f"< {thr_txt} of resolvable gap to a plausible SR {plausible_sr_text()}")}
     return {"allowed": True, "budget_remaining": k, "sr0": sr0, "threshold": thr,
             "reason": f"budget ok: {k} more registrable"}
 

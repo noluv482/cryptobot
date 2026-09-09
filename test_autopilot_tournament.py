@@ -1019,15 +1019,22 @@ _a7.killed = {}
 _a7.configs = {}
 _a7.n_eff = _a7.n_clusters = _a7.sd_sr = _a7.sr0 = None
 # two near-copies (same decision clock, rho > 0.7) + one independent stream
+# 24 decisions each, not 12: an SR from a record shorter than
+# MIN_SR_CONTRIB_DECISIONS no longer counts toward sd_SR (sr = t_{n-1}/sqrt(n-1),
+# so a short record contributes its own sampling noise, not strategy dispersion).
+# This block tests N_eff clustering and the SR0 wiring, so the streams are simply
+# made long enough to be admissible; the correlation structure is unchanged.
 _base = [0.004, -0.002, 0.006, -0.001, 0.003, -0.004, 0.005, 0.001,
-         -0.003, 0.002, 0.004, -0.005]
+         -0.003, 0.002, 0.004, -0.005, 0.003, -0.003, 0.007, -0.002,
+         0.002, -0.006, 0.004, 0.002, -0.001, 0.005, -0.004, 0.003]
 _twin = [x + (0.0002 if i % 2 else -0.0002) for i, x in enumerate(_base)]
 _indep = [-0.003, 0.005, -0.006, 0.002, -0.001, 0.004, -0.005, 0.003,
-          0.006, -0.002, -0.004, 0.001]
-_clock = [1_780_000_000.0 + i * 86400 for i in range(12)]
+          0.006, -0.002, -0.004, 0.001, -0.005, 0.002, 0.006, -0.003,
+          0.001, 0.004, -0.002, -0.006, 0.005, -0.001, 0.003, -0.004]
+_clock = [1_780_000_000.0 + i * 86400 for i in range(24)]
 _nets = {"n_a": _base, "n_b": _twin, "n_c": _indep}
 _tss = {"n_a": list(_clock), "n_b": list(_clock), "n_c": list(_clock)}
-_out7 = {cid: {"id": cid, "n_oos": 12, "oos_edge": 0.001, "t": 1.0,
+_out7 = {cid: {"id": cid, "n_oos": 24, "oos_edge": 0.001, "t": 1.0,
                "clears_cost": False, "via": "cf_price", "family": "regime_gate"}
          for cid in _nets}
 _a7._attach_survival_stats(_out7, _nets, _tss)
@@ -1044,6 +1051,27 @@ check("SR0 is the expected max SR of N_eff unskilled tries",
       _a7.sr0 is not None
       and abs(_a7.sr0 - ap.expected_max_sr(_a7.sd_sr ** 2, _a7.n_eff)) < 1e-12,
       (_a7.sr0, _a7.n_eff))
+# The record-length floor. sr = mean/pstdev = t_{n-1}/sqrt(n-1) exactly, so under
+# the null Var[sr] = 1/(n-3): infinite at n=3, no finite value at n=2. Admitting
+# those made sd_SR a measure of record length -- 24 zero-skill entrants scored
+# this way reproduce the live sd_SR 0.7012 to three decimals, which is how the
+# hurdle reached an annualised Sharpe of 10+ and killed everything.
+_a8 = ap.Autopilot.__new__(ap.Autopilot)
+_a8.trials_count = 20
+_a8.killed = {}
+_a8.configs = {}
+_a8.n_eff = _a8.n_clusters = _a8.sd_sr = _a8.sr0 = None
+_short = {"s_a": _base[:4], "s_b": _indep[:4]}
+_short_ts = {k: _clock[:4] for k in _short}
+_out8 = {cid: {"id": cid, "n_oos": 4, "oos_edge": 0.001, "t": 1.0,
+               "clears_cost": False, "via": "cf_price", "family": "regime_gate"}
+         for cid in _short}
+_a8._attach_survival_stats(_out8, _short, _short_ts)
+check("an SR from a record under MIN_SR_CONTRIB_DECISIONS never enters sd_SR",
+      _a8.sd_sr is None, (_a8.sd_sr, ap.MIN_SR_CONTRIB_DECISIONS))
+check("and with no admissible SRs the hurdle is unknown, NOT zero",
+      _a8.sr0 is None, _a8.sr0)
+
 check("requirement 1: sd_SR, SR0 and N_eff are printed next to EVERY verdict",
       all(("sd_SR" in r["verdict"] and "SR0" in r["verdict"]
            and "N_eff" in r["verdict"]) for r in _out7.values()),
