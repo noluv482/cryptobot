@@ -130,6 +130,23 @@ check("the ledger distinguishes contributed / overlap / ambiguous",
 check("nothing is silently dropped — every outcome is counted and logged",
       "retired as overlapping" in SRC and "unlabelable" in SRC)
 
+# ── 3b. the pass has to actually RUN ─────────────────────────────────────────
+print("")
+print("[3b] the pass is reachable on the cycles that matter")
+# It was originally placed AFTER the filler loop's pending check, which does
+# `continue` whenever there is nothing new to fill. With a 9,000-row resolved
+# backlog that is most cycles, so it ran zero times in 35 minutes of live
+# waiting. Unit tests all passed; only end-to-end watching caught it. The
+# existing _fwd168_backfill_pass sits above the guard for exactly this reason.
+_loop = SRC.split('log("LAB", "learning filler loop started')[-1]
+_call = _loop.find("_counterfactual_learn_pass()")
+_guard = _loop.find("if not srows and not erows and not mrows and not prows:")
+check("the filler loop still has its early-continue guard", _guard > 0, _guard)
+check("the counterfactual pass runs BEFORE that guard, not after it",
+      0 < _call < _guard, (_call, _guard))
+check("...for the same stated reason the fwd168 backfill does",
+      _loop.find("_fwd168_backfill_pass()") < _guard)
+
 # ── 4. the weight denominator ────────────────────────────────────────────────
 print("\n[4] pillar weights are a ratio to the MEASURED base, not to 50%")
 check("no hard-coded 50% denominator survives in either path",

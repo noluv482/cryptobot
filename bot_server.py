@@ -22551,6 +22551,27 @@ def _learning_filler_loop():
             # only. Runs before the pending check so it drains even on
             # passes with nothing new to fill. Own try/except inside.
             _fwd168_backfill_pass()
+            # Same reason as the backfill above, and it matters more here: the
+            # pending check below `continue`s whenever there is nothing NEW to
+            # fill, and with a 9,000-row resolved backlog that is most cycles.
+            # Placed after the guard this never ran once. The cost of running
+            # first is that rows resolved later in THIS pass wait for the next
+            # one - 30 minutes against a 48h horizon, which is nothing.
+            cf = _counterfactual_learn_pass()
+            if any(v for k, v in cf.items() if k != "report"):
+                log("LAB", f"counterfactual learning: {cf['contributed']} row(s) "
+                           f"contributed, {cf['overlap']} retired as overlapping, "
+                           f"{cf['ambiguous']} unlabelable (both barriers touched)")
+                rep = cf.get("report")
+                if rep:
+                    _rb = rep["realised_base"]
+                    log("LAB", "counterfactual pillar weights (REPORT ONLY, live "
+                               f"weights still realised): base {rep['counterfactual_base']:.3f} "
+                               f"vs realised {('%.3f' % _rb) if _rb else 'unknown'}; "
+                               f"{len(rep['would_move'])} of {rep['overlap']} pillars would "
+                               "move by >= 0.15")
+                    for _p, _r, _c in rep["would_move"][:6]:
+                        log("LAB", f"    {_p}: realised {_r:.2f} -> counterfactual {_c:.2f}")
             cutoff = time.time() - 49 * 3600
             # Shadow rows wait for the FULL 7-day horizon (169h) so fwd168 can
             # be filled in the same pass as fwd6/24/48 — one row, one write.
@@ -22656,22 +22677,6 @@ def _learning_filler_loop():
                 filled += 1
             if filled:
                 log("LAB", f"filled forward returns for {filled} row(s)")
-            # Learn from what the book DECLINED. Runs after the fill so this
-            # cycle's freshly resolved rows are already eligible.
-            cf = _counterfactual_learn_pass()
-            if any(cf.values()):
-                log("LAB", f"counterfactual learning: {cf['contributed']} row(s) "
-                           f"contributed, {cf['overlap']} retired as overlapping, "
-                           f"{cf['ambiguous']} unlabelable (both barriers touched)")
-                rep = cf.get("report")
-                if rep:
-                    log("LAB", "counterfactual pillar weights (REPORT ONLY, live "
-                               f"weights still realised): base {rep['counterfactual_base']:.3f} "
-                               f"vs realised {rep['realised_base'] or float('nan'):.3f}; "
-                               f"{len(rep['would_move'])} of {rep['overlap']} pillars would "
-                               "move by >= 0.15")
-                    for _p, _r, _c in rep["would_move"][:6]:
-                        log("LAB", f"    {_p}: realised {_r:.2f} -> counterfactual {_c:.2f}")
         except Exception as e:
             log("LAB", f"filler error: {e}", "ERR")
 
