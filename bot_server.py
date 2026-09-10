@@ -464,6 +464,11 @@ MAKER_FILL_WAIT_SCANS = int(os.environ.get(
     "MAKER_FILL_WAIT_SCANS", max(3, int(INTERVAL * 60 / max(REFRESH_SEC, 1) / 3))))
 _pending_entries = {}          # pair -> pending passive entry awaiting a fill
 SLIPPAGE                = 0.001
+
+# Fewest active pillar rows before a measured base rate is trusted as the
+# weight denominator. Below this the ratio is noise divided by noise, so
+# the weights are left exactly as they are rather than re-centred on air.
+PILLAR_BASE_MIN_N       = 100
 ORDER_TTL_SECS          = 45      # max seconds from signal to order placement; older signals are dropped
 LIVE_SLIPPAGE_TOLERANCE = 0.003   # 0.3% worst acceptable fill vs signal price on live orders
 MAX_TRADES_DAY   = 10
@@ -1168,6 +1173,17 @@ class Database:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS fi_fkey ON feature_outcomes(fkey)")
+            # PROVENANCE (2026-09-09). A realised row is the outcome of a trade
+            # that actually happened; a counterfactual row is what a signal the
+            # book DECLINED went on to do. They must never be pooled by
+            # accident: there are 193 realised feature rows and roughly 9,000
+            # resolvable counterfactual ones, so one unqualified query and the
+            # labelling convention silently becomes the learning. Added BEFORE
+            # any counterfactual writer exists, defaulted so every existing row
+            # is correctly stamped without a backfill.
+            cur.execute("ALTER TABLE feature_outcomes ADD COLUMN IF NOT EXISTS "
+                        "src TEXT NOT NULL DEFAULT 'realised'")
+            cur.execute("CREATE INDEX IF NOT EXISTS fi_src ON feature_outcomes(src, fkey)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS pillar_outcomes (
                     id     SERIAL PRIMARY KEY,
@@ -1178,6 +1194,9 @@ class Database:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS pi_pillar ON pillar_outcomes(pillar, active)")
+            cur.execute("ALTER TABLE pillar_outcomes ADD COLUMN IF NOT EXISTS "
+                        "src TEXT NOT NULL DEFAULT 'realised'")
+            cur.execute("CREATE INDEX IF NOT EXISTS pi_src ON pillar_outcomes(src, pillar, active)")
             # Learning lab (2026-08-13). shadow_signals: EVERY signal that
             # reaches the entry gates, taken or not, with its raw feature
             # values — the bot used to learn only from ~1 taken trade a day
@@ -1198,6 +1217,13 @@ class Database:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS ss_done ON shadow_signals(fwd_done, ts)")
+            # learned: 0 pending, 1 contributed, 2 skipped as OVERLAP,
+            # 3 skipped as an ambiguous label. Every resolved row ends up
+            # non-zero, so "how much evidence did we decline to use, and why"
+            # is answerable from the table rather than from a log line.
+            cur.execute("ALTER TABLE shadow_signals ADD COLUMN IF NOT EXISTS "
+                        "learned INT NOT NULL DEFAULT 0")
+            cur.execute("CREATE INDEX IF NOT EXISTS ss_learned ON shadow_signals(learned, fwd_done)")
             # 2026-08-24: the gate-loosening audit needed ADX and ER per signal
             # and they were never recorded — both had to be recomputed from
             # stored candles, and the strict subset came back too small to
@@ -1578,13 +1604,16 @@ class Database:
             log("DB", f"best_exit_reason error: {e}", "ERR")
             return []
 
-    def log_feature(self, fkey, pair, won):
+    def log_feature(self, fkey, pair, won, src="realised", ts=None):
+        """One feature outcome. `src` is the provenance and defaults to the only
+        kind that existed before: a real closed trade."""
         if not self.conn or not fkey: return
         try:
             with self.conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO feature_outcomes (fkey,pair,won,ts) VALUES (%s,%s,%s,%s)",
-                    (fkey, pair, won, time.time()))
+                    "INSERT INTO feature_outcomes (fkey,pair,won,ts,src) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (fkey, pair, won, float(ts) if ts else time.time(), src))
         except Exception as e:
             log("DB", f"log_feature error: {e}", "ERR")
 
@@ -1596,6 +1625,7 @@ class Database:
                     SELECT fkey, COUNT(*) AS n,
                            SUM(CASE WHEN won THEN 1 ELSE 0 END)::float/COUNT(*)*100 AS wr
                     FROM feature_outcomes
+                    WHERE src = 'realised'
                     GROUP BY fkey HAVING COUNT(*) >= 5
                 """)
                 return {r[0]: {"n": r[1], "wr": float(r[2])} for r in cur.fetchall()}
@@ -1621,15 +1651,20 @@ class Database:
             log("DB", f"hourly_win_rates error: {e}", "ERR")
             return {}
 
-    def log_pillars(self, pillars: dict, won: bool):
-        """Store per-pillar outcome for adaptive weight learning."""
+    def log_pillars(self, pillars: dict, won: bool, src="realised", ts=None):
+        """Store per-pillar outcome for adaptive weight learning.
+
+        `src` is the provenance and defaults to a real closed trade, which is
+        the only kind that existed before 2026-09-09."""
         if not self.conn or not pillars: return
+        stamp = float(ts) if ts else time.time()
         try:
             with self.conn.cursor() as cur:
                 for pillar, active in pillars.items():
                     cur.execute(
-                        "INSERT INTO pillar_outcomes (pillar,active,won,ts) VALUES (%s,%s,%s,%s)",
-                        (pillar, bool(active), won, time.time()))
+                        "INSERT INTO pillar_outcomes (pillar,active,won,ts,src) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (pillar, bool(active), won, stamp, src))
         except Exception as e:
             log("DB", f"log_pillars error: {e}", "ERR")
 
@@ -1749,6 +1784,98 @@ class Database:
                             (f6, f24, f48, f168, max_up, max_dn, sid))
         except Exception as e:
             log("DB", f"fill_shadow: {e}", "ERR")
+
+    # A 48h horizon means two signals on the same pair inside 48h describe
+    # overlapping windows and are NOT independent observations. Measured
+    # 2026-09-09: 8,990 resolved rows collapse to 269 independent ones across
+    # 33 pairs, a 33x overstatement. Writing them all as separate learning
+    # outcomes would fit the weights on a sample 33 times larger than the
+    # evidence - which is exactly the error that made the min_conf gate look
+    # like it was rejecting +2.8% winners when de-overlapped it is -0.18%.
+    SHADOW_BUCKET_S = 48 * 3600
+
+    def shadow_learn_batch(self, limit=200):
+        """One de-overlapped batch of resolved, not-yet-learned shadow rows.
+
+        Returns (representatives, overlap_ids): the first row in each
+        (pair, 48h bucket), plus every other row id in those same buckets so
+        the caller can retire them as OVERLAP. Retiring the whole bucket is
+        what makes the de-overlap hold across batches - picking one per batch
+        would let the next batch pick another from the same window.
+        """
+        if not self.conn: return [], []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT ON (pair, floor(ts / %s))
+                           id, pair, sig, ts, tgt_pct, stop_pct,
+                           max_up_48, max_dn_48, fwd48, pillars, fkey
+                    FROM shadow_signals
+                    WHERE learned = 0 AND fwd_done = 1
+                      AND sig IN ('BUY','SELL')
+                      AND tgt_pct IS NOT NULL AND stop_pct IS NOT NULL
+                    ORDER BY pair, floor(ts / %s), ts
+                    LIMIT %s
+                """, (self.SHADOW_BUCKET_S, self.SHADOW_BUCKET_S, int(limit)))
+                reps = cur.fetchall()
+                if not reps:
+                    return [], []
+                keys = [(r[1], int(r[3] // self.SHADOW_BUCKET_S)) for r in reps]
+                rep_ids = [r[0] for r in reps]
+                cur.execute("""
+                    SELECT id FROM shadow_signals
+                    WHERE learned = 0 AND fwd_done = 1
+                      AND (pair, floor(ts / %s)::bigint) IN %s
+                      AND id <> ALL(%s)
+                """, (self.SHADOW_BUCKET_S, tuple(keys), rep_ids))
+                return reps, [r[0] for r in cur.fetchall()]
+        except Exception as e:
+            log("DB", f"shadow_learn_batch: {e}", "ERR")
+            return [], []
+
+    def mark_shadow_learned(self, ids, state):
+        """Retire rows: 1 contributed, 2 overlap, 3 ambiguous."""
+        if not self.conn or not ids: return
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("UPDATE shadow_signals SET learned = %s WHERE id = ANY(%s)",
+                            (int(state), list(ids)))
+        except Exception as e:
+            log("DB", f"mark_shadow_learned: {e}", "ERR")
+
+    def counterfactual_counts(self):
+        """How the resolved evidence was used. Reported, never inferred."""
+        if not self.conn: return {}
+        try:
+            with self.conn.cursor() as cur:
+                # "pending" counts only rows the batch could actually pick.
+                # A resolved row with no target/stop, or a HOLD, is never
+                # eligible and never retired, so counting it as pending would
+                # report a backlog that can never drain.
+                cur.execute("""
+                    SELECT learned,
+                           (sig IN ('BUY','SELL')
+                            AND tgt_pct IS NOT NULL
+                            AND stop_pct IS NOT NULL) AS eligible,
+                           COUNT(*)
+                    FROM shadow_signals WHERE fwd_done = 1
+                    GROUP BY 1, 2
+                """)
+                rows = cur.fetchall()
+            by = {}
+            not_eligible = 0
+            for state, eligible, n in rows:
+                if eligible:
+                    by[int(state)] = by.get(int(state), 0) + int(n)
+                elif int(state) == 0:
+                    not_eligible += int(n)
+            return {"pending": by.get(0, 0), "contributed": by.get(1, 0),
+                    "skipped_overlap": by.get(2, 0),
+                    "skipped_ambiguous": by.get(3, 0),
+                    "not_eligible": not_eligible}
+        except Exception as e:
+            log("DB", f"counterfactual_counts: {e}", "ERR")
+            return {}
 
     def shadow_pending_168(self, limit=500):
         """fwd168 BACKFILL candidates: rows already resolved (fwd_done=1)
@@ -2131,8 +2258,14 @@ class Database:
         except Exception as e:
             log("DB", f"ensure_config: {e}", "ERR")
 
-    def pillar_win_rates(self):
-        """Per-pillar win rate when that pillar was ACTIVE. Min 10 samples."""
+    def pillar_win_rates(self, src="realised"):
+        """Per-pillar win rate when that pillar was ACTIVE. Min 10 samples.
+
+        `src` defaults to 'realised' so every existing caller keeps the exact
+        behaviour it had. 'counterfactual' asks the same question of the
+        signals the book DECLINED — the only evidence still growing while the
+        book is flat.
+        """
         if not self.conn: return {}
         try:
             with self.conn.cursor() as cur:
@@ -2141,13 +2274,44 @@ class Database:
                            COUNT(*) AS n,
                            SUM(CASE WHEN won THEN 1 ELSE 0 END)::float/COUNT(*)*100 AS wr
                     FROM pillar_outcomes
-                    WHERE active = true
+                    WHERE active = true AND src = %s
                     GROUP BY pillar HAVING COUNT(*) >= 10
-                """)
+                """, (src,))
                 return {r[0]: {"n": r[1], "wr": float(r[2])} for r in cur.fetchall()}
         except Exception as e:
             log("DB", f"pillar_win_rates error: {e}", "ERR")
             return {}
+
+    def pillar_base_rate(self, src="realised"):
+        """Win rate over the SAME population pillar_win_rates() draws from.
+
+        The weight is a RATIO to the field, so the denominator has to be the
+        field. It was hard-coded to 50%, and this book has never had a 50% base:
+        measured 21.08% over 1,039 active rows. Dividing a 27% pillar by 50%
+        gave 0.545, so all eleven pillars landed in the bottom tenth of the
+        0.4-1.5 range and four sat exactly on the floor - the weighting carried
+        almost no information, and _compute_pillar_weights' own promise that a
+        winning pillar scores above 1.0 was unreachable by construction.
+        Measured rather than pinned so it tracks the book instead of ageing.
+
+        Returns a FRACTION, or None when there is not enough to measure.
+        """
+        if not self.conn: return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*),
+                           SUM(CASE WHEN won THEN 1 ELSE 0 END)
+                    FROM pillar_outcomes
+                    WHERE active = true AND src = %s
+                """, (src,))
+                n, w = cur.fetchone()
+                if not n or n < PILLAR_BASE_MIN_N or not w:
+                    return None
+                return float(w) / float(n)
+        except Exception as e:
+            log("DB", f"pillar_base_rate error: {e}", "ERR")
+            return None
 
     def exit_pattern(self, pair):
         """Per-exit-reason stats for a pair (n, avg_pnl, early-stop count)."""
@@ -6485,8 +6649,20 @@ class PaperTrader:
 def _compute_pillar_weights(trades, weights_out):
     """Recompute pillar weights in-place from in-memory trade history.
     Pillar that fires on winning trades gets weight > 1.0; losing pillar < 1.0.
-    Requires ≥5 samples per pillar; falls back to current value otherwise."""
+    Requires >=5 samples per pillar; falls back to current value otherwise.
+
+    Centred on THIS SAMPLE'S OWN base win rate, not a hard-coded 50%. The
+    docstring line above was unreachable before: the book's measured base is
+    ~21%, so wr/0.50 could only exceed 1.0 for a pillar winning better than
+    half its trades, which has never happened. Every pillar landed between
+    0.400 and 0.545 and four sat exactly on the 0.4 floor, so a 57% relative
+    difference in win rate moved the weight by almost nothing. The base is
+    measured over the same population as the numerator - pillar-instances where
+    that pillar was ACTIVE - so the ratio is dimensionless and 1.0 means
+    "average for this book".
+    """
     counts: dict = {}
+    base_n = base_w = 0
     for t in trades[-200:]:
         pils = t.get("pillars", {})
         won  = t.get("pnl", 0) > 0
@@ -6494,12 +6670,19 @@ def _compute_pillar_weights(trades, weights_out):
             if active:
                 rec = counts.setdefault(pil, [0, 0])
                 rec[0] += 1
+                base_n += 1
                 if won:
                     rec[1] += 1
+                    base_w += 1
+    # No base, no re-centring. Leaving the weights untouched is the honest
+    # degrade; inventing a denominator is how the 0.50 got there.
+    if base_n < PILLAR_BASE_MIN_N or base_w == 0:
+        return
+    base = base_w / base_n
     for pil, (n, w) in counts.items():
         if n >= 5:
             wr = w / n
-            weights_out[pil] = round(max(0.4, min(1.5, wr / 0.50)), 2)
+            weights_out[pil] = round(max(0.4, min(1.5, wr / base)), 2)
 
 # ── Signal engine ─────────────────────────────────────────────────────────────
 class SignalEngine:
@@ -6844,10 +7027,16 @@ class SignalEngine:
             if db.connected:
                 try:
                     pw_raw = db.pillar_win_rates()
-                    self._pillar_weights = {
-                        p: max(0.4, min(1.5, s["wr"] / 50.0))
-                        for p, s in pw_raw.items()
-                    }
+                    # Same denominator as _compute_pillar_weights: the measured
+                    # base of the population these rates come from, never a
+                    # hard-coded 50% the book has never hit. pillar_win_rates()
+                    # returns PERCENT, pillar_base_rate() a FRACTION.
+                    base = db.pillar_base_rate()
+                    if base:
+                        self._pillar_weights = {
+                            p: max(0.4, min(1.5, (s["wr"] / 100.0) / base))
+                            for p, s in pw_raw.items()
+                        }
                 except Exception:
                     pass
             else:
@@ -22200,6 +22389,134 @@ def _spread_map_loop():
         time.sleep(86400)
 
 
+# ── Counterfactual learning ──────────────────────────────────────────────────
+# The adaptive pillar/feature weights only ever learned at position CLOSE, so
+# when the book went flat on 2026-08-24 the learning stopped four days later and
+# has produced nothing since - while the signals kept being evaluated and their
+# outcomes kept being resolved. This pass reads that declined evidence.
+#
+# Two rules keep it honest:
+#   1. It is written with src='counterfactual' and every reader of the realised
+#      tables filters src='realised'. A counterfactual is what a trade WOULD
+#      have done; it must never be counted as one that did, and the PROVEN
+#      verdict stays realised-trades-only.
+#   2. It is DE-OVERLAPPED first (see shadow_learn_batch). Otherwise ~9,000
+#      overlapping rows would be fitted as ~9,000 independent observations when
+#      they carry the information of about 269.
+
+def _cf_label(sig, tgt, stop, max_up, max_dn, fwd48):
+    """(won, reason) for one resolved signal, or (None, reason) if unlabelable.
+
+    Barrier test where it is UNAMBIGUOUS. We hold the 48h high and low but NOT
+    the order they happened in, so a row that touched BOTH the target and the
+    stop cannot be labelled without inventing the sequence - that is 46.6% of
+    BUY rows, and guessing would bias every weight it touches. Those are
+    skipped and counted, never resolved by assumption.
+
+    A row that touched NEITHER barrier is labelled by where it actually ended,
+    net of the real round-trip cost: that is what a timed exit would have paid.
+    """
+    if tgt is None or stop is None or max_up is None or max_dn is None:
+        return None, "missing barrier data"
+    long_side = (sig == "BUY")
+    # Reframe both sides as "did it reach +tgt before -stop", in trade terms.
+    up, dn = (max_up, max_dn) if long_side else (-max_dn, -max_up)
+    hit_tgt, hit_stop = (up >= tgt), (dn <= -stop)
+    if hit_tgt and hit_stop:
+        return None, "ambiguous: both barriers touched, order unknown"
+    if hit_tgt:
+        return True, "target hit, stop never touched"
+    if hit_stop:
+        return False, "stop hit, target never reached"
+    if fwd48 is None:
+        return None, "neither barrier touched and no close to fall back on"
+    net = (fwd48 if long_side else -fwd48) - ROUND_TRIP_COST_PCT
+    return (net > 0), "neither barrier touched; timed exit net of cost"
+
+
+def _pillar_weights_from(src):
+    """The weight map `src` implies, using that src's OWN measured base."""
+    rates = db.pillar_win_rates(src)
+    base = db.pillar_base_rate(src)
+    if not rates or not base:
+        return {}, base
+    return ({p: round(max(0.4, min(1.5, (s["wr"] / 100.0) / base)), 2)
+             for p, s in rates.items()}, base)
+
+
+def _counterfactual_weight_report():
+    """What the declined signals say the weights should be, next to what the
+    realised trades say. REPORTED, NOT APPLIED.
+
+    The live weights still come from realised rows only. This exists because
+    the realised evidence is FROZEN — 193 feature rows and 2,123 pillar rows,
+    none newer than 2026-08-21 — while the counterfactual set grows every day
+    and is now the only live evidence there is. Switching the weights over is a
+    research decision with a feedback loop attached (weights change which
+    signals score well, which generates the next counterfactuals), so it is put
+    in front of the owner as a measured comparison rather than taken quietly.
+    The same pattern the sd_SR floor went through before it was applied.
+    """
+    try:
+        r_w, r_base = _pillar_weights_from("realised")
+        c_w, c_base = _pillar_weights_from("counterfactual")
+    except Exception as e:                                     # noqa: BLE001
+        log("LAB", f"counterfactual weight report: {e}", "ERR")
+        return None
+    if not c_w:
+        return None
+    both = sorted(set(r_w) & set(c_w))
+    moved = [(p, r_w[p], c_w[p]) for p in both if abs(r_w[p] - c_w[p]) >= 0.15]
+    return {"realised": r_w, "counterfactual": c_w,
+            "realised_base": r_base, "counterfactual_base": c_base,
+            "overlap": len(both), "would_move": moved, "applied": "realised"}
+
+
+def _counterfactual_learn_pass(limit=200):
+    """One bounded batch. Returns a counts dict; never raises into the loop."""
+    out = {"contributed": 0, "overlap": 0, "ambiguous": 0}
+    if not db.connected:
+        return out
+    try:
+        reps, overlap_ids = db.shadow_learn_batch(limit=limit)
+    except Exception as e:                                     # noqa: BLE001
+        log("LAB", f"counterfactual batch failed: {e}", "ERR")
+        return out
+    if not reps and not overlap_ids:
+        return out
+
+    used, ambiguous = [], []
+    for (sid, pair, sig, ts, tgt, stop, max_up, max_dn, fwd48,
+         pillars_raw, fkey) in reps:
+        won, _why = _cf_label(sig, tgt, stop, max_up, max_dn, fwd48)
+        if won is None:
+            ambiguous.append(sid)
+            continue
+        pillars = {}
+        if pillars_raw:
+            try:
+                pillars = json.loads(pillars_raw) or {}
+            except Exception:                                  # noqa: BLE001
+                pillars = {}
+        try:
+            if pillars:
+                db.log_pillars(pillars, bool(won), src="counterfactual", ts=ts)
+            if fkey:
+                db.log_feature(fkey, pair, bool(won), src="counterfactual", ts=ts)
+        except Exception as e:                                 # noqa: BLE001
+            log("LAB", f"counterfactual write {sid}: {e}", "ERR")
+            continue
+        used.append(sid)
+
+    db.mark_shadow_learned(used, 1)
+    db.mark_shadow_learned(overlap_ids, 2)
+    db.mark_shadow_learned(ambiguous, 3)
+    out["contributed"], out["overlap"], out["ambiguous"] = (
+        len(used), len(overlap_ids), len(ambiguous))
+    out["report"] = _counterfactual_weight_report()
+    return out
+
+
 def _learning_filler_loop():
     """Fill forward returns for shadow signals and exit-lab counterfactuals.
 
@@ -22339,6 +22656,22 @@ def _learning_filler_loop():
                 filled += 1
             if filled:
                 log("LAB", f"filled forward returns for {filled} row(s)")
+            # Learn from what the book DECLINED. Runs after the fill so this
+            # cycle's freshly resolved rows are already eligible.
+            cf = _counterfactual_learn_pass()
+            if any(cf.values()):
+                log("LAB", f"counterfactual learning: {cf['contributed']} row(s) "
+                           f"contributed, {cf['overlap']} retired as overlapping, "
+                           f"{cf['ambiguous']} unlabelable (both barriers touched)")
+                rep = cf.get("report")
+                if rep:
+                    log("LAB", "counterfactual pillar weights (REPORT ONLY, live "
+                               f"weights still realised): base {rep['counterfactual_base']:.3f} "
+                               f"vs realised {rep['realised_base'] or float('nan'):.3f}; "
+                               f"{len(rep['would_move'])} of {rep['overlap']} pillars would "
+                               "move by >= 0.15")
+                    for _p, _r, _c in rep["would_move"][:6]:
+                        log("LAB", f"    {_p}: realised {_r:.2f} -> counterfactual {_c:.2f}")
         except Exception as e:
             log("LAB", f"filler error: {e}", "ERR")
 

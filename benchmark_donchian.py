@@ -38,10 +38,26 @@ import sys
 import time
 import urllib.request
 
-TAKER_FEE = 0.0026
-MAKER_FEE = 0.0016
-SLIPPAGE = 0.001
-ROUND_TRIP = 2 * TAKER_FEE + 2 * SLIPPAGE       # 0.72%, matches bot_server
+# SINGLE-SOURCED from the bot (2026-09-09). These were hard-coded at
+# TAKER 0.0026 / MAKER 0.0016 with a comment claiming "0.72%, matches
+# bot_server" -- it did not. Kraken's base tier moved to 0.008 taker on
+# 2026-07-09 and the bot switched to maker entries, so the real round trip is
+# 1.30%. This file was benchmarking against a cost 1.8x too low and saying so
+# in a comment that read as verification. A benchmark that understates cost
+# manufactures edges that do not exist.
+try:
+    import bot_server as _bs
+    TAKER_FEE = _bs.KRAKEN_FEE
+    MAKER_FEE = _bs.KRAKEN_MAKER_FEE
+    SLIPPAGE = _bs.SLIPPAGE
+    ROUND_TRIP = _bs.ROUND_TRIP_COST_PCT
+    _COST_SRC = "bot_server"
+except Exception:                                # standalone use, no bot on path
+    TAKER_FEE = 0.008
+    MAKER_FEE = 0.004
+    SLIPPAGE = 0.001
+    ROUND_TRIP = TAKER_FEE + SLIPPAGE + MAKER_FEE
+    _COST_SRC = "fallback (bot_server unavailable) - VERIFY against the bot"
 # Posting passively earns the maker fee AND avoids slippage (you name the price),
 # but only fills if price comes back to you. For a breakout that is precisely the
 # adverse-selection case: the trades that never pull back are the ones that ran.
