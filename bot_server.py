@@ -1806,6 +1806,24 @@ class Database:
         if not self.conn: return [], []
         try:
             with self.conn.cursor() as cur:
+                # LEAK, found 2026-09-12 by counting: 292 buckets held 499
+                # representatives. A bucket's rows resolve over a ~48h spread
+                # (each waits 169h after its own ts), so the first pass to see
+                # ANY resolved row picked it and retired the others that were
+                # resolved AT THAT MOMENT - and rows resolving later, into a
+                # bucket already represented, were still learned=0 and got
+                # picked again by a later pass. 17 recent buckets accumulated
+                # 207 excess reps this way. The fix is a sweep before selection:
+                # any pending row whose bucket already carries a representative
+                # is overlap by definition, whenever it happened to resolve.
+                cur.execute("""
+                    UPDATE shadow_signals s SET learned = 2
+                    WHERE s.learned = 0 AND s.fwd_done = 1
+                      AND EXISTS (SELECT 1 FROM shadow_signals r
+                                  WHERE r.pair = s.pair
+                                    AND floor(r.ts / %s) = floor(s.ts / %s)
+                                    AND r.learned IN (1, 3))
+                """, (self.SHADOW_BUCKET_S, self.SHADOW_BUCKET_S))
                 cur.execute("""
                     SELECT DISTINCT ON (pair, floor(ts / %s))
                            id, pair, sig, ts, tgt_pct, stop_pct,

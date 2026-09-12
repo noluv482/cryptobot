@@ -130,6 +130,25 @@ check("the ledger distinguishes contributed / overlap / ambiguous",
 check("nothing is silently dropped — every outcome is counted and logged",
       "retired as overlapping" in SRC and "unlabelable" in SRC)
 
+# -- 3a. the de-overlap must hold ACROSS passes, not just within one ----------
+print("")
+print("[3a] a bucket that already has a representative never gets another")
+# Found 2026-09-12 by counting, not by reasoning: 292 buckets held 499
+# representatives. Rows in one bucket resolve over a ~48h spread, so the first
+# pass retired only the rows resolved AT THAT MOMENT; later-resolving rows in an
+# already-represented bucket were still learned=0 and got picked as fresh reps.
+# 17 recent buckets accumulated 207 excess reps - the correlated rows the
+# de-overlap exists to exclude, re-admitted through a timing gap.
+_batch = SRC.split("def shadow_learn_batch(")[-1].split("def mark_shadow_learned(")[0]
+_sweep = _batch.find("UPDATE shadow_signals s SET learned = 2")
+_select = _batch.find("SELECT DISTINCT ON (pair, floor(ts / %s))")
+check("the batch sweeps late-resolving rows into overlap",  _sweep > 0, _sweep)
+check("...BEFORE it selects new representatives", 0 < _sweep < _select, (_sweep, _select))
+check("...keyed on buckets that already carry a rep (learned 1 or 3)",
+      "r.learned IN (1, 3)" in _batch)
+check("...and compares the bucket the same way the selection does",
+      "floor(r.ts / %s) = floor(s.ts / %s)" in _batch)
+
 # ── 3b. the pass has to actually RUN ─────────────────────────────────────────
 print("")
 print("[3b] the pass is reachable on the cycles that matter")
