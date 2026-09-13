@@ -295,11 +295,28 @@ KRAKEN_FUTURES_API_KEY    = _clean_env(os.environ.get("KRAKEN_FUTURES_API_KEY", 
 KRAKEN_FUTURES_API_SECRET = _clean_env(os.environ.get("KRAKEN_FUTURES_API_SECRET", ""))
 KRAKEN_FUTURES_BASE_URL   = "https://futures.kraken.com"
 KRAKEN_FUTURES_FEE        = 0.0005  # 0.05% taker fee (5× cheaper than Kraken spot)
-LIVE_MODE         = bool(
+def _allow_live_env():
+    """True only when the server was EXPLICITLY told real orders are allowed.
+
+    Having keys is not a decision to trade real money. Before 2026-09-13 the
+    presence of a key — in the environment, or in data/api_keys.json saved from
+    the dashboard, or restored with a data volume — was the whole decision:
+    LIVE_MODE derived itself from key presence in two separate places. PAPER_LOCK
+    was the only thing standing in front of it, and PAPER_LOCK DEFAULTS TO OFF,
+    so a fresh deploy that lacked the env was armed by a key alone.
+
+    This inverts that default. Read live, not cached, so the answer cannot be
+    frozen at import time by a half-configured boot.
+    """
+    return os.environ.get("ALLOW_LIVE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_LIVE_KEYS_PRESENT = bool(
     (USE_BINANCE and BINANCE_API_KEY and BINANCE_API_SECRET) or
     (USE_FUTURES and KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_API_SECRET) or
     (not USE_BINANCE and not USE_FUTURES and KRAKEN_API_KEY and KRAKEN_API_SECRET)
 )
+LIVE_MODE         = bool(_LIVE_KEYS_PRESENT and _allow_live_env())
 LIVE_EXCHANGE     = ("binance"         if (USE_BINANCE and BINANCE_API_KEY) else
                      "kraken_futures"  if (USE_FUTURES and KRAKEN_FUTURES_API_KEY) else
                      "kraken")
@@ -477,6 +494,43 @@ ACTIVE_HOURS_UTC  = (0, 24)   # 24/7 — crypto never closes; covers Asian sessi
 FUNDING_THRESHOLD = 0.0005
 MAX_POSITIONS     = 2          # max 2 simultaneous positions (was 3) — focus on quality
 MAX_TOTAL_RISK    = 0.25       # total margin ≤ 25% (was 40%) — reduce correlated exposure
+
+# ── Live hard caps (2026-09-13) ──────────────────────────────────────────────
+# RISK_MAX and MAX_TOTAL_RISK above are FRACTIONS of balance, and both are
+# editable from the dashboard up to 0.30 / 0.60. That is a sizing policy, not a
+# safety limit: it scales with the account and it can be changed from a phone.
+# These two are absolute, env-only, and apply to every live order regardless of
+# exchange, confidence, leverage tier or risk setting.
+#
+# They exist because an audit on 2026-09-13 found the live path had NO notional
+# ceiling of any kind (grep for MAX_NOTIONAL returned nothing) while the
+# kraken_futures branch hard-codes leverage = 20 at confidence >= 0.84. A 12%
+# risk setting on a $1,000 balance at 20x is $2,400 of notional on one signal,
+# from a book whose measured edge is indistinguishable from zero.
+#
+# Defaults are the smallest useful values. Raising them is an explicit env
+# change on the server, which is the point.
+def _safe_env_num(name, default, cast):
+    """Parse a numeric env var, falling back to the SAFE default on junk.
+
+    These are read at import. A bare int()/float() on a typo raises there and
+    the whole bot fails to boot — paper included — which turns a mistyped
+    safety limit into a total outage. Falling back keeps the strictest value
+    and says so loudly.
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return cast(str(raw).strip())
+    except (TypeError, ValueError):
+        log("BOOT", f"{name}={raw!r} is not a number — using the safe default "
+                    f"{default}", "ERR")
+        return default
+
+
+LIVE_MAX_LEVERAGE     = max(1, _safe_env_num("LIVE_MAX_LEVERAGE", 1, int))
+LIVE_MAX_NOTIONAL_USD = max(0.0, _safe_env_num("LIVE_MAX_NOTIONAL_USD", 100.0, float))
 BREAKEVEN_PCT     = 0.020      # lock breakeven at +2% (was 1.2%) — 15-min moves are bigger
 MIN_RR_RATIO      = 1.5        # require 1.5:1 R:R minimum — still asymmetric, more opportunities
 # Round-trip cost as a fraction of price: fee charged on entry AND exit, plus
@@ -700,7 +754,14 @@ def _load_api_keys_from_file():
             if _k and _s:
                 KRAKEN_API_KEY    = _k
                 KRAKEN_API_SECRET = _s
-                LIVE_MODE         = True
+                # Keys still LOAD without ALLOW_LIVE, so balance and other
+                # read-only calls keep working; only the arming is gated.
+                if _allow_live_env():
+                    LIVE_MODE = True
+                else:
+                    log("BOOT", "Kraken keys loaded from disk but ALLOW_LIVE is "
+                                "not set — staying in paper mode (keys still "
+                                "usable for read-only calls)")
         if not ANTHROPIC_API_KEY:
             _ak = _clean_env(_kd.get("anthropic_key", ""))
             if _ak:
@@ -2722,10 +2783,14 @@ def is_live():
     """True when real orders should be placed — keys present AND paper override is off.
 
     PAPER_LOCK is a deliberate hard stop that outranks both. It exists because
-    LIVE_MODE flips to True automatically the moment Kraken keys land in
-    api_keys.json (see _load_api_keys_from_file), and _paper_mode defaults to
-    False — so entering keys in the dashboard would start placing real orders
-    with no second confirmation. As of 2026-07-30 no tested strategy has a
+    LIVE_MODE USED TO flip to True automatically the moment Kraken keys landed
+    in api_keys.json or the environment, and _paper_mode defaults to False — so
+    entering keys in the dashboard would start placing real orders with no
+    second confirmation. Since 2026-09-13 key presence alone no longer arms
+    anything: both derivations require ALLOW_LIVE (see _allow_live_env), so the
+    default for a fresh deploy is paper even with keys and no PAPER_LOCK set.
+    PAPER_LOCK remains the outranking stop and the two are independent on
+    purpose. As of 2026-07-30 no tested strategy has a
     demonstrable edge (see benchmark_donchian.py / benchmark_xsection.py), so
     going live by accident is the specific failure worth engineering against.
     Unlike _paper_mode this cannot be toggled from the dashboard or Telegram:
@@ -3177,6 +3242,33 @@ def _kraken_get_usd_balance():
         tg(f"⚠️ Kraken balance error: `{e}`")
         return 0.0
 
+def _live_clamp(margin, leverage, name=""):
+    """(margin, leverage) reduced to the absolute live caps. Never raises them.
+
+    Called by EVERY live branch after its leverage tier is chosen and before the
+    order is placed, so a future exchange branch that forgets to call it is the
+    only way past — which is exactly what test_live_safety.py asserts against
+    the source text.
+
+    Returns (0.0, leverage) when the cap cannot be honoured at all; callers treat
+    a zero margin as "do not place".
+    """
+    lev = max(1, min(int(leverage or 1), LIVE_MAX_LEVERAGE))
+    if LIVE_MAX_NOTIONAL_USD <= 0:
+        return 0.0, lev
+    notional = float(margin) * lev
+    # FLOOR, never round. round() can carry a value UP - round(47.886097, 4)
+    # is 47.8861 - and a cap that can increase a size, by any amount, is not
+    # a cap. Caught by the 2000-input property test in test_live_safety.py.
+    if notional > LIVE_MAX_NOTIONAL_USD:
+        capped = math.floor((LIVE_MAX_NOTIONAL_USD / lev) * 10000.0) / 10000.0
+        log("LIVE", f"{name}: notional ${notional:.2f} over the "
+                    f"${LIVE_MAX_NOTIONAL_USD:.2f} cap — margin ${margin:.2f} "
+                    f"-> ${capped:.2f} at {lev}x")
+        return capped, lev
+    return math.floor(float(margin) * 10000.0) / 10000.0, lev
+
+
 def _kraken_place_order(pair, side, volume, validate=False, leverage=None,
                         price_limit=None, post_only=False):
     """
@@ -3441,7 +3533,18 @@ def _kf_place_order(pair, side, size_usd, leverage):
     sym  = _kf_pair(pair)
     if not sym:
         raise ValueError(f"No Kraken Futures contract for {pair} — pair not supported")
-    size = max(1, int(round(size_usd)))
+    # FLOOR, and refuse below one contract — never round up and never bump to 1.
+    # PF_ contracts are 1 USD each, so this is the last place the notional is
+    # quantised, and `max(1, int(round(...)))` could undo _live_clamp twice over:
+    # round() carries 99.6 up to 100, and max(1, ...) turns a legitimate $0.50
+    # cap into a $1 order. Both are small in dollars and both mean the cap did
+    # not hold. A size that cannot be expressed in whole contracts without
+    # exceeding the cap is not tradeable; the caller catches this and skips.
+    size = int(math.floor(float(size_usd)))
+    if size < 1:
+        raise ValueError(
+            f"size ${size_usd:.4f} is under one 1-USD contract after the live "
+            f"cap — refusing rather than rounding up to $1")
     params = {
         "orderType": "mkt",
         "symbol":    sym,
@@ -5906,6 +6009,10 @@ class PaperTrader:
                 else:
                     leverage      = 2
                     contract_tier = "Cautious"
+                margin, leverage = _live_clamp(margin, leverage, name)
+                if margin <= 0:
+                    log("LIVE", f"{name}: live notional cap is zero — entry refused")
+                    return
                 size_usd = round(margin * leverage, 2)
                 try:
                     _oid, contracts, _fp = _kf_place_order(pair, side, size_usd, leverage)
@@ -5923,6 +6030,10 @@ class PaperTrader:
             elif LIVE_EXCHANGE == "binance":
                 leverage      = 1
                 contract_tier = "Spot"
+                margin, leverage = _live_clamp(margin, leverage, name)
+                if margin <= 0:
+                    log("LIVE", f"{name}: live notional cap is zero — entry refused")
+                    return
                 try:
                     _oid, contracts, fill = _binance_place_order(pair, "BUY", usdt_amount=margin)
                     self._live_orders[pair] = _oid
@@ -5942,6 +6053,10 @@ class PaperTrader:
                 else:
                     leverage      = 1
                     contract_tier = "Spot"
+                margin, leverage = _live_clamp(margin, leverage, name)
+                if margin <= 0:
+                    log("LIVE", f"{name}: live notional cap is zero — entry refused")
+                    return
                 try:
                     order_side = "buy" if side == "LONG" else "sell"
                     lev_arg    = leverage if KRAKEN_MARGIN else None
@@ -6216,6 +6331,10 @@ class PaperTrader:
                                 "contracts": contracts, "margin": margin,
                                 "target": effective_target, "opened_at": time.time(),
                                 "confidence": confidence, "leverage": leverage,
+                                # Was THIS position actually placed on an
+                                # exchange? Read by _close before it sends a real
+                                # order. See the note there.
+                                "opened_live": bool(self._is_live()),
                                 "contract_tier": contract_tier,
                                 "pair": pair, "name": name,
                                 "trail_stop": trail_stop, "trail_peak": fill,
@@ -6303,7 +6422,16 @@ class PaperTrader:
             except Exception:
                 _arr_mid_c = None
 
-        if self._is_live():
+        # PROVENANCE. is_live() describes the bot NOW; it says nothing about
+        # whether THIS position was ever opened on an exchange. Positions persist
+        # across restarts and mode flips, so without this a position opened on
+        # paper becomes a real order the moment live is armed: the watchdog
+        # force-closes anything past its max_mins, and a restored SHORT would
+        # close as a real market BUY, or a restored LONG as a real SELL of coin
+        # the owner actually holds. Set at open (see "opened_live" in the
+        # position record); positions from before this field existed are absent
+        # and therefore treated as paper, which is the safe direction.
+        if self._is_live() and p.get("opened_live"):
             contracts = p.get("contracts", 0.0)
             fill      = price
             try:
@@ -6318,7 +6446,19 @@ class PaperTrader:
                     real_usd_after = _binance_get_usdt_balance()
                 else:
                     close_side = "sell" if p["side"] == "LONG" else "buy"
-                    lev_arg    = KRAKEN_LEVERAGE if KRAKEN_MARGIN else None
+                    # The leverage THIS POSITION was opened with, not the env
+                    # constant. Until 2026-09-13 both sides read KRAKEN_LEVERAGE
+                    # so they agreed by construction; _live_clamp then started
+                    # rewriting the OPEN side and nothing read it back here.
+                    # With the shipped default LIVE_MAX_LEVERAGE=1 they diverge
+                    # on every trade, and the divergence is load-bearing:
+                    # _kraken_place_order only sends the leverage param when it
+                    # is >= 2, so a clamped open is a SPOT buy while this close
+                    # would be a MARGIN sell. A leveraged sell with no leveraged
+                    # long to net against does not sell the coin — it borrows
+                    # and opens a short, leaving the spot position unsold.
+                    _pos_lev   = int(p.get("leverage") or 1)
+                    lev_arg    = _pos_lev if (KRAKEN_MARGIN and _pos_lev >= 2) else None
                     _kraken_place_order(pair, close_side, contracts, leverage=lev_arg)
                     self._live_orders.pop(pair, None)
                     real_usd_after = _kraken_get_usd_balance()
@@ -20365,11 +20505,20 @@ def _web_api_keys():
                          mimetype="application/json")
     KRAKEN_API_KEY    = new_key
     KRAKEN_API_SECRET = new_secret
-    LIVE_MODE         = True
-    threading.Thread(target=tg, args=(
-        "🔑 *API keys saved* via dashboard\n"
-        "Kraken spot keys are set — bot will trade live on the next signal.",
-    ), daemon=True).start()
+    # Saving a key through the dashboard USED TO arm live trading outright,
+    # and the message below said so out loud. That made a phone the last
+    # thing between a typo and a real order. ALLOW_LIVE is server-side and
+    # env-only by design: this endpoint cannot set it.
+    if _allow_live_env():
+        LIVE_MODE = True
+        _msg = ("🔑 *API keys saved* via dashboard\n"
+                "Kraken spot keys are set and ALLOW_LIVE is on — the bot "
+                "will trade live on the next signal.")
+    else:
+        _msg = ("🔑 *API keys saved* via dashboard\n"
+                "Keys are stored and usable for balance/read-only calls.\n"
+                "_Live trading stays OFF: ALLOW_LIVE is not set on the server._")
+    threading.Thread(target=tg, args=(_msg,), daemon=True).start()
     return _Response('{"ok":true}', mimetype="application/json")
 
 @_flask_app.route("/api/keys/test", methods=["POST"])
@@ -20632,9 +20781,21 @@ def _web_control():
             _sim_enabled = False
         elif action == "toggle_sim":
             _sim_enabled = not _sim_enabled
-        if action in ("sim_on", "sim_off", "toggle_sim") and _sim_trader:
-            _sim_trader._save()      # the switch survives restarts (same as the TG path)
-        else:
+        # This `else` used to catch EVERY action, not just an unrecognised one,
+        # so it ran after the chain above had already set the intended state:
+        # "pause" set _paused True and this flipped it straight back, and "live"
+        # armed live mode and then replaced the "Real orders will now be placed"
+        # warning with a pause/resume line. _paused is the real entry gate
+        # (on_signal reads it) and is what the session-drawdown breaker sets, so
+        # a single dashboard tap could clear a fired circuit breaker. The bare
+        # toggle is legacy behaviour for a request that names NO known action;
+        # it must never override one that does.
+        _HANDLED = ("pause", "resume", "paper", "live", "toggle_mode",
+                    "sim_on", "sim_off", "toggle_sim")
+        if action in ("sim_on", "sim_off", "toggle_sim"):
+            if _sim_trader:
+                _sim_trader._save()  # the switch survives restarts (same as the TG path)
+        elif action not in _HANDLED:
             _paused = not _paused
             tg_msg = ("⏸ *Trading PAUSED* via dashboard\nThe bot will not open new trades."
                       if _paused else
