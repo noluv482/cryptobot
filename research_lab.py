@@ -597,58 +597,100 @@ def _precompute(c, h, l, v):
 
 
 # ── Family evaluators ────────────────────────────────────────────────────────
-# Each returns (n_buy, sum_buy, sumsq_buy, n_sell, sum_sell, sumsq_sell) over
-# [a2, b), where sell returns are already direction-flipped (fwd of a SELL is
-# -fwd of a BUY, exactly find_signal.fwd). Guards (a2) reproduce each original
-# candidate's "if i < ...: return None" so warmup semantics match at every
+# Each YIELDS (bar_index, side) in ascending bar order over [a2, b) and never
+# reads a forward return - _fold_events turns an event stream into the
+# (n_buy, sum, sumsq, n_sell, sum, sumsq) sextuple, flipping SHORT returns
+# exactly as find_signal.fwd does, and drops fires that land inside an open
+# decision window. Keeping the fold in one place is deliberate: the overlap bug
+# this structure retires was 20 separate accumulate sites, and a new evaluator
+# written in this shape cannot reintroduce it.
+# Guards (a2) reproduce each original
 # parameterization, not just the defaults.
-def _move_rule(rn, thr, fade, a2, b, fwd):
+#: a decision is LONG (+1) or SHORT (-1); evaluators yield (bar_index, side)
+#: in ascending bar order and never touch a forward return themselves.
+LONG, SHORT = 1, -1
+
+
+def _fold_events(events, fwd, hz):
+    """(n_buy, sum, sumsq, n_sell, sum, sumsq) from an event stream.
+
+    THE ONLY place a forward return enters a rule's score, and therefore the
+    only place the spacing rule has to be correct.
+
+    SPACING. A decision at bar i owns the window [i, i+hz]. Any fire inside
+    that window is the SAME decision observed again, not a new one, so it is
+    dropped. Events must arrive in ascending bar order (every evaluator is a
+    single ascending loop) - the guard compares against the last KEPT bar, so
+    an unsorted stream would silently under-count rather than double-count.
+
+    This is not a tuning knob. spacing == hz is definitional: it is what makes
+    consecutive kept returns non-overlapping, which is what the t-statistic in
+    _score already assumes. Nothing here was chosen from the data.
+    """
     nb = ns_ = 0
     sb = qb = ss_ = qs_ = 0.0
-    for i in range(a2, b):
-        r = rn[i]
-        if r > thr:
-            f = fwd[i]
-            if fade:
-                g = -f; ns_ += 1; ss_ += g; qs_ += g * g
-            else:
-                nb += 1; sb += f; qb += f * f
-        elif r < -thr:
-            f = fwd[i]
-            if fade:
-                nb += 1; sb += f; qb += f * f
-            else:
-                g = -f; ns_ += 1; ss_ += g; qs_ += g * g
+    last = -(1 << 62)
+    for i, side in events:
+        if i - last < hz:
+            continue                       # inside the open window: same decision
+        f = fwd[i]
+        if f is None:
+            continue                       # no hz-bar return here (corpus tail)
+        last = i
+        if side == LONG:
+            nb += 1; sb += f; qb += f * f
+        else:
+            g = -f; ns_ += 1; ss_ += g; qs_ += g * g
     return nb, sb, qb, ns_, ss_, qs_
 
 
-def _ev_reversal(pre, c, h, l, v, p, a, b, fwd):
+def _baseline_events(a, b):
+    """The direction-matched baseline, sampled on the SAME spacing as a rule.
+
+    _score subtracts this mean from every adjusted return, so if the baseline
+    were still folded over every bar (it was: `bacc[1] += math.fsum(fwd[a:b])`)
+    the rule and its benchmark would sit on different effective-n scales."""
+    return ((i, LONG) for i in range(a, b))
+
+
+def _move_rule(rn, thr, fade, a2, b):
+    for i in range(a2, b):
+        r = rn[i]
+        if r > thr:
+            yield i, (SHORT if fade else LONG)
+        elif r < -thr:
+            yield i, (LONG if fade else SHORT)
+
+
+def _ev_reversal(pre, c, h, l, v, p, a, b):
     lag = p["n"]
-    return _move_rule(pre["ret"][lag], p["thr"], True, max(a, lag + 1), b, fwd)
+    # `yield from`, not `return`: both forms hand back the same event stream,
+    # but only this one makes the function itself a generator, so the
+    # "every evaluator is a generator" check in test_lab_deoverlap.py can stay
+    # strict instead of also accepting "returns something iterable" — which is
+    # the loophole a future accumulate-inline evaluator would slip through.
+    yield from _move_rule(pre["ret"][lag], p["thr"], True, max(a, lag + 1), b)
 
 
-def _ev_momentum(pre, c, h, l, v, p, a, b, fwd):
+def _ev_momentum(pre, c, h, l, v, p, a, b):
     w = p["window"]
-    return _move_rule(pre["ret"][w], p["thr"], False, max(a, w + 1), b, fwd)
+    yield from _move_rule(pre["ret"][w], p["thr"], False, max(a, w + 1), b)
 
 
-def _ev_zscore(pre, c, h, l, v, p, a, b, fwd):
+def _ev_zscore(pre, c, h, l, v, p, a, b):
     zarr = pre["z"][p["window"]]
     k = p["z"]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, p["window"] - 1), b):
         z = zarr[i]
         if z is None:
             continue
         if z > k:                                      # stretched high -> fade short
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
+            yield i, SHORT
         elif z < -k:
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, LONG
 
 
-def _ev_ma_cross(pre, c, h, l, v, p, a, b, fwd):
+def _ev_ma_cross(pre, c, h, l, v, p, a, b):
     # Fidelity note (measured on SOLUSD, 45k bars): prefix-sum SMAs can round
     # differently from find_signal's per-bar sum(xs[-n:]) at an EXACT fast==slow
     # tie (diff 0.0 vs -5e-12), which moves that cross detection by one bar.
@@ -658,57 +700,46 @@ def _ev_ma_cross(pre, c, h, l, v, p, a, b, fwd):
     # module exists to eliminate.
     fa = pre["sma"][p["fast"]]
     sl = pre["sma"][p["slow"]]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, p["slow"] + 1), b):
         fv, sv, pf, ps = fa[i], sl[i], fa[i - 1], sl[i - 1]
         if pf <= ps and fv > sv:                       # cross up event
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
+            yield i, LONG
         elif pf >= ps and fv < sv:
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, SHORT
 
 
-def _ev_breakout(pre, c, h, l, v, p, a, b, fwd):
+def _ev_breakout(pre, c, h, l, v, p, a, b):
     lb = p["lookback"]
     hiw = pre["dmax"][lb]
     low = pre["dmin"][lb]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, lb + 1), b):
         ci = c[i]
         if ci > hiw[i]:                                # Donchian up-break
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
+            yield i, LONG
         elif ci < low[i]:
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, SHORT
 
 
-def _ev_vol_expansion(pre, c, h, l, v, p, a, b, fwd):
+def _ev_vol_expansion(pre, c, h, l, v, p, a, b):
     w = p["window"]
     mult = p["mult"]
     rng = pre["rng"]
     rm = pre["rngm"][w]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, w + 2), b):
         if rng[i] < mult * rm[i]:                      # not an expansion bar
             continue
         if c[i] > (h[i] + l[i]) / 2:                   # direction of the break
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
+            yield i, LONG
         else:
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, SHORT
 
 
-def _ev_volume_spike_fade(pre, c, h, l, v, p, a, b, fwd):
+def _ev_volume_spike_fade(pre, c, h, l, v, p, a, b):
     w = p["window"]
     mult = p["mult"]
     thr = p["thr"]
     med = pre["vmed"][w]
     r1 = pre["ret"][1]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, w + 2), b):
         vi = v[i]
         if not vi:
@@ -718,33 +749,27 @@ def _ev_volume_spike_fade(pre, c, h, l, v, p, a, b, fwd):
             continue
         r = r1[i]
         if r > thr:                                    # blowoff -> fade short
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
+            yield i, SHORT
         elif r < -thr:                                 # capitulation -> fade long
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, LONG
 
 
-def _ev_rsi_extreme(pre, c, h, l, v, p, a, b, fwd):
+def _ev_rsi_extreme(pre, c, h, l, v, p, a, b):
     rsi = pre["rsi"]
     hi_t = p["hi"]
     lo_t = p["lo"]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, 30), b):                     # original's i<30 guard
         r = rsi[i]
         if r is None:
             continue
         if r > hi_t:
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
+            yield i, SHORT
         elif r < lo_t:
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, LONG
 
 
-def _ev_inside_bar(pre, c, h, l, v, p, a, b, fwd):
+def _ev_inside_bar(pre, c, h, l, v, p, a, b):
     k = p["k"]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, k + 2), b):
         ok = True
         for j in range(1, k + 1):                      # k consecutive inside bars
@@ -754,38 +779,31 @@ def _ev_inside_bar(pre, c, h, l, v, p, a, b, fwd):
         if not ok:
             continue
         if c[i] > h[i - 1]:                            # resolution direction
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
+            yield i, LONG
         elif c[i] < l[i - 1]:
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, SHORT
 
 
-def _ev_gap_fade(pre, c, h, l, v, p, a, b, fwd):
+def _ev_gap_fade(pre, c, h, l, v, p, a, b):
     thr = p["thr"]
     r1 = pre["ret"][1]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, 2), b):
         r = r1[i]
         if r >= thr:                                   # big up bar -> fade short
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
+            yield i, SHORT
         elif r <= -thr:
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, LONG
 
 
-def _ev_three_in_a_row(pre, c, h, l, v, p, a, b, fwd):
+def _ev_three_in_a_row(pre, c, h, l, v, p, a, b):
     k = p["k"]
     dn = pre["dn"]
     up = pre["up"]
-    nb = ns_ = 0
-    sb = qb = ss_ = qs_ = 0.0
     for i in range(max(a, k + 1), b):
         if dn[i] >= k:                                 # k straight down closes -> fade long
-            f = fwd[i]; nb += 1; sb += f; qb += f * f
+            yield i, LONG
         elif up[i] >= k:
-            f = -fwd[i]; ns_ += 1; ss_ += f; qs_ += f * f
-    return nb, sb, qb, ns_, ss_, qs_
+            yield i, SHORT
 
 
 _EVALS = {
@@ -871,11 +889,17 @@ def _sweep_pair(pair, part):
                 b = min(b, int(n * hi) - hz)
             if b <= a:
                 continue
+            # The baseline is sampled on the SAME hz spacing as every rule
+            # (see _baseline_events): _score subtracts its mean from each
+            # adjusted return, so a baseline folded over every bar would put
+            # the rule and its benchmark on different effective-n scales.
             bacc = base[f"h{hz}_{wname}"]
-            bacc[0] += b - a
-            bacc[1] += math.fsum(fwd[a:b])
+            b_n, b_s, _, _, _, _ = _fold_events(_baseline_events(a, b), fwd, hz)
+            bacc[0] += b_n
+            bacc[1] += b_s
             for slug, fam, params in _GRID:
-                res = _EVALS[fam](pre, c, h, l, v, params, a, b, fwd)
+                res = _fold_events(
+                    _EVALS[fam](pre, c, h, l, v, params, a, b), fwd, hz)
                 slot = acc[f"{slug}_h{hz}"][wname]
                 for j in range(6):
                     slot[j] += res[j]

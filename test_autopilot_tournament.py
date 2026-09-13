@@ -792,17 +792,29 @@ try:
 
     # --- proven rule ([G] proven + [S] autopilot_proven) ---------------------
     PUSHED.clear()
+    # direction_state "confirmed" on every entrant that is being refused for
+    # some OTHER reason, so each case still isolates the bar it names. PROVEN
+    # additionally requires directional evidence — p_nodir below is the entrant
+    # that pins THAT bar, and test_direction_gate.py covers the statistic.
     inst.scores = {
         "p_yes":   {"id": "p_yes", "min_trl": 10, "trades_n": 22, "dsr": 0.97,
-                    "family": "trend", "clears_cost": True},
+                    "family": "trend", "clears_cost": True,
+                    "direction_state": "confirmed"},
         "p_thin":  {"id": "p_thin", "min_trl": 40, "trades_n": 22, "dsr": 0.99,
-                    "family": "trend", "clears_cost": True},
+                    "family": "trend", "clears_cost": True,
+                    "direction_state": "confirmed"},
         "p_weak":  {"id": "p_weak", "min_trl": 10, "trades_n": 22, "dsr": 0.90,
-                    "family": "carry", "clears_cost": True},
+                    "family": "carry", "clears_cost": True,
+                    "direction_state": "confirmed"},
         "p_dead":  {"id": "p_dead", "min_trl": 10, "trades_n": 22, "dsr": 0.99,
-                    "family": "carry", "clears_cost": True},
+                    "family": "carry", "clears_cost": True,
+                    "direction_state": "confirmed"},
         "p_blank": {"id": "p_blank", "min_trl": None, "trades_n": None, "dsr": None,
                     "family": "trend", "clears_cost": False},
+        # everything p_yes has, except the directional control has not spoken
+        "p_nodir": {"id": "p_nodir", "min_trl": 10, "trades_n": 22, "dsr": 0.97,
+                    "family": "trend", "clears_cost": True,
+                    "direction_state": "undetermined"},
     }
     inst.killed["p_dead"] = {"ts": _t.time(), "reason": "killed earlier"}
     inst._apply_proven_rule()
@@ -815,6 +827,13 @@ try:
     check("a KILLED entrant can never be proven", "p_dead" not in inst.proven)
     check("an unmeasured entrant is not proven (None is not a pass)",
           "p_blank" not in inst.proven)
+    # A high DSR is exactly what an attention effect produces on raw return:
+    # the live book scores +0.700% on its BUY side and +0.499% on its SELL
+    # side, so it beats the benchmark in BOTH directions and knows neither.
+    check("an entrant with no directional evidence is not proven, whatever "
+          "its DSR", "p_nodir" not in inst.proven, inst.proven)
+    check("...and it is NOT killed for it — the gate blocks promotion only",
+          "p_nodir" not in inst.killed)
     check("[S] autopilot_proven payload = {entrant, dsr, n, min_trl}",
           len(prov) == 1 and set(prov[0]) >= {"entrant", "dsr", "n", "min_trl"}, prov)
     inst._apply_proven_rule()
