@@ -147,6 +147,16 @@ _EM_GAMMA   = 0.5772156649015329   # Euler-Mascheroni, for the expected-max-SR t
 # on its THIRD decision). At n=20 the estimator's own variance is 1/17.
 MIN_SR_CONTRIB_DECISIONS = 20     # minimum decisions before an SR counts
 
+# The same floor, applied to VERDICTS. Found 2026-09-12: the variance floor above
+# lowered SR0 from 1.39 to 0.37, which lowered MinTRL - and MinTRL is the ONLY
+# record-length test the kill and proven rules had. One day after that fix,
+# tsmom_btc_20w and carry_or_trend were killed on TWO decisions each ('past
+# MinTRL (2 decisions >= 2)'). A Sharpe on n=2 is Cauchy - it has no finite
+# variance - so 'PSR 0.045' on that record is not a measurement, and the kill
+# is permanent by design. No verdict of either sign fires under this many
+# decisions, whatever MinTRL says.
+VERDICT_MIN_DECISIONS = MIN_SR_CONTRIB_DECISIONS
+
 # TRIALS_SEED documents the honest N at the moment this counter shipped
 # (2026-09-03): 13 entrants existed (10 built-in configs — base, selective,
 # high_conviction, momentum, strict_gates, exit_6h, exit_24h, trend_rr,
@@ -370,8 +380,15 @@ def merge_daily_bars(native_daily, hourly_rows):
     return [days[k] for k in sorted(days)]
 
 
-def weekly_rows_from_native(rows, interval_m=WEEKLY_INTERVAL_M):
+def weekly_rows_from_native(rows, interval_m=WEEKLY_INTERVAL_M, now=None):
     """[(week_key, decision_ts, close, None)] from native weekly bars.
+
+    A bar whose bucket has NOT ENDED is dropped. Found 2026-09-12: the newest
+    ZECUSD weekly bar started 2026-09-10 and was being graded as the week
+    ending 2026-09-17, three days before that week had happened - its "close"
+    was simply the latest print. A weekly decision scored on a partial week is
+    a decision scored on noise, and two entrants were killed on exactly such
+    grades. `now` is injectable for tests.
 
     A native weekly bar's ts is the bucket START (bot_server.resample_bars and
     Kraken's own OHLC both align to ts // bucket * bucket), so the bar's CLOSE
@@ -387,6 +404,7 @@ def weekly_rows_from_native(rows, interval_m=WEEKLY_INTERVAL_M):
     """
     span = int(interval_m) * 60
     last_day_offset = max(0, span - 86400)
+    cutoff = (time.time() if now is None else float(now))
     out = {}
     for row in (rows or []):
         try:
@@ -394,12 +412,14 @@ def weekly_rows_from_native(rows, interval_m=WEEKLY_INTERVAL_M):
             close = float(row[3])
         except Exception:
             continue
+        if ts + span > cutoff:
+            continue                      # bucket still open: not a week yet
         dts = (ts // 86400) * 86400 + last_day_offset
         out[_iso_week_key(dts)] = (dts, close)
     return [(k, v[0], v[1], None) for k, v in out.items()]
 
 
-def weekly_series(daily, native_weekly=None):
+def weekly_series(daily, native_weekly=None, now=None):
     """[(week_key, decision_ts, close, daily_index|None)] — ONE row per ISO
     week, sorted by decision_ts.
 
@@ -418,25 +438,41 @@ def weekly_series(daily, native_weekly=None):
     rather than hidden.
     """
     rows = {}
-    for wk in weekly_rows_from_native(native_weekly):
+    for wk in weekly_rows_from_native(native_weekly, now=now):
         rows[wk[0]] = wk
-    for wk in weekly_closes_from_daily(daily):
+    for wk in weekly_closes_from_daily(daily, now=now):
         rows[wk[0]] = wk                      # daily-derived wins on collision
     out = list(rows.values())
     out.sort(key=lambda x: x[1])
     return out
 
 
-def weekly_closes_from_daily(daily):
+def weekly_closes_from_daily(daily, now=None):
     """[(week_key, decision_ts, close, daily_index)] — EXACTLY one per ISO week.
 
     decision_ts is the last daily bar's day-start in that week: the moment the
     weekly decision is taken. The dict-keyed grouping IS the one-decision-per-
     ISO-week enforcement — duplicate days in a week collapse to the last one.
+
+    The ISO week containing `now` is NOT emitted. Grouping "last daily bar in
+    the week" made the in-progress week a row whose close was simply the most
+    recent day - a one-to-six-day "week" graded as if it had closed. Same
+    defect as the native path (see weekly_rows_from_native), different shape.
+    `now` is injectable for tests.
     """
+    cutoff = time.time() if now is None else float(now)
     weeks = {}
     for i, (day_ts, _hi, _lo, close) in enumerate(daily):
-        weeks[_iso_week_key(day_ts)] = (day_ts, close, i)
+        wk = _iso_week_key(day_ts)
+        # An ISO week ends at 00:00 UTC on the following Monday. Keep it only
+        # once that moment has passed - the same "bucket end <= now" rule the
+        # native path applies, so a fixture that extends past now truncates
+        # cleanly instead of losing the one week that happens to contain now.
+        week_end = datetime.fromisocalendar(wk[0], wk[1], 1).replace(
+            tzinfo=timezone.utc).timestamp() + 7 * 86400
+        if week_end > cutoff:
+            continue                      # this week has not closed yet
+        weeks[wk] = (day_ts, close, i)
     out = [(k, v[0], v[1], v[2]) for k, v in weeks.items()]
     out.sort(key=lambda x: x[1])
     return out
@@ -2210,7 +2246,11 @@ class Autopilot:
         native_daily = self._fetch_bars(pair, DAILY_INTERVAL_M)
         native_weekly = self._fetch_bars(pair, WEEKLY_INTERVAL_M)
         daily = merge_daily_bars(native_daily, hourly)
-        weekly = weekly_series(daily, native_weekly)
+        # The clock decides which weekly bars have CLOSED. Production reads the
+        # wall clock; a test whose fixture extends into the future sets
+        # self._clock to a moment past its own data.
+        now = getattr(self, "_clock", time.time)()
+        weekly = weekly_series(daily, native_weekly, now=now)
         return daily, weekly, trend_bars_source(pair, hourly, native_daily,
                                                 native_weekly, daily, weekly)
 
@@ -2593,7 +2633,8 @@ class Autopilot:
             if cid in self.killed:
                 continue
             mt, n, dsr = s.get("min_trl"), s.get("trades_n"), s.get("dsr")
-            if mt is None or n is None or dsr is None or n < mt or dsr >= KILL_PSR:
+            if (mt is None or n is None or dsr is None or n < mt
+                    or n < VERDICT_MIN_DECISIONS or dsr >= KILL_PSR):
                 continue
             cfg = self.configs.get(cid, {})
             reason = (f"past MinTRL ({n} decisions >= {mt:.0f}) with deflated "
@@ -2643,7 +2684,8 @@ class Autopilot:
             if cid in self.killed or cid in self.proven:
                 continue
             mt, n, dsr = s.get("min_trl"), s.get("trades_n"), s.get("dsr")
-            if mt is None or n is None or dsr is None or n < mt or dsr < PROVEN_DSR:
+            if (mt is None or n is None or dsr is None or n < mt
+                    or n < VERDICT_MIN_DECISIONS or dsr < PROVEN_DSR):
                 continue
             self.proven.append(cid)
             log("AUTOPILOT", f"PROVEN {cid}: n={n} >= MinTRL {mt:.0f}, DSR {dsr:.3f} >= {PROVEN_DSR}")

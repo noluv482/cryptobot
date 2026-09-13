@@ -146,6 +146,11 @@ def with_db(tables, fn):
 
 
 AP_BARE = ap.Autopilot.__new__(ap.Autopilot)     # no __init__: pure scorer surface
+# The fixture deliberately runs ~12 weeks past AP_CF_EPOCH into the future so the
+# scorer has post-epoch decisions. Weekly bars are now graded only once their
+# week has CLOSED (autopilot.weekly_series's `now`), so the scorer's clock is
+# pinned past the last fixture bar; the wall clock would truncate the tail.
+AP_BARE._clock = lambda: EPOCH_DAY + 400 * DAY
 
 
 # ═════════════════════════ 1. the reader asks for the coarse intervals ═══════
@@ -356,7 +361,8 @@ check("a native weekly bar's decision_ts is its bucket's LAST day",
       wb[0][1] == EPOCH_DAY + 6 * DAY and wb[0][2] == 42.0, wb)
 check("...and it carries no daily_index", wb[0][3] is None)
 check("native weekly bars collapse to one row per ISO week",
-      len(ap.weekly_rows_from_native(weekly_bars(EPOCH_DAY, 30))) == 30)
+      len(ap.weekly_rows_from_native(weekly_bars(EPOCH_DAY, 30),
+                                     now=EPOCH_DAY + 400 * DAY)) == 30)
 
 # merge precedence: a day covered by both keeps the venue's native bar
 merged = ap.merge_daily_bars([(EPOCH_DAY, 9.0, 1.0, 5.0)],

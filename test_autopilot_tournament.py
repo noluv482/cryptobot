@@ -379,6 +379,10 @@ saved = bs.db.conn
 try:
     bs.db.conn = TableConn({("candles", "XBTUSD"): mk_candles()})
     a4 = ap.Autopilot.__new__(ap.Autopilot)
+    # Weekly bars are graded only once their week has CLOSED. This fixture is
+    # synthetic and may extend past the wall clock, so pin the scorer's clock
+    # just past its own last daily bar - every fixture week counts as closed.
+    a4._clock = lambda: max(d[0] for d in daily) + 8 * 86400
     rt = a4._score_cf_trend({"id": "tt", "kind": "trend",
                              "cf": {"rule": "tsmom", "pair": "XBTUSD", "weeks": 20}})
     check("trend scorer produces weekly decisions post-epoch",
