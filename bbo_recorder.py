@@ -228,8 +228,15 @@ def status(conn) -> None:
         print("  MISSING      %d minutes with no poll row at all%s"
               % (missing, "  <- the recorder was down" if missing else ""))
         # the spread-gate cells this is meant to fill
+        # EXTRACT, not a modulo. `%` is psycopg2's parameter marker, so a
+        # literal one has to be doubled — but psycopg2 only UNDOUBLES it when
+        # parameters are actually passed, and this query passes none. The `%%`
+        # therefore reached Postgres verbatim: "operator does not exist:
+        # bigint %% integer". EXTRACT sidesteps the escaping rule entirely and
+        # is the more correct expression anyway: it yields the real UTC hour,
+        # which is what the spread map keys its (pair, hour) cells on.
         cur.execute("""SELECT count(*) FROM (
-                           SELECT pair, (ts/3600)%%24 AS hr
+                           SELECT pair, EXTRACT(HOUR FROM to_timestamp(ts))::int AS hr
                            FROM bbo_1m GROUP BY pair, hr HAVING count(*) >= 100
                        ) q""")
         print("  gate cells   %d (pair,hour) cells at n>=100 — the spread map's bar"
