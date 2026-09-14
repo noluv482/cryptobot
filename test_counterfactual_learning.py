@@ -57,8 +57,23 @@ print("[1] the counterfactual label")
 T, S = 0.03, 0.02
 C = bs.ROUND_TRIP_COST_PCT
 
-check("cost is a FRACTION and is the real 1.30%, not a guessed 0.2%",
-      abs(C - 0.013) < 1e-9, C)
+# This used to pin the literal 0.013. That guarded the right thing — the cost
+# had once been a guessed 0.2%, and a percent-vs-fraction mix-up here silently
+# changes every label — but pinning the VALUE meant the test broke on a correct
+# fee change and invited someone to just edit the number. It now pins the two
+# properties that actually matter, so it survives a real fee change and still
+# fails a guess.
+check("cost is a FRACTION, not a percent (0.013 not 1.3)",
+      0.0005 < C < 0.05, C)
+check("cost is COMPOSED from the fee constants, not a hard-coded number",
+      abs(C - (bs._ENTRY_COST_PCT + bs._EXIT_COST_PCT)) < 1e-12, C)
+check("entry is priced at what the exchange would really charge",
+      # No caller passes post_only, so the live entry crosses the spread and
+      # pays taker. bot_server.LIVE_MAKER_ENTRIES_WIRED records that; flipping
+      # it without wiring post_only is caught in test_cost_gates.py.
+      abs(bs._ENTRY_COST_PCT - (bs.KRAKEN_MAKER_FEE if bs.LIVE_MAKER_ENTRIES_WIRED
+                                else bs.KRAKEN_FEE + bs.SLIPPAGE)) < 1e-12,
+      bs._ENTRY_COST_PCT)
 
 for name, sig, up, dn, f48, want in [
     ("BUY target only",   "BUY",  0.040, -0.005,  0.035, True),

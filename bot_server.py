@@ -573,9 +573,31 @@ def _sr_clusters(highs, lows):
 #   exit  — always a market close: taker fee plus slippage.
 # The old value hard-coded the taker-both-ways case (0.72%), overstating the real
 # cost by ~38% whenever maker entries are on, which is the default.
-_ENTRY_COST_PCT = (KRAKEN_MAKER_FEE if USE_MAKER_ENTRIES and not (USE_BINANCE or USE_FUTURES)
-                   else (BINANCE_FEE if USE_BINANCE else
-                         KRAKEN_FUTURES_FEE if USE_FUTURES else KRAKEN_FEE) + SLIPPAGE)
+# IS A MAKER ENTRY ACTUALLY SENT? No — and the cost model must price what the
+# exchange would really charge, not what the paper simulation assumes.
+#
+# _kraken_place_order takes a post_only parameter (see its signature and the
+# `if post_only:` branch that sets oflags=post), but NOTHING EVER PASSES IT:
+# the live entry sends a marketable limit priced LIVE_SLIPPAGE_TOLERANCE
+# through the touch, which crosses the spread and pays TAKER, and the live exit
+# sends a plain market order. USE_MAKER_ENTRIES drives only the PAPER
+# simulation of a resting fill (_resolve_pending_entry), so with the maker
+# branch below the paper book was charged 0.40% for an entry that live pays
+# 0.80% + slippage for — a round trip of 1.30% modelled against 1.80% real.
+#
+# Every entry gate in this project compares a target against
+# ROUND_TRIP_COST_PCT, so that understatement made paper results flatter than
+# live could ever be. Pricing at taker is the conservative and honest side, and
+# it is what the flag below says: flip it to True in the same change that
+# actually passes post_only=True from the entry path, not before.
+LIVE_MAKER_ENTRIES_WIRED = False
+
+_ENTRY_COST_PCT = ((KRAKEN_MAKER_FEE
+                    if (LIVE_MAKER_ENTRIES_WIRED and USE_MAKER_ENTRIES
+                        and not (USE_BINANCE or USE_FUTURES))
+                    else (BINANCE_FEE if USE_BINANCE else
+                          KRAKEN_FUTURES_FEE if USE_FUTURES else KRAKEN_FEE)
+                         + SLIPPAGE))
 _EXIT_COST_PCT  = (BINANCE_FEE if USE_BINANCE else
                    KRAKEN_FUTURES_FEE if USE_FUTURES else KRAKEN_FEE) + SLIPPAGE
 ROUND_TRIP_COST_PCT   = _ENTRY_COST_PCT + _EXIT_COST_PCT

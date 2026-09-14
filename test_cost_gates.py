@@ -17,12 +17,14 @@ gate arithmetic lifted out of bot_server.py, and checks:
 Usage:  python test_cost_gates.py
 """
 import ast
+import re
 import sys
 
 SRC = "bot_server.py"
 
 CONSTS = ["KRAKEN_FEE", "KRAKEN_MAKER_FEE", "SLIPPAGE", "BINANCE_FEE",
           "KRAKEN_FUTURES_FEE", "USE_BINANCE", "USE_FUTURES", "USE_MAKER_ENTRIES",
+          "LIVE_MAKER_ENTRIES_WIRED",
           "_ENTRY_COST_PCT", "_EXIT_COST_PCT", "ROUND_TRIP_COST_PCT",
           "MIN_PROFIT_VS_COST_MULT", "MIN_STOP_VS_COST_MULT", "MIN_RR_RATIO",
           "EXCHANGE", "ATR_MULTIPLIER", "TRAIL_PCT"]
@@ -87,16 +89,44 @@ def main():
     P("  COST MODEL")
     P("=" * 74)
     P(f"  exchange           {C['EXCHANGE']}   maker entries: {C['USE_MAKER_ENTRIES']}")
-    P(f"  entry cost         {C['_ENTRY_COST_PCT']*100:.3f}%   (maker fee, no slippage — a resting limit fills at its price)")
+    _entry_kind = ("maker fee, no slippage — a resting limit fills at its price"
+                   if C.get("LIVE_MAKER_ENTRIES_WIRED")
+                   else "taker fee + slippage — the entry limit crosses the spread")
+    P(f"  entry cost         {C['_ENTRY_COST_PCT']*100:.3f}%   ({_entry_kind})")
     P(f"  exit cost          {C['_EXIT_COST_PCT']*100:.3f}%   (taker fee + slippage — the close always crosses)")
     P(f"  round trip         {cost*100:.3f}%")
-    P(f"  old hard-coded     {(2*C['KRAKEN_FEE'] + 2*C['SLIPPAGE'])*100:.3f}%   (taker both ways — overstated by "
+    P(f"  taker both ways    {(2*C['KRAKEN_FEE'] + 2*C['SLIPPAGE'])*100:.3f}%   (reference; delta "
       f"{((2*C['KRAKEN_FEE']+2*C['SLIPPAGE'])/cost - 1)*100:.0f}%)")
-    # With maker entries on, paying a taker fee on entry is simply not what happens.
-    expect = C["KRAKEN_MAKER_FEE"] + C["KRAKEN_FEE"] + C["SLIPPAGE"]
-    if C["USE_MAKER_ENTRIES"] and not (C["USE_BINANCE"] or C["USE_FUTURES"]):
+    # The entry cost must price what the EXCHANGE would charge, not what the
+    # paper simulation assumes. _kraken_place_order accepts post_only, but no
+    # caller passes it: the live entry sends a marketable limit (crosses the
+    # spread -> taker) and the live exit a market order. So while
+    # LIVE_MAKER_ENTRIES_WIRED is False the round trip is taker both ways, and
+    # charging the maker fee understated it by 0.50% on every gate in the
+    # project. Derived FROM SOURCE below rather than trusted, so that wiring
+    # post_only without revisiting this flag fails here instead of silently
+    # flattering the book again.
+    # Look for a real CALL passing post_only=True, via the AST — a text search
+    # matches the prose explaining why nothing does, which is how this check
+    # first fired against its own documentation.
+    passes_post_only = any(
+        isinstance(n, ast.Call)
+        and any(kw.arg == "post_only"
+                and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                for kw in n.keywords)
+        for n in ast.walk(ast.parse(open(SRC, encoding="utf-8").read())))
+    if C.get("LIVE_MAKER_ENTRIES_WIRED"):
+        expect = C["KRAKEN_MAKER_FEE"] + C["KRAKEN_FEE"] + C["SLIPPAGE"]
+        if not passes_post_only:
+            fails.append("LIVE_MAKER_ENTRIES_WIRED is True but no caller passes post_only=True")
+    else:
+        expect = 2 * (C["KRAKEN_FEE"] + C["SLIPPAGE"])
+        if passes_post_only:
+            fails.append("a caller now passes post_only=True — "
+                         "set LIVE_MAKER_ENTRIES_WIRED and re-price the entry")
+    if not (C["USE_BINANCE"] or C["USE_FUTURES"]):
         if abs(cost - expect) > 1e-12:
-            fails.append(f"round trip {cost} != maker+taker+slip {expect}")
+            fails.append(f"round trip {cost} != expected {expect}")
 
     P()
     P("=" * 74)
