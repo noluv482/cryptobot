@@ -157,6 +157,26 @@ MIN_SR_CONTRIB_DECISIONS = 20     # minimum decisions before an SR counts
 # decisions, whatever MinTRL says.
 VERDICT_MIN_DECISIONS = MIN_SR_CONTRIB_DECISIONS
 
+# ── Directional evidence (2026-09-13) ────────────────────────────────────────
+# A rule that fires BOTH ways gives us the best placebo there is: its own
+# opposite side. Same generator, same pairs, same hours, same conditioning.
+#
+#   xs_dir = (mean(basket excess | BUY) - mean(basket excess | SELL)) / 2
+#
+# If the rule knows DIRECTION, the BUY side beats the basket and the SELL side
+# trails it, so xs_dir > 0. If it only knows which pairs are ABOUT TO MOVE, both
+# sides beat the basket, the terms cancel, and xs_dir ~ 0 - which is exactly
+# what the live book measures: BUY +0.700%, SELL +0.499%, xs_dir +0.101%
+# against a standard error of 0.26%.
+#
+# NEITHER THRESHOLD IS FITTED TO THIS DATASET. The per-side floor reuses
+# MIN_SR_CONTRIB_DECISIONS, the project's existing "below this a Sharpe is a
+# coin flip" bar. The t bar reuses T_MARGIN, the existing best-of-N
+# multiple-comparison margin. Picking new numbers here would be fitting the
+# referee to the game.
+DIRECTION_MIN_PER_SIDE = MIN_SR_CONTRIB_DECISIONS
+DIRECTION_T_BAR        = T_MARGIN
+
 # TRIALS_SEED documents the honest N at the moment this counter shipped
 # (2026-09-03): 13 entrants existed (10 built-in configs — base, selective,
 # high_conviction, momentum, strict_gates, exit_6h, exit_24h, trend_rr,
@@ -2100,6 +2120,107 @@ class Autopilot:
         log("AUTOPILOT", f"cf score {cfg.get('id')}: unknown kind {kind!r}", "WRN")
         return None
 
+    def _basket_map(self, hor_s):
+        """{hour_ts: (sum_fwd, n_pairs)} - the whole quoted universe's forward
+        return at each hour, for the horizon `hor_s` seconds.
+
+        This is the RESEARCH benchmark, and it is deliberately not tradeable: a
+        US Kraken spot account cannot short a basket. It answers "did the rule
+        pick pairs that beat the others over the same hours", which is the only
+        question a benchmark can answer about a signal. Whether the result pays
+        the fee is a separate bar (clears_cost, unchanged).
+
+        Cached for one scoring pass - `score()` clears it - because every
+        candidate at a given horizon wants the identical map. Measured: 1,179
+        basket hours from 38,254 hourly candle rows, 176 ms to build.
+
+        Returns {} when the candle archive cannot answer; callers degrade to
+        "not measured" rather than to a number.
+        """
+        # getattr, not self._basket_cache: score() owns the cache's lifetime,
+        # but _score_cf_price is reachable from tests and from a future caller
+        # that has not been through score() yet.
+        cache = getattr(self, "_basket_cache", None)
+        if cache is None:
+            cache = self._basket_cache = {}
+        cached = cache.get(hor_s)
+        if cached is not None:
+            return cached
+        out = {}
+        if bs.db.connected:
+            try:
+                with bs.db.conn.cursor() as cur:
+                    cur.execute("""SELECT c.ts,
+                                          sum((c2.close - c.close) / c.close),
+                                          count(*)
+                                   FROM candles c
+                                   JOIN candles c2
+                                     ON c2.pair = c.pair
+                                    AND c2.interval_m = 60
+                                    AND c2.ts = c.ts + %s
+                                   WHERE c.interval_m = 60
+                                     AND c.close > 0
+                                   GROUP BY c.ts""", (int(hor_s),))
+                    out = {int(ts): (float(s), int(k)) for ts, s, k in cur.fetchall()}
+            except Exception as e:
+                log("AUTOPILOT", f"basket map @{hor_s}s: {e}", "WRN")
+                out = {}
+        cache[hor_s] = out
+        return out
+
+    @staticmethod
+    def _direction_stats(buy_xs, sell_xs):
+        """Directional evidence from the two sides' basket excesses.
+
+        {xs_dir, xs_dir_t, n_buy, n_sell, state} where state is one of:
+
+          confirmed    - both sides present and powered, xs_dir > 0 past the bar
+          refuted      - both sides present and powered, xs_dir < 0 past the bar
+                         (the rule is ANTI-directional; measured on the live
+                         book at adx>=30, where SELL beats BUY by 2.1 points)
+          undetermined - both sides present, not enough evidence either way
+          one-sided    - only one side ever fires, so the control cannot run
+          not measured - no basket excesses at all
+
+        'one-sided' is NOT a pass. A one-sided rule in a rising market is
+        exactly the case the attention effect explains, and there is no
+        opposite side to net it out against.
+
+        A plain two-sample standard error is used rather than a cluster-robust
+        one because the basket subtraction already removes the common time
+        factor: MEASURED ICC of basket excess is -0.038, design effect 1.00
+        (raw return, for contrast: ICC 0.408, deff 10.45).
+        """
+        out = {"xs_dir": None, "xs_dir_t": None, "n_buy": len(buy_xs),
+               "n_sell": len(sell_xs), "state": "not measured"}
+        if not buy_xs and not sell_xs:
+            return out
+        if not buy_xs or not sell_xs:
+            out["state"] = "one-sided"
+            return out
+        mb = statistics.fmean(buy_xs)
+        ms = statistics.fmean(sell_xs)
+        out["xs_dir"] = (mb - ms) / 2.0
+        if (len(buy_xs) < DIRECTION_MIN_PER_SIDE
+                or len(sell_xs) < DIRECTION_MIN_PER_SIDE):
+            out["state"] = "undetermined"
+            return out
+        vb = statistics.pvariance(buy_xs) / len(buy_xs)
+        vs = statistics.pvariance(sell_xs) / len(sell_xs)
+        se = math.sqrt(vb + vs) / 2.0
+        if se <= 1e-12:
+            out["state"] = "undetermined"
+            return out
+        t = out["xs_dir"] / se
+        out["xs_dir_t"] = t
+        if t >= DIRECTION_T_BAR:
+            out["state"] = "confirmed"
+        elif t <= -DIRECTION_T_BAR:
+            out["state"] = "refuted"
+        else:
+            out["state"] = "undetermined"
+        return out
+
     def _score_cf_price(self, cfg):
         """Score one config against the RECORDED signal stream.
 
@@ -2142,6 +2263,8 @@ class Autopilot:
         hor_s = {"fwd6": 6, "fwd24": 24, "fwd48": 48, "fwd168": 168}[horizon] * 3600
         weekly = bool(spec.get("weekly"))
         nets, last_kept, weeks_seen = [], {}, set()
+        basket = self._basket_map(hor_s)
+        buy_xs, sell_xs = [], []
         for ts, pair, sig, conf, adx, er, rr_net, fwd in rows:
             if spec.get("conf") is not None and (conf is None or float(conf) < spec["conf"]):
                 continue
@@ -2162,9 +2285,31 @@ class Autopilot:
             last_kept[pair] = float(ts)
             gross = float(fwd) if sig == "BUY" else -float(fwd)
             nets.append((gross - bs.ROUND_TRIP_COST_PCT, gross, float(ts)))
+            # RESEARCH bar, alongside (never replacing) the raw numbers above.
+            # LEAVE ONE OUT: the signal's own pair is removed from its own
+            # benchmark. With ~34 pairs the plain mean subtracts 1/34 of the
+            # signal's own return from itself, shrinking the estimate toward
+            # zero by ~2.9% - measured at 0.7000% plain vs 0.7191% LOO. The two
+            # correlate at 0.999984, so this is a correctness point, not a
+            # materiality one, and it costs nothing: sum and count are already
+            # here.
+            hour = int(float(ts) // 3600) * 3600
+            bk = basket.get(hour)
+            if bk and bk[1] > 1 and fwd is not None:
+                loo = (bk[0] - float(fwd)) / (bk[1] - 1)
+                (buy_xs if sig == "BUY" else sell_xs).append(float(fwd) - loo)
+        direction = self._direction_stats(buy_xs, sell_xs)
+        xs_signed = [x for x in buy_xs] + [-x for x in sell_xs]
         return self._cf_result(cfg, [x[0] for x in nets], [x[1] for x in nets],
                                via="cf", gross_bar=bs.ROUND_TRIP_COST_PCT,
-                               ts=[x[2] for x in nets])
+                               ts=[x[2] for x in nets],
+                               extra={"direction_state": direction["state"],
+                                      "xs_dir": direction["xs_dir"],
+                                      "xs_dir_t": direction["xs_dir_t"],
+                                      "xs_n_buy": direction["n_buy"],
+                                      "xs_n_sell": direction["n_sell"],
+                                      "xs_edge": (statistics.fmean(xs_signed)
+                                                  if xs_signed else None)})
 
     @staticmethod
     def _cf_result(cfg, net, gross_l, via, gross_bar=None, extra=None, ts=None):
@@ -2480,9 +2625,14 @@ class Autopilot:
         out = {}
         nets_by_id = {}                # transient per-decision NET streams (never persisted)
         ts_by_id = {}                  # transient decision timestamps (for N_eff alignment)
+        # One basket build per pass per horizon, not one per candidate. Cleared
+        # HERE rather than on a timer so a pass can never mix a fresh candidate
+        # against a stale universe.
+        self._basket_cache = {}
         for cid, cfg in self.configs.items():
             t = self.traders.get(cid)
             res = {"id": cid, "n": 0, "n_oos": 0, "oos_edge": None,
+                   "direction_state": "not measured",
                    "t": None, "avg_pnl_net": None, "gross_edge": None,
                    "clears_cost": False, "via": "live",
                    "balance": round(t.balance, 2) if t else None}
@@ -2522,10 +2672,23 @@ class Autopilot:
                           "bars_source"):
                     if k in cf:
                         res[k] = cf[k]
+                # PROVENANCE. The whitelist above copies cf keys onto res
+                # unconditionally - it sits OUTSIDE this guard - so a
+                # direction verdict added there would ride the shadow
+                # counterfactual onto a record the LIVE book is driving.
+                # `base` is exactly that shape: a cf spec plus a graduated live
+                # book. The cf's directional evidence describes the recorded
+                # signal stream, and says nothing about the live stream, so it
+                # travels only when cf is actually driving the record.
                 if res["n_oos"] < MIN_OOS_TRADES:
                     res.update({"n_oos": cf["n_oos"], "oos_edge": cf["oos_edge"],
                                 "t": cf["t"], "gross_edge": cf["gross_edge"],
                                 "clears_cost": cf["clears_cost"], "via": cf["via"]})
+                    for k in ("direction_state", "xs_dir", "xs_dir_t",
+                              "xs_n_buy", "xs_n_sell", "xs_edge"):
+                        res[k] = cf.get(k)
+                else:
+                    res["direction_state"] = "not measured (live book)"
             # The DSR stats run on whichever stream is driving the record.
             use_cf = cf_nets is not None and str(res["via"]).startswith("cf")
             nets_by_id[cid] = cf_nets if use_cf else live_nets
@@ -2687,6 +2850,19 @@ class Autopilot:
             if (mt is None or n is None or dsr is None or n < mt
                     or n < VERDICT_MIN_DECISIONS or dsr < PROVEN_DSR):
                 continue
+            # PROVEN is a claim that the edge is REAL, so it needs the one
+            # control that separates a real edge from an attention effect. A
+            # high Sharpe on raw return does not survive this: the live book
+            # scores +0.700% on its BUY side and +0.499% on its SELL side, and
+            # a rule that beats the basket in BOTH directions has told us which
+            # pairs are moving, not which way. Nothing is KILLED here - the
+            # entrant keeps running and keeps accumulating evidence; it just
+            # cannot be crowned on a statistic that cannot tell the two apart.
+            dstate = s.get("direction_state")
+            if dstate != "confirmed":
+                s["verdict"] = (f"clears the cost bar but direction is {dstate} "
+                                f"— not PROVEN without directional evidence")
+                continue
             self.proven.append(cid)
             log("AUTOPILOT", f"PROVEN {cid}: n={n} >= MinTRL {mt:.0f}, DSR {dsr:.3f} >= {PROVEN_DSR}")
             self._push("autopilot_proven", {"entrant": cid, "dsr": dsr, "n": n,
@@ -2722,8 +2898,16 @@ class Autopilot:
         self._apply_kill_rule()
         self._apply_proven_rule()
         self._announce_clears()
+        # A rule measured to point the WRONG way does not trade, whatever its
+        # Sharpe says. Only "refuted" is excluded - a measured, powered,
+        # negative xs_dir. "undetermined" and "one-sided" stay eligible on
+        # purpose: excluding a candidate for having too little evidence is how
+        # tsmom_btc_20w and carry_or_trend were wrongly killed on n=2 records,
+        # and this gate must not repeat it. Underpowered means KEEP LOOKING,
+        # never means GUILTY.
         eligible = {cid: s for cid, s in scores.items()
-                    if s["clears_cost"] and cid not in self.killed}
+                    if s["clears_cost"] and cid not in self.killed
+                    and s.get("direction_state") != "refuted"}
 
         prev = self.champion_id
         why = None

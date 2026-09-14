@@ -50,9 +50,19 @@ def _bare(scores):
     return a
 
 
-def _score(n, dsr, min_trl=2.0, sr=-0.3):
+def _score(n, dsr, min_trl=2.0, sr=-0.3, direction_state="confirmed"):
+    """A synthetic score record.
+
+    direction_state defaults to "confirmed" so the checks below isolate the
+    RECORD-LENGTH floor, which is what this file exists to pin. PROVEN also
+    requires directional evidence (see test_direction_gate.py) — leaving that
+    unset here would make every proven-rule check pass for the wrong reason,
+    and the file would stop testing its own subject. Section [4] pins the
+    interaction explicitly.
+    """
     return {"trades_n": n, "min_trl": min_trl, "dsr": dsr, "sr": sr, "sr0": 0.371,
-            "psr": dsr, "family": "trend", "cluster_size": 1}
+            "psr": dsr, "family": "trend", "cluster_size": 1,
+            "direction_state": direction_state}
 
 
 print("[1] the kill rule refuses a record under the floor")
@@ -126,6 +136,32 @@ check("week 37 (closed) is emitted", (2026, 37) in weeks, weeks)
 check("week 38 (open, contains now) is NOT emitted", (2026, 38) not in weeks, weeks)
 check("the closed week's decision is its LAST day, Sunday the 13th",
       any(k == (2026, 37) and abs(r[1] - 13.0) < 1e-9 for k, *r in out), out)
+
+print("\n[5] the record floor and the direction gate are INDEPENDENT bars")
+# A record can be long enough AND have a high DSR and still not be PROVEN,
+# because a high Sharpe on raw return is exactly what an attention effect
+# produces. Conversely the direction gate must not rescue a short record.
+a = _bare({"lucky": _score(20, 0.99, min_trl=2.0, sr=2.5,
+                           direction_state="undetermined")})
+a._apply_proven_rule()
+check("n=20, DSR 0.99, direction UNDETERMINED -> not proven",
+      "lucky" not in a.proven, a.proven)
+check("...and the refusal says why, without killing anything",
+      "direction" in str(a.scores["lucky"].get("verdict", "")) and not a.killed,
+      a.scores["lucky"].get("verdict"))
+
+for st in ("one-sided", "refuted", "not measured", None):
+    a = _bare({"lucky": _score(20, 0.99, min_trl=2.0, sr=2.5,
+                               direction_state=st)})
+    a._apply_proven_rule()
+    check("n=20, DSR 0.99, direction %r -> not proven" % (st,),
+          "lucky" not in a.proven)
+
+a = _bare({"lucky": _score(2, 0.99, min_trl=2.0, sr=2.5,
+                           direction_state="confirmed")})
+a._apply_proven_rule()
+check("a CONFIRMED direction does not rescue an n=2 record",
+      "lucky" not in a.proven, a.proven)
 
 print("\n" + "=" * 60)
 if _failed:
