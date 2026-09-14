@@ -444,7 +444,16 @@ def _build_grid():
 
 _GRID     = _build_grid()
 _FAMILIES = sorted({fam for _, fam, _ in _GRID})
-_GRID_SIG = f"{len(_GRID)}x{len(HORIZONS)}-purged"   # invalidates a resumed sweep if the grid OR window semantics changed
+# Invalidates a resumed sweep if the grid OR the window semantics changed. The
+# "-spaced" tag is the de-overlap fold (see _fold_events) and MUST be bumped by
+# any future change to how a decision is counted, not only to _GRID's length.
+# Without it the signature was byte-identical across that change, so a sweep
+# paused on budget under the old every-bar scorer would resume under the new
+# one and fold spaced accumulators into overlapping ones. Measured: that hybrid
+# reports 52/128 tests past |t|>2.5 with max|t| 9.46, against the correct
+# 28/128 and 6.01 — i.e. it silently reconstitutes the exact inflation this
+# module was changed to retire.
+_GRID_SIG = f"{len(_GRID)}x{len(HORIZONS)}-purged-spaced"
 _RET_NS   = (1, 6, 12, 24, 72)
 _SMA_WS   = (8, 12, 24, 48, 96)
 _Z_WS     = (24, 48, 96)
