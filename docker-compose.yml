@@ -72,3 +72,25 @@ services:
     command: tunnel --no-autoupdate --url http://bot:8080
     depends_on:
       - bot
+
+  # Top-of-book recorder. Its OWN container, deliberately: it runs for weeks
+  # unattended, and a crash, a memory leak or a wedged HTTP call must be able to
+  # take down a data collector without touching the process that trades.
+  # restart: unless-stopped is what makes it survive the 10-hour power cut this
+  # machine had in September — once the BIOS is set to power on after AC loss.
+  bbo:
+    build: .
+    restart: unless-stopped
+    command: python bbo_recorder.py
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # DELIBERATELY MINIMAL. Same explicit-environment rule as `bot` above —
+      # unlisted vars never reach the container — and here that is a feature:
+      # this service is given no TG_TOKEN, no DASHBOARD_PIN, no exchange key and
+      # no PAPER_LOCK, because it needs none of them. It reads public market
+      # data and writes two tables of its own. A credential it never receives is
+      # one it can never leak.
+      DATABASE_URL: postgresql://cryptobot:${DB_PASSWORD}@db:5432/cryptobot
+      DATA_DIR: /data
