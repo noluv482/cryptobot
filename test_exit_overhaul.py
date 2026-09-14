@@ -17,6 +17,7 @@ if hasattr(sys.stdout, "reconfigure"):   # Windows consoles default to cp1252
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import ast
+import re
 import os
 
 import bot_server as bs
@@ -122,6 +123,72 @@ check("expired maker orders notify instead of dying silently",
 check("find_signal takes --cost", '"--cost"' in FS_SRC)
 check("verdict warns that battery windows overlap",
       "non-overlapping re-test" in FS_SRC)
+
+# ── 6. the stale exit cannot reference an unbound trail local ───────────────
+# With TRAIL_ENABLED off — the default this whole file is about — the block that
+# assigns the local `atr_dist` never runs. The stale exit then read it as a
+# .get() default, which Python evaluates EAGERLY, so it raised UnboundLocalError
+# on every managed position even when "vol_dist" was present and the fallback
+# was never needed. Observed live:
+#   "lab_r32s2 manage HYPEUSD: cannot access local variable 'atr_dist'"
+# Structural, not behavioural: a behaviour test only covers the path someone
+# thought to exercise, and this one is the DEFAULT path.
+#
+# Scoped to the function CONTAINING the gate. An unbound-local hazard is a
+# per-function question, and _open assigns atr_dist unconditionally — scanning
+# the whole file reports that as a violation and the check becomes noise.
+_gate_line = next(i for i, l in enumerate(SRC.splitlines(), 1)
+                  if l.strip() == "if TRAIL_ENABLED:")
+
+_fn = None
+for _node in ast.walk(tree):
+    if isinstance(_node, ast.FunctionDef) and _node.lineno <= _gate_line <= (
+            _node.end_lineno or _node.lineno):
+        # innermost enclosing function
+        if _fn is None or _node.lineno > _fn.lineno:
+            _fn = _node
+check("the gate sits inside a function the scan can bound", _fn is not None)
+
+_bare = []
+if _fn is not None:
+    _gate_node = None
+    for _node in ast.walk(_fn):
+        if isinstance(_node, ast.If) and _node.lineno == _gate_line:
+            _gate_node = _node
+            break
+    _lo = _gate_node.lineno if _gate_node else _gate_line
+    _hi = (_gate_node.end_lineno if _gate_node else _gate_line) or _gate_line
+    for _node in ast.walk(_fn):
+        if (isinstance(_node, ast.Name) and _node.id == "atr_dist"
+                and isinstance(_node.ctx, ast.Load)
+                and not (_lo <= _node.lineno <= _hi)):
+            _bare.append(_node.lineno)
+
+check("the local atr_dist is never read outside `if TRAIL_ENABLED:` in the "
+      "manage path (it is unbound there, and TRAIL_ENABLED defaults to off)",
+      not _bare, f"reachable at lines {sorted(set(_bare))}")
+
+# Comments stripped: bot_server.py now documents the old broken expression by
+# quoting it, and a raw search matches that prose. This check exists to find
+# CODE, so it must read code.
+_CODE = "\n".join(l.split("#", 1)[0] if not l.strip().startswith("#") else ""
+                   for l in SRC.splitlines())
+
+check("the stale exit falls back through vol_dist -> stored atr_dist -> TRAIL_PCT",
+      'p.get("vol_dist")' in _CODE and 'or p.get("atr_dist")' in _CODE
+      and "or price * TRAIL_PCT" in _CODE)
+
+check("...as an `or` chain, not a .get() default whose fallback is eager",
+      'p.get("vol_dist", atr_dist)' not in _CODE)
+
+# The split this protects: _open captures vol_dist BEFORE the cost floor widens
+# atr_dist, precisely so a cost-widened stop does not raise the bar for "went
+# nowhere". Raising ROUND_TRIP_COST_PCT widens that floor, so a fallback that
+# reached for the floored number would drift with the fee schedule.
+check("vol_dist is still captured before the cost floor at _open",
+      "vol_dist = atr_dist" in SRC
+      and SRC.index("vol_dist = atr_dist") < SRC.index("_min_stop_dist = fill"))
+
 
 print()
 if FAILS:

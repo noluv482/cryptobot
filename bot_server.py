@@ -5708,7 +5708,9 @@ class PaperTrader:
             elif mins_open >= _STRATEGIES.get(p.get("strategy", ""), {}).get("max_mins", MAX_TRADE_MINS):
                 self._close(price, name, "time limit",   pair); closed_this_tick = True
             elif mins_open >= STALE_EXIT_MINS and \
-                 abs(move) * p["entry"] < p.get("vol_dist", atr_dist):
+                 abs(move) * p["entry"] < (p.get("vol_dist")
+                                           or p.get("atr_dist")
+                                           or price * TRAIL_PCT):
                 # Measured and left alone deliberately. After STALE_EXIT_MINS of
                 # no movement the position has no edge left in either direction:
                 # forward returns from the exit point are 41-57% positive at every
@@ -5722,6 +5724,24 @@ class PaperTrader:
                 # not because the timer is wrong. That is fixed at entry, above.
                 # Judged on vol_dist, not atr_dist, so a cost-widened stop does
                 # not change what counts as "went nowhere".
+                #
+                # This was written `p.get("vol_dist", atr_dist)` and was wrong
+                # twice. (1) atr_dist is assigned inside `if TRAIL_ENABLED:`
+                # above, and TRAIL_ENABLED defaults to OFF, so the name was
+                # unbound here on every managed position — and a .get() default
+                # is evaluated EAGERLY, so it raised UnboundLocalError even when
+                # "vol_dist" was present and the fallback was never needed.
+                # Observed live: "lab_r32s2 manage HYPEUSD: cannot access local
+                # variable 'atr_dist'", once per position per tick.
+                # (2) With the trail ON it did bind — to the COST-FLOORED value
+                # (see the max() at the assignment), which is the exact number
+                # the split at _open exists to keep out of this test. Raising
+                # ROUND_TRIP_COST_PCT to the real 1.80% widened that floor and
+                # so made the wrong fallback wronger.
+                # The chain below is volatility-only and always bound: the
+                # position's own vol_dist, else its stored atr_dist, else the
+                # flat TRAIL_PCT distance. `or` rather than a .get() default,
+                # because a stored 0 is not a usable distance either.
                 self._close(price, name, "stale exit",   pair); closed_this_tick = True
             elif ((side == "LONG"  and price >= p.get("target", float("inf"))) or
                   (side == "SHORT" and price <= p.get("target", 0))):
