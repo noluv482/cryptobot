@@ -45,6 +45,11 @@ COPY research_evidence.py .
 # test_leakage.py --live 50` rebuilds shadow_signals features from archived
 # bars strictly before each row's ts. Same reason: DB-only, so ship it.
 COPY test_leakage.py .
+# Top-of-book recorder (2026-09-14): needs DATABASE_URL, so it only runs inside
+# the container. Same story as every COPY above — and the deploy that added it
+# hit exactly the footgun line 10 describes, with the file present in the repo
+# on the host and absent from /app.
+COPY bbo_recorder.py .
 
 RUN useradd -r -u 1001 -s /bin/false bot && mkdir -p /data && chown bot:bot /data
 
