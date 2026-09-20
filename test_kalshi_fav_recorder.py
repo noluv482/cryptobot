@@ -203,12 +203,24 @@ check("0 losses in 20 event-days -> COUNTS ONLY", K.decide(0, 20, BE).startswith
 check("987 event-days -> POWERED", K.decide(5, 987, BE).startswith("POWERED"))
 
 # the break-even is a function of the price paid, not a constant
-check("break-even at 96c is 3.00% (a cheap favorite has room)",
-      abs(K.break_even([0.96]) - 0.03) < 1e-9, K.break_even([0.96]))
-check("break-even at 98c is 1.00%", abs(K.break_even([0.98]) - 0.01) < 1e-9, K.break_even([0.98]))
-check("break-even at 99c is ZERO — under the cent-rounded fee a 99c favorite cannot"
-      " be profitable at ANY win rate, and a quarter of the original sample sat there",
-      K.break_even([0.99]) < 1e-9, K.break_even([0.99]))
+# The fee is charged PER ORDER, so order SIZE decides the bar more than the
+# rounding rule everyone argued about. A one-contract order pays 7x the raw
+# fee; ten contracts pay 1.46x; fifty pay 1.00x.
+check("fee per contract at 98c: 1.000c at C=1, 0.200c at C=10, 0.137c at C=51",
+      abs(K.fee_per_contract(0.98, 1) - 0.01) < 1e-9
+      and abs(K.fee_per_contract(0.98, 10) - 0.002) < 1e-9
+      and abs(K.fee_per_contract(0.98, 51) - 0.1373 / 100) < 1e-5,
+      [round(100 * K.fee_per_contract(0.98, c), 4) for c in (1, 10, 51)])
+check("break-even at 96c is 3.70% for a $1,000 order (a cheap favorite has room)",
+      abs(K.break_even([0.96]) - 0.037) < 1e-9, K.break_even([0.96]))
+check("break-even at 98c is 1.80% for a $1,000 order", abs(K.break_even([0.98]) - 0.018) < 1e-9,
+      K.break_even([0.98]))
+check("break-even at 99c is 0.90% at a $1,000 order, NOT zero — 'a 99c favorite can"
+      " never pay' was a ONE-CONTRACT artifact of the per-order cent rounding",
+      abs(K.break_even([0.99]) - 0.009) < 1e-9 and K.break_even([0.99], 1) < 1e-9,
+      (K.break_even([0.99]), K.break_even([0.99], 1)))
+check("...and a bigger order is never worse than a smaller one",
+      K.break_even([0.98], 51) >= K.break_even([0.98], 10) >= K.break_even([0.98], 1))
 check("with no prices it falls back to the measured constant",
       K.break_even([]) == K.BREAK_EVEN_FALLBACK)
 check("Clopper-Pearson 0/149 is just under 2%", 0.019 < K.cp_upper(0, 149) < 0.020,

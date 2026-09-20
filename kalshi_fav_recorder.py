@@ -52,13 +52,20 @@ ONLY — no rates, no EV — because a percentage of 12 would carry the authorit
 of a measurement it does not have. At roughly one independent event-day per
 calendar day, BOUNDED is a four-to-five month wait, not a three-day one.
 
-FEES ARE REPORTED TWICE
------------------------
-Kalshi's taker fee is roundup(0.07 * P * (1-P)) per contract. Whether that
-rounds up to the centicent (the published schedule) or to the CENT per order
-(what two referees believed) is UNRESOLVED and at 98c it is the difference
-between +2.0c and +1.0c. Every P&L number is therefore printed in both
-variants, labelled fee_centicent and fee_cent, and nothing here picks one.
+THE FEE, AND WHY ORDER SIZE MATTERS MORE THAN THE ROUNDING RULE
+----------------------------------------------------------------
+Kalshi's taker fee is roundup(0.07 * C * P * (1-P)) charged PER ORDER, rounded
+up to the cent - settled 2026-09-20, because per-order cent rounding reproduces
+21 of 21 rows of Kalshi's own published table and per-contract reproduces 0.
+The long argument about centicent-versus-cent turned out to matter far less
+than C. At 98c the fee is 1.000c/contract at C=1, 0.200c at C=10 and 0.137c at
+C=51, against a raw 0.1372c. A $1,000 account buys about 10 contracts and a
+$5,000 account about 51, so the one-contract number this file first treated as
+its honest case is the one case the owner will never trade: it overstated the
+fee sevenfold, understated the break-even by 0.80 points, and produced the
+false claim that a 99c favorite can never be profitable (true at C=1, and
+0.90% at C=10). ORDER_CONTRACTS sets the size the report prices, and --status
+prints the raw-fee and one-contract bounds either side of it.
 
 WHAT IT WILL NOT DO
 -------------------
@@ -147,15 +154,35 @@ N_POWER = 987
 N_MIN_REPORT = 30
 
 
-def break_even(prices):
-    """q* = 1 - P - fee at the capital-weighted entry price. A favorite bought
-    at 99c has to be right 99.07% of the time; one bought at 96c only 96.6%.
-    Reporting both against a single 2% bar flattered the expensive half."""
+# Contracts per order, for the fee. THIS MATTERS MORE THAN THE ROUNDING RULE
+# EVERYONE ARGUED ABOUT. Kalshi charges roundup(0.07*C*P*(1-P)) per ORDER, so
+# the cent rounding is amortised over C: at 98c it costs 1.000c/contract at
+# C=1, 0.200c at C=10, and 0.137c at C=51 - against a raw fee of 0.1372c. A
+# $1,000 account buys ~10 contracts and a $5,000 account ~51, so the
+# one-contract number that this file previously used as its honest case is the
+# one case the owner will never trade. It made the break-even look 0.80 points
+# harsher than it is, and it is what produced the claim that a 99c favorite can
+# never be profitable - true at C=1, false (0.92%) at C=51.
+ORDER_CONTRACTS = 10               # a $1,000 account at ~98c; the pessimistic realistic end
+
+
+def fee_per_contract(p: float, contracts: int = ORDER_CONTRACTS) -> float:
+    """The per-order fee, divided back out to one contract."""
+    c = max(1, int(contracts))
+    return (math.ceil(round(FEE_RATE * c * p * (1.0 - p) * 100.0, 6)) / 100.0) / c
+
+
+def break_even(prices, contracts: int = ORDER_CONTRACTS):
+    """q* = 1 - P - fee at the capital-weighted entry price, for an order of
+    `contracts`. A favorite bought at 99c must be right 99.08% of the time; one
+    bought at 96c only 96.8%. Reporting both against a single 2% bar flattered
+    the expensive half; reporting either at C=1 flatters nothing and just
+    charges a fee nobody pays."""
     ps = [float(p) for p in prices if p]
     if not ps:
         return BREAK_EVEN_FALLBACK
     p = sum(x * x for x in ps) / sum(ps)          # capital-weighted
-    return max(0.0, 1.0 - p - fee_cent(p))
+    return max(0.0, 1.0 - p - fee_per_contract(p, contracts))
 
 # Kalshi's terminal states. The listing's status filter says "open" but rows
 # come back as "active"; a finished market is "finalized" (sometimes
@@ -755,8 +782,11 @@ def render_status(obs_rows: list, settle_rows: list, poll_rows: list) -> str:
              % (100.0 * rate, 100.0 * ub, 100.0 * be))
     mu_cc, se_cc = _mean_se([d["pnl_cc"] for d in days])
     mu_c, se_c = _mean_se([d["pnl_c"] for d in days])
-    L.append("  mean P&L      fee_centicent %+.2fc (day-clustered SE %.2fc)   fee_cent %+.2fc (SE %.2fc)"
-             % (100 * mu_cc, 100 * se_cc, 100 * mu_c, 100 * se_c))
+    L.append("  mean P&L      fee at %d-contract orders %+.2fc (day-clustered SE %.2fc)"
+             % (ORDER_CONTRACTS, 100 * mu_cc, 100 * se_cc))
+    L.append("                bounds: raw fee %+.2fc ... 1-contract orders %+.2fc"
+             " (the cent rounding is per ORDER, so size decides which end you get)"
+             % (100 * mu_cc, 100 * mu_c))
     if n >= N_POWER:
         L.append("  95%% CI        fee_centicent [%+.2fc, %+.2fc]   fee_cent [%+.2fc, %+.2fc]"
                  % (100 * (mu_cc - 1.96 * se_cc), 100 * (mu_cc + 1.96 * se_cc),
