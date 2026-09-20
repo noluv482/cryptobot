@@ -36,12 +36,21 @@ observation per ticker.
 Settlement: once a recorded market's scheduled close is more than an hour in
 the past, GET /markets/{ticker} until it is settled/finalized with a result.
 
-Decision (--status), exactly these rules: REFUTED if the event loss rate
-exceeds 2.0% with >= 100 settled events; otherwise NOT YET until >= 149
-events with a Clopper-Pearson 95% upper bound under 2.0% => BOUNDED; >= 987
-events => POWERED (report the CI). Below 30 settled events it prints COUNTS
-ONLY — no rates, no EV — because a percentage of 12 events would carry the
-authority of a measurement it does not have.
+Decision (--status). CORRECTED 2026-09-20, before any verdict was reached and
+in the harder direction only: the unit is INDEPENDENT EVENT-DAYS, not events,
+because one weather system drives every city ladder that settles the same day
+(the live feed put 41 weather events into 2 calendar days), and the break-even
+is q* = 1 - P - fee rather than a flat 2%, which was right only at exactly 98c
+and far too kind at 99c, where under cent-rounded fees the break-even is ZERO.
+REFUTED if the event-day loss rate exceeds that measured break-even with >= 100
+event-days; BOUNDED when the Clopper-Pearson 95% upper bound falls under it
+(about 165 zero-loss event-days at the cell's measured 98.43c entry — and the
+gate is the bound itself, never a magic n, because the old 149 was reverse-
+engineered as the smallest number that cleared 2% and did so by 0.0096 of a
+percentage point); POWERED at 987. Below 30 settled event-days it prints COUNTS
+ONLY — no rates, no EV — because a percentage of 12 would carry the authority
+of a measurement it does not have. At roughly one independent event-day per
+calendar day, BOUNDED is a four-to-five month wait, not a three-day one.
 
 FEES ARE REPORTED TWICE
 -----------------------
@@ -112,11 +121,41 @@ PRICE_HI = 0.995
 MAX_SPREAD = 0.05
 EPS = 1e-9                         # 0.95 <= "0.9500" must not fail on float noise
 FEE_RATE = 0.07
-BREAK_EVEN_LOSS = 0.02
+# CORRECTED 2026-09-20, before any verdict was reached, and every correction
+# makes the bar HARDER - which is the only direction a pre-registered rule may
+# be moved after the fact without dishonesty.
+#
+# (1) THE BREAK-EVEN IS NOT A CONSTANT. Buying a favorite at P wins (1-P-fee)
+#     and loses (P+fee), so the break-even loss rate is q* = 1-P-fee: 3.38% at
+#     96.4c, 1.86% at 98c, 0.93% at 99c. The old flat 0.02 was right only at
+#     exactly 98c and was far too generous at 99c, where a quarter of the
+#     sample sits. It is now computed from the cell's own capital-weighted
+#     entry price. BREAK_EVEN_FALLBACK is used only when no prices are to hand.
+# (2) COUNT EVENT-DAYS, NOT EVENTS. Forty-one "independent" weather events on
+#     one Tuesday are one synoptic system. Measured on the live feed: 139 fresh
+#     candidates spanned 3 event-days, and 99 weather tickers spanned 2 calendar
+#     days across 41 city ladders. Clustering by event_ticker alone would have
+#     declared BOUNDED on an effective n near 2.
+# (3) N_BOUND WAS A RUBBER STAMP. cp_upper(0,149) = 1.9904% against a 2.0000%
+#     bar clears by 0.0096 of a percentage point - the number was the smallest n
+#     that passes, which is not a test. It is now solved from the measured
+#     break-even, and at 1.81% it takes 164 zero-loss event-days.
+BREAK_EVEN_FALLBACK = 0.0181       # solved at the cell's measured 98.43c entry
 N_REFUTE = 100
-N_BOUND = 149
+N_BOUND = 165        # solved, not chosen: the first n whose CP95 clears 1.81%
 N_POWER = 987
 N_MIN_REPORT = 30
+
+
+def break_even(prices):
+    """q* = 1 - P - fee at the capital-weighted entry price. A favorite bought
+    at 99c has to be right 99.07% of the time; one bought at 96c only 96.6%.
+    Reporting both against a single 2% bar flattered the expensive half."""
+    ps = [float(p) for p in prices if p]
+    if not ps:
+        return BREAK_EVEN_FALLBACK
+    p = sum(x * x for x in ps) / sum(ps)          # capital-weighted
+    return max(0.0, 1.0 - p - fee_cent(p))
 
 # Kalshi's terminal states. The listing's status filter says "open" but rows
 # come back as "active"; a finished market is "finalized" (sometimes
@@ -294,17 +333,29 @@ def cp_upper(k: int, n: int, alpha: float = 0.05) -> float:
     return hi
 
 
-def decide(losses: int, events: int) -> str:
+def decide(losses: int, events: int, be: float = BREAK_EVEN_FALLBACK) -> str:
+    """`events` must be INDEPENDENT EVENT-DAYS. `be` is the measured
+    price-weighted break-even. Passing raw event counts here is the mistake
+    that would have rubber-stamped this cell in three days."""
     if events < N_MIN_REPORT:
-        return "COUNTS ONLY (fewer than %d settled events: no rate, no EV)" % N_MIN_REPORT
+        return ("COUNTS ONLY (fewer than %d settled event-days: no rate, no EV)"
+                % N_MIN_REPORT)
     rate = losses / float(events)
-    if events >= N_REFUTE and rate > BREAK_EVEN_LOSS:
-        return "REFUTED (event loss rate above the 2.0c break-even with >= %d events)" % N_REFUTE
+    if events >= N_REFUTE and rate > be:
+        return ("REFUTED (loss rate %.2f%% is above the measured %.2f%% break-even "
+                "with >= %d event-days)" % (100 * rate, 100 * be, N_REFUTE))
     if events >= N_POWER:
-        return "POWERED (>= %d events; report the CI)" % N_POWER
-    if events >= N_BOUND and cp_upper(losses, events) < BREAK_EVEN_LOSS:
-        return "BOUNDED (CP95 upper bound under 2.0 pct with >= %d events)" % N_BOUND
-    return "NOT YET (need >= %d zero-loss events, or a CP95 bound under 2.0 pct)" % N_BOUND
+        return "POWERED (>= %d event-days; report the CI)" % N_POWER
+    # The gate is the BOUND ITSELF, not a magic n. Making n the gate is how the
+    # old rule became a rubber stamp: 149 was chosen as the smallest number that
+    # cleared a 2% bar, which it did by 0.0096 of a percentage point. N_BOUND is
+    # now only an estimate of how long the wait will be, printed for planning.
+    if cp_upper(losses, events) < be:
+        return ("BOUNDED (CP95 upper bound %.2f%% is under the measured %.2f%% "
+                "break-even with >= %d event-days)"
+                % (100 * cp_upper(losses, events), 100 * be, N_BOUND))
+    return ("NOT YET (need a CP95 bound under the measured %.2f%% break-even; "
+            "that takes >= %d zero-loss event-days)" % (100 * be, N_BOUND))
 
 
 # ── schema ──────────────────────────────────────────────────────────────────
@@ -611,9 +662,34 @@ def _event_stats(cell: dict, settle: dict) -> dict:
             if s.get("close_time_final") and r.get("close_time") and \
                     s["close_time_final"] < r["close_time"]:
                 early = True
-        events.append({"event": ev, "n": len(rows), "lost": lost, "early": early,
+        # The settlement DAY, taken from when the market actually resolved
+        # (falling back to its scheduled close): the unit of independence.
+        _t = None
+        for r in rows:
+            s = settle[r["ticker"]]
+            _t = s.get("close_time_final") or r.get("close_time") or r.get("ts")
+            if _t:
+                break
+        day = time.strftime("%Y-%m-%d", time.gmtime(int(_t))) if _t else "?"
+        events.append({"event": ev, "n": len(rows), "lost": lost, "early": early, "day": day,
                        "pnl_cc": sum(pnl_cc) / len(pnl_cc), "pnl_c": sum(pnl_c) / len(pnl_c)})
-    return {"events": events, "n_events_all": len(by_event)}
+    # EVENT-DAYS, the unit the verdict is actually counted in. One weather
+    # system drives every city ladder that settles the same day, so 41 "events"
+    # on a Tuesday are one draw, not 41. Measured on this recorder's own first
+    # day: 99 weather tickers across 41 ladders spanned 2 calendar days. An
+    # event-day loses if ANY event in it lost, and its P&L is the mean of its
+    # events, so a bad day cannot be diluted by the good markets beside it.
+    by_day = {}
+    for e in events:
+        by_day.setdefault(e.get("day") or "?", []).append(e)
+    days = []
+    for d, evs in sorted(by_day.items()):
+        days.append({"day": d, "n_events": len(evs),
+                     "lost": any(e["lost"] for e in evs),
+                     "early": any(e["early"] for e in evs),
+                     "pnl_cc": sum(e["pnl_cc"] for e in evs) / len(evs),
+                     "pnl_c": sum(e["pnl_c"] for e in evs) / len(evs)})
+    return {"events": events, "n_events_all": len(by_event), "days": days}
 
 
 def render_status(obs_rows: list, settle_rows: list, poll_rows: list) -> str:
@@ -655,21 +731,31 @@ def render_status(obs_rows: list, settle_rows: list, poll_rows: list) -> str:
         L.append("  capacity      $%.0f/day mean of sum(size*price) over %d observation days"
                  % (sum(per_day.values()) / len(per_day), len(per_day)))
 
-    n = len(events)
+    # The verdict is counted in EVENT-DAYS. Reporting the event count beside it
+    # is deliberate: the gap between the two numbers is the whole reason this
+    # test takes months rather than days, and hiding it would flatter the run.
+    days = st["days"]
+    n = len(days)
+    day_losses = sum(1 for d in days if d["lost"])
+    be = break_even([r["price"] for t, r in cell.items() if t in settle])
+    L.append("  independent   %d event-days (from %d events; a weather system drives"
+             " every city ladder that settles the same day)" % (n, len(events)))
+    L.append("  break-even    %.2f%% loss rate, from the cell's own capital-weighted"
+             " entry (NOT a flat 2%%: q* = 1 - P - fee)" % (100 * be))
     if n < N_MIN_REPORT:
-        L.append("  decision      %s" % decide(losses, n))
-        L.append("  (no rate, no EV and no interval are printed below %d settled events:"
+        L.append("  decision      %s" % decide(day_losses, n, be))
+        L.append("  (no rate, no EV and no interval are printed below %d settled event-days:"
                  " an under-powered number rendered with authority is the failure this"
                  " project exists to avoid)" % N_MIN_REPORT)
         return "\n".join(L)
 
-    rate = losses / float(n)
-    ub = cp_upper(losses, n)
-    L.append("  event loss    %.2f%%  (Clopper-Pearson 95%% upper bound %.2f%%; break-even 2.00%%)"
-             % (100.0 * rate, 100.0 * ub))
-    mu_cc, se_cc = _mean_se([e["pnl_cc"] for e in events])
-    mu_c, se_c = _mean_se([e["pnl_c"] for e in events])
-    L.append("  mean P&L      fee_centicent %+.2fc (event-clustered SE %.2fc)   fee_cent %+.2fc (SE %.2fc)"
+    rate = day_losses / float(n)
+    ub = cp_upper(day_losses, n)
+    L.append("  day loss      %.2f%%  (Clopper-Pearson 95%% upper bound %.2f%%; break-even %.2f%%)"
+             % (100.0 * rate, 100.0 * ub, 100.0 * be))
+    mu_cc, se_cc = _mean_se([d["pnl_cc"] for d in days])
+    mu_c, se_c = _mean_se([d["pnl_c"] for d in days])
+    L.append("  mean P&L      fee_centicent %+.2fc (day-clustered SE %.2fc)   fee_cent %+.2fc (SE %.2fc)"
              % (100 * mu_cc, 100 * se_cc, 100 * mu_c, 100 * se_c))
     if n >= N_POWER:
         L.append("  95%% CI        fee_centicent [%+.2fc, %+.2fc]   fee_cent [%+.2fc, %+.2fc]"
@@ -685,7 +771,7 @@ def render_status(obs_rows: list, settle_rows: list, poll_rows: list) -> str:
         else:
             L.append("  %-13s %d events, %d losing (counts only below %d)"
                      % (label, len(sub), sum(1 for e in sub if e["lost"]), N_MIN_REPORT))
-    L.append("  decision      %s" % decide(losses, n))
+    L.append("  decision      %s" % decide(day_losses, n, be))
     return "\n".join(L)
 
 

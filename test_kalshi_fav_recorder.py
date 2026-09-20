@@ -180,16 +180,37 @@ check("the fee is charged on both variants in the report",
 print()
 print("[4] the stopping rules, fixed before the data")
 
-check("0 losses in 149 events -> BOUNDED", K.decide(0, 149).startswith("BOUNDED"), K.decide(0, 149))
-check("0 losses in 148 events -> not yet BOUNDED", not K.decide(0, 148).startswith("BOUNDED"))
-check("0 losses in 100 events -> NOT YET", K.decide(0, 100).startswith("NOT YET"), K.decide(0, 100))
-check("3 losses in 100 events (3%) -> REFUTED", K.decide(3, 100).startswith("REFUTED"))
-check("2 losses in 100 events (2.0%, not ABOVE) -> not refuted",
-      not K.decide(2, 100).startswith("REFUTED"), K.decide(2, 100))
-check("3 losses in 99 events -> not refuted (the >=100 gate holds)",
-      not K.decide(3, 99).startswith("REFUTED"))
-check("0 losses in 20 events -> COUNTS ONLY", K.decide(0, 20).startswith("COUNTS ONLY"))
-check("987 events -> POWERED", K.decide(5, 987).startswith("POWERED"))
+# CORRECTED 2026-09-20. Two things changed and both make the bar harder, which
+# is the only honest direction to move a pre-registered rule after the fact:
+# the unit is EVENT-DAYS (one weather system drives every city ladder settling
+# that day), and the break-even is q* = 1 - P - fee rather than a flat 2%,
+# which was right only at exactly 98c.
+BE = K.BREAK_EVEN_FALLBACK              # 1.81%, solved at the measured 98.43c entry
+check("0 losses in 165 event-days -> BOUNDED", K.decide(0, 165, BE).startswith("BOUNDED"),
+      K.decide(0, 165, BE))
+check("...and 164 does NOT — the gate is the BOUND itself, so this boundary is"
+      " solved rather than chosen", not K.decide(0, 164, BE).startswith("BOUNDED"))
+check("0 losses in 149 event-days is NO LONGER enough (the old bar was a rubber stamp:"
+      " cp_upper(0,149)=1.9904% cleared a 2.0000% bar by 0.0096pp)",
+      not K.decide(0, 149, BE).startswith("BOUNDED"), K.decide(0, 149, BE))
+check("0 losses in 100 event-days -> NOT YET", K.decide(0, 100, BE).startswith("NOT YET"))
+check("3 losses in 100 event-days (3%) -> REFUTED", K.decide(3, 100, BE).startswith("REFUTED"))
+check("2 losses in 100 event-days (2.0%) -> REFUTED too, because break-even is 1.81% not 2%",
+      K.decide(2, 100, BE).startswith("REFUTED"), K.decide(2, 100, BE))
+check("3 losses in 99 event-days -> not refuted (the >=100 gate holds)",
+      not K.decide(3, 99, BE).startswith("REFUTED"))
+check("0 losses in 20 event-days -> COUNTS ONLY", K.decide(0, 20, BE).startswith("COUNTS ONLY"))
+check("987 event-days -> POWERED", K.decide(5, 987, BE).startswith("POWERED"))
+
+# the break-even is a function of the price paid, not a constant
+check("break-even at 96c is 3.00% (a cheap favorite has room)",
+      abs(K.break_even([0.96]) - 0.03) < 1e-9, K.break_even([0.96]))
+check("break-even at 98c is 1.00%", abs(K.break_even([0.98]) - 0.01) < 1e-9, K.break_even([0.98]))
+check("break-even at 99c is ZERO — under the cent-rounded fee a 99c favorite cannot"
+      " be profitable at ANY win rate, and a quarter of the original sample sat there",
+      K.break_even([0.99]) < 1e-9, K.break_even([0.99]))
+check("with no prices it falls back to the measured constant",
+      K.break_even([]) == K.BREAK_EVEN_FALLBACK)
 check("Clopper-Pearson 0/149 is just under 2%", 0.019 < K.cp_upper(0, 149) < 0.020,
       K.cp_upper(0, 149))
 check("Clopper-Pearson 0/148 is not under 2%", K.cp_upper(0, 148) >= 0.020, K.cp_upper(0, 148))
@@ -280,32 +301,49 @@ print()
 print("[7] --status honesty")
 
 
-def obs(t, price=0.98, ev=None, cat="Politics", v24=500.0, ts=T0):
+# `day` puts each synthetic market on its OWN settlement day unless told
+# otherwise, because the verdict is now counted in event-days: seeding 40
+# markets that all settle on one Tuesday is one draw, not forty, and the
+# report must say so.
+def obs(t, price=0.98, ev=None, cat="Politics", v24=500.0, ts=T0, day=0):
+    close = T0 + 24 * HOUR + day * 24 * HOUR
     return {"ticker": t, "ts": ts, "event_ticker": ev or ("EV-" + t), "series": "KX",
             "category": cat, "side": "YES", "price": price, "size_fp": 100.0,
             "yes_bid": price - 0.02, "yes_ask": price, "yes_bid_size": 100.0,
             "yes_ask_size": 100.0, "mid": price - 0.01, "spread": 0.02,
-            "close_time": T0 + 24 * HOUR, "expected_expiration_time": T0 + 24 * HOUR,
+            "close_time": close, "expected_expiration_time": close,
             "volume_24h": v24, "volume": 9000.0, "open_interest": 100.0, "updated_time": T0}
 
 
-def sett(t, result="yes", final=None):
+def sett(t, result="yes", final=None, day=0):
+    close = T0 + 24 * HOUR + day * 24 * HOUR
     return {"ticker": t, "result": result, "status": "settled",
-            "close_time_final": final if final is not None else T0 + 24 * HOUR,
-            "settlement_ts": T0 + 24 * HOUR}
+            "close_time_final": final if final is not None else close,
+            "settlement_ts": close}
 
 
-small = [obs("T%d" % i) for i in range(20)]
-out = K.render_status(small, [sett("T%d" % i) for i in range(20)], [(T0, True)])
-check("under 30 settled events the report prints NO percentage at all",
-      "%" not in out, [l for l in out.split("\n") if "%" in l])
+small = [obs("T%d" % i, day=i) for i in range(20)]
+out = K.render_status(small, [sett("T%d" % i, day=i) for i in range(20)], [(T0, True)])
+# The break-even IS printed below 30 - it is a property of the prices paid, not
+# an estimate of anything uncertain. What must never appear early is a measured
+# OUTCOME: a loss rate, an EV or an interval.
+check("under 30 settled event-days the report prints no loss rate",
+      "day loss" not in out, [l for l in out.split("\n") if "loss" in l])
 check("...and no EV", "P&L" not in out and "SE" not in out)
 check("...and says why", "COUNTS ONLY" in out)
 
-big = [obs("B%d" % i) for i in range(40)]
-out2 = K.render_status(big, [sett("B%d" % i) for i in range(40)], [(T0, True)])
-check("at 40 settled events the rate and EV appear", "event loss" in out2 and "mean P&L" in out2)
-check("40 zero-loss events is still NOT YET (149 is the bar)", "NOT YET" in out2, out2[-80:])
+# 40 markets that all settle on ONE day are ONE draw: the report must refuse.
+same = [obs("Z%d" % i, day=0) for i in range(40)]
+outs = K.render_status(same, [sett("Z%d" % i, day=0) for i in range(40)], [(T0, True)])
+check("40 events that all settle on the SAME day are 1 event-day, and the report"
+      " refuses to score them (this is the correction that matters most)",
+      "COUNTS ONLY" in outs and "1 event-days" in outs,
+      [l for l in outs.split("\n") if "independent" in l])
+
+big = [obs("B%d" % i, day=i) for i in range(40)]
+out2 = K.render_status(big, [sett("B%d" % i, day=i) for i in range(40)], [(T0, True)])
+check("at 40 settled event-days the rate and EV appear", "day loss" in out2 and "mean P&L" in out2)
+check("40 zero-loss event-days is still NOT YET (164 is the bar)", "NOT YET" in out2, out2[-80:])
 # A 98c favorite that wins collects 2c gross. The fee decides almost half of
 # what is left: 2 - 0.14 = 1.86c if Kalshi rounds to the centicent, 2 - 1.00 =
 # 1.00c if it rounds to the cent per order. That unresolved rule is why both
@@ -314,16 +352,16 @@ check("40 zero-loss events is still NOT YET (149 is the bar)", "NOT YET" in out2
 check("a winning 98c favorite nets +1.86c (centicent) vs +1.00c (cent)",
       "+1.86c" in out2 and "+1.00c" in out2, [l for l in out2.split("\n") if "mean P&L" in l])
 
-mixed = [obs("M%d" % i) for i in range(40)]
-msett = [sett("M%d" % i, "no" if i < 4 else "yes") for i in range(40)]
+mixed = [obs("M%d" % i, day=i) for i in range(40)]
+msett = [sett("M%d" % i, "no" if i < 4 else "yes", day=i) for i in range(40)]
 out3 = K.render_status(mixed, msett, [(T0, True)])
 check("4 losses in 40 events reports a 10.00% loss rate", "10.00%" in out3,
       [l for l in out3.split("\n") if "event loss" in l])
 check("...but is not REFUTED below 100 events", "REFUTED" not in out3)
 
-hund = [obs("H%d" % i) for i in range(100)]
-hsett = [sett("H%d" % i, "no" if i < 3 else "yes") for i in range(100)]
-check("3 losses in 100 events IS refuted", "REFUTED" in K.render_status(hund, hsett, [(T0, True)]))
+hund = [obs("H%d" % i, day=i) for i in range(100)]
+hsett = [sett("H%d" % i, "no" if i < 3 else "yes", day=i) for i in range(100)]
+check("3 losses in 100 event-days IS refuted", "REFUTED" in K.render_status(hund, hsett, [(T0, True)]))
 
 # the primary cell: first fresh observation per ticker, known category
 cell = K.primary_cell([obs("A", ts=T0 + HOUR), obs("A", price=0.99, ts=T0),
