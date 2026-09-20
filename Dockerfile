@@ -50,6 +50,10 @@ COPY test_leakage.py .
 # hit exactly the footgun line 10 describes, with the file present in the repo
 # on the host and absent from /app.
 COPY bbo_recorder.py .
+# Kalshi favorites forward test (2026-09-19): the pre-registered recorder for
+# the one cell the venue audit could not close. Same footgun as line 10 — it is
+# useless in the repo and only real in the image.
+COPY kalshi_fav_recorder.py .
 
 RUN useradd -r -u 1001 -s /bin/false bot && mkdir -p /data && chown bot:bot /data
 

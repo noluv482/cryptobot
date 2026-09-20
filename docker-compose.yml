@@ -94,3 +94,24 @@ services:
       # one it can never leak.
       DATABASE_URL: postgresql://cryptobot:${DB_PASSWORD}@db:5432/cryptobot
       DATA_DIR: /data
+
+  # The Kalshi favorites forward test (2026-09-19). A RECORDER, not a trader:
+  # one unauthenticated public GET an hour, four tables of its own, no order
+  # verb anywhere in the file. It exists because a venue-wide audit found 65
+  # wins and 0 losses in this cell, which cannot bound a 2% tail — so the rule
+  # was pre-registered and the data is being collected before any money moves.
+  # `docker compose exec kalshi python kalshi_fav_recorder.py --status` reads
+  # the verdict; it will say COUNTS ONLY for the first thirty settled events,
+  # and that is the point.
+  kalshi:
+    build: .
+    restart: unless-stopped
+    command: python kalshi_fav_recorder.py
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Same reasoning as `bbo`: a credential it never receives is one it can
+      # never leak. Kalshi is read anonymously, so there is nothing to hold.
+      DATABASE_URL: postgresql://cryptobot:${DB_PASSWORD}@db:5432/cryptobot
+      DATA_DIR: /data
