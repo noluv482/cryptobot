@@ -438,6 +438,13 @@ def _hold(mins_at_15m):
     """
     return min(int(mins_at_15m * _TF_SCALE * HOLD_SCALE), MAX_TRADE_MINS)
 POSITION_WATCHDOG_SECS = 60    # how often the watchdog re-checks open positions
+# Minimum outcomes before a signal fingerprint may move its own stake at all.
+# Belt and braces with the Wilson interval in _feature_multiplier, which
+# already keeps small samples neutral on its own: at n=20 a fingerprint has to
+# be roughly 25 points away from the book's pooled rate before the interval
+# clears it. The old floor was 5, where an 18.75% slice of genuinely average
+# fingerprints got cut to a quarter stake for a run of bad luck.
+FEATURE_MIN_N = 20
 KRAKEN_FEE       = float(os.environ.get('KRAKEN_FEE', '0.008'))   # taker: crossing the spread (base tier since 2026-07-09)
 KRAKEN_MAKER_FEE = float(os.environ.get('KRAKEN_MAKER_FEE', '0.004')) # maker: resting order that provides liquidity
 # NOTE: the base-tier rates above make the LIVE round-trip cost ~1.30% with maker
@@ -1706,12 +1713,18 @@ class Database:
             with self.conn.cursor() as cur:
                 cur.execute("""
                     SELECT fkey, COUNT(*) AS n,
+                           SUM(CASE WHEN won THEN 1 ELSE 0 END) AS wins,
                            SUM(CASE WHEN won THEN 1 ELSE 0 END)::float/COUNT(*)*100 AS wr
                     FROM feature_outcomes
                     WHERE src = 'realised'
                     GROUP BY fkey HAVING COUNT(*) >= 5
                 """)
-                return {r[0]: {"n": r[1], "wr": float(r[2])} for r in cur.fetchall()}
+                # `wins` is returned alongside `wr` so a consumer can compute a
+                # Wilson interval rather than trusting a point estimate off five
+                # samples. _feature_multiplier needs it; the two count-only
+                # consumers are unaffected by the extra key.
+                return {r[0]: {"n": r[1], "wins": int(r[2]), "wr": float(r[3])}
+                        for r in cur.fetchall()}
         except Exception as e:
             log("DB", f"feature_win_rates error: {e}", "ERR")
             return {}
@@ -5180,9 +5193,63 @@ class PaperTrader:
         return 0.0
 
     # ── Learning method 1: signal-condition fingerprint ──────────────────────
+    @staticmethod
+    def _wilson(wins, n, z=1.96):
+        """Wilson 95% interval for a binomial proportion -> (lo, hi), 0..1.
+
+        Same formula as learning_report.wilson() and the dashboard's own
+        _wilson() in the served JS. Duplicated rather than imported to keep
+        this file's import graph flat; the three must agree, and
+        test_feature_multiplier.py pins this one against reference values."""
+        if n <= 0:
+            return 0.0, 1.0
+        p = wins / float(n)
+        denom = 1 + z * z / n
+        center = (p + z * z / (2 * n)) / denom
+        half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+        return max(0.0, center - half), min(1.0, center + half)
+
     def _feature_multiplier(self, fkey):
-        """Scale stake up/down based on realized win rate of this signal fingerprint.
-        Needs ≥5 samples; uses DB when available, in-memory trades otherwise."""
+        """Scale stake by how this fingerprint performs AGAINST THIS BOOK'S OWN
+        base rate, and only when the evidence supports a difference.
+
+        REWRITTEN 2026-09-25, because the previous version was measured doing
+        the opposite of learning. It compared a fingerprint's raw win rate to
+        fixed thresholds (>=65 -> 1.15x, >=55 -> 1.0, >=45 -> 0.70, >=35 ->
+        0.45, else 0.25) on a minimum of FIVE samples. Three faults, each fatal
+        on its own:
+
+        1. THE THRESHOLDS WERE ABSOLUTE, THE BOOK IS NOT. This book's pooled
+           win rate is about 22%: it takes many small losses and fewer larger
+           wins, which is what a trend-following book DOES. Judged against a
+           65/55/45/35 ladder built for a coin flip, essentially every
+           fingerprint lands in the bottom bucket. Measured: 8 of 10
+           fingerprints were cut to 0.25x, where a null in which every
+           fingerprint shares the pooled rate predicts 8.83. It was not
+           finding bad fingerprints. It was finding that the ladder was wrong.
+
+        2. FIVE SAMPLES IS NOISE. At n=5 a true 50% fingerprint shows <=1 win
+           18.75% of the time, and was cut to a quarter stake for it.
+
+        3. IT GOT WORSE WITH MORE EVIDENCE. The chance a genuinely 50%
+           fingerprint ever reached the 1.15x bucket fell from 0.189 at n=5 to
+           0.002 at n=100, because the observed rate converges on 50% and 50%
+           is below the fixed 65 gate. A learner whose reward becomes
+           unreachable as evidence accumulates is worse than no learner: it is
+           a slow ratchet toward minimum size on noise.
+
+        The replacement compares like with like and respects uncertainty. The
+        reference is the book's OWN pooled win rate over the same outcomes, so
+        a 22% book judges its fingerprints against 22%. The test is whether a
+        Wilson 95% interval EXCLUDES that pooled rate - the project's standing
+        rule that colour follows the interval, not the point estimate. Nothing
+        moves off 1.0 until the evidence says it should, which means small n
+        is automatically neutral instead of automatically punished, and more
+        evidence now makes a real difference easier to see rather than harder.
+
+        The surviving adjustments are deliberately mild (1.15x / 0.70x): this
+        is position sizing on a book with no measured directional edge, not a
+        conviction signal."""
         if self._no_persist or not fkey:
             return 1.0
         now = time.time()
@@ -5196,14 +5263,28 @@ class PaperTrader:
                 log("PAPER", f"feature cache: {e}", "ERR")
             self._feat_ts = now
         stats = self._feat_cache.get(fkey)
-        if not stats or stats["n"] < 5:
+        if not stats or stats["n"] < FEATURE_MIN_N:
             return 1.0
-        wr = stats["wr"]
-        if wr >= 65: return 1.15
-        if wr >= 55: return 1.0
-        if wr >= 45: return 0.70
-        if wr >= 35: return 0.45
-        return 0.25
+        wins = stats.get("wins")
+        if wins is None:                      # older cache shape: derive it
+            wins = int(round(stats["wr"] / 100.0 * stats["n"]))
+
+        # The book's own base rate, pooled over exactly the outcomes that fed
+        # this cache. Computed here rather than passed in so it can never drift
+        # from the numerator it is being compared against.
+        tot_n = sum(s["n"] for s in self._feat_cache.values() if s.get("n"))
+        tot_w = sum(s.get("wins", int(round(s["wr"] / 100.0 * s["n"])))
+                    for s in self._feat_cache.values() if s.get("n"))
+        if tot_n < FEATURE_MIN_N:
+            return 1.0
+        pooled = tot_w / float(tot_n)
+
+        lo, hi = self._wilson(wins, stats["n"])
+        if lo > pooled:                       # better than this book, established
+            return 1.15
+        if hi < pooled:                       # worse than this book, established
+            return 0.70
+        return 1.0                            # not established: do not guess
 
     # ── Learning method 2: per-pair ATR multiplier self-tuning ───────────────
     def _refresh_exit_cache(self, pair):
@@ -5466,7 +5547,7 @@ class PaperTrader:
             if t["pnl"] > 0:
                 rates[fk]["wins"] += 1
         return {
-            fk: {"wr": v["wins"] / v["n"] * 100, "n": v["n"]}
+            fk: {"wr": v["wins"] / v["n"] * 100, "n": v["n"], "wins": v["wins"]}
             for fk, v in rates.items()
             if v["n"] >= min_trades
         }
@@ -6004,13 +6085,43 @@ class PaperTrader:
             except Exception:
                 pass
             self._wr_ts = now_ts
+        # Same disease, same cure as _feature_multiplier (2026-09-25). This was
+        # an absolute 65/40/45 ladder on a book whose pooled win rate is ~22%,
+        # reading min_trades=5, so `wr <= 40 -> 0.60` fired for very nearly
+        # every pair — it was not finding weak pairs, it was rediscovering that
+        # the ladder was written for a different book. Judged against the
+        # book's own pooled rate, and only when a Wilson 95% interval actually
+        # excludes it, so an ordinary pair is left alone instead of shrunk.
+        #
+        # ONE HONEST APPROXIMATION, stated rather than buried: coin_win_rates()
+        # returns a RECENCY-WEIGHTED rate (14-day half-life), not a raw count,
+        # so `wins = wr * n` reconstructs a binomial that was never exactly
+        # binomial. The point estimate is right; the interval is slightly too
+        # NARROW, because exponential weighting means the effective sample is
+        # smaller than n. That errs toward acting, which is the wrong
+        # direction, so FEATURE_MIN_N does real work here and this path should
+        # be revisited if the weighting ever gets steeper.
         wr_data = self._wr_cache.get(pair)
         wr_mult = 1.0
-        if wr_data:
-            wr = wr_data["wr"]
-            if   wr >= 65: wr_mult = 1.20; log("PAPER", f"{pair} WR {wr:.0f}% → +20% stake")
-            elif wr <= 40: wr_mult = 0.60; log("PAPER", f"{pair} WR {wr:.0f}% → -40% stake")
-            elif wr <= 45: wr_mult = 0.80; log("PAPER", f"{pair} WR {wr:.0f}% → -20% stake")
+        if wr_data and wr_data.get("n", 0) >= FEATURE_MIN_N:
+            _tot_n = sum(d["n"] for d in self._wr_cache.values() if d.get("n"))
+            _tot_w = sum(d.get("wins", int(round(d["wr"] / 100.0 * d["n"])))
+                         for d in self._wr_cache.values() if d.get("n"))
+            if _tot_n >= FEATURE_MIN_N:
+                _pooled = _tot_w / float(_tot_n)
+                _wins = wr_data.get("wins")
+                if _wins is None:
+                    _wins = int(round(wr_data["wr"] / 100.0 * wr_data["n"]))
+                _lo, _hi = self._wilson(_wins, wr_data["n"])
+                wr = wr_data["wr"]
+                if _lo > _pooled:
+                    wr_mult = 1.20
+                    log("PAPER", f"{pair} WR {wr:.0f}% beats the book's "
+                                 f"{100*_pooled:.0f}% → +20% stake")
+                elif _hi < _pooled:
+                    wr_mult = 0.60
+                    log("PAPER", f"{pair} WR {wr:.0f}% lags the book's "
+                                 f"{100*_pooled:.0f}% → -40% stake")
 
         # Kelly Criterion base risk when ≥20 trades available (half-Kelly)
         # Floor at 50% of the linear formula to prevent a jarring drop when Kelly
