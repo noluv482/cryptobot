@@ -62,16 +62,22 @@ services:
       db:
         condition: service_started
 
-  tunnel:
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    # Quick tunnel (no account needed) — URL printed in logs on startup.
-    # For a permanent URL: create a tunnel at dash.cloudflare.com, copy the
-    # token into .env as CLOUDFLARE_TUNNEL_TOKEN, then change the command to:
-    #   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
-    command: tunnel --no-autoupdate --url http://bot:8080
-    depends_on:
-      - bot
+  # REMOVED 2026-09-24 — the quick tunnel published this dashboard to the open
+  # internet. Verified from outside on 2026-09-20: GET / returned 200 and
+  # 401,147 bytes, GET /status returned balance, P&L, win rate and the recent
+  # trade list to anyone with the URL, with no authentication of any kind, on a
+  # page carrying Kraken API key and secret input fields. An anonymous
+  # trycloudflare hostname is not a secret; it is a URL that has been handed to
+  # Cloudflare's edge and logged.
+  #
+  # The container was stopped that day, but stopping was not enough: this block
+  # stayed here with restart: unless-stopped, so the next `docker compose up -d`
+  # would have recreated it and quietly republished everything. Deleting the
+  # block is what actually closes it.
+  #
+  # If remote access is wanted again, the answer is Tailscale (already running,
+  # already private) or a NAMED Cloudflare tunnel with Access in front of it —
+  # never an anonymous quick tunnel onto a port that can place orders.
 
   # Top-of-book recorder. Its OWN container, deliberately: it runs for weeks
   # unattended, and a crash, a memory leak or a wedged HTTP call must be able to

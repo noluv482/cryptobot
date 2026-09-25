@@ -2771,11 +2771,25 @@ def _save_trusted_devices():
 def _request_is_authorized(body=None):
     """Gate for control-plane actions (pause/resume/close/live-toggle).
     Authorized if the caller is a previously-trusted device_id, OR supplies
-    the correct DASHBOARD_PIN directly. If no DASHBOARD_PIN is configured at
-    all, access is left open (matches the rest of the dashboard's behavior
-    when PIN protection hasn't been set up)."""
+    the correct DASHBOARD_PIN directly.
+
+    FAILS CLOSED (changed 2026-09-24). This used to `return True` when no
+    DASHBOARD_PIN was configured, on the reasoning that an unconfigured PIN
+    meant the owner had not asked for protection. That is backwards for a
+    control plane: the one state where nobody has set a password is exactly
+    the state where "allow everything" is most dangerous, and it is the
+    DEFAULT state — a fresh deploy, a missing .env line, or a typo in the
+    variable name all land here silently. An audit found this reachable
+    alongside a dashboard that was published to the open internet.
+
+    A misconfiguration must now refuse, not admit. The cost of being wrong in
+    this direction is a locked-out owner who reads a log line; the cost in the
+    other direction is a stranger closing positions."""
     if not DASHBOARD_PIN:
-        return True
+        log("AUTH", "control-plane request REFUSED: DASHBOARD_PIN is not "
+                    "configured. Set it in the compose environment block (not "
+                    "just .env) to enable control actions.", "ERR")
+        return False
     body = body if body is not None else (_flask_request.get_json(silent=True) or {})
     dev_id = body.get("device_id", "") or _flask_request.args.get("device_id", "")
     if dev_id and dev_id in _trusted_devices:
@@ -3303,6 +3317,23 @@ def _kraken_place_order(pair, side, volume, validate=False, leverage=None,
       like a market order but is guaranteed not to fill worse than the limit.
     Returns txid string or raises on failure.
     """
+    # THE LAST GATE, and deliberately the innermost one (added 2026-09-24).
+    # Every caller is supposed to check is_live() first. This does not trust
+    # that. It is the single narrowest point through which a real order can
+    # leave this process, so the hard stop belongs HERE as well as upstream:
+    # a new endpoint, a webhook receiver, a refactor that forgets the check, or
+    # a path nobody has written yet cannot reach Kraken without passing this
+    # line. An audit found 16 of 24 mutating routes with no authentication at
+    # all and /force_trade calling straight into the open path, which is
+    # exactly the shape of bug this catches.
+    #
+    # `validate=True` is Kraken's dry-run flag — it prices and checks an order
+    # without placing it — so it stays allowed under the lock on purpose.
+    if PAPER_LOCK and not validate:
+        raise RuntimeError(
+            "PAPER_LOCK is set: refusing to place a real %s order for %.8f %s. "
+            "Clearing it requires editing the compose environment and restarting."
+            % (side, volume, pair))
     min_vol = _KRAKEN_MIN_VOL.get(pair, 0.0)
     if volume < min_vol:
         raise ValueError(f"Order volume {volume:.8f} below Kraken minimum {min_vol} for {pair}")
