@@ -65,7 +65,7 @@ class _Fake:
     # staticmethod() re-wraps it: PaperTrader._wilson hands back the plain
     # underlying function, and a plain function assigned to a class becomes an
     # instance method, which would pass `self` in as `wins`.
-    _wilson = staticmethod(B.PaperTrader._wilson)
+    _wilson = staticmethod(B._wilson)
     _feature_multiplier = B.PaperTrader._feature_multiplier
 
 
@@ -143,7 +143,7 @@ check("no absolute win-rate ladder survives in either STAKE path",
       not re.search(r"wr\s*>=\s*65", _stake_paths)
       and not re.search(r"wr\s*<=\s*4[05]", _stake_paths))
 check("the per-pair stake multiplier is now interval-based too",
-      "_lo > _pooled" in SRC and "_hi < _pooled" in SRC)
+      "_beats_book(_wins_of(wr_data)" in SRC)
 check("the 0.25x quarter-stake bucket is gone",
       "return 0.25" not in SRC.split("def _feature_multiplier")[1].split("\n    def ")[0])
 
@@ -194,6 +194,38 @@ check("a cache without `wins` still works (older shape is derived, not crashed)"
       _Fake({"a": {"n": 100, "wr": 45.0}, "b": {"n": 400, "wr": 22.0}}
             )._feature_multiplier("a") == 1.15)
 check("the multiplier is still applied to sizing", "_feature_multiplier(fkey)" in SRC)
+
+# ── [6] the shared helpers, used by all four former ladders ────────────────
+print()
+print("[6] one rule, four call sites")
+
+_bk = {"a": {"n": 100, "wins": 22}, "b": {"n": 100, "wins": 22},
+       "c": {"n": 100, "wins": 22}, "d": {"n": 100, "wins": 45}}
+_p = B._pooled_rate(_bk)
+check("pooled is computed from the same rows being judged", abs(_p - 0.2775) < 0.001, _p)
+check("a member matching the book scores 0 (leave it alone)",
+      B._beats_book(22, 100, _p) == 0)
+check("a member genuinely beating it scores +1", B._beats_book(45, 100, _p) == 1)
+check("a member genuinely lagging it scores -1", B._beats_book(5, 100, _p) == -1)
+check("too few samples is 0, never a guess", B._beats_book(0, 10, 0.242) == 0)
+check("no pooled rate available is 0", B._beats_book(50, 100, None) == 0)
+check("wins is derived when absent, not crashed",
+      B._wins_of({"n": 100, "wr": 45.0}) == 45)
+
+# The hard exclusion is the one that removed a pair from trading entirely.
+# Against CODE, not SRC. My own comment explaining the removal contains the
+# very string being searched for — the exact false-positive this project has
+# now hit five times (post_only, video-cadence, the vol_dist default, the
+# stripped INSERT). Strip comments first, then assert.
+_CODE = re.sub(r"#[^%s]*" % chr(10), "", SRC)
+check("the `score = -1000` hard exclusion is gone from the scoring path",
+      "score = -1000" not in _CODE)
+check("...and the string still appears in a COMMENT, so this check is proven"
+      " capable of failing", "score = -1000" in SRC)
+check("...and all four former ladders now route through _beats_book",
+      SRC.count("_beats_book(") >= 4, SRC.count("_beats_book("))
+check("the confidence-tier ladder is gone too",
+      not re.search(r"if wr >= 55: return 1\.0", SRC))
 
 print()
 if FAILS:

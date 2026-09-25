@@ -445,6 +445,68 @@ POSITION_WATCHDOG_SECS = 60    # how often the watchdog re-checks open positions
 # clears it. The old floor was 5, where an 18.75% slice of genuinely average
 # fingerprints got cut to a quarter stake for a run of bad luck.
 FEATURE_MIN_N = 20
+
+
+def _wilson(wins, n, z=1.96):
+    """Wilson 95% interval for a binomial proportion -> (lo, hi), each 0..1.
+
+    Same formula as learning_report.wilson() and the dashboard's served
+    _wilson(); the three must agree and test_feature_multiplier.py pins this
+    one against reference values."""
+    if n <= 0:
+        return 0.0, 1.0
+    p = wins / float(n)
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def _pooled_rate(cache):
+    """The book's own win rate over exactly the rows in `cache` (0..1, or None).
+
+    Computed from the same dict a caller is about to judge a member of, so the
+    reference can never drift from the numerator it is compared against."""
+    tot_n = sum(d["n"] for d in cache.values() if d.get("n"))
+    if tot_n < FEATURE_MIN_N:
+        return None
+    tot_w = sum(d.get("wins", int(round(d.get("wr", 0.0) / 100.0 * d["n"])))
+                for d in cache.values() if d.get("n"))
+    return tot_w / float(tot_n)
+
+
+def _beats_book(wins, n, pooled, min_n=FEATURE_MIN_N):
+    """+1 / 0 / -1: established better than the book, not established, worse.
+
+    THE POINT OF THIS FUNCTION. Four separate places in this file used to
+    compare a win rate against a fixed ladder - 65 good, 35 bad - written for a
+    book that wins about half its trades. THIS book's pooled win rate is 24.2%
+    (measured 2026-09-25, 32 pairs), because a trend-following book takes many
+    small losses and fewer larger wins. Against a 65/35 ladder, a pair whose
+    TRUE rate is exactly the book's own 24.2% reads as "bad" with probability
+    0.913 at n=20 and 0.995 at n=100. The ladders were not finding weak
+    pairs; they were measuring the distance between this book and a coin flip,
+    and getting more confident about it the more evidence arrived.
+
+    So: judge against the book's own rate, and only when a Wilson 95% interval
+    actually excludes it. Insufficient or ambiguous evidence returns 0 and the
+    caller leaves its number alone. More data now makes a real difference
+    easier to detect rather than harder, which is the property the ladders
+    inverted."""
+    if pooled is None or n < min_n:
+        return 0
+    lo, hi = _wilson(wins, n)
+    if lo > pooled:
+        return 1
+    if hi < pooled:
+        return -1
+    return 0
+
+
+def _wins_of(d):
+    """Wins from a rates dict, deriving from wr*n when the key is absent."""
+    w = d.get("wins")
+    return int(round(d.get("wr", 0.0) / 100.0 * d["n"])) if w is None else w
 KRAKEN_FEE       = float(os.environ.get('KRAKEN_FEE', '0.008'))   # taker: crossing the spread (base tier since 2026-07-09)
 KRAKEN_MAKER_FEE = float(os.environ.get('KRAKEN_MAKER_FEE', '0.004')) # maker: resting order that provides liquidity
 # NOTE: the base-tier rates above make the LIVE round-trip cost ~1.30% with maker
@@ -4367,13 +4429,29 @@ def rank_coins():
             if pair in db_rates:
                 wr = db_rates[pair]["wr"]
                 n  = db_rates[pair]["n"]
-                if   wr >= 65: score += 20; learned = f"Learned {wr:.0f}%WR✅"
-                elif wr >= 55: score += 10; learned = f"Learned {wr:.0f}%WR"
-                elif wr <= 35 and n >= 20:
-                    score = -1000          # hard exclusion — consistently losing, skip entirely
-                    learned = f"Excluded {wr:.0f}%WR❌ ({n}t)"
-                elif wr <= 35: score -= 20; learned = f"Learned {wr:.0f}%WR❌"
-                elif wr <= 45: score -= 10; learned = f"Learned {wr:.0f}%WR"
+                # Judged against THIS book's pooled rate, not a fixed ladder,
+                # and only when a Wilson interval excludes it. See _beats_book.
+                #
+                # THE HARD EXCLUSION IS GONE, and it mattered most here. It
+                # fired on `wr <= 35 and n >= 20` and set score = -1000, which
+                # removes the pair from consideration entirely. On a book whose
+                # pooled win rate is 24.2%, a pair performing EXACTLY like the
+                # book trips that at n=20 with probability 0.913, rising to
+                # 0.995 by n=100 (measured). Only one pair has 20+ trades
+                # today, so the damage so far is one pair — but the rule was a
+                # timer: every pair that accumulated history would have been
+                # excluded for being ordinary, and the bot would have ended up
+                # trading only the pairs it knew least about. A win rate alone
+                # should never be a hard exclusion on a book where profit
+                # factor, not hit rate, is the thing that pays.
+                _verdict = _beats_book(_wins_of(db_rates[pair]), n,
+                                       _pooled_rate(db_rates))
+                if _verdict > 0:
+                    score += 20
+                    learned = f"Beats book {wr:.0f}%WR✅ ({n}t)"
+                elif _verdict < 0:
+                    score -= 20
+                    learned = f"Lags book {wr:.0f}%WR❌ ({n}t)"
 
             # ── Social / trending boost ───────────────────────────────────
             tb = trending_boost.get(pair, 0)
@@ -5080,12 +5158,24 @@ class PaperTrader:
         stats = self._calib.get(tier)
         if not stats or stats.get("n", 0) < 15:
             return 1.0
-        wr = stats.get("wr", 50.0)
-        if wr >= 55: return 1.0
-        if wr >= 50: return 0.85
-        if wr >= 45: return 0.65
-        if wr >= 40: return 0.50
-        return 0.35
+        # Same fixed-ladder bug as the other three sites (fixed 2026-09-25).
+        # This one compares a CONFIDENCE TIER's win rate to 55/50/45/40 and
+        # bottoms out at 0.35x. On a 24.2% book both tiers sit far below 40, so
+        # every trade in both tiers was permanently sized at 0.35x — the
+        # multiplier had exactly one reachable value and told the bot nothing.
+        # The question it should answer is comparative: does the HIGH tier
+        # actually beat the LOW tier, which is what a calibrated confidence
+        # score is supposed to mean.
+        other = self._calib.get("low" if tier == "high" else "high") or {}
+        pair_cache = {k: v for k, v in (("this", stats), ("other", other))
+                      if v and v.get("n")}
+        verdict = _beats_book(_wins_of(stats), stats.get("n", 0),
+                              _pooled_rate(pair_cache), min_n=15)
+        if verdict > 0:
+            return 1.0                       # this tier genuinely leads
+        if verdict < 0:
+            return 0.65                      # genuinely lags — size down, not off
+        return 1.0                           # not established: do not guess
 
     @property
     def consecutive_losses(self):
@@ -5193,21 +5283,7 @@ class PaperTrader:
         return 0.0
 
     # ── Learning method 1: signal-condition fingerprint ──────────────────────
-    @staticmethod
-    def _wilson(wins, n, z=1.96):
-        """Wilson 95% interval for a binomial proportion -> (lo, hi), 0..1.
-
-        Same formula as learning_report.wilson() and the dashboard's own
-        _wilson() in the served JS. Duplicated rather than imported to keep
-        this file's import graph flat; the three must agree, and
-        test_feature_multiplier.py pins this one against reference values."""
-        if n <= 0:
-            return 0.0, 1.0
-        p = wins / float(n)
-        denom = 1 + z * z / n
-        center = (p + z * z / (2 * n)) / denom
-        half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-        return max(0.0, center - half), min(1.0, center + half)
+    _wilson = staticmethod(_wilson)          # module-level; see _beats_book
 
     def _feature_multiplier(self, fkey):
         """Scale stake by how this fingerprint performs AGAINST THIS BOOK'S OWN
@@ -5272,18 +5348,11 @@ class PaperTrader:
         # The book's own base rate, pooled over exactly the outcomes that fed
         # this cache. Computed here rather than passed in so it can never drift
         # from the numerator it is being compared against.
-        tot_n = sum(s["n"] for s in self._feat_cache.values() if s.get("n"))
-        tot_w = sum(s.get("wins", int(round(s["wr"] / 100.0 * s["n"])))
-                    for s in self._feat_cache.values() if s.get("n"))
-        if tot_n < FEATURE_MIN_N:
-            return 1.0
-        pooled = tot_w / float(tot_n)
-
-        lo, hi = self._wilson(wins, stats["n"])
-        if lo > pooled:                       # better than this book, established
-            return 1.15
-        if hi < pooled:                       # worse than this book, established
-            return 0.70
+        verdict = _beats_book(wins, stats["n"], _pooled_rate(self._feat_cache))
+        if verdict > 0:
+            return 1.15                       # better than this book, established
+        if verdict < 0:
+            return 0.70                       # worse than this book, established
         return 1.0                            # not established: do not guess
 
     # ── Learning method 2: per-pair ATR multiplier self-tuning ───────────────
@@ -6103,25 +6172,15 @@ class PaperTrader:
         # be revisited if the weighting ever gets steeper.
         wr_data = self._wr_cache.get(pair)
         wr_mult = 1.0
-        if wr_data and wr_data.get("n", 0) >= FEATURE_MIN_N:
-            _tot_n = sum(d["n"] for d in self._wr_cache.values() if d.get("n"))
-            _tot_w = sum(d.get("wins", int(round(d["wr"] / 100.0 * d["n"])))
-                         for d in self._wr_cache.values() if d.get("n"))
-            if _tot_n >= FEATURE_MIN_N:
-                _pooled = _tot_w / float(_tot_n)
-                _wins = wr_data.get("wins")
-                if _wins is None:
-                    _wins = int(round(wr_data["wr"] / 100.0 * wr_data["n"]))
-                _lo, _hi = self._wilson(_wins, wr_data["n"])
-                wr = wr_data["wr"]
-                if _lo > _pooled:
-                    wr_mult = 1.20
-                    log("PAPER", f"{pair} WR {wr:.0f}% beats the book's "
-                                 f"{100*_pooled:.0f}% → +20% stake")
-                elif _hi < _pooled:
-                    wr_mult = 0.60
-                    log("PAPER", f"{pair} WR {wr:.0f}% lags the book's "
-                                 f"{100*_pooled:.0f}% → -40% stake")
+        if wr_data and wr_data.get("n", 0):
+            _pooled = _pooled_rate(self._wr_cache)
+            _verdict = _beats_book(_wins_of(wr_data), wr_data["n"], _pooled)
+            if _verdict:
+                wr, pct = wr_data["wr"], 100 * _pooled
+                wr_mult = 1.20 if _verdict > 0 else 0.60
+                log("PAPER", "%s WR %.0f%% %s the book's %.0f%% → %+d%% stake"
+                    % (pair, wr, "beats" if _verdict > 0 else "lags", pct,
+                       20 if _verdict > 0 else -40))
 
         # Kelly Criterion base risk when ≥20 trades available (half-Kelly)
         # Floor at 50% of the linear formula to prevent a jarring drop when Kelly
